@@ -10,3 +10,5 @@ target/
 .omc/
 .studywiki/
 prototype/operation-runner/sample-workspace/
+.claude/
+*.tsbuildinfo

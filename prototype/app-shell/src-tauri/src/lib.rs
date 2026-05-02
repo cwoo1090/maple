@@ -1,12 +1,13 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
+    collections::HashMap,
     env, fs,
     path::{Component, Path, PathBuf},
     process::Command,
     sync::Mutex,
 };
-use tauri::{Manager, State};
+use tauri::{AppHandle, Manager, State};
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -61,6 +62,204 @@ struct AppCommandResult {
 
 struct WorkspaceStore {
     path: Mutex<Option<PathBuf>>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct AppSettings {
+    provider: String,
+    models: HashMap<String, String>,
+}
+
+fn default_settings() -> AppSettings {
+    let mut models = HashMap::new();
+    models.insert("codex".to_string(), "gpt-5-codex".to_string());
+    models.insert("claude".to_string(), "claude-sonnet-4-6".to_string());
+    AppSettings {
+        provider: "codex".to_string(),
+        models,
+    }
+}
+
+fn settings_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_config_dir()
+        .map_err(|error| format!("Failed to resolve app config dir: {error}"))?;
+    fs::create_dir_all(&dir)
+        .map_err(|error| format!("Failed to create app config dir: {error}"))?;
+    Ok(dir.join("settings.json"))
+}
+
+fn read_settings(app: &AppHandle) -> AppSettings {
+    let Ok(path) = settings_path(app) else {
+        return default_settings();
+    };
+    let Ok(bytes) = fs::read(&path) else {
+        return default_settings();
+    };
+    serde_json::from_slice::<AppSettings>(&bytes).unwrap_or_else(|_| default_settings())
+}
+
+fn write_settings(app: &AppHandle, settings: &AppSettings) -> Result<(), String> {
+    let path = settings_path(app)?;
+    let json = serde_json::to_vec_pretty(settings)
+        .map_err(|error| format!("Failed to serialize settings: {error}"))?;
+    fs::write(&path, json)
+        .map_err(|error| format!("Failed to write settings: {error}"))
+}
+
+#[tauri::command]
+async fn get_settings(app: AppHandle) -> Result<AppSettings, String> {
+    Ok(read_settings(&app))
+}
+
+#[tauri::command]
+async fn set_provider(app: AppHandle, name: String) -> Result<AppSettings, String> {
+    let mut settings = read_settings(&app);
+    settings.provider = name;
+    write_settings(&app, &settings)?;
+    Ok(settings)
+}
+
+#[tauri::command]
+async fn set_model(
+    app: AppHandle,
+    provider: String,
+    model_id: String,
+) -> Result<AppSettings, String> {
+    let mut settings = read_settings(&app);
+    settings.models.insert(provider, model_id);
+    write_settings(&app, &settings)?;
+    Ok(settings)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderModel {
+    id: String,
+    label: String,
+    description: Option<String>,
+    recommended: Option<bool>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderInfo {
+    name: String,
+    label: String,
+    install_command: String,
+    login_command: String,
+    default_model: String,
+    supported_models: Vec<ProviderModel>,
+}
+
+#[tauri::command]
+async fn list_providers() -> Result<Vec<ProviderInfo>, String> {
+    Ok(vec![
+        ProviderInfo {
+            name: "codex".into(),
+            label: "ChatGPT (via Codex CLI)".into(),
+            install_command: "npm i -g @openai/codex".into(),
+            login_command: "codex login".into(),
+            default_model: "gpt-5-codex".into(),
+            supported_models: vec![
+                ProviderModel {
+                    id: "gpt-5-codex".into(),
+                    label: "GPT-5 Codex".into(),
+                    description: None,
+                    recommended: Some(true),
+                },
+                ProviderModel {
+                    id: "gpt-5".into(),
+                    label: "GPT-5".into(),
+                    description: None,
+                    recommended: None,
+                },
+                ProviderModel {
+                    id: "gpt-5-mini".into(),
+                    label: "GPT-5 Mini".into(),
+                    description: None,
+                    recommended: None,
+                },
+            ],
+        },
+        ProviderInfo {
+            name: "claude".into(),
+            label: "Claude (via Claude Code CLI)".into(),
+            install_command: "npm i -g @anthropic-ai/claude-code".into(),
+            login_command: "claude".into(),
+            default_model: "claude-sonnet-4-6".into(),
+            supported_models: vec![
+                ProviderModel {
+                    id: "claude-sonnet-4-6".into(),
+                    label: "Sonnet 4.6".into(),
+                    description: None,
+                    recommended: Some(true),
+                },
+                ProviderModel {
+                    id: "claude-opus-4-7".into(),
+                    label: "Opus 4.7".into(),
+                    description: Some("Heavy rate limits on Pro; Max recommended".into()),
+                    recommended: None,
+                },
+                ProviderModel {
+                    id: "claude-haiku-4-5-20251001".into(),
+                    label: "Haiku 4.5".into(),
+                    description: Some("Fastest".into()),
+                    recommended: None,
+                },
+            ],
+        },
+    ])
+}
+
+#[tauri::command]
+async fn check_provider(name: String) -> Result<RunnerOutput, String> {
+    run_runner_with_args(&[
+        "check".to_string(),
+        "--provider".to_string(),
+        name,
+    ])
+}
+
+#[tauri::command]
+async fn install_provider(name: String) -> Result<RunnerOutput, String> {
+    let cmd = match name.as_str() {
+        "codex" => "npm i -g @openai/codex",
+        "claude" => "npm i -g @anthropic-ai/claude-code",
+        other => return Err(format!("Unknown provider: {other}")),
+    };
+    open_terminal_with(cmd)
+}
+
+#[tauri::command]
+async fn login_provider(name: String) -> Result<RunnerOutput, String> {
+    let cmd = match name.as_str() {
+        "codex" => "codex login",
+        "claude" => "claude",
+        other => return Err(format!("Unknown provider: {other}")),
+    };
+    open_terminal_with(cmd)
+}
+
+fn open_terminal_with(command: &str) -> Result<RunnerOutput, String> {
+    let escaped = command.replace('"', "\\\"");
+    let script = format!(
+        "tell application \"Terminal\"\n    activate\n    do script \"{}\"\nend tell",
+        escaped
+    );
+    let output = Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .map_err(|error| format!("Failed to launch Terminal: {error}"))?;
+    Ok(RunnerOutput {
+        success: output.status.success(),
+        code: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+    })
 }
 
 #[tauri::command]
@@ -152,29 +351,13 @@ async fn check_soffice(state: State<'_, WorkspaceStore>) -> Result<AppCommandRes
 async fn install_libreoffice(
     state: State<'_, WorkspaceStore>,
 ) -> Result<AppCommandResult, String> {
-    let script = r#"tell application "Terminal"
-    activate
-    do script "brew install --cask libreoffice"
-end tell"#;
-
-    let output = Command::new("osascript")
-        .arg("-e")
-        .arg(script)
-        .output()
-        .map_err(|error| format!("Failed to launch Terminal: {error}"))?;
-
+    let runner = open_terminal_with("brew install --cask libreoffice")?;
     let workspace_state = match current_workspace_optional(&state) {
         Some(path) => load_state_at(&path)?,
         None => WorkspaceState::empty(),
     };
-
     Ok(AppCommandResult {
-        runner: Some(RunnerOutput {
-            success: output.status.success(),
-            code: output.status.code(),
-            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-        }),
+        runner: Some(runner),
         state: workspace_state,
     })
 }
@@ -256,9 +439,26 @@ async fn remove_raw_source(
 }
 
 #[tauri::command]
-async fn build_wiki(state: State<'_, WorkspaceStore>) -> Result<AppCommandResult, String> {
+async fn build_wiki(
+    app: AppHandle,
+    state: State<'_, WorkspaceStore>,
+) -> Result<AppCommandResult, String> {
     let workspace = current_workspace(&state)?;
-    let runner = run_runner(&workspace, "build", &[])?;
+    let settings = read_settings(&app);
+    let provider = settings.provider.clone();
+    let model = settings
+        .models
+        .get(&provider)
+        .cloned()
+        .unwrap_or_else(|| match provider.as_str() {
+            "claude" => "claude-sonnet-4-6".to_string(),
+            _ => "gpt-5-codex".to_string(),
+        });
+    let runner = run_runner(
+        &workspace,
+        "build",
+        &["--provider", &provider, "--model", &model],
+    )?;
     Ok(AppCommandResult {
         runner: Some(runner),
         state: load_state_at(&workspace)?,
@@ -335,18 +535,21 @@ fn run_runner(
     command: &str,
     extra_args: &[&str],
 ) -> Result<RunnerOutput, String> {
-    let runner_root = runner_root()?;
-    let node = node_executable()?;
-    let workspace_str = workspace.to_string_lossy().to_string();
-
-    let mut all_args: Vec<String> = vec![command.to_string(), workspace_str];
+    let mut all_args: Vec<String> =
+        vec![command.to_string(), workspace.to_string_lossy().to_string()];
     for arg in extra_args {
         all_args.push((*arg).to_string());
     }
+    run_runner_with_args(&all_args)
+}
+
+fn run_runner_with_args(args: &[String]) -> Result<RunnerOutput, String> {
+    let runner_root = runner_root()?;
+    let node = node_executable()?;
 
     let output = Command::new(&node)
         .arg("src/operation-runner.js")
-        .args(&all_args)
+        .args(args)
         .env("PATH", runner_path_env(&node))
         .current_dir(&runner_root)
         .output()
@@ -743,6 +946,13 @@ pub fn run() {
             cancel_build,
             read_interrupted_operation,
             discard_interrupted_operation,
+            get_settings,
+            set_provider,
+            set_model,
+            list_providers,
+            check_provider,
+            install_provider,
+            login_provider,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
