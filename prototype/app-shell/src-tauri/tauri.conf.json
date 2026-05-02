@@ -26,7 +26,8 @@
       "assetProtocol": {
         "enable": true,
         "scope": [
-          "$HOME/**"
+          "$HOME/**",
+          "$HOME/**/.studywiki/**"
         ]
       }
     }

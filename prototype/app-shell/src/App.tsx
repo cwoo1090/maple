@@ -186,6 +186,7 @@ function parseEventsToMessages(jsonl: string): ChatMessage[] {
 
 const IMAGE_EXT_REGEX = /\.(apng|avif|gif|jpe?g|png|svg|webp)$/i;
 const PDF_EXT_REGEX = /\.pdf$/i;
+const PPTX_EXT_REGEX = /\.pptx?$/i;
 
 type LinkGraphEntry = { outbound: string[]; backlinks: string[] };
 type LinkGraph = Record<string, LinkGraphEntry>;
@@ -240,6 +241,12 @@ function App() {
   const [pendingAnchor, setPendingAnchor] = useState<string | null>(null);
   const [viewMode, setViewMode] = useState<"page" | "graph">("page");
   const [showSettings, setShowSettings] = useState(false);
+  const [pptxRender, setPptxRender] = useState<{
+    sourcePath: string;
+    status: "pending" | "ready" | "error";
+    pdfPath?: string;
+    error?: string;
+  } | null>(null);
   const isBuilding = busy === "Building wiki";
 
   const changedFiles = workspace.changedMarker?.changedFiles ?? [];
@@ -527,6 +534,43 @@ function App() {
       active = false;
     };
   }, [selectedPath, workspace.indexMd, workspace.logMd, workspace.workspacePath]);
+
+  useEffect(() => {
+    if (!PPTX_EXT_REGEX.test(selectedPath)) {
+      setPptxRender(null);
+      return;
+    }
+    if (!workspace.workspacePath) return;
+    if (sofficeStatus && !sofficeStatus.installed) {
+      setPptxRender({
+        sourcePath: selectedPath,
+        status: "error",
+        error: "LibreOffice is required to render PowerPoint files.",
+      });
+      return;
+    }
+    let active = true;
+    setPptxRender({ sourcePath: selectedPath, status: "pending" });
+    (async () => {
+      try {
+        const pdfPath = await invoke<string>("convert_pptx_to_pdf", {
+          relativePath: selectedPath,
+        });
+        if (!active) return;
+        setPptxRender({ sourcePath: selectedPath, status: "ready", pdfPath });
+      } catch (err) {
+        if (!active) return;
+        setPptxRender({
+          sourcePath: selectedPath,
+          status: "error",
+          error: String(err),
+        });
+      }
+    })();
+    return () => {
+      active = false;
+    };
+  }, [selectedPath, workspace.workspacePath, sofficeStatus]);
 
   async function runCommand(command: CommandName, label: string) {
     setBusy(label);
@@ -884,11 +928,13 @@ function App() {
                     ? "Image"
                     : PDF_EXT_REGEX.test(selectedPath)
                       ? "PDF"
-                      : selectedPath.startsWith("wiki/")
-                        ? "Study page"
-                        : selectedPath.startsWith("raw/")
-                          ? "Source"
-                          : "Workspace file"}
+                      : PPTX_EXT_REGEX.test(selectedPath)
+                        ? "Slides"
+                        : selectedPath.startsWith("wiki/")
+                          ? "Study page"
+                          : selectedPath.startsWith("raw/")
+                            ? "Source"
+                            : "Workspace file"}
                 </span>
               ) : null}
               <div className="view-toggle">
@@ -932,6 +978,23 @@ function App() {
                 key={selectedPath}
                 src={makeWorkspaceAssetUrl(workspace.workspacePath, selectedPath)}
               />
+            ) : PPTX_EXT_REGEX.test(selectedPath) && workspace.workspacePath ? (
+              pptxRender?.sourcePath === selectedPath && pptxRender.status === "ready" && pptxRender.pdfPath ? (
+                <PdfViewer
+                  key={pptxRender.pdfPath}
+                  src={makeWorkspaceAssetUrl(workspace.workspacePath, pptxRender.pdfPath)}
+                />
+              ) : pptxRender?.sourcePath === selectedPath && pptxRender.status === "error" ? (
+                <div className="pptx-status pptx-status-error">
+                  <strong>Couldn't render slides.</strong>
+                  <p>{pptxRender.error}</p>
+                  {sofficeStatus && !sofficeStatus.installed ? (
+                    <p>Install LibreOffice from the right panel, then reopen this file.</p>
+                  ) : null}
+                </div>
+              ) : (
+                <div className="pptx-status">Rendering slides…</div>
+              )
             ) : (
               <MarkdownDocument
                 content={selectedDocument.content || `${selectedDocument.path} is not available.`}

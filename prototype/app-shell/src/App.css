@@ -606,6 +606,9 @@ code {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  direction: rtl;
+  text-align: left;
+  unicode-bidi: plaintext;
 }
 
 button.tree-name-clickable {
@@ -733,6 +736,26 @@ button.tree-name-clickable {
   height: auto;
   border-radius: 6px;
   background: var(--bg-elevated);
+}
+
+.pptx-status {
+  color: var(--text-secondary);
+  font-size: 13px;
+  padding: 16px 0;
+}
+
+.pptx-status-error {
+  color: var(--text-primary);
+}
+
+.pptx-status-error strong {
+  display: block;
+  margin-bottom: 6px;
+}
+
+.pptx-status-error p {
+  margin: 4px 0 0;
+  color: var(--text-secondary);
 }
 
 .graph-view {

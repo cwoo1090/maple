@@ -362,6 +362,124 @@ async fn install_libreoffice(
     })
 }
 
+fn find_soffice_bin() -> Option<PathBuf> {
+    if let Ok(output) = Command::new("sh")
+        .arg("-lc")
+        .arg("command -v soffice")
+        .output()
+    {
+        if output.status.success() {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !path.is_empty() {
+                return Some(PathBuf::from(path));
+            }
+        }
+    }
+    let mac_default = PathBuf::from("/Applications/LibreOffice.app/Contents/MacOS/soffice");
+    if mac_default.exists() {
+        return Some(mac_default);
+    }
+    None
+}
+
+#[tauri::command]
+async fn convert_pptx_to_pdf(
+    relative_path: String,
+    state: State<'_, WorkspaceStore>,
+) -> Result<String, String> {
+    let workspace = current_workspace(&state)?;
+    let normalized_path = normalize_workspace_relative_path(&relative_path)?;
+    let normalized = normalized_path.to_string_lossy().replace('\\', "/");
+
+    let lower = normalized.to_lowercase();
+    if !(lower.ends_with(".pptx") || lower.ends_with(".ppt")) {
+        return Err("Only .pptx/.ppt files can be converted".to_string());
+    }
+    if !normalized.starts_with("raw/") {
+        return Err("Only raw sources can be converted".to_string());
+    }
+
+    let workspace_root = workspace
+        .canonicalize()
+        .map_err(|error| format!("Failed to resolve workspace path: {error}"))?;
+    let source_full = workspace.join(&normalized_path);
+    let source_canonical = source_full
+        .canonicalize()
+        .map_err(|error| format!("Failed to resolve {normalized}: {error}"))?;
+    if !source_canonical.starts_with(&workspace_root) {
+        return Err("Source path escaped the workspace".to_string());
+    }
+
+    let mtime_secs = fs::metadata(&source_canonical)
+        .and_then(|m| m.modified())
+        .map_err(|error| format!("Failed to read source metadata: {error}"))?
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let raw_stem = source_canonical
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("slide")
+        .to_string();
+    let safe_stem: String = raw_stem
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+
+    let cache_dir = workspace.join(".studywiki").join("cache").join("pptx");
+    fs::create_dir_all(&cache_dir)
+        .map_err(|error| format!("Failed to create cache directory: {error}"))?;
+    let cached_pdf = cache_dir.join(format!("{safe_stem}-{mtime_secs}.pdf"));
+    let cached_relative = format!(".studywiki/cache/pptx/{safe_stem}-{mtime_secs}.pdf");
+
+    if cached_pdf.exists() {
+        return Ok(cached_relative);
+    }
+
+    let soffice_bin = find_soffice_bin().ok_or_else(|| {
+        "LibreOffice (soffice) not found. Install it from the right panel first.".to_string()
+    })?;
+
+    let output = Command::new(&soffice_bin)
+        .arg("--headless")
+        .arg("--convert-to")
+        .arg("pdf")
+        .arg("--outdir")
+        .arg(&cache_dir)
+        .arg(&source_canonical)
+        .output()
+        .map_err(|error| format!("Failed to run soffice: {error}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("soffice failed: {stderr}"));
+    }
+
+    let produced = cache_dir.join(format!("{raw_stem}.pdf"));
+    if !produced.exists() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(format!(
+            "Expected converted PDF not found at {}.\n{stdout}\n{stderr}",
+            produced.display()
+        ));
+    }
+
+    if produced != cached_pdf {
+        fs::rename(&produced, &cached_pdf)
+            .map_err(|error| format!("Failed to move converted PDF: {error}"))?;
+    }
+
+    Ok(cached_relative)
+}
+
 #[tauri::command]
 async fn reset_sample_workspace(
     state: State<'_, WorkspaceStore>,
@@ -937,6 +1055,7 @@ pub fn run() {
             read_workspace_file,
             check_soffice,
             install_libreoffice,
+            convert_pptx_to_pdf,
             reset_sample_workspace,
             import_sources,
             remove_raw_source,
