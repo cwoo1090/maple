@@ -76,20 +76,45 @@ const NOT_IMPLEMENTED = () => {
   throw new Error("Claude provider is stubbed; implement in Task 7+");
 };
 
+function buildExecArgs(ctx) {
+  const maxTurns = ctx.maxTurns && ctx.maxTurns > 0 ? ctx.maxTurns : 25;
+  return [
+    "-p",
+    "--output-format", "stream-json",
+    "--verbose",
+    "--dangerously-skip-permissions",
+    "--add-dir", ctx.workspace,
+    "--model", ctx.model,
+    "--max-turns", String(maxTurns),
+  ];
+}
+
+function buildSpawnEnv(baseEnv) {
+  const env = { ...baseEnv };
+  delete env.ANTHROPIC_API_KEY;
+  return env;
+}
+
+function feedPrompt(child, prompt) {
+  child.stdin.end(prompt);
+}
+
 module.exports = {
   name: "claude",
   binary: "claude",
   defaultModel: "claude-sonnet-4-6",
   supportedModels: [
     { id: "claude-sonnet-4-6", label: "Sonnet 4.6", recommended: true },
+    { id: "claude-opus-4-7", label: "Opus 4.7", description: "Heavy rate limits on Pro; Max recommended" },
+    { id: "claude-haiku-4-5-20251001", label: "Haiku 4.5", description: "Fastest" },
   ],
   installCommand: "npm i -g @anthropic-ai/claude-code",
   loginCommand: "claude",
   defaultTimeoutMs: 30 * 60 * 1000,
   checkInstalled,
   checkLoggedIn,
-  buildExecArgs: NOT_IMPLEMENTED,
-  buildSpawnEnv: (env) => ({ ...env }),
-  feedPrompt: NOT_IMPLEMENTED,
+  buildExecArgs,
+  buildSpawnEnv,
+  feedPrompt,
   finalizeLastMessage: NOT_IMPLEMENTED,
 };
