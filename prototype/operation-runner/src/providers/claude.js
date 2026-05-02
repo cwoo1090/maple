@@ -1,4 +1,5 @@
 const fs = require("node:fs");
+const fsp = require("node:fs/promises");
 const path = require("node:path");
 const os = require("node:os");
 const { spawnSync } = require("node:child_process");
@@ -72,10 +73,6 @@ function checkLoggedIn() {
   return { loggedIn: false, statusText: "Not signed in", warnings };
 }
 
-const NOT_IMPLEMENTED = () => {
-  throw new Error("Claude provider is stubbed; implement in Task 7+");
-};
-
 function buildExecArgs(ctx) {
   const maxTurns = ctx.maxTurns && ctx.maxTurns > 0 ? ctx.maxTurns : 25;
   return [
@@ -99,6 +96,32 @@ function feedPrompt(child, prompt) {
   child.stdin.end(prompt);
 }
 
+async function finalizeLastMessage(ctx) {
+  let content = "";
+  try {
+    content = await fsp.readFile(ctx.eventsPath, "utf8");
+  } catch (_e) {}
+
+  let subtype = null;
+  let result = "";
+  for (const line of content.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    let event;
+    try {
+      event = JSON.parse(line);
+    } catch (_e) {
+      continue;
+    }
+    if (event && event.type === "result") {
+      subtype = event.subtype || null;
+      if (typeof event.result === "string") result = event.result;
+    }
+  }
+
+  await fsp.writeFile(ctx.lastMessagePath, result);
+  return { subtype };
+}
+
 module.exports = {
   name: "claude",
   binary: "claude",
@@ -116,5 +139,5 @@ module.exports = {
   buildExecArgs,
   buildSpawnEnv,
   feedPrompt,
-  finalizeLastMessage: NOT_IMPLEMENTED,
+  finalizeLastMessage,
 };
