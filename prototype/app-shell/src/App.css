@@ -1122,6 +1122,94 @@ button.tree-name-clickable {
   align-self: flex-start;
 }
 
+/* ============ Study chat (right pane) ============ */
+
+.study-chat-section {
+  gap: 10px;
+}
+
+.study-chat-messages {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 360px;
+  overflow: auto;
+}
+
+.study-chat-msg {
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+.study-chat-msg-user {
+  align-self: flex-end;
+  max-width: 88%;
+  padding: 7px 10px;
+  border-radius: 8px 8px 2px 8px;
+  background: var(--accent-bg-strong);
+  color: var(--accent);
+}
+
+.study-chat-msg-assistant {
+  color: var(--text);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 8px 8px 8px 2px;
+  padding: 9px 11px;
+}
+
+.study-chat-msg-assistant p {
+  margin: 0 0 8px;
+}
+
+.study-chat-msg-assistant p:last-child {
+  margin-bottom: 0;
+}
+
+.study-chat-msg-assistant ul,
+.study-chat-msg-assistant ol {
+  margin: 6px 0 8px 18px;
+  padding: 0;
+}
+
+.study-chat-msg-system {
+  color: var(--danger);
+  background: var(--danger-bg);
+  border-radius: 6px;
+  padding: 7px 10px;
+}
+
+.study-chat-form {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px;
+  align-items: end;
+}
+
+.study-chat-input {
+  width: 100%;
+  min-height: 64px;
+  resize: vertical;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--text);
+  padding: 8px 9px;
+  font: inherit;
+  font-size: 12.5px;
+  line-height: 1.4;
+}
+
+.study-chat-input:focus {
+  outline: none;
+  border-color: var(--accent-border);
+  box-shadow: 0 0 0 2px var(--accent-bg);
+}
+
+.study-chat-submit {
+  min-width: 48px;
+}
+
 /* ============ Changed-files list (right pane) ============ */
 
 .changed-list {

@@ -109,6 +109,21 @@ type ChatMessage = {
   severity?: "info" | "warn" | "success" | "error";
 };
 
+type StudyChatMessage = {
+  id: string;
+  role: "user" | "assistant" | "system";
+  text: string;
+};
+
+type StudyChatReport = {
+  status: string;
+  provider: string;
+  model: string;
+  selectedPath: string;
+  question: string;
+  answer: string;
+};
+
 type BuildProgress = {
   running: boolean;
   marker?: { operationId?: string; pid?: number; startedAt?: string; type?: string };
@@ -235,6 +250,8 @@ function App() {
   const [sofficeInstalling, setSofficeInstalling] = useState(false);
   const [sofficeInstallStartedAt, setSofficeInstallStartedAt] = useState<number | null>(null);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
+  const [studyChatMessages, setStudyChatMessages] = useState<StudyChatMessage[]>([]);
+  const [studyQuestion, setStudyQuestion] = useState("");
   const [interruptedOp, setInterruptedOp] = useState<InterruptedCheck | null>(null);
   const [dragOver, setDragOver] = useState(false);
   const [linkGraph, setLinkGraph] = useState<LinkGraph>({});
@@ -249,6 +266,7 @@ function App() {
     error?: string;
   } | null>(null);
   const isBuilding = busy === "Building wiki";
+  const isAskingWiki = busy === "Asking wiki";
 
   const changedFiles = workspace.changedMarker?.changedFiles ?? [];
   const rawSources = workspace.rawSources ?? [];
@@ -654,6 +672,64 @@ function App() {
       },
     ]);
     await runCommand("build_wiki", "Building wiki");
+  }
+
+  async function askStudyChat() {
+    const question = studyQuestion.trim();
+    if (!question) return;
+
+    const userMessage: StudyChatMessage = {
+      id: `study-user-${Date.now()}`,
+      role: "user",
+      text: question,
+    };
+    setStudyChatMessages((prev) => [...prev, userMessage]);
+    setStudyQuestion("");
+    setBusy("Asking wiki");
+    setError(null);
+
+    try {
+      const result = await invoke<RunnerOutput>("ask_wiki", {
+        question,
+        selectedPath,
+      });
+      const report = parseRunnerJson<StudyChatReport>(result);
+      if (report?.status === "completed" && report.answer.trim()) {
+        setStudyChatMessages((prev) => [
+          ...prev,
+          {
+            id: `study-assistant-${Date.now()}`,
+            role: "assistant",
+            text: report.answer.trim(),
+          },
+        ]);
+      } else {
+        const status = report?.status || `code ${result.code ?? "unknown"}`;
+        setStudyChatMessages((prev) => [
+          ...prev,
+          {
+            id: `study-system-${Date.now()}`,
+            role: "system",
+            text: `Study Chat failed with status: ${status}.`,
+          },
+        ]);
+        if (!result.success) {
+          setError(`Study Chat exited with code ${result.code ?? "unknown"}.`);
+        }
+      }
+    } catch (err) {
+      setStudyChatMessages((prev) => [
+        ...prev,
+        {
+          id: `study-system-${Date.now()}`,
+          role: "system",
+          text: String(err),
+        },
+      ]);
+      setError(String(err));
+    } finally {
+      setBusy(null);
+    }
   }
 
   async function cancelRunningBuild() {
@@ -1064,16 +1140,80 @@ function App() {
             </div>
           ) : null}
 
+          <div className="right-section study-chat-section">
+            <div className="right-section-header">
+              <span>Study Chat</span>
+              <span className="right-section-meta">
+                {isAskingWiki ? "Thinking" : selectedPath}
+              </span>
+            </div>
+            {studyChatMessages.length === 0 ? (
+              <div className="right-empty">
+                Ask about the current page or workspace. Answers are read-only.
+              </div>
+            ) : (
+              <div className="study-chat-messages">
+                {studyChatMessages.map((message) => (
+                  <div
+                    key={message.id}
+                    className={`study-chat-msg study-chat-msg-${message.role}`}
+                  >
+                    {message.role === "assistant" ? (
+                      <ReactMarkdown
+                        remarkPlugins={[remarkGfm, remarkMath]}
+                        rehypePlugins={[rehypeKatex]}
+                      >
+                        {message.text}
+                      </ReactMarkdown>
+                    ) : (
+                      message.text
+                    )}
+                  </div>
+                ))}
+                {isAskingWiki ? <div className="chat-thinking">Reading the wiki…</div> : null}
+              </div>
+            )}
+            <form
+              className="study-chat-form"
+              onSubmit={(event) => {
+                event.preventDefault();
+                void askStudyChat();
+              }}
+            >
+              <textarea
+                className="study-chat-input"
+                value={studyQuestion}
+                disabled={Boolean(busy) || !workspace.workspacePath}
+                placeholder="Ask about this page…"
+                rows={3}
+                onChange={(event) => setStudyQuestion(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" && !event.shiftKey) {
+                    event.preventDefault();
+                    void askStudyChat();
+                  }
+                }}
+              />
+              <button
+                type="submit"
+                className="study-chat-submit"
+                disabled={Boolean(busy) || !workspace.workspacePath || !studyQuestion.trim()}
+              >
+                Ask
+              </button>
+            </form>
+          </div>
+
           <div className="right-section">
             <div className="right-section-header">
               <span>Activity</span>
               <span className="right-section-meta">
-                {isBuilding ? "Codex working" : chatMessages.length > 0 ? "Idle" : "—"}
+                {isBuilding ? "AI working" : chatMessages.length > 0 ? "Idle" : "—"}
               </span>
             </div>
             {chatMessages.length === 0 && !isBuilding ? (
               <div className="right-empty">
-                Click <strong>Build wiki</strong> to start. Codex's progress streams here.
+                Click <strong>Build wiki</strong> to start. Build progress streams here.
               </div>
             ) : (
               <div className="chat-messages">

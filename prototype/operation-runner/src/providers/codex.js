@@ -37,15 +37,27 @@ function buildExecArgs(ctx) {
     "--json",
     "--cd", ctx.workspace,
     "--skip-git-repo-check",
-    "--sandbox", "workspace-write",
+    "--sandbox", ctx.sandbox || "workspace-write",
     "-c", 'approval_policy="never"',
     "--output-last-message", ctx.lastMessagePath,
     "-m", ctx.model,
   ];
+  if (ctx.ephemeral) {
+    args.push("--ephemeral");
+  }
   for (const imagePath of ctx.imageAttachments || []) {
     args.push("--image", imagePath);
   }
   return args;
+}
+
+function askExecArgs(ctx) {
+  return buildExecArgs({
+    ...ctx,
+    sandbox: "read-only",
+    ephemeral: true,
+    imageAttachments: [],
+  });
 }
 
 function buildSpawnEnv(baseEnv) {
@@ -76,6 +88,7 @@ module.exports = {
   checkInstalled,
   checkLoggedIn,
   buildExecArgs,
+  askExecArgs,
   buildSpawnEnv,
   feedPrompt,
   finalizeLastMessage,

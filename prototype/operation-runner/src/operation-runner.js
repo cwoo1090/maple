@@ -15,6 +15,7 @@ const RUNNER_METADATA_PREFIXES = [
   ".studywiki/operations/",
   ".studywiki/changed/",
   ".studywiki/running/",
+  ".studywiki/chat/",
 ];
 const DEFAULT_CODEX_TIMEOUT_MS = 15 * 60 * 1000;
 const RUNNING_MARKER_PATH = ".studywiki/running/operation.json";
@@ -33,6 +34,7 @@ const WORKSPACE_DIRECTORIES = [
   "wiki/assets",
   ".studywiki",
   ".studywiki/running",
+  ".studywiki/chat",
 ];
 
 async function main(argv = process.argv.slice(2)) {
@@ -79,6 +81,16 @@ async function main(argv = process.argv.slice(2)) {
           timeoutMs: parsePositiveInteger(flags["timeout-ms"], 0),
         });
         break;
+      case "ask":
+      case "study-chat":
+        await runStudyChat(resolveWorkspace(args[0]), {
+          provider: flags.provider || "codex",
+          model: flags.model || "",
+          question: flags.question || "",
+          selectedPath: flags["selected-path"] || "",
+          timeoutMs: parsePositiveInteger(flags["timeout-ms"], 0),
+        });
+        break;
       case "status":
         await printStatus(resolveWorkspace(args[0]));
         break;
@@ -122,6 +134,7 @@ Usage:
   node src/operation-runner.js create-sample [workspace] [--force]
   node src/operation-runner.js check [--provider codex|claude]
   node src/operation-runner.js build [workspace] [--provider codex|claude] [--model <id>] [--instruction "..."] [--strict-validation] [--timeout-ms 600000]
+  node src/operation-runner.js ask [workspace] [--provider codex|claude] [--model <id>] --question "..." [--selected-path wiki/page.md]
   node src/operation-runner.js status [workspace]
   node src/operation-runner.js undo [workspace]
 
@@ -446,6 +459,7 @@ async function runBuildWiki(workspace, options = {}) {
       cwd: workspace,
       eventsPath,
       stderrPath,
+      lastMessagePath,
       runningMarkerPath: path.join(workspace, RUNNING_MARKER_PATH),
       timeoutMs: options.timeoutMs,
       operationId,
@@ -574,6 +588,97 @@ async function runBuildWiki(workspace, options = {}) {
   }
 }
 
+async function runStudyChat(workspace, options = {}) {
+  await assertWorkspace(workspace);
+
+  const question = String(options.question || "").trim();
+  if (!question) {
+    throw new Error("Study Chat requires a non-empty question.");
+  }
+
+  const provider = selectProvider(options.provider || "codex");
+  const installed = provider.checkInstalled();
+  if (!installed.installed) {
+    throw new Error(`${provider.name} CLI is not installed. Run: ${provider.installCommand}`);
+  }
+  const auth = provider.checkLoggedIn();
+  if (!auth.loggedIn) {
+    throw new Error(`${provider.name} login was not confirmed. Run: ${provider.loginCommand}`);
+  }
+
+  const chatId = createOperationId();
+  const chatDir = path.join(workspace, ".studywiki", "chat", chatId);
+  await ensureDir(chatDir);
+
+  const startedAt = new Date().toISOString();
+  const prompt = await buildStudyChatPrompt(workspace, options);
+  const promptPath = path.join(chatDir, "prompt.md");
+  const eventsPath = path.join(chatDir, "events.jsonl");
+  const stderrPath = path.join(chatDir, "stderr.log");
+  const lastMessagePath = path.join(chatDir, "answer.md");
+  const reportPath = path.join(chatDir, "report.json");
+  await fsp.writeFile(promptPath, prompt);
+
+  const args = provider.askExecArgs({
+    workspace,
+    model: options.model || provider.defaultModel,
+    lastMessagePath,
+    maxTurns: 8,
+  });
+
+  const providerResult = await runProviderExec(provider, args, prompt, {
+    cwd: workspace,
+    eventsPath,
+    stderrPath,
+    lastMessagePath,
+    runningMarkerPath: path.join(chatDir, "running.json"),
+    timeoutMs: options.timeoutMs || 5 * 60 * 1000,
+    operationId: chatId,
+    operationType: "study-chat",
+    mirrorStdout: false,
+    mirrorStderr: false,
+  });
+
+  const finalize = await provider.finalizeLastMessage({
+    eventsPath,
+    lastMessagePath,
+  });
+  const answer = await fsp.readFile(lastMessagePath, "utf8").catch(() => "");
+  const completedAt = new Date().toISOString();
+  const status =
+    providerResult.timedOut
+      ? "timed_out"
+      : providerResult.cancelled
+        ? "cancelled"
+        : finalize.subtype === "error_during_execution" || providerResult.exitCode !== 0
+          ? "provider_failed"
+          : "completed";
+
+  const report = {
+    id: chatId,
+    type: "study-chat",
+    provider: provider.name,
+    model: options.model || provider.defaultModel,
+    status,
+    workspace,
+    selectedPath: options.selectedPath || "",
+    question,
+    answer,
+    startedAt,
+    completedAt,
+    promptPath: path.relative(workspace, promptPath),
+    eventsPath: path.relative(workspace, eventsPath),
+    stderrPath: path.relative(workspace, stderrPath),
+  };
+
+  await fsp.writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`);
+  console.log(JSON.stringify(report, null, 2));
+
+  if (providerResult.exitCode !== 0) {
+    process.exitCode = providerResult.exitCode || 1;
+  }
+}
+
 async function runProviderExec(provider, args, prompt, paths) {
   await fsp.writeFile(paths.eventsPath, "");
   await fsp.writeFile(paths.stderrPath, "");
@@ -644,12 +749,16 @@ async function runProviderExec(provider, args, prompt, paths) {
 
     child.stdout.on("data", (chunk) => {
       eventsStream.write(chunk);
-      process.stdout.write(chunk);
+      if (paths.mirrorStdout !== false) {
+        process.stdout.write(chunk);
+      }
     });
 
     child.stderr.on("data", (chunk) => {
       stderrStream.write(chunk);
-      process.stderr.write(chunk);
+      if (paths.mirrorStderr !== false) {
+        process.stderr.write(chunk);
+      }
     });
 
     provider.feedPrompt(child, prompt);
@@ -694,7 +803,7 @@ async function runProviderExec(provider, args, prompt, paths) {
         stderrPath: path.relative(paths.cwd, paths.stderrPath),
         lastMessagePath: path.relative(
           paths.cwd,
-          args[args.indexOf("--output-last-message") + 1],
+          paths.lastMessagePath || args[args.indexOf("--output-last-message") + 1],
         ),
       });
     });
@@ -788,6 +897,127 @@ Linking:
 
   prompt += `\nWorkspace path: ${workspace}\n`;
   return prompt;
+}
+
+async function buildStudyChatPrompt(workspace, options) {
+  const rawSources = await listRawSourceFiles(workspace);
+  const wikiFiles = await listWikiFiles(workspace);
+  const selectedPath = normalizeRelativePath(options.selectedPath || "");
+  const selectedContent = selectedPath
+    ? await readChatContextFile(workspace, selectedPath, 24000)
+    : null;
+  const selectedPreparedText =
+    selectedPath && !selectedContent && selectedPath.startsWith("raw/")
+      ? await readLatestPreparedSourceText(workspace, selectedPath, 24000)
+      : null;
+  const indexContent = await readChatContextFile(workspace, "index.md", 16000);
+  const logContent = await readChatContextFile(workspace, "log.md", 8000);
+
+  const selectedBlock = selectedPath
+    ? selectedContent
+      ? renderContextBlock(selectedPath, selectedContent)
+      : selectedPreparedText
+        ? `Selected file: ${selectedPath}\n\n${renderContextBlock(
+            `latest extracted text for ${selectedPath}`,
+            selectedPreparedText,
+          )}`
+        : `Selected file: ${selectedPath}\n\nThe selected file is binary, missing, or too large for direct prompt context. Use read-only tools only if you need to inspect it.`
+    : "No selected file was provided.";
+
+  return `You are Study Chat inside AI Study Wiki Builder.
+
+Role:
+- Help a student understand the local study wiki and its raw sources.
+- Answer clearly and concretely for a non-technical learner.
+- Prefer short explanations, bullets, and formulas only when useful.
+
+Read-only boundary:
+- Do not edit, create, delete, rename, or move files.
+- If the user asks for a wiki change, describe the proposed change instead of applying it.
+- Cite relevant workspace paths in your answer, such as \`wiki/concepts/example.md\` or \`raw/source.pdf\`.
+
+Current workspace:
+${workspace}
+
+Current selected context:
+${selectedBlock}
+
+Workspace index:
+${indexContent ? renderContextBlock("index.md", indexContent) : "index.md is not available."}
+
+Recent log:
+${logContent ? renderContextBlock("log.md", logContent) : "log.md is not available."}
+
+Wiki pages:
+${wikiFiles.length ? wikiFiles.map((file) => `- ${file}`).join("\n") : "- No wiki pages yet."}
+
+Raw sources:
+${rawSources.length ? rawSources.map((file) => `- ${file}`).join("\n") : "- No raw sources yet."}
+
+Student question:
+${String(options.question || "").trim()}
+
+Answer now.`;
+}
+
+async function readChatContextFile(workspace, relPath, maxChars) {
+  const normalized = normalizeRelativePath(relPath);
+  if (!normalized) return null;
+  if (
+    normalized !== "index.md" &&
+    normalized !== "log.md" &&
+    !normalized.startsWith("wiki/") &&
+    !normalized.startsWith("raw/")
+  ) {
+    return null;
+  }
+  if (!/\.(md|txt)$/i.test(normalized)) {
+    return null;
+  }
+
+  const filePath = safeJoin(workspace, normalized);
+  let content;
+  try {
+    content = await fsp.readFile(filePath, "utf8");
+  } catch (_error) {
+    return null;
+  }
+  if (content.length <= maxChars) return content;
+  return `${content.slice(0, maxChars)}\n\n[truncated after ${maxChars} characters]`;
+}
+
+function renderContextBlock(label, content) {
+  return `<${label}>\n${content}\n</${label}>`;
+}
+
+async function readLatestPreparedSourceText(workspace, rawPath, maxChars) {
+  const extractedRoot = path.join(workspace, ".studywiki", "extracted");
+  let operationDirs;
+  try {
+    operationDirs = await fsp.readdir(extractedRoot, { withFileTypes: true });
+  } catch (_error) {
+    return null;
+  }
+
+  const sourceSlug = slugFromSourcePath(rawPath);
+  const candidates = operationDirs
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name)
+    .sort()
+    .reverse()
+    .map((operationId) => path.join(extractedRoot, operationId, sourceSlug, "text.md"));
+
+  for (const candidate of candidates) {
+    let content;
+    try {
+      content = await fsp.readFile(candidate, "utf8");
+    } catch (_error) {
+      continue;
+    }
+    if (content.length <= maxChars) return content;
+    return `${content.slice(0, maxChars)}\n\n[truncated after ${maxChars} characters]`;
+  }
+  return null;
 }
 
 function renderPreparedSourcesForPrompt(preparedSources) {
@@ -1050,6 +1280,20 @@ async function listRawSourceFiles(workspace) {
   });
   sources.sort();
   return sources;
+}
+
+async function listWikiFiles(workspace) {
+  const wikiRoot = path.join(workspace, "wiki");
+  const files = [];
+  if (!(await exists(wikiRoot))) {
+    return files;
+  }
+
+  await walkFiles(workspace, wikiRoot, async (_absolutePath, relPath) => {
+    files.push(relPath);
+  });
+  files.sort();
+  return files;
 }
 
 async function createSnapshot(workspace, id) {

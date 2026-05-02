@@ -18,6 +18,7 @@ const REQUIRED_METHODS = [
   "checkInstalled",
   "checkLoggedIn",
   "buildExecArgs",
+  "askExecArgs",
   "buildSpawnEnv",
   "feedPrompt",
   "finalizeLastMessage",

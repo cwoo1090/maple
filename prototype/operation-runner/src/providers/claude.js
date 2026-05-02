@@ -101,6 +101,20 @@ function buildExecArgs(ctx) {
   ];
 }
 
+function askExecArgs(ctx) {
+  const maxTurns = ctx.maxTurns && ctx.maxTurns > 0 ? ctx.maxTurns : 8;
+  return [
+    "-p",
+    "--output-format", "stream-json",
+    "--verbose",
+    "--no-session-persistence",
+    "--tools", "Read,Grep,Glob",
+    "--add-dir", ctx.workspace,
+    "--model", ctx.model,
+    "--max-turns", String(maxTurns),
+  ];
+}
+
 function buildSpawnEnv(baseEnv) {
   return { ...baseEnv };
 }
@@ -150,6 +164,7 @@ module.exports = {
   checkInstalled,
   checkLoggedIn,
   buildExecArgs,
+  askExecArgs,
   buildSpawnEnv,
   feedPrompt,
   finalizeLastMessage,

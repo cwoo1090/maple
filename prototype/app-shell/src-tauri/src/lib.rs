@@ -601,6 +601,44 @@ async fn build_wiki(
 }
 
 #[tauri::command]
+async fn ask_wiki(
+    app: AppHandle,
+    question: String,
+    selected_path: String,
+    state: State<'_, WorkspaceStore>,
+) -> Result<RunnerOutput, String> {
+    let workspace = current_workspace(&state)?;
+    let question = question.trim().to_string();
+    if question.is_empty() {
+        return Err("Ask a question first.".to_string());
+    }
+    let settings = read_settings(&app);
+    let provider = settings.provider.clone();
+    let model = settings
+        .models
+        .get(&provider)
+        .cloned()
+        .unwrap_or_else(|| match provider.as_str() {
+            "claude" => "claude-sonnet-4-6".to_string(),
+            _ => "gpt-5.5".to_string(),
+        });
+    run_runner(
+        &workspace,
+        "ask",
+        &[
+            "--provider",
+            &provider,
+            "--model",
+            &model,
+            "--question",
+            &question,
+            "--selected-path",
+            &selected_path,
+        ],
+    )
+}
+
+#[tauri::command]
 async fn undo_last_operation(
     state: State<'_, WorkspaceStore>,
 ) -> Result<AppCommandResult, String> {
@@ -1077,6 +1115,7 @@ pub fn run() {
             import_sources,
             remove_raw_source,
             build_wiki,
+            ask_wiki,
             undo_last_operation,
             read_build_progress,
             cancel_build,
