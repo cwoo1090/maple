@@ -163,10 +163,28 @@ code {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0 12px;
+  padding: 0 12px 0 80px;
   background: var(--bg-topbar);
   border-bottom: 1px solid var(--border);
   user-select: none;
+  -webkit-app-region: drag;
+}
+
+.app-topbar button,
+.app-topbar details,
+.app-topbar summary,
+.app-topbar a,
+.app-topbar input {
+  -webkit-app-region: no-drag;
+}
+
+.empty-state {
+  -webkit-app-region: drag;
+}
+
+.empty-state button,
+.empty-state a {
+  -webkit-app-region: no-drag;
 }
 
 .topbar-left {
