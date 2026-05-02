@@ -16,6 +16,7 @@ import ForceGraph2D from "react-force-graph-2d";
 import { forceCollide } from "d3-force";
 import "katex/dist/katex.min.css";
 import "./App.css";
+import { Settings } from "./Settings";
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
@@ -238,6 +239,7 @@ function App() {
   const [connectionsOpen, setConnectionsOpen] = useState(false);
   const [pendingAnchor, setPendingAnchor] = useState<string | null>(null);
   const [viewMode, setViewMode] = useState<"page" | "graph">("page");
+  const [showSettings, setShowSettings] = useState(false);
   const isBuilding = busy === "Building wiki";
 
   const changedFiles = workspace.changedMarker?.changedFiles ?? [];
@@ -806,6 +808,12 @@ function App() {
             <div className="topbar-menu-items">
               <button
                 type="button"
+                onClick={() => setShowSettings(true)}
+              >
+                Settings…
+              </button>
+              <button
+                type="button"
                 disabled={Boolean(busy) || !canUndo}
                 onClick={() => runCommand("undo_last_operation", "Undoing operation")}
               >
@@ -1130,6 +1138,8 @@ function App() {
           </div>
         </div>
       ) : null}
+
+      {showSettings ? <Settings onClose={() => setShowSettings(false)} /> : null}
     </main>
   );
 }
