@@ -454,6 +454,11 @@ async function runBuildWiki(workspace, options = {}) {
 
   await normalizeGeneratedMarkdownFiles(workspace);
 
+  const finalize = await provider.finalizeLastMessage({
+    eventsPath,
+    lastMessagePath,
+  });
+
   const changedFiles = await diffSnapshot(workspace, snapshot);
   const validatedChanges = await validateAndRestoreChanges(workspace, snapshot, changedFiles);
   const userVisibleChangedFiles = getUserVisibleChangedFiles(validatedChanges);
@@ -478,8 +483,10 @@ async function runBuildWiki(workspace, options = {}) {
     status = "timed_out";
   } else if (codexResult.cancelled) {
     status = "cancelled";
-  } else if (codexResult.exitCode !== 0) {
-    status = "codex_failed";
+  } else if (finalize.subtype === "error_max_turns") {
+    status = "turn_budget_exceeded";
+  } else if (finalize.subtype === "error_during_execution" || codexResult.exitCode !== 0) {
+    status = "provider_failed";
   } else if (forbiddenCount > 0) {
     status = "completed_with_forbidden_edits_restored";
   } else if (!producedExpectedContent && !options.dryRun) {
@@ -491,6 +498,8 @@ async function runBuildWiki(workspace, options = {}) {
   const report = {
     id: operationId,
     type: "build-wiki",
+    provider: provider.name,
+    model: options.model || provider.defaultModel,
     status,
     workspace,
     startedAt,
