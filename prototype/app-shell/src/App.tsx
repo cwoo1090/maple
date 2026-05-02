@@ -1,12 +1,23 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { documentDir } from "@tauri-apps/api/path";
 import { open } from "@tauri-apps/plugin-dialog";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import type { UnlistenFn } from "@tauri-apps/api/event";
 import ReactMarkdown, { type Components } from "react-markdown";
 import rehypeKatex from "rehype-katex";
+import rehypeSlug from "rehype-slug";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
+import * as pdfjsLib from "pdfjs-dist";
+import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.mjs?url";
+import ForceGraph2D from "react-force-graph-2d";
+import { forceCollide } from "d3-force";
 import "katex/dist/katex.min.css";
 import "./App.css";
+
+pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
 type ChangedFile = {
   path: string;
@@ -172,8 +183,21 @@ function parseEventsToMessages(jsonl: string): ChatMessage[] {
   return messages;
 }
 
+const IMAGE_EXT_REGEX = /\.(apng|avif|gif|jpe?g|png|svg|webp)$/i;
+const PDF_EXT_REGEX = /\.pdf$/i;
+
+type LinkGraphEntry = { outbound: string[]; backlinks: string[] };
+type LinkGraph = Record<string, LinkGraphEntry>;
+
+function makeWorkspaceAssetUrl(workspacePath: string, relativePath: string): string {
+  const absolute = `${workspacePath.replace(/\/$/, "")}/${relativePath}`;
+  const tauriWindow = window as Window & { __TAURI_INTERNALS__?: unknown };
+  return tauriWindow.__TAURI_INTERNALS__
+    ? convertFileSrc(absolute)
+    : `file://${absolute}`;
+}
+
 type CommandName =
-  | "check_codex"
   | "check_soffice"
   | "install_libreoffice"
   | "reset_sample_workspace"
@@ -209,6 +233,11 @@ function App() {
   const [sofficeInstallStartedAt, setSofficeInstallStartedAt] = useState<number | null>(null);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [interruptedOp, setInterruptedOp] = useState<InterruptedCheck | null>(null);
+  const [dragOver, setDragOver] = useState(false);
+  const [linkGraph, setLinkGraph] = useState<LinkGraph>({});
+  const [connectionsOpen, setConnectionsOpen] = useState(false);
+  const [pendingAnchor, setPendingAnchor] = useState<string | null>(null);
+  const [viewMode, setViewMode] = useState<"page" | "graph">("page");
   const isBuilding = busy === "Building wiki";
 
   const changedFiles = workspace.changedMarker?.changedFiles ?? [];
@@ -225,8 +254,8 @@ function App() {
     [workspace.wikiFiles],
   );
   const availableDocuments = useMemo(
-    () => ["index.md", ...wikiPages, "log.md"],
-    [wikiPages],
+    () => ["index.md", ...workspace.wikiFiles, ...workspace.rawSources, "log.md"],
+    [workspace.wikiFiles, workspace.rawSources],
   );
   const canUndo = changedFiles.length > 0 && !workspace.changedMarker?.undoneAt;
   const canRemoveRawSources = changedFiles.length === 0 || Boolean(workspace.changedMarker?.undoneAt);
@@ -244,14 +273,50 @@ function App() {
     return parts[parts.length - 1] || workspace.workspacePath;
   }, [workspace.workspacePath]);
 
+  const isSampleWorkspace = useMemo(
+    () => workspace.workspacePath.endsWith("/sample-workspace"),
+    [workspace.workspacePath],
+  );
+
+  const [expandedFolders, setExpandedFolders] = useState<Set<string>>(() => new Set());
+
+  function toggleFolder(path: string) {
+    setExpandedFolders((prev) => {
+      const next = new Set(prev);
+      if (next.has(path)) next.delete(path);
+      else next.add(path);
+      return next;
+    });
+  }
+
+  const rawTree = useMemo(() => buildTree(rawSources, "raw/"), [rawSources]);
+  const wikiTree = useMemo(() => {
+    const subtree = buildTree(workspace.wikiFiles, "wiki/");
+    return [
+      { name: "index.md", path: "index.md", isDir: false, children: [] },
+      ...subtree,
+      { name: "log.md", path: "log.md", isDir: false, children: [] },
+    ];
+  }, [workspace.wikiFiles]);
+
+
   useEffect(() => {
-    refreshState();
-    invoke<RunnerOutput>("read_interrupted_operation")
-      .then((runner) => {
-        const parsed = parseRunnerJson<InterruptedCheck>(runner);
-        if (parsed?.interrupted) setInterruptedOp(parsed);
+    const saved = localStorage.getItem("workspacePath");
+    if (!saved) return;
+    invoke<WorkspaceState>("set_workspace", { workspacePath: saved })
+      .then((state) => {
+        setWorkspace(state);
+        invoke<RunnerOutput>("read_interrupted_operation")
+          .then((runner) => {
+            const parsed = parseRunnerJson<InterruptedCheck>(runner);
+            if (parsed?.interrupted) setInterruptedOp(parsed);
+          })
+          .catch(() => {});
       })
-      .catch(() => {});
+      .catch((err) => {
+        localStorage.removeItem("workspacePath");
+        setError(`Could not open last workspace: ${err}`);
+      });
   }, []);
 
   useEffect(() => {
@@ -318,6 +383,108 @@ function App() {
   }, [availableDocuments, selectedPath]);
 
   useEffect(() => {
+    if (!pendingAnchor) return;
+    if (!selectedDocument.content) return;
+    const id = pendingAnchor;
+    const raf = requestAnimationFrame(() => {
+      const el = document.getElementById(id);
+      if (el) {
+        el.scrollIntoView({ behavior: "smooth", block: "start" });
+      }
+      setPendingAnchor(null);
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [pendingAnchor, selectedDocument.content]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function build() {
+      if (!workspace.workspacePath) {
+        setLinkGraph({});
+        return;
+      }
+      const wikiPagePaths = workspace.wikiFiles.filter((p) => p.endsWith(".md"));
+      const allPaths = ["index.md", ...wikiPagePaths, "log.md"];
+
+      const contents = await Promise.all(
+        allPaths.map(async (path) => {
+          if (path === "index.md") return [path, workspace.indexMd ?? ""] as const;
+          if (path === "log.md") return [path, workspace.logMd ?? ""] as const;
+          try {
+            const file = await invoke<WorkspaceFile>("read_workspace_file", {
+              relativePath: path,
+            });
+            return [path, file.content] as const;
+          } catch {
+            return [path, ""] as const;
+          }
+        }),
+      );
+      if (cancelled) return;
+
+      const outbound: Record<string, Set<string>> = {};
+      for (const [path, content] of contents) {
+        outbound[path] = new Set(extractWikiLinkTargets(content, path, allPaths));
+      }
+
+      const graph: LinkGraph = {};
+      for (const path of allPaths) {
+        graph[path] = { outbound: Array.from(outbound[path] || []), backlinks: [] };
+      }
+      for (const [from, targets] of Object.entries(outbound)) {
+        for (const target of targets) {
+          if (graph[target]) graph[target].backlinks.push(from);
+        }
+      }
+      if (!cancelled) setLinkGraph(graph);
+    }
+
+    build();
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    workspace.workspacePath,
+    workspace.wikiFiles.length,
+    workspace.indexMd,
+    workspace.logMd,
+    workspace.changedMarker?.completedAt,
+  ]);
+
+  useEffect(() => {
+    if (!workspace.workspacePath) return;
+    let unlisten: UnlistenFn | null = null;
+    let active = true;
+
+    getCurrentWebviewWindow()
+      .onDragDropEvent((event) => {
+        if (event.payload.type === "enter" || event.payload.type === "over") {
+          setDragOver(true);
+        } else if (event.payload.type === "leave") {
+          setDragOver(false);
+        } else if (event.payload.type === "drop") {
+          setDragOver(false);
+          importDroppedFiles(event.payload.paths);
+        }
+      })
+      .then((un) => {
+        if (active) {
+          unlisten = un;
+        } else {
+          un();
+        }
+      })
+      .catch(() => {});
+
+    return () => {
+      active = false;
+      if (unlisten) unlisten();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [workspace.workspacePath]);
+
+  useEffect(() => {
     let active = true;
 
     async function loadSelectedDocument() {
@@ -358,15 +525,6 @@ function App() {
       active = false;
     };
   }, [selectedPath, workspace.indexMd, workspace.logMd, workspace.workspacePath]);
-
-  async function refreshState() {
-    try {
-      const state = await invoke<WorkspaceState>("load_workspace_state");
-      setWorkspace(state);
-    } catch (err) {
-      setError(String(err));
-    }
-  }
 
   async function runCommand(command: CommandName, label: string) {
     setBusy(label);
@@ -458,6 +616,29 @@ function App() {
     }
   }
 
+  async function importDroppedFiles(paths: string[]) {
+    const supported = paths.filter((p) =>
+      /\.(pdf|pptx|ppt|md|txt|png|jpe?g|webp|gif)$/i.test(p),
+    );
+    if (supported.length === 0) {
+      setError("No supported files in drop. Use PDF, PPTX, MD, TXT, or images.");
+      return;
+    }
+    setBusy("Importing sources");
+    setError(null);
+    try {
+      const result = await invoke<AppCommandResult>("import_sources", {
+        sourcePaths: supported,
+      });
+      setRunner(result.runner);
+      setWorkspace(result.state);
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setBusy(null);
+    }
+  }
+
   async function importSourceFiles() {
     setError(null);
 
@@ -504,6 +685,48 @@ function App() {
     }
   }
 
+  async function pickWorkspace(title: string) {
+    setError(null);
+    let defaultPath: string | undefined;
+    try {
+      defaultPath = await documentDir();
+    } catch (_error) {}
+    const selected = await open({ directory: true, title, defaultPath });
+    if (!selected) return;
+    const path = Array.isArray(selected) ? selected[0] : selected;
+    try {
+      const state = await invoke<WorkspaceState>("set_workspace", {
+        workspacePath: path,
+      });
+      localStorage.setItem("workspacePath", path);
+      setWorkspace(state);
+    } catch (err) {
+      setError(String(err));
+    }
+  }
+
+  async function switchWorkspace() {
+    setError(null);
+    let defaultPath: string | undefined;
+    try {
+      defaultPath = await documentDir();
+    } catch (_error) {}
+    const selected = await open({
+      directory: true,
+      title: "Switch workspace",
+      defaultPath,
+    });
+    if (!selected) return;
+    const path = Array.isArray(selected) ? selected[0] : selected;
+    try {
+      await invoke<WorkspaceState>("set_workspace", { workspacePath: path });
+      localStorage.setItem("workspacePath", path);
+      window.location.reload();
+    } catch (err) {
+      setError(String(err));
+    }
+  }
+
   void runner;
 
   if (!workspace.workspacePath) {
@@ -514,14 +737,21 @@ function App() {
             <h1>AI Study Wiki Builder</h1>
             <p>Open or create a workspace to start.</p>
             <div className="empty-state-actions">
-              <button type="button" className="primary" disabled>
+              <button
+                type="button"
+                className="primary"
+                onClick={() => pickWorkspace("Create new workspace")}
+              >
                 Create new workspace
               </button>
-              <button type="button" disabled>
+              <button
+                type="button"
+                onClick={() => pickWorkspace("Open existing workspace")}
+              >
                 Open existing folder
               </button>
             </div>
-            <p className="empty-state-hint">Workspace picker arrives in B1b.</p>
+            {error ? <p className="empty-state-error">{error}</p> : null}
           </div>
         </div>
       </main>
@@ -532,9 +762,20 @@ function App() {
     <main className="app">
       <header className="app-topbar">
         <div className="topbar-left">
-          <span className="topbar-workspace" title={workspace.workspacePath}>
-            {workspaceName || workspace.workspacePath}
-          </span>
+          <details className="topbar-workspace-menu">
+            <summary>
+              <span className="topbar-workspace" title={workspace.workspacePath}>
+                {workspaceName || workspace.workspacePath}
+              </span>
+              <span className="topbar-workspace-chevron">⌄</span>
+            </summary>
+            <div className="topbar-workspace-dropdown">
+              <p className="topbar-workspace-dropdown-path">{workspace.workspacePath}</p>
+              <button type="button" onClick={switchWorkspace}>
+                Switch workspace…
+              </button>
+            </div>
+          </details>
           <span className={`topbar-status-pill ${busy ? "active" : ""}`}>{statusLabel}</span>
         </div>
         <div className="topbar-right">
@@ -570,13 +811,15 @@ function App() {
               >
                 Undo last build
               </button>
-              <button
-                type="button"
-                disabled={Boolean(busy)}
-                onClick={() => runCommand("reset_sample_workspace", "Resetting sample")}
-              >
-                Reset sample workspace
-              </button>
+              {isSampleWorkspace ? (
+                <button
+                  type="button"
+                  disabled={Boolean(busy)}
+                  onClick={() => runCommand("reset_sample_workspace", "Resetting sample")}
+                >
+                  Reset sample workspace
+                </button>
+              ) : null}
             </div>
           </details>
         </div>
@@ -592,24 +835,16 @@ function App() {
             {rawSources.length === 0 ? (
               <p className="sidebar-empty">No sources imported.</p>
             ) : (
-              <ul className="sidebar-list">
-                {rawSources.map((file) => (
-                  <li key={file}>
-                    <span className="sidebar-item-label" title={file}>
-                      {file.replace(/^raw\//, "")}
-                    </span>
-                    <button
-                      type="button"
-                      className="sidebar-icon-btn ghost"
-                      disabled={Boolean(busy) || !canRemoveRawSources}
-                      onClick={() => removeRawSource(file)}
-                      title="Remove"
-                    >
-                      ×
-                    </button>
-                  </li>
-                ))}
-              </ul>
+              <TreeView
+                nodes={rawTree}
+                level={0}
+                expanded={expandedFolders}
+                toggleFolder={toggleFolder}
+                selectedPath={selectedPath}
+                onSelect={setSelectedPath}
+                onRemove={removeRawSource}
+                removeDisabled={Boolean(busy) || !canRemoveRawSources}
+              />
             )}
           </div>
 
@@ -618,57 +853,90 @@ function App() {
               <span>Wiki</span>
               <span className="sidebar-section-count">{wikiPages.length + 2}</span>
             </div>
-            <ul className="sidebar-list">
-              <li>
-                <button
-                  type="button"
-                  className={`sidebar-file ${selectedPath === "index.md" ? "selected" : ""}`}
-                  onClick={() => setSelectedPath("index.md")}
-                >
-                  index.md
-                </button>
-              </li>
-              {wikiPages.map((file) => (
-                <li key={file}>
-                  <button
-                    type="button"
-                    className={`sidebar-file ${selectedPath === file ? "selected" : ""}`}
-                    onClick={() => setSelectedPath(file)}
-                    title={file}
-                  >
-                    {file.replace(/^wiki\//, "")}
-                  </button>
-                </li>
-              ))}
-              <li>
-                <button
-                  type="button"
-                  className={`sidebar-file ${selectedPath === "log.md" ? "selected" : ""}`}
-                  onClick={() => setSelectedPath("log.md")}
-                >
-                  log.md
-                </button>
-              </li>
-            </ul>
+            <TreeView
+              nodes={wikiTree}
+              level={0}
+              expanded={expandedFolders}
+              toggleFolder={toggleFolder}
+              selectedPath={selectedPath}
+              onSelect={setSelectedPath}
+            />
           </div>
         </aside>
 
         <section className="app-center">
           <div className="center-header">
-            <span className="center-title">{selectedDocument.path}</span>
-            <span className="center-subtitle">
-              {selectedPath.startsWith("wiki/") ? "Study page" : "Workspace file"}
+            <span className="center-title">
+              {viewMode === "graph" ? "Graph view" : selectedPath}
             </span>
+            <div className="center-header-right">
+              {viewMode === "page" ? (
+                <span className="center-subtitle">
+                  {IMAGE_EXT_REGEX.test(selectedPath)
+                    ? "Image"
+                    : PDF_EXT_REGEX.test(selectedPath)
+                      ? "PDF"
+                      : selectedPath.startsWith("wiki/")
+                        ? "Study page"
+                        : selectedPath.startsWith("raw/")
+                          ? "Source"
+                          : "Workspace file"}
+                </span>
+              ) : null}
+              <div className="view-toggle">
+                <button
+                  type="button"
+                  className={`view-toggle-btn ${viewMode === "page" ? "active" : ""}`}
+                  onClick={() => setViewMode("page")}
+                >
+                  Page
+                </button>
+                <button
+                  type="button"
+                  className={`view-toggle-btn ${viewMode === "graph" ? "active" : ""}`}
+                  onClick={() => setViewMode("graph")}
+                >
+                  Graph
+                </button>
+              </div>
+            </div>
           </div>
           <div className="center-body">
-            <MarkdownDocument
-              content={selectedDocument.content || `${selectedDocument.path} is not available.`}
-              currentPath={selectedDocument.path}
-              workspacePath={workspace.workspacePath}
-              availableDocuments={availableDocuments}
-              onOpenDocument={setSelectedPath}
-              onOpenImage={setExpandedImage}
-            />
+            {viewMode === "graph" ? (
+              <GraphView
+                linkGraph={linkGraph}
+                selectedPath={selectedPath}
+                onOpenNode={(path) => {
+                  setSelectedPath(path);
+                  setPendingAnchor(null);
+                  setViewMode("page");
+                }}
+              />
+            ) : IMAGE_EXT_REGEX.test(selectedPath) && workspace.workspacePath ? (
+              <div className="image-viewer">
+                <img
+                  src={makeWorkspaceAssetUrl(workspace.workspacePath, selectedPath)}
+                  alt={selectedPath}
+                />
+              </div>
+            ) : PDF_EXT_REGEX.test(selectedPath) && workspace.workspacePath ? (
+              <PdfViewer
+                key={selectedPath}
+                src={makeWorkspaceAssetUrl(workspace.workspacePath, selectedPath)}
+              />
+            ) : (
+              <MarkdownDocument
+                content={selectedDocument.content || `${selectedDocument.path} is not available.`}
+                currentPath={selectedDocument.path}
+                workspacePath={workspace.workspacePath}
+                availableDocuments={availableDocuments}
+                onOpenDocument={(path, anchor) => {
+                  setSelectedPath(path);
+                  setPendingAnchor(anchor ?? null);
+                }}
+                onOpenImage={setExpandedImage}
+              />
+            )}
           </div>
         </section>
 
@@ -744,6 +1012,75 @@ function App() {
             )}
           </div>
 
+          {selectedPath.endsWith(".md") && linkGraph[selectedPath] ? (
+            <div className="right-section">
+              <button
+                type="button"
+                className="right-section-toggle"
+                onClick={() => setConnectionsOpen((v) => !v)}
+                aria-expanded={connectionsOpen}
+              >
+                <span className="right-section-chevron">{connectionsOpen ? "▾" : "▸"}</span>
+                <span>Connections</span>
+                <span className="right-section-meta">
+                  {linkGraph[selectedPath].backlinks.length +
+                    linkGraph[selectedPath].outbound.length}
+                </span>
+              </button>
+              {connectionsOpen ? (
+                linkGraph[selectedPath].backlinks.length === 0 &&
+                linkGraph[selectedPath].outbound.length === 0 ? (
+                  <p className="connections-empty">No connections to this page yet.</p>
+                ) : (
+                  <>
+                    {linkGraph[selectedPath].backlinks.length > 0 ? (
+                      <>
+                        <div className="connections-label">
+                          Linked from ({linkGraph[selectedPath].backlinks.length})
+                        </div>
+                        <ul className="connections-list">
+                          {linkGraph[selectedPath].backlinks.map((path) => (
+                            <li key={`bl-${path}`}>
+                              <button
+                                type="button"
+                                className="connection-link"
+                                onClick={() => setSelectedPath(path)}
+                                title={path}
+                              >
+                                {path.replace(/^wiki\//, "")}
+                              </button>
+                            </li>
+                          ))}
+                        </ul>
+                      </>
+                    ) : null}
+                    {linkGraph[selectedPath].outbound.length > 0 ? (
+                      <>
+                        <div className="connections-label">
+                          Links from this page ({linkGraph[selectedPath].outbound.length})
+                        </div>
+                        <ul className="connections-list">
+                          {linkGraph[selectedPath].outbound.map((path) => (
+                            <li key={`out-${path}`}>
+                              <button
+                                type="button"
+                                className="connection-link"
+                                onClick={() => setSelectedPath(path)}
+                                title={path}
+                              >
+                                {path.replace(/^wiki\//, "")}
+                              </button>
+                            </li>
+                          ))}
+                        </ul>
+                      </>
+                    ) : null}
+                  </>
+                )
+              ) : null}
+            </div>
+          ) : null}
+
           {changedFiles.length > 0 ? (
             <div className="right-section">
               <div className="right-section-header">
@@ -784,7 +1121,255 @@ function App() {
           {expandedImage.alt ? <p>{expandedImage.alt}</p> : null}
         </div>
       ) : null}
+
+      {dragOver ? (
+        <div className="drop-overlay" aria-hidden>
+          <div className="drop-overlay-card">
+            <strong>Drop to import</strong>
+            <p>PDF, PPTX, MD, TXT, or images</p>
+          </div>
+        </div>
+      ) : null}
     </main>
+  );
+}
+
+type GraphNode = { id: string; name: string; degree: number };
+
+function GraphView({
+  linkGraph,
+  selectedPath,
+  onOpenNode,
+}: {
+  linkGraph: LinkGraph;
+  selectedPath: string;
+  onOpenNode: (path: string) => void;
+}) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const fgRef = useRef<any>(null);
+  const fittedRef = useRef(false);
+  const [size, setSize] = useState({ width: 600, height: 400 });
+  const [hoverNode, setHoverNode] = useState<string | null>(null);
+
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const measure = () => setSize({ width: el.clientWidth, height: el.clientHeight });
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
+
+  const graphData = useMemo(() => {
+    const nodeMap = new Map<string, GraphNode>();
+    const links: { source: string; target: string }[] = [];
+    const ensureNode = (id: string) => {
+      let n = nodeMap.get(id);
+      if (!n) {
+        n = { id, name: nodeLabel(id), degree: 0 };
+        nodeMap.set(id, n);
+      }
+      return n;
+    };
+    for (const [path, entry] of Object.entries(linkGraph)) {
+      const src = ensureNode(path);
+      for (const target of entry.outbound) {
+        const tgt = ensureNode(target);
+        links.push({ source: path, target });
+        src.degree += 1;
+        tgt.degree += 1;
+      }
+    }
+    return { nodes: Array.from(nodeMap.values()), links };
+  }, [linkGraph]);
+
+  const highlightNodes = useMemo(() => {
+    if (!hoverNode) return null;
+    const set = new Set<string>([hoverNode]);
+    const entry = linkGraph[hoverNode];
+    if (entry) {
+      for (const t of entry.outbound) set.add(t);
+      for (const t of entry.backlinks) set.add(t);
+    }
+    return set;
+  }, [hoverNode, linkGraph]);
+
+  useEffect(() => {
+    const fg = fgRef.current;
+    if (!fg) return;
+    fg.d3Force("charge")?.strength(-400);
+    fg.d3Force("link")?.distance(100);
+    fg.d3Force("collide", forceCollide(14));
+    fittedRef.current = false;
+  }, [graphData]);
+
+  return (
+    <div ref={containerRef} className="graph-view">
+      {graphData.nodes.length === 0 ? (
+        <div className="graph-empty">No wiki pages to graph yet.</div>
+      ) : (
+        <ForceGraph2D
+          ref={fgRef}
+          graphData={graphData}
+          width={size.width}
+          height={size.height}
+          backgroundColor="#1e1e1e"
+          nodeRelSize={4}
+          linkColor={(link) => {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const src = (link.source as any)?.id ?? link.source;
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const tgt = (link.target as any)?.id ?? link.target;
+            if (hoverNode && (src === hoverNode || tgt === hoverNode)) {
+              return "rgba(167, 139, 250, 0.7)";
+            }
+            if (hoverNode) return "rgba(180, 180, 180, 0.05)";
+            return "rgba(180, 180, 180, 0.18)";
+          }}
+          linkWidth={(link) => {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const src = (link.source as any)?.id ?? link.source;
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const tgt = (link.target as any)?.id ?? link.target;
+            if (hoverNode && (src === hoverNode || tgt === hoverNode)) return 1.4;
+            return 0.6;
+          }}
+          linkDirectionalArrowLength={0}
+          cooldownTicks={300}
+          d3VelocityDecay={0.35}
+          onNodeClick={(node) => onOpenNode((node as GraphNode).id)}
+          onNodeHover={(node) => {
+            setHoverNode(node ? (node as GraphNode).id : null);
+            document.body.style.cursor = node ? "pointer" : "";
+          }}
+          onEngineStop={() => {
+            if (!fittedRef.current && fgRef.current) {
+              fgRef.current.zoomToFit(500, 60);
+              fittedRef.current = true;
+            }
+          }}
+          nodeCanvasObjectMode={() => "replace"}
+          nodeCanvasObject={(node, ctx, globalScale) => {
+            const n = node as GraphNode & { x?: number; y?: number };
+            if (n.x === undefined || n.y === undefined) return;
+
+            const isSelected = n.id === selectedPath;
+            const isHovered = n.id === hoverNode;
+            const isHighlighted = highlightNodes?.has(n.id) ?? false;
+            const isDimmed = highlightNodes !== null && !isHighlighted;
+
+            const baseRadius = 3 + Math.sqrt(n.degree) * 1.4;
+            const radius = isSelected || isHovered ? baseRadius * 1.4 : baseRadius;
+
+            ctx.beginPath();
+            ctx.arc(n.x, n.y, radius, 0, 2 * Math.PI);
+            if (isHovered || isSelected) {
+              ctx.fillStyle = "#a78bfa";
+            } else if (isHighlighted) {
+              ctx.fillStyle = "#c4b3fc";
+            } else if (isDimmed) {
+              ctx.fillStyle = "rgba(156, 163, 175, 0.35)";
+            } else {
+              ctx.fillStyle = "#9ca3af";
+            }
+            ctx.fill();
+
+            if (globalScale > 0.7) {
+              const fontSize = Math.max(8, 10 / globalScale);
+              ctx.font = `${fontSize}px -apple-system, system-ui, sans-serif`;
+              ctx.textAlign = "center";
+              ctx.textBaseline = "top";
+              if (isHovered || isSelected) {
+                ctx.fillStyle = "#c4b3fc";
+              } else if (isHighlighted) {
+                ctx.fillStyle = "#a78bfa";
+              } else if (isDimmed) {
+                ctx.fillStyle = "rgba(107, 114, 128, 0.45)";
+              } else {
+                ctx.fillStyle = "#9ca3af";
+              }
+              ctx.fillText(n.name, n.x, n.y + radius + 2);
+            }
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+function nodeLabel(path: string): string {
+  const trimmed = path.replace(/^wiki\//, "").replace(/\.md$/, "");
+  return trimmed.split("/").pop() || trimmed;
+}
+
+function PdfViewer({ src }: { src: string }) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+
+    async function load() {
+      const container = containerRef.current;
+      if (!container) return;
+      container.innerHTML = "";
+
+      try {
+        const loadingTask = pdfjsLib.getDocument({
+          url: src,
+          cMapUrl: "/pdfjs/cmaps/",
+          cMapPacked: true,
+          standardFontDataUrl: "/pdfjs/standard_fonts/",
+        });
+        const pdf = await loadingTask.promise;
+        if (cancelled) return;
+
+        const dpr = window.devicePixelRatio || 1;
+        const scale = 1.5;
+
+        for (let i = 1; i <= pdf.numPages; i++) {
+          if (cancelled) return;
+          const page = await pdf.getPage(i);
+          const viewport = page.getViewport({ scale });
+          const canvas = document.createElement("canvas");
+          canvas.className = "pdf-page";
+          canvas.width = viewport.width * dpr;
+          canvas.height = viewport.height * dpr;
+          canvas.style.maxWidth = `${viewport.width}px`;
+          container.appendChild(canvas);
+
+          const ctx = canvas.getContext("2d");
+          if (!ctx) continue;
+          ctx.scale(dpr, dpr);
+          await page.render({ canvasContext: ctx, viewport }).promise;
+        }
+
+        if (!cancelled) setLoading(false);
+      } catch (err) {
+        if (!cancelled) {
+          setError(String(err));
+          setLoading(false);
+        }
+      }
+    }
+
+    load();
+    return () => {
+      cancelled = true;
+    };
+  }, [src]);
+
+  return (
+    <div className="pdf-canvas-viewer">
+      {loading ? <div className="pdf-status">Loading PDF…</div> : null}
+      {error ? <div className="pdf-status pdf-status-error">PDF failed to load: {error}</div> : null}
+      <div ref={containerRef} className="pdf-pages" />
+    </div>
   );
 }
 
@@ -828,6 +1413,154 @@ function ChatMessageView({ message }: { message: ChatMessage }) {
   return null;
 }
 
+type TreeNode = {
+  name: string;
+  path: string;
+  isDir: boolean;
+  children: TreeNode[];
+};
+
+function buildTree(files: string[], rootPrefix: string): TreeNode[] {
+  const trimmedRoot = rootPrefix.replace(/\/$/, "");
+  const root: TreeNode[] = [];
+
+  for (const file of files) {
+    if (!file.startsWith(rootPrefix)) continue;
+    const relative = file.slice(rootPrefix.length);
+    if (!relative) continue;
+    const parts = relative.split("/");
+
+    let level = root;
+    let pathSoFar = trimmedRoot;
+
+    for (let i = 0; i < parts.length; i++) {
+      const name = parts[i];
+      const isLeaf = i === parts.length - 1;
+      pathSoFar = pathSoFar ? `${pathSoFar}/${name}` : name;
+
+      let node = level.find((n) => n.name === name);
+      if (!node) {
+        node = { name, path: pathSoFar, isDir: !isLeaf, children: [] };
+        level.push(node);
+      }
+      level = node.children;
+    }
+  }
+
+  function sortRec(nodes: TreeNode[]) {
+    nodes.sort((a, b) => {
+      if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
+      return a.name.localeCompare(b.name);
+    });
+    for (const node of nodes) sortRec(node.children);
+  }
+  sortRec(root);
+  return root;
+}
+
+type TreeViewProps = {
+  nodes: TreeNode[];
+  level: number;
+  expanded: Set<string>;
+  toggleFolder: (path: string) => void;
+  selectedPath: string;
+  onSelect?: (path: string) => void;
+  onRemove?: (path: string) => void;
+  removeDisabled?: boolean;
+};
+
+function TreeView(props: TreeViewProps) {
+  return (
+    <ul className="tree" style={props.level === 0 ? undefined : { paddingLeft: 0 }}>
+      {props.nodes.map((node) => (
+        <TreeItem key={node.path} node={node} {...props} />
+      ))}
+    </ul>
+  );
+}
+
+function TreeItem({
+  node,
+  level,
+  expanded,
+  toggleFolder,
+  selectedPath,
+  onSelect,
+  onRemove,
+  removeDisabled,
+}: TreeViewProps & { node: TreeNode }) {
+  const indent = 6 + level * 12;
+
+  if (node.isDir) {
+    const isOpen = expanded.has(node.path);
+    return (
+      <li>
+        <button
+          type="button"
+          className="tree-row tree-folder"
+          style={{ paddingLeft: indent }}
+          onClick={() => toggleFolder(node.path)}
+          title={node.path}
+        >
+          <span className="tree-chevron">{isOpen ? "▾" : "▸"}</span>
+          <span className="tree-name">{node.name}</span>
+        </button>
+        {isOpen ? (
+          <TreeView
+            nodes={node.children}
+            level={level + 1}
+            expanded={expanded}
+            toggleFolder={toggleFolder}
+            selectedPath={selectedPath}
+            onSelect={onSelect}
+            onRemove={onRemove}
+            removeDisabled={removeDisabled}
+          />
+        ) : null}
+      </li>
+    );
+  }
+
+  const isSelected = selectedPath === node.path;
+  const fileIndent = indent + 12;
+
+  return (
+    <li>
+      <div
+        className={`tree-row tree-file-row ${isSelected ? "selected" : ""}`}
+        style={{ paddingLeft: fileIndent }}
+        title={node.path}
+      >
+        {onSelect ? (
+          <button
+            type="button"
+            className="tree-name tree-name-clickable"
+            onClick={() => onSelect(node.path)}
+            title={node.path}
+          >
+            {node.name}
+          </button>
+        ) : (
+          <span className="tree-name" title={node.path}>
+            {node.name}
+          </span>
+        )}
+        {onRemove ? (
+          <button
+            type="button"
+            className="tree-icon-btn ghost"
+            disabled={removeDisabled}
+            onClick={() => onRemove(node.path)}
+            title="Remove"
+          >
+            ×
+          </button>
+        ) : null}
+      </div>
+    </li>
+  );
+}
+
 function MarkdownDocument({
   content,
   currentPath,
@@ -840,7 +1573,7 @@ function MarkdownDocument({
   currentPath: string;
   workspacePath: string;
   availableDocuments: string[];
-  onOpenDocument: (path: string) => void;
+  onOpenDocument: (path: string, anchor?: string | null) => void;
   onOpenImage: (image: ExpandedImage) => void;
 }) {
   const renderedContent = normalizeMarkdownForDisplay(
@@ -850,20 +1583,56 @@ function MarkdownDocument({
   );
   const components: Components = {
     a({ href, children, ...props }) {
-      const workspaceTarget = href ? resolveWorkspacePath(currentPath, href) : null;
-      const canOpenInApp =
-        workspaceTarget !== null &&
-        workspaceTarget.endsWith(".md") &&
-        availableDocuments.includes(workspaceTarget);
+      if (href?.startsWith("studywiki-broken://")) {
+        const target = decodeURIComponent(href.slice("studywiki-broken://".length));
+        return (
+          <span className="broken-wikilink" title={`No page named "${target}" yet`}>
+            {children}
+          </span>
+        );
+      }
 
-      if (canOpenInApp) {
+      if (href && isExternalUrl(href)) {
         return (
           <a
             {...props}
             href={href}
             onClick={(event) => {
               event.preventDefault();
-              onOpenDocument(workspaceTarget);
+              openUrl(href).catch(() => {});
+            }}
+          >
+            {children}
+          </a>
+        );
+      }
+
+      let targetPath: string | null = null;
+      let targetAnchor: string | null = null;
+      if (href) {
+        const hashIndex = href.indexOf("#");
+        const pathPart = hashIndex === -1 ? href : href.slice(0, hashIndex);
+        targetAnchor = hashIndex === -1 ? null : href.slice(hashIndex + 1) || null;
+        if (pathPart && availableDocuments.includes(pathPart)) {
+          targetPath = pathPart;
+        } else if (pathPart) {
+          const resolved = resolveWorkspacePath(currentPath, pathPart);
+          if (resolved && availableDocuments.includes(resolved)) {
+            targetPath = resolved;
+          }
+        }
+      }
+
+      if (targetPath) {
+        const finalTarget = targetPath;
+        const finalAnchor = targetAnchor;
+        return (
+          <a
+            {...props}
+            href={href}
+            onClick={(event) => {
+              event.preventDefault();
+              onOpenDocument(finalTarget, finalAnchor);
             }}
           >
             {children}
@@ -872,7 +1641,7 @@ function MarkdownDocument({
       }
 
       return (
-        <a {...props} href={href} target={isExternalUrl(href) ? "_blank" : undefined}>
+        <a {...props} href={href}>
           {children}
         </a>
       );
@@ -907,7 +1676,7 @@ function MarkdownDocument({
     <article className="study-document">
       <ReactMarkdown
         remarkPlugins={[remarkGfm, [remarkMath, { singleDollarTextMath: true }]]}
-        rehypePlugins={[rehypeKatex]}
+        rehypePlugins={[rehypeSlug, rehypeKatex]}
         components={components}
         urlTransform={(url) => url}
       >
@@ -970,14 +1739,14 @@ function convertWikiLinks(
   currentPath: string,
   availableDocuments: string[],
 ) {
-  return content.replace(/\[\[([^\]\n]+?)\]\]/g, (match, body: string) => {
+  return content.replace(/\[\[([^\]\n]+?)\]\]/g, (_match, body: string) => {
     const divider = body.indexOf("|");
     const target = divider === -1 ? body.trim() : body.slice(0, divider).trim();
     const label = divider === -1 ? humanizeWikiLinkLabel(target) : body.slice(divider + 1).trim();
     const resolvedPath = resolveWikiLinkTarget(currentPath, target, availableDocuments);
 
     if (!resolvedPath) {
-      return label || match;
+      return `[${escapeMarkdownLinkLabel(label || target)}](studywiki-broken://${encodeURIComponent(target)})`;
     }
 
     return `[${escapeMarkdownLinkLabel(label || resolvedPath)}](${resolvedPath})`;
@@ -997,6 +1766,26 @@ function transformMarkdownOutsideCodeFences(
       return transform(part);
     })
     .join("");
+}
+
+function extractWikiLinkTargets(
+  content: string,
+  currentPath: string,
+  availablePaths: string[],
+): string[] {
+  const targets = new Set<string>();
+  const stripped = content.replace(/```[\s\S]*?```|~~~[\s\S]*?~~~/g, "");
+  const matches = stripped.matchAll(/\[\[([^\]\n]+?)\]\]/g);
+  for (const m of matches) {
+    const body = m[1];
+    const divider = body.indexOf("|");
+    const target = divider === -1 ? body.trim() : body.slice(0, divider).trim();
+    const resolved = resolveWikiLinkTarget(currentPath, target, availablePaths);
+    if (!resolved) continue;
+    const path = resolved.split("#")[0];
+    if (path && path !== currentPath) targets.add(path);
+  }
+  return Array.from(targets);
 }
 
 function resolveWikiLinkTarget(

@@ -305,6 +305,89 @@ code {
   background: var(--bg-hover);
 }
 
+.topbar-workspace-menu {
+  position: relative;
+}
+
+.topbar-workspace-menu summary {
+  list-style: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 6px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.topbar-workspace-menu summary::-webkit-details-marker {
+  display: none;
+}
+
+.topbar-workspace-menu summary:hover {
+  background: var(--bg-hover);
+}
+
+.topbar-workspace-menu[open] summary {
+  background: var(--bg-hover);
+}
+
+.topbar-workspace-chevron {
+  font-size: 11px;
+  color: var(--text-muted);
+  line-height: 1;
+}
+
+.topbar-workspace-dropdown {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  display: flex;
+  flex-direction: column;
+  min-width: 280px;
+  padding: 8px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+  z-index: 10;
+}
+
+.topbar-workspace-dropdown-path {
+  margin: 0 0 6px;
+  padding: 6px 8px;
+  background: var(--bg);
+  border-radius: 4px;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  font-size: 11px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.topbar-workspace-dropdown button {
+  text-align: left;
+  padding: 7px 10px;
+  border-radius: 4px;
+  font-size: 12.5px;
+  color: var(--text);
+}
+
+.topbar-workspace-dropdown button:hover:not(:disabled) {
+  background: var(--bg-hover);
+}
+
+.empty-state-error {
+  margin: 12px 0 0;
+  padding: 8px 12px;
+  background: var(--danger-bg);
+  border: 1px solid var(--danger-border);
+  border-radius: 6px;
+  color: var(--danger);
+  font-size: 12px;
+  text-align: left;
+}
+
 /* ============ Body grid ============ */
 
 .app-body {
@@ -450,17 +533,155 @@ code {
   font-style: italic;
 }
 
+.tree {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.tree li {
+  display: block;
+}
+
+.tree-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+  min-height: 22px;
+  padding-right: 8px;
+  border: 0;
+  background: transparent;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  font-size: 11.5px;
+  color: var(--text-muted);
+  text-align: left;
+  cursor: pointer;
+}
+
+.tree-row:hover {
+  background: var(--bg-hover);
+}
+
+.tree-folder {
+  color: var(--text-muted);
+}
+
+.tree-folder .tree-name {
+  color: var(--text);
+  font-weight: 500;
+}
+
+.tree-chevron {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 12px;
+  font-size: 9px;
+  color: var(--text-faint);
+  flex-shrink: 0;
+}
+
+.tree-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+button.tree-name-clickable {
+  padding: 0;
+  background: transparent;
+  border: 0;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.tree-file-row {
+  cursor: default;
+}
+
+.tree-file-row.selected {
+  background: var(--accent-bg);
+}
+
+.tree-file-row.selected .tree-name {
+  color: var(--accent);
+}
+
+.tree-icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 3px;
+  color: var(--text-dim);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1;
+  flex-shrink: 0;
+}
+
+.tree-icon-btn:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text);
+}
+
+.tree-icon-btn.ghost {
+  visibility: hidden;
+}
+
+.tree-row:hover .tree-icon-btn.ghost {
+  visibility: visible;
+}
+
 /* ============ Center pane ============ */
 
 .center-header {
   display: flex;
-  align-items: baseline;
+  align-items: center;
   justify-content: space-between;
   gap: 12px;
   padding: 10px 20px;
   border-bottom: 1px solid var(--border);
   background: var(--bg);
   flex-shrink: 0;
+}
+
+.center-header-right {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.view-toggle {
+  display: inline-flex;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-strong);
+  border-radius: 5px;
+  overflow: hidden;
+}
+
+.view-toggle-btn {
+  height: 22px;
+  padding: 0 10px;
+  font-size: 11px;
+  color: var(--text-muted);
+  border-radius: 0;
+}
+
+.view-toggle-btn:hover:not(.active) {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.view-toggle-btn.active {
+  background: var(--accent-bg);
+  color: var(--accent);
 }
 
 .center-title {
@@ -479,6 +700,77 @@ code {
   min-height: 0;
   overflow: auto;
   padding: 24px 32px;
+}
+
+.image-viewer {
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  width: 100%;
+}
+
+.image-viewer img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  border-radius: 6px;
+  background: var(--bg-elevated);
+}
+
+.graph-view {
+  width: 100%;
+  height: 100%;
+  min-height: calc(100vh - 130px);
+  position: relative;
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--bg);
+}
+
+.graph-empty {
+  display: grid;
+  place-items: center;
+  width: 100%;
+  height: 100%;
+  min-height: 240px;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.pdf-canvas-viewer {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  width: 100%;
+  gap: 8px;
+}
+
+.pdf-pages {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+}
+
+.pdf-page {
+  display: block;
+  width: 100%;
+  height: auto;
+  border-radius: 4px;
+  background: #fff;
+  box-shadow: 0 1px 6px rgba(0, 0, 0, 0.4);
+}
+
+.pdf-status {
+  padding: 12px 16px;
+  color: var(--text-muted);
+  font-size: 12px;
+  text-align: center;
+}
+
+.pdf-status-error {
+  color: var(--danger);
 }
 
 /* ============ Right pane ============ */
@@ -507,6 +799,38 @@ code {
   text-transform: none;
 }
 
+.right-section-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 4px 0 8px;
+  border: 0;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  text-align: left;
+  cursor: pointer;
+}
+
+.right-section-toggle:hover {
+  color: var(--text-muted);
+}
+
+.right-section-toggle .right-section-meta {
+  margin-left: auto;
+}
+
+.right-section-chevron {
+  display: inline-block;
+  width: 10px;
+  font-size: 9px;
+  color: var(--text-faint);
+}
+
 .right-empty {
   padding: 14px;
   background: var(--bg-elevated);
@@ -515,6 +839,55 @@ code {
   font-size: 12px;
   color: var(--text-muted);
   line-height: 1.55;
+}
+
+.connections-empty {
+  margin: 0;
+  padding: 8px 0;
+  color: var(--text-faint);
+  font-size: 11.5px;
+  font-style: italic;
+}
+
+.connections-label {
+  margin-top: 8px;
+  margin-bottom: 4px;
+  color: var(--text-faint);
+  font-size: 10.5px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+}
+
+.connections-label:first-child {
+  margin-top: 0;
+}
+
+.connections-list {
+  list-style: none;
+  margin: 0 0 8px;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.connection-link {
+  display: block;
+  width: 100%;
+  padding: 4px 8px;
+  border-radius: 4px;
+  text-align: left;
+  color: var(--text-muted);
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  font-size: 11.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.connection-link:hover {
+  background: var(--bg-hover);
+  color: var(--accent);
 }
 
 /* ============ Banners ============ */
@@ -892,6 +1265,15 @@ code {
   text-decoration: underline;
 }
 
+.study-document .broken-wikilink {
+  color: var(--danger);
+  font-weight: 500;
+  text-decoration: underline dashed;
+  text-underline-offset: 2px;
+  cursor: help;
+  opacity: 0.85;
+}
+
 .study-document code {
   border-radius: 4px;
   padding: 0.1rem 0.32rem;
@@ -1018,4 +1400,38 @@ code {
 
 .lightbox-close:hover {
   background: var(--bg-hover);
+}
+
+.drop-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: grid;
+  place-items: center;
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(4px);
+  pointer-events: none;
+}
+
+.drop-overlay-card {
+  padding: 28px 36px;
+  border: 2px dashed var(--accent);
+  background: var(--bg-elevated);
+  border-radius: 12px;
+  text-align: center;
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.5);
+}
+
+.drop-overlay-card strong {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--accent);
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.drop-overlay-card p {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 12px;
 }
