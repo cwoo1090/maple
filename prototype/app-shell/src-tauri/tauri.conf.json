@@ -24,7 +24,7 @@
       "assetProtocol": {
         "enable": true,
         "scope": [
-          "$HOME/ai-study-wiki-builder/prototype/operation-runner/sample-workspace/wiki/assets/**"
+          "$HOME/**"
         ]
       }
     }

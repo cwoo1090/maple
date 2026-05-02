@@ -4,7 +4,9 @@ use std::{
     env, fs,
     path::{Component, Path, PathBuf},
     process::Command,
+    sync::Mutex,
 };
+use tauri::{Manager, State};
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -28,6 +30,21 @@ struct WorkspaceState {
     wiki_files: Vec<String>,
 }
 
+impl WorkspaceState {
+    fn empty() -> Self {
+        Self {
+            workspace_path: String::new(),
+            status: None,
+            changed_marker: None,
+            index_md: None,
+            log_md: None,
+            report_md: None,
+            raw_sources: Vec::new(),
+            wiki_files: Vec::new(),
+        }
+    }
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct WorkspaceFile {
@@ -42,19 +59,58 @@ struct AppCommandResult {
     state: WorkspaceState,
 }
 
-#[tauri::command]
-async fn load_workspace_state() -> Result<WorkspaceState, String> {
-    load_state()
+struct WorkspaceStore {
+    path: Mutex<Option<PathBuf>>,
 }
 
 #[tauri::command]
-async fn read_workspace_file(relative_path: String) -> Result<WorkspaceFile, String> {
-    let workspace = sample_workspace_path()?;
+async fn set_workspace(
+    workspace_path: String,
+    state: State<'_, WorkspaceStore>,
+) -> Result<WorkspaceState, String> {
+    let path = PathBuf::from(&workspace_path);
+    if !path.is_absolute() {
+        return Err("Workspace path must be absolute".to_string());
+    }
+    fs::create_dir_all(&path)
+        .map_err(|error| format!("Failed to create workspace directory: {error}"))?;
+    init_workspace_dirs(&path)?;
+    let canonical = path
+        .canonicalize()
+        .map_err(|error| format!("Failed to resolve workspace path: {error}"))?;
+    *state.path.lock().unwrap() = Some(canonical.clone());
+    load_state_at(&canonical)
+}
+
+#[tauri::command]
+async fn close_workspace(state: State<'_, WorkspaceStore>) -> Result<(), String> {
+    *state.path.lock().unwrap() = None;
+    Ok(())
+}
+
+#[tauri::command]
+async fn load_workspace_state(state: State<'_, WorkspaceStore>) -> Result<WorkspaceState, String> {
+    match current_workspace_optional(&state) {
+        Some(path) => load_state_at(&path),
+        None => Ok(WorkspaceState::empty()),
+    }
+}
+
+#[tauri::command]
+async fn read_workspace_file(
+    relative_path: String,
+    state: State<'_, WorkspaceStore>,
+) -> Result<WorkspaceFile, String> {
+    let workspace = current_workspace(&state)?;
     let normalized_path = normalize_workspace_relative_path(&relative_path)?;
     let normalized = normalized_path.to_string_lossy().replace('\\', "/");
 
-    if normalized != "index.md" && normalized != "log.md" && !normalized.starts_with("wiki/") {
-        return Err("Only workspace wiki files can be read by the app preview".to_string());
+    if normalized != "index.md"
+        && normalized != "log.md"
+        && !normalized.starts_with("wiki/")
+        && !normalized.starts_with("raw/")
+    {
+        return Err("Only workspace files can be read by the app preview".to_string());
     }
 
     if normalized_path.extension().and_then(|value| value.to_str()) != Some("md") {
@@ -70,7 +126,7 @@ async fn read_workspace_file(relative_path: String) -> Result<WorkspaceFile, Str
         .map_err(|error| format!("Failed to resolve {normalized}: {error}"))?;
 
     if !file_path.starts_with(&workspace_root) {
-        return Err("Workspace file path escaped the sample workspace".to_string());
+        return Err("Workspace file path escaped the workspace".to_string());
     }
 
     let content = fs::read_to_string(&file_path)
@@ -83,25 +139,19 @@ async fn read_workspace_file(relative_path: String) -> Result<WorkspaceFile, Str
 }
 
 #[tauri::command]
-async fn check_codex() -> Result<AppCommandResult, String> {
-    let runner = run_runner(&["check-codex"])?;
+async fn check_soffice(state: State<'_, WorkspaceStore>) -> Result<AppCommandResult, String> {
+    let workspace = current_workspace(&state)?;
+    let runner = run_runner(&workspace, "check-soffice", &[])?;
     Ok(AppCommandResult {
         runner: Some(runner),
-        state: load_state()?,
+        state: load_state_at(&workspace)?,
     })
 }
 
 #[tauri::command]
-async fn check_soffice() -> Result<AppCommandResult, String> {
-    let runner = run_runner(&["check-soffice"])?;
-    Ok(AppCommandResult {
-        runner: Some(runner),
-        state: load_state()?,
-    })
-}
-
-#[tauri::command]
-async fn install_libreoffice() -> Result<AppCommandResult, String> {
+async fn install_libreoffice(
+    state: State<'_, WorkspaceStore>,
+) -> Result<AppCommandResult, String> {
     let script = r#"tell application "Terminal"
     activate
     do script "brew install --cask libreoffice"
@@ -113,6 +163,11 @@ end tell"#;
         .output()
         .map_err(|error| format!("Failed to launch Terminal: {error}"))?;
 
+    let workspace_state = match current_workspace_optional(&state) {
+        Some(path) => load_state_at(&path)?,
+        None => WorkspaceState::empty(),
+    };
+
     Ok(AppCommandResult {
         runner: Some(RunnerOutput {
             success: output.status.success(),
@@ -120,22 +175,28 @@ end tell"#;
             stdout: String::from_utf8_lossy(&output.stdout).to_string(),
             stderr: String::from_utf8_lossy(&output.stderr).to_string(),
         }),
-        state: load_state()?,
+        state: workspace_state,
     })
 }
 
 #[tauri::command]
-async fn reset_sample_workspace() -> Result<AppCommandResult, String> {
-    let runner = run_runner(&["create-sample", "--force"])?;
+async fn reset_sample_workspace(
+    state: State<'_, WorkspaceStore>,
+) -> Result<AppCommandResult, String> {
+    let workspace = current_workspace(&state)?;
+    let runner = run_runner(&workspace, "create-sample", &["--force"])?;
     Ok(AppCommandResult {
         runner: Some(runner),
-        state: load_state()?,
+        state: load_state_at(&workspace)?,
     })
 }
 
 #[tauri::command]
-async fn import_sources(source_paths: Vec<String>) -> Result<AppCommandResult, String> {
-    let workspace = sample_workspace_path()?;
+async fn import_sources(
+    source_paths: Vec<String>,
+    state: State<'_, WorkspaceStore>,
+) -> Result<AppCommandResult, String> {
+    let workspace = current_workspace(&state)?;
     let raw_dir = workspace.join("raw");
     fs::create_dir_all(&raw_dir)
         .map_err(|error| format!("Failed to create raw source directory: {error}"))?;
@@ -146,13 +207,16 @@ async fn import_sources(source_paths: Vec<String>) -> Result<AppCommandResult, S
 
     Ok(AppCommandResult {
         runner: None,
-        state: load_state()?,
+        state: load_state_at(&workspace)?,
     })
 }
 
 #[tauri::command]
-async fn remove_raw_source(relative_path: String) -> Result<AppCommandResult, String> {
-    let workspace = sample_workspace_path()?;
+async fn remove_raw_source(
+    relative_path: String,
+    state: State<'_, WorkspaceStore>,
+) -> Result<AppCommandResult, String> {
+    let workspace = current_workspace(&state)?;
 
     if has_pending_generated_changes(&workspace) {
         return Err("Undo or reset generated changes before removing raw sources.".to_string());
@@ -187,62 +251,102 @@ async fn remove_raw_source(relative_path: String) -> Result<AppCommandResult, St
 
     Ok(AppCommandResult {
         runner: None,
-        state: load_state()?,
+        state: load_state_at(&workspace)?,
     })
 }
 
 #[tauri::command]
-async fn build_wiki() -> Result<AppCommandResult, String> {
-    let runner = run_runner(&["build"])?;
+async fn build_wiki(state: State<'_, WorkspaceStore>) -> Result<AppCommandResult, String> {
+    let workspace = current_workspace(&state)?;
+    let runner = run_runner(&workspace, "build", &[])?;
     Ok(AppCommandResult {
         runner: Some(runner),
-        state: load_state()?,
+        state: load_state_at(&workspace)?,
     })
 }
 
 #[tauri::command]
-async fn undo_last_operation() -> Result<AppCommandResult, String> {
-    let runner = run_runner(&["undo"])?;
+async fn undo_last_operation(
+    state: State<'_, WorkspaceStore>,
+) -> Result<AppCommandResult, String> {
+    let workspace = current_workspace(&state)?;
+    let runner = run_runner(&workspace, "undo", &[])?;
     Ok(AppCommandResult {
         runner: Some(runner),
-        state: load_state()?,
+        state: load_state_at(&workspace)?,
     })
 }
 
 #[tauri::command]
-async fn read_build_progress() -> Result<RunnerOutput, String> {
-    run_runner(&["progress"])
+async fn read_build_progress(state: State<'_, WorkspaceStore>) -> Result<RunnerOutput, String> {
+    let workspace = current_workspace(&state)?;
+    run_runner(&workspace, "progress", &[])
 }
 
 #[tauri::command]
-async fn cancel_build() -> Result<AppCommandResult, String> {
-    let runner = run_runner(&["cancel"])?;
+async fn cancel_build(state: State<'_, WorkspaceStore>) -> Result<AppCommandResult, String> {
+    let workspace = current_workspace(&state)?;
+    let runner = run_runner(&workspace, "cancel", &[])?;
     Ok(AppCommandResult {
         runner: Some(runner),
-        state: load_state()?,
+        state: load_state_at(&workspace)?,
     })
 }
 
 #[tauri::command]
-async fn read_interrupted_operation() -> Result<RunnerOutput, String> {
-    run_runner(&["interrupted"])
+async fn read_interrupted_operation(
+    state: State<'_, WorkspaceStore>,
+) -> Result<RunnerOutput, String> {
+    let workspace = current_workspace(&state)?;
+    run_runner(&workspace, "interrupted", &[])
 }
 
 #[tauri::command]
-async fn discard_interrupted_operation() -> Result<AppCommandResult, String> {
-    let runner = run_runner(&["discard-interrupted"])?;
+async fn discard_interrupted_operation(
+    state: State<'_, WorkspaceStore>,
+) -> Result<AppCommandResult, String> {
+    let workspace = current_workspace(&state)?;
+    let runner = run_runner(&workspace, "discard-interrupted", &[])?;
     Ok(AppCommandResult {
         runner: Some(runner),
-        state: load_state()?,
+        state: load_state_at(&workspace)?,
     })
 }
 
-fn run_runner(args: &[&str]) -> Result<RunnerOutput, String> {
+fn current_workspace(state: &State<'_, WorkspaceStore>) -> Result<PathBuf, String> {
+    current_workspace_optional(state).ok_or_else(|| "No workspace is open".to_string())
+}
+
+fn current_workspace_optional(state: &State<'_, WorkspaceStore>) -> Option<PathBuf> {
+    state.path.lock().unwrap().clone()
+}
+
+fn init_workspace_dirs(workspace: &Path) -> Result<(), String> {
+    for dir in ["raw", "wiki", ".studywiki"] {
+        let target = workspace.join(dir);
+        fs::create_dir_all(&target)
+            .map_err(|error| format!("Failed to create {}: {error}", target.display()))?;
+    }
+    Ok(())
+}
+
+fn run_runner(
+    workspace: &Path,
+    command: &str,
+    extra_args: &[&str],
+) -> Result<RunnerOutput, String> {
     let runner_root = runner_root()?;
     let node = node_executable()?;
+    let workspace_str = workspace.to_string_lossy().to_string();
+
+    let mut all_args: Vec<String> = vec![command.to_string(), workspace_str];
+    for arg in extra_args {
+        all_args.push((*arg).to_string());
+    }
+
     let output = Command::new(&node)
         .arg("src/operation-runner.js")
-        .args(args)
+        .args(&all_args)
         .env("PATH", runner_path_env(&node))
         .current_dir(&runner_root)
         .output()
@@ -385,9 +489,8 @@ fn login_shell_path() -> Option<String> {
     Some(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-fn load_state() -> Result<WorkspaceState, String> {
-    let workspace = sample_workspace_path()?;
-    let status = run_runner(&["status"])
+fn load_state_at(workspace: &Path) -> Result<WorkspaceState, String> {
+    let status = run_runner(workspace, "status", &[])
         .ok()
         .and_then(|output| serde_json::from_str::<Value>(&output.stdout).ok());
     let changed_marker_path = workspace.join(".studywiki/changed/last-operation.json");
@@ -405,8 +508,8 @@ fn load_state() -> Result<WorkspaceState, String> {
         index_md: read_text_if_exists(&workspace.join("index.md")),
         log_md: read_text_if_exists(&workspace.join("log.md")),
         report_md,
-        raw_sources: list_raw_sources(&workspace)?,
-        wiki_files: list_wiki_files(&workspace)?,
+        raw_sources: list_raw_sources(workspace)?,
+        wiki_files: list_wiki_files(workspace)?,
     })
 }
 
@@ -417,10 +520,6 @@ fn runner_root() -> Result<PathBuf, String> {
         .and_then(Path::parent)
         .ok_or_else(|| "Could not resolve prototype directory".to_string())?;
     Ok(prototype_dir.join("operation-runner"))
-}
-
-fn sample_workspace_path() -> Result<PathBuf, String> {
-    Ok(runner_root()?.join("sample-workspace"))
 }
 
 fn read_text_if_exists(path: &Path) -> Option<String> {
@@ -622,10 +721,17 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .setup(|app| {
+            app.manage(WorkspaceStore {
+                path: Mutex::new(None),
+            });
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
+            set_workspace,
+            close_workspace,
             load_workspace_state,
             read_workspace_file,
-            check_codex,
             check_soffice,
             install_libreoffice,
             reset_sample_workspace,
