@@ -1,0 +1,18 @@
+{
+  "name": "study-wiki-operation-runner",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local operation runner spike for AI Study Wiki Builder.",
+  "scripts": {
+    "init": "node src/operation-runner.js create-sample",
+    "check": "node src/operation-runner.js check-codex",
+    "build": "node src/operation-runner.js build",
+    "status": "node src/operation-runner.js status",
+    "undo": "node src/operation-runner.js undo",
+    "reset": "node src/operation-runner.js create-sample --force",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
