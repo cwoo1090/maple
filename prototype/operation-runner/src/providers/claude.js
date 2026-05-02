@@ -41,33 +41,48 @@ function checkInstalled() {
   };
 }
 
-function checkLoggedIn() {
+function detectAuthSource() {
   const credPath = path.join(os.homedir(), ".claude", ".credentials.json");
-  const warnings = [];
-  if (process.env.ANTHROPIC_API_KEY) {
-    warnings.push(
-      "ANTHROPIC_API_KEY is set in your shell. The app strips it before launching Claude so your subscription is used. Unset it if you want subscription auth in your own terminal too.",
-    );
-  }
-
-  // Path 1: filesystem credentials (some platforms / older versions)
   try {
     const stat = fs.statSync(credPath);
-    if (stat.isFile() && stat.size > 0) {
-      return { loggedIn: true, statusText: "Signed in (subscription)", warnings };
-    }
+    if (stat.isFile() && stat.size > 0) return "subscription_file";
   } catch (_e) {}
 
-  // Path 2: macOS Keychain (current Claude Code default on darwin)
   if (process.platform === "darwin") {
     const keychainCheck = spawnSync(
       "security",
       ["find-generic-password", "-s", "Claude Code-credentials"],
       { encoding: "utf8" },
     );
-    if (keychainCheck.status === 0) {
-      return { loggedIn: true, statusText: "Signed in (subscription)", warnings };
+    if (keychainCheck.status === 0) return "subscription_keychain";
+  }
+
+  if (process.env.ANTHROPIC_API_KEY) return "api_key";
+
+  return "none";
+}
+
+function checkLoggedIn() {
+  const source = detectAuthSource();
+  const warnings = [];
+
+  if (source === "subscription_file" || source === "subscription_keychain") {
+    if (process.env.ANTHROPIC_API_KEY) {
+      warnings.push(
+        "ANTHROPIC_API_KEY is set in your shell. Claude Code prefers it over your subscription, so this build will use API credits instead. Unset the env var to force subscription billing.",
+      );
     }
+    return { loggedIn: true, statusText: "Signed in (subscription)", warnings };
+  }
+
+  if (source === "api_key") {
+    return {
+      loggedIn: true,
+      statusText: "Using ANTHROPIC_API_KEY (per-token billing)",
+      warnings: [
+        "No Claude subscription credentials found. This build will use ANTHROPIC_API_KEY and bill per-token. Sign in with `claude` in Terminal to use your Pro/Max subscription instead.",
+      ],
+    };
   }
 
   return { loggedIn: false, statusText: "Not signed in", warnings };
@@ -87,9 +102,7 @@ function buildExecArgs(ctx) {
 }
 
 function buildSpawnEnv(baseEnv) {
-  const env = { ...baseEnv };
-  delete env.ANTHROPIC_API_KEY;
-  return env;
+  return { ...baseEnv };
 }
 
 function feedPrompt(child, prompt) {
