@@ -45,10 +45,25 @@ async function main(argv = process.argv.slice(2)) {
           force: Boolean(flags.force),
         });
         break;
-      case "check":
       case "check-codex":
-        await printCodexCheck();
+        flags.provider = "codex";
+        // fall through
+      case "check": {
+        const providerName = flags.provider || "codex";
+        const provider = selectProvider(providerName);
+        const installed = provider.checkInstalled();
+        const auth = installed.installed
+          ? provider.checkLoggedIn()
+          : { loggedIn: false, statusText: null, warnings: [] };
+        console.log(JSON.stringify({
+          provider: provider.name,
+          installed,
+          auth,
+          installCommand: provider.installCommand,
+          loginCommand: provider.loginCommand,
+        }, null, 2));
         break;
+      }
       case "check-soffice":
         await printSofficeCheck();
         break;
@@ -105,7 +120,7 @@ function printHelp() {
 
 Usage:
   node src/operation-runner.js create-sample [workspace] [--force]
-  node src/operation-runner.js check-codex
+  node src/operation-runner.js check [--provider codex|claude]
   node src/operation-runner.js build [workspace] [--provider codex|claude] [--model <id>] [--instruction "..."] [--strict-validation] [--timeout-ms 600000]
   node src/operation-runner.js status [workspace]
   node src/operation-runner.js undo [workspace]
@@ -300,21 +315,6 @@ Never modify source files under \`raw/\`.
   console.log(`Sample workspace ready: ${workspace}`);
 }
 
-async function printCodexCheck() {
-  const check = checkCodex();
-  console.log(JSON.stringify(check, null, 2));
-
-  if (!check.installed) {
-    console.log("\nCodex is not installed. On macOS, the MVP setup command is:");
-    console.log("  npm i -g @openai/codex");
-    return;
-  }
-
-  if (!check.loggedIn) {
-    console.log("\nCodex is installed but login was not confirmed. Run:");
-    console.log("  codex login");
-  }
-}
 
 async function printSofficeCheck() {
   const check = checkSoffice();
