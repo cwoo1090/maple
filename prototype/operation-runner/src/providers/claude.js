@@ -48,16 +48,28 @@ function checkLoggedIn() {
       "ANTHROPIC_API_KEY is set in your shell. The app strips it before launching Claude so your subscription is used. Unset it if you want subscription auth in your own terminal too.",
     );
   }
-  let loggedIn = false;
-  let statusText = "Not signed in";
+
+  // Path 1: filesystem credentials (some platforms / older versions)
   try {
     const stat = fs.statSync(credPath);
     if (stat.isFile() && stat.size > 0) {
-      loggedIn = true;
-      statusText = "Signed in (subscription)";
+      return { loggedIn: true, statusText: "Signed in (subscription)", warnings };
     }
   } catch (_e) {}
-  return { loggedIn, statusText, warnings };
+
+  // Path 2: macOS Keychain (current Claude Code default on darwin)
+  if (process.platform === "darwin") {
+    const keychainCheck = spawnSync(
+      "security",
+      ["find-generic-password", "-s", "Claude Code-credentials"],
+      { encoding: "utf8" },
+    );
+    if (keychainCheck.status === 0) {
+      return { loggedIn: true, statusText: "Signed in (subscription)", warnings };
+    }
+  }
+
+  return { loggedIn: false, statusText: "Not signed in", warnings };
 }
 
 const NOT_IMPLEMENTED = () => {
