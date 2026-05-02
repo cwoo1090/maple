@@ -6,6 +6,8 @@ const fsp = require("node:fs/promises");
 const path = require("node:path");
 const { spawn, spawnSync } = require("node:child_process");
 
+const { selectProvider } = require("./providers");
+
 const PROTOTYPE_ROOT = path.resolve(__dirname, "..");
 const DEFAULT_WORKSPACE = path.join(PROTOTYPE_ROOT, "sample-workspace");
 const RUNNER_METADATA_PREFIXES = [
@@ -53,11 +55,13 @@ async function main(argv = process.argv.slice(2)) {
       case "build":
       case "build-wiki":
         await runBuildWiki(resolveWorkspace(args[0]), {
+          provider: flags.provider || "codex",
+          model: flags.model || "",
           extraInstruction: flags.instruction || "",
           promptFile: flags["prompt-file"] || "",
           dryRun: Boolean(flags["dry-run"]),
           strictValidation: Boolean(flags["strict-validation"]),
-          timeoutMs: parsePositiveInteger(flags["timeout-ms"], DEFAULT_CODEX_TIMEOUT_MS),
+          timeoutMs: parsePositiveInteger(flags["timeout-ms"], 0),
         });
         break;
       case "status":
@@ -102,7 +106,7 @@ function printHelp() {
 Usage:
   node src/operation-runner.js create-sample [workspace] [--force]
   node src/operation-runner.js check-codex
-  node src/operation-runner.js build [workspace] [--instruction "..."] [--strict-validation] [--timeout-ms 600000]
+  node src/operation-runner.js build [workspace] [--provider codex|claude] [--model <id>] [--instruction "..."] [--strict-validation] [--timeout-ms 600000]
   node src/operation-runner.js status [workspace]
   node src/operation-runner.js undo [workspace]
 
@@ -369,12 +373,14 @@ function checkSoffice() {
 async function runBuildWiki(workspace, options = {}) {
   await assertWorkspace(workspace);
 
-  const codex = checkCodex();
-  if (!codex.installed) {
-    throw new Error("Codex CLI is not installed. Run: npm i -g @openai/codex");
+  const provider = selectProvider(options.provider || "codex");
+  const installed = provider.checkInstalled();
+  if (!installed.installed) {
+    throw new Error(`${provider.name} CLI is not installed. Run: ${provider.installCommand}`);
   }
-  if (!codex.loggedIn) {
-    throw new Error("Codex login was not confirmed. Run: codex login");
+  const auth = provider.checkLoggedIn();
+  if (!auth.loggedIn) {
+    throw new Error(`${provider.name} login was not confirmed. Run: ${provider.loginCommand}`);
   }
 
   const rawSourcesPreview = await listRawSourceFiles(workspace);
@@ -409,32 +415,22 @@ async function runBuildWiki(workspace, options = {}) {
 
   await fsp.writeFile(promptPath, prompt);
 
-  const args = [
-    "exec",
-    "--json",
-    "--cd",
+  const args = provider.buildExecArgs({
     workspace,
-    "--skip-git-repo-check",
-    "--sandbox",
-    "workspace-write",
-    "-c",
-    'approval_policy="never"',
-    "--output-last-message",
+    model: options.model || provider.defaultModel,
     lastMessagePath,
-  ];
-  for (const imagePath of preparedSources.imageAttachments) {
-    args.push("--image", imagePath);
-  }
+    imageAttachments: preparedSources.imageAttachments,
+  });
 
   console.log(`Snapshot created: ${path.relative(workspace, snapshot.dir)}`);
-  console.log("Running Codex Build Wiki operation...");
-  console.log(`Command: codex ${args.join(" ")} <prompt via stdin>`);
+  console.log(`Running ${provider.name} Build Wiki operation...`);
+  console.log(`Command: ${provider.binary} ${args.join(" ")} <prompt via stdin>`);
 
   let codexResult = {
     skipped: true,
     exitCode: 0,
     signal: null,
-    command: "codex",
+    command: provider.binary,
     args: args.concat("<prompt via stdin>"),
     eventsPath: path.relative(workspace, eventsPath),
     stderrPath: path.relative(workspace, stderrPath),
@@ -442,12 +438,12 @@ async function runBuildWiki(workspace, options = {}) {
   };
 
   if (!options.dryRun) {
-    codexResult = await runCodexExec(args, prompt, {
+    codexResult = await runProviderExec(provider, args, prompt, {
       cwd: workspace,
       eventsPath,
       stderrPath,
       runningMarkerPath: path.join(workspace, RUNNING_MARKER_PATH),
-      timeoutMs: options.timeoutMs || DEFAULT_CODEX_TIMEOUT_MS,
+      timeoutMs: options.timeoutMs,
       operationId,
       operationType: "build-wiki",
     });
@@ -565,19 +561,22 @@ async function runBuildWiki(workspace, options = {}) {
   }
 }
 
-async function runCodexExec(args, prompt, paths) {
+async function runProviderExec(provider, args, prompt, paths) {
   await fsp.writeFile(paths.eventsPath, "");
   await fsp.writeFile(paths.stderrPath, "");
 
   const runningMarkerPath = paths.runningMarkerPath
     ? paths.runningMarkerPath
     : path.join(paths.cwd, RUNNING_MARKER_PATH);
-  const timeoutMs = paths.timeoutMs || DEFAULT_CODEX_TIMEOUT_MS;
+  const timeoutMs = paths.timeoutMs && paths.timeoutMs > 0
+    ? paths.timeoutMs
+    : provider.defaultTimeoutMs;
 
   return new Promise((resolve, reject) => {
-    const child = spawn("codex", args, {
+    const child = spawn(provider.binary, args, {
       cwd: paths.cwd,
       stdio: ["pipe", "pipe", "pipe"],
+      env: provider.buildSpawnEnv(process.env),
     });
     const eventsStream = fs.createWriteStream(paths.eventsPath, { flags: "a" });
     const stderrStream = fs.createWriteStream(paths.stderrPath, { flags: "a" });
@@ -640,7 +639,7 @@ async function runCodexExec(args, prompt, paths) {
       process.stderr.write(chunk);
     });
 
-    child.stdin.end(prompt);
+    provider.feedPrompt(child, prompt);
 
     child.on("error", (error) => {
       clearTimeout(timeoutHandle);
@@ -676,7 +675,7 @@ async function runCodexExec(args, prompt, paths) {
         cancelled:
           !timedOut &&
           (cancelRequested || signal === "SIGTERM" || signal === "SIGKILL"),
-        command: "codex",
+        command: provider.binary,
         args: args.concat("<prompt via stdin>"),
         eventsPath: path.relative(paths.cwd, paths.eventsPath),
         stderrPath: path.relative(paths.cwd, paths.stderrPath),
