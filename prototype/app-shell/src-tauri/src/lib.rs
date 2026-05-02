@@ -73,12 +73,27 @@ struct AppSettings {
 
 fn default_settings() -> AppSettings {
     let mut models = HashMap::new();
-    models.insert("codex".to_string(), "gpt-5-codex".to_string());
+    models.insert("codex".to_string(), "gpt-5.5".to_string());
     models.insert("claude".to_string(), "claude-sonnet-4-6".to_string());
     AppSettings {
         provider: "codex".to_string(),
         models,
     }
+}
+
+fn normalize_settings(mut settings: AppSettings) -> AppSettings {
+    match settings.models.get("codex").map(String::as_str) {
+        Some("gpt-5-codex") | Some("gpt-5") | None => {
+            settings.models.insert("codex".to_string(), "gpt-5.5".to_string());
+        }
+        _ => {}
+    }
+    if !settings.models.contains_key("claude") {
+        settings
+            .models
+            .insert("claude".to_string(), "claude-sonnet-4-6".to_string());
+    }
+    settings
 }
 
 fn settings_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -98,7 +113,9 @@ fn read_settings(app: &AppHandle) -> AppSettings {
     let Ok(bytes) = fs::read(&path) else {
         return default_settings();
     };
-    serde_json::from_slice::<AppSettings>(&bytes).unwrap_or_else(|_| default_settings())
+    serde_json::from_slice::<AppSettings>(&bytes)
+        .map(normalize_settings)
+        .unwrap_or_else(|_| default_settings())
 }
 
 fn write_settings(app: &AppHandle, settings: &AppSettings) -> Result<(), String> {
@@ -162,24 +179,24 @@ async fn list_providers() -> Result<Vec<ProviderInfo>, String> {
             label: "ChatGPT (via Codex CLI)".into(),
             install_command: "npm i -g @openai/codex".into(),
             login_command: "codex login".into(),
-            default_model: "gpt-5-codex".into(),
+            default_model: "gpt-5.5".into(),
             supported_models: vec![
                 ProviderModel {
-                    id: "gpt-5-codex".into(),
-                    label: "GPT-5 Codex".into(),
+                    id: "gpt-5.5".into(),
+                    label: "GPT-5.5".into(),
                     description: None,
                     recommended: Some(true),
                 },
                 ProviderModel {
-                    id: "gpt-5".into(),
-                    label: "GPT-5".into(),
+                    id: "gpt-5.4".into(),
+                    label: "GPT-5.4".into(),
                     description: None,
                     recommended: None,
                 },
                 ProviderModel {
-                    id: "gpt-5-mini".into(),
-                    label: "GPT-5 Mini".into(),
-                    description: None,
+                    id: "gpt-5.4-mini".into(),
+                    label: "GPT-5.4 Mini".into(),
+                    description: Some("Fastest".into()),
                     recommended: None,
                 },
             ],
@@ -570,7 +587,7 @@ async fn build_wiki(
         .cloned()
         .unwrap_or_else(|| match provider.as_str() {
             "claude" => "claude-sonnet-4-6".to_string(),
-            _ => "gpt-5-codex".to_string(),
+            _ => "gpt-5.5".to_string(),
         });
     let runner = run_runner(
         &workspace,

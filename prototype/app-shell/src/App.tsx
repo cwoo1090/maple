@@ -160,6 +160,7 @@ function parseEventsToMessages(jsonl: string): ChatMessage[] {
       messages.push({ id: baseId, kind: "codex_message", text: item.text });
     } else if (itemType === "command_execution" && typeof item.command === "string") {
       const exit = item.exit_code as number | undefined;
+      if (exit === 0 || exit === undefined) continue;
       messages.push({
         id: baseId,
         kind: "codex_command",
@@ -267,6 +268,7 @@ function App() {
     [workspace.wikiFiles, workspace.rawSources],
   );
   const canUndo = changedFiles.length > 0 && !workspace.changedMarker?.undoneAt;
+  const hasPendingGeneratedChanges = canUndo;
   const canRemoveRawSources = changedFiles.length === 0 || Boolean(workspace.changedMarker?.undoneAt);
   const statusLabel = useMemo(() => {
     if (busy) return busy;
@@ -844,7 +846,7 @@ function App() {
               disabled={Boolean(busy)}
               onClick={() => startBuildWiki()}
             >
-              Build wiki
+              {hasPendingGeneratedChanges ? "Build again" : "Build wiki"}
             </button>
           )}
           <details className="topbar-menu">

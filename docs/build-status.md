@@ -1,11 +1,11 @@
 # Build Status
 
-Last updated: 2026-05-02. Stack: Tauri 2 + React 19 + Vite + Node operation-runner + Codex CLI.
+Last updated: 2026-05-02. Stack: Tauri 2 + React 19 + Vite + Node operation-runner + Codex CLI + Claude Code CLI.
 
 ## Shipped
 
 ### Phase 1 — Operation runner + first shell (pre-rebuild)
-Pre-existing before this session. PPTX→PDF auto-conversion via LibreOffice (`soffice`), real completion validation, dependency UI, live progress chat panel, cancel via `cancel-requested.flag`, timeout, stuck-recovery (code in place, **untested**).
+Pre-existing before the UI rebuild. Real completion validation, dependency UI, live progress/activity panel, cancel via `cancel-requested.flag`, timeout, stuck-recovery (code in place, **untested**).
 
 ### Phase 3 — Product UI rebuild
 
@@ -26,6 +26,7 @@ Pre-existing before this session. PPTX→PDF auto-conversion via LibreOffice (`s
 **B2 — Source flow**
 
 - **3.4 PDF preview:** PDF.js (`pdfjs-dist@4.x`) — pinned to v4 because v5 uses `Map.prototype.getOrInsertComputed` not in current macOS WKWebView. Iframe/embed approach was tried first and abandoned because of WebKit state caching bug (PDF blanks after navigating away and back). Canvas-based viewer renders all pages at 1.5× scale, DPR-aware. CMap files (`public/pdfjs/cmaps/`) and standard fonts (`public/pdfjs/standard_fonts/`) copied from package — required for Korean PDFs to render correctly.
+- **3.4 PPTX preview:** Raw `.pptx` / `.ppt` files render inline by converting through LibreOffice (`soffice`) to a cached PDF under `.studywiki/cache/pptx/<stem>-<mtime>.pdf`, then reusing the existing PDF.js viewer. Cache keys include source mtime so changed slides invalidate automatically.
 - **3.4 Image preview:** clicking a wiki image (e.g., `wiki/assets/foo.png`) renders inline in center pane via `convertFileSrc` + Tauri asset protocol. `assetProtocol.scope` widened to `$HOME/**` so any workspace under home directory can serve assets.
 - **3.3 DnD import:** `getCurrentWebviewWindow().onDragDropEvent` handler. Drag-over shows full-screen overlay with dashed-purple drop zone. Filters supported extensions, calls `import_sources`. Workspace must be open.
 - **3.3 Paste-from-clipboard:** **deferred** — low value vs. effort.
@@ -54,26 +55,30 @@ Pre-existing before this session. PPTX→PDF auto-conversion via LibreOffice (`s
   - Click node → switches back to Page view, opens that page.
   - Labels hide when zoomed out (`globalScale < 0.7`).
 
+### Phase 6 — Launch polish
+
+- Rebrand complete: product/app identifiers moved to Maple, app icon replaced, light cream/maple-orange theme applied.
+- macOS title bar polish complete: overlay titlebar, hidden native title, draggable topbar/empty state, traffic-light-safe left padding.
+- Long-filename RTL ellipsis complete for tree rows with identical-prefix lecture names.
+
 ## Pending
 
 Listed in roughly the order they should ship.
 
-### Phase 6 — Launch polish *(highest visual ROI)*
-- macOS title bar: kill the white strip via Tauri `titleBarStyle: "transparent"` + reposition traffic lights.
-- App icon (replaces default Tauri "T").
-- Long-filename RTL ellipsis option for identical-prefix lecture PDFs.
-- Error message + edge case pass (missing `node`, codex CLI errors, etc.).
+### Phase 6.4 — Error/edge-case pass
+- Error message + edge case pass (missing `node`, provider CLI errors, stuck/cancel states, etc.).
 
 ### Loose ends *(small, fast)*
 - **Build-prompt anchor support:** edit `operation-runner.js` to instruct Codex to emit `[[page#section]]` when citing a specific section. Without this, the anchor-jump infrastructure is dormant.
-- PPTX clicks → route to converted PDF if one exists.
 - **L2:** actually exercise the stuck-recovery flow (code in place, never tested end-to-end).
+- Provider report naming: `report.json` still stores provider process details under `codex` even for Claude. Behavior works, but the key should become provider-neutral before more provider-specific UX is built.
+- Codex model list now defaults to `gpt-5.5` after `gpt-5-codex` stopped working with ChatGPT auth. Settings normalization maps old local selections to `gpt-5.5`.
 
 ### Phase 5 — Wiki Health
 Tab/panel listing: orphan pages (no inbound links), broken `[[wikilinks]]` workspace-wide, "stale" pages (not updated in N builds), missing summaries. Lower priority — useful once the wiki gets messy.
 
-### Phase 4 — Chat *(deferred — gated on Claude work in separate session)*
-AI conversation panel. Reads wiki pages, cites slides, proposes edits. Plugs into Phase 4 once Claude support exists. Current right-pane Activity section is the placeholder where this will live.
+### Phase 4 — Chat *(next core product step)*
+Read-only Study Chat should replace/extend the right-pane Activity placeholder. First version: ask questions against the current wiki page and selected raw/wiki context, answer with citations, and avoid file writes. Later version can propose edits and apply them through the same snapshot/review flow used by Build wiki.
 
 ## Architecture decisions *(don't re-litigate)*
 
@@ -83,7 +88,7 @@ AI conversation panel. Reads wiki pages, cites slides, proposes edits. Plugs int
 - **Workspace persistence = localStorage**, not Tauri config plugin. No new plugin install, simpler for solo dev.
 - **PDF rendering = PDF.js, not iframe.** Iframe was unreliable (WebKit state cache bug after navigation). PDF.js also unblocks future features: programmatic page jump for citations, text extraction for AI grounding, custom highlights — all needed for Phase 4+ value. ~30 min one-time setup cost.
 - **PDF.js v4, not v5.** v5 uses `Map.prototype.getOrInsertComputed` (Stage-3 proposal) not yet in current WKWebView.
-- **Asset protocol scope = `$HOME/**`.** Original scope was hardcoded to sample-workspace path; needed widening so any user workspace renders images.
+- **Asset protocol scope = `$HOME/**` plus `$HOME/**/.studywiki/**`.** Original scope was hardcoded to sample-workspace path; needed widening so any user workspace renders images, and dot-prefixed cache paths need explicit scope.
 - **Graph view = `react-force-graph-2d` + `d3-force`.** Tried defaults first (too compressed), bumped repulsion + link distance + added collide for Obsidian-style spread.
 - **Connections panel = collapsible, default closed.** User feedback: always-visible panel was redundant.
 - **Wikilink resolution = direct `availableDocuments.includes(href)` first, then `resolveWorkspacePath` fallback.** Original code only tried relative resolution, which broke workspace-absolute paths produced by `convertWikiLinks`.
@@ -95,4 +100,4 @@ AI conversation panel. Reads wiki pages, cites slides, proposes edits. Plugs int
 - Tree expansion state resets on workspace switch (because reload). Acceptable.
 - `<details>` dropdowns (workspace switcher, ⋯ menu) don't auto-close on outside click. Click summary to close.
 - Anchor-style wikilinks not yet produced by AI build — infrastructure ready, content not.
-- Macos title bar still light — pending Phase 6.
+- Study Chat not started. Current right-pane messages are build-operation progress, not a general chat surface.

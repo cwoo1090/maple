@@ -64,11 +64,11 @@ async function finalizeLastMessage() {
 module.exports = {
   name: "codex",
   binary: "codex",
-  defaultModel: "gpt-5-codex",
+  defaultModel: "gpt-5.5",
   supportedModels: [
-    { id: "gpt-5-codex", label: "GPT-5 Codex", recommended: true },
-    { id: "gpt-5", label: "GPT-5" },
-    { id: "gpt-5-mini", label: "GPT-5 Mini" },
+    { id: "gpt-5.5", label: "GPT-5.5", recommended: true },
+    { id: "gpt-5.4", label: "GPT-5.4" },
+    { id: "gpt-5.4-mini", label: "GPT-5.4 Mini", description: "Fastest" },
   ],
   installCommand: "npm i -g @openai/codex",
   loginCommand: "codex login",

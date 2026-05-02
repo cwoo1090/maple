@@ -18,7 +18,7 @@ These need a running Tauri app and live AI providers, so we couldn't automate th
 
 1. **Settings page renders.** Open the app → ⋯ menu → Settings… → both providers visible with model dropdowns, status pills, and Recheck/Install/Sign-in buttons.
 2. **Persistence.** Switch provider → close Settings → reopen → choice survived. Switch model → reopen → survived. Backing file lives at `appConfigDir/settings.json`.
-3. **Codex Build wiki.** Set provider=codex / model=gpt-5-codex → Build wiki → report.json includes `"provider": "codex"` and `"model": "gpt-5-codex"`.
+3. **Codex Build wiki.** Set provider=codex / model=gpt-5.5 → Build wiki → report.json includes `"provider": "codex"` and `"model": "gpt-5.5"`.
 4. **Claude Build wiki.** Set provider=claude / model=claude-sonnet-4-6 → Build wiki → report.json includes `"provider": "claude"` and `"model": "claude-sonnet-4-6"`. Also confirm `events.jsonl` ends in `result` event with `subtype: "success"`.
 5. **Codex vs Claude image quality.** Same workspace, two consecutive Build wiki runs (with Undo between), compare wiki output qualitatively for image-derived figures and references.
 6. **Install/Sign-in flows.** With a provider not installed or not signed in, Install in Terminal / Sign in in Terminal should open Terminal.app with the right command.
@@ -33,7 +33,7 @@ If a future Claude Code release moves credential storage somewhere else, this tw
 
 ### ANTHROPIC_API_KEY in shell
 
-If the user has `ANTHROPIC_API_KEY` exported in their shell, `check --provider claude` surfaces a warning. The runner's `buildSpawnEnv` deletes it from the spawned process env so subscription auth is forced — this is by design and is the safety net behind the warning.
+If the user has `ANTHROPIC_API_KEY` exported in their shell, `check --provider claude` surfaces a warning. The runner keeps the env var in the spawned process env, so Claude Code may use API-key billing instead of subscription billing until the user unsets it.
 
 ### `--provider` and `--model` plumbing in Tauri
 
