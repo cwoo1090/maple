@@ -415,11 +415,15 @@ async function runBuildWiki(workspace, options = {}) {
 
   await fsp.writeFile(promptPath, prompt);
 
+  const imageCount = preparedSources.imageAttachments.length;
+  const maxTurns = Math.max(25, imageCount + 20);
+
   const args = provider.buildExecArgs({
     workspace,
     model: options.model || provider.defaultModel,
     lastMessagePath,
     imageAttachments: preparedSources.imageAttachments,
+    maxTurns,
   });
 
   console.log(`Snapshot created: ${path.relative(workspace, snapshot.dir)}`);
@@ -734,6 +738,11 @@ Source handling:
 - For binary sources such as PDF, PPTX, DOCX, or images, use local tools as needed to inspect or extract content.
 - If extraction creates intermediate files, write them under .studywiki/extracted/.
 - Cite the original raw source paths in generated wiki pages.
+
+Reading prepared images:
+- Read every image listed under "Prepared source artifacts" before writing any wiki page.
+- Treat skipping any prepared image as a failure mode.
+- If a prepared text file is also present for a source, read both.
 
 Visual assets:
 - If a source contains useful figures, diagrams, charts, screenshots, or slide visuals, extract a focused set of study-worthy images.
