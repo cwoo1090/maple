@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { documentDir } from "@tauri-apps/api/path";
@@ -203,6 +203,16 @@ function parseEventsToMessages(jsonl: string): ChatMessage[] {
 const IMAGE_EXT_REGEX = /\.(apng|avif|gif|jpe?g|png|svg|webp)$/i;
 const PDF_EXT_REGEX = /\.pdf$/i;
 const PPTX_EXT_REGEX = /\.pptx?$/i;
+const LEFT_PANEL_WIDTH_KEY = "studywiki.leftPanelWidth";
+const RIGHT_PANEL_WIDTH_KEY = "studywiki.rightPanelWidth";
+const DEFAULT_LEFT_PANEL_WIDTH = 260;
+const DEFAULT_RIGHT_PANEL_WIDTH = 320;
+const MIN_LEFT_PANEL_WIDTH = 180;
+const MAX_LEFT_PANEL_WIDTH = 480;
+const MIN_RIGHT_PANEL_WIDTH = 260;
+const MAX_RIGHT_PANEL_WIDTH = 560;
+const MIN_CENTER_PANEL_WIDTH = 420;
+const RESIZE_HANDLE_WIDTH = 1;
 
 type LinkGraphEntry = { outbound: string[]; backlinks: string[] };
 type LinkGraph = Record<string, LinkGraphEntry>;
@@ -213,6 +223,21 @@ function makeWorkspaceAssetUrl(workspacePath: string, relativePath: string): str
   return tauriWindow.__TAURI_INTERNALS__
     ? convertFileSrc(absolute)
     : `file://${absolute}`;
+}
+
+function clampNumber(value: number, min: number, max: number): number {
+  return Math.min(Math.max(value, min), max);
+}
+
+function readStoredPanelWidth(
+  key: string,
+  fallback: number,
+  min: number,
+  max: number,
+): number {
+  const stored = Number(window.localStorage.getItem(key));
+  if (!Number.isFinite(stored)) return fallback;
+  return clampNumber(stored, min, max);
 }
 
 type CommandName =
@@ -236,6 +261,7 @@ const emptyState: WorkspaceState = {
 };
 
 function App() {
+  const appBodyRef = useRef<HTMLDivElement | null>(null);
   const [workspace, setWorkspace] = useState<WorkspaceState>(emptyState);
   const [runner, setRunner] = useState<RunnerOutput | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
@@ -259,6 +285,22 @@ function App() {
   const [pendingAnchor, setPendingAnchor] = useState<string | null>(null);
   const [viewMode, setViewMode] = useState<"page" | "graph">("page");
   const [showSettings, setShowSettings] = useState(false);
+  const [leftPanelWidth, setLeftPanelWidth] = useState(() =>
+    readStoredPanelWidth(
+      LEFT_PANEL_WIDTH_KEY,
+      DEFAULT_LEFT_PANEL_WIDTH,
+      MIN_LEFT_PANEL_WIDTH,
+      MAX_LEFT_PANEL_WIDTH,
+    ),
+  );
+  const [rightPanelWidth, setRightPanelWidth] = useState(() =>
+    readStoredPanelWidth(
+      RIGHT_PANEL_WIDTH_KEY,
+      DEFAULT_RIGHT_PANEL_WIDTH,
+      MIN_RIGHT_PANEL_WIDTH,
+      MAX_RIGHT_PANEL_WIDTH,
+    ),
+  );
   const [pptxRender, setPptxRender] = useState<{
     sourcePath: string;
     status: "pending" | "ready" | "error";
@@ -307,7 +349,59 @@ function App() {
     [workspace.workspacePath],
   );
 
-  const [expandedFolders, setExpandedFolders] = useState<Set<string>>(() => new Set());
+  const [expandedFolders, setExpandedFolders] = useState<Set<string>>(
+    () => new Set(["raw", "wiki"]),
+  );
+  const bodyGridTemplateColumns = `${leftPanelWidth}px ${RESIZE_HANDLE_WIDTH}px minmax(${MIN_CENTER_PANEL_WIDTH}px, 1fr) ${RESIZE_HANDLE_WIDTH}px ${rightPanelWidth}px`;
+
+  function startPanelResize(
+    panel: "left" | "right",
+    event: ReactPointerEvent<HTMLButtonElement>,
+  ) {
+    const body = appBodyRef.current;
+    if (!body) return;
+
+    event.preventDefault();
+    event.currentTarget.setPointerCapture(event.pointerId);
+
+    const rect = body.getBoundingClientRect();
+    document.body.classList.add("panel-resizing");
+
+    function resizePanel(moveEvent: PointerEvent) {
+      const availableWidth = rect.width - MIN_CENTER_PANEL_WIDTH - RESIZE_HANDLE_WIDTH * 2;
+      if (panel === "left") {
+        const maxLeft = Math.min(MAX_LEFT_PANEL_WIDTH, availableWidth - rightPanelWidth);
+        const nextLeft = clampNumber(
+          moveEvent.clientX - rect.left,
+          MIN_LEFT_PANEL_WIDTH,
+          Math.max(MIN_LEFT_PANEL_WIDTH, maxLeft),
+        );
+        setLeftPanelWidth(nextLeft);
+        window.localStorage.setItem(LEFT_PANEL_WIDTH_KEY, String(Math.round(nextLeft)));
+        return;
+      }
+
+      const maxRight = Math.min(MAX_RIGHT_PANEL_WIDTH, availableWidth - leftPanelWidth);
+      const nextRight = clampNumber(
+        rect.right - moveEvent.clientX,
+        MIN_RIGHT_PANEL_WIDTH,
+        Math.max(MIN_RIGHT_PANEL_WIDTH, maxRight),
+      );
+      setRightPanelWidth(nextRight);
+      window.localStorage.setItem(RIGHT_PANEL_WIDTH_KEY, String(Math.round(nextRight)));
+    }
+
+    function stopResize() {
+      document.body.classList.remove("panel-resizing");
+      window.removeEventListener("pointermove", resizePanel);
+      window.removeEventListener("pointerup", stopResize);
+      window.removeEventListener("pointercancel", stopResize);
+    }
+
+    window.addEventListener("pointermove", resizePanel);
+    window.addEventListener("pointerup", stopResize);
+    window.addEventListener("pointercancel", stopResize);
+  }
 
   function toggleFolder(path: string) {
     setExpandedFolders((prev) => {
@@ -319,14 +413,16 @@ function App() {
   }
 
   const rawTree = useMemo(() => buildTree(rawSources, "raw/"), [rawSources]);
-  const wikiTree = useMemo(() => {
-    const subtree = buildTree(workspace.wikiFiles, "wiki/");
-    return [
+  const wikiTree = useMemo(() => buildTree(workspace.wikiFiles, "wiki/"), [workspace.wikiFiles]);
+  const workspaceTree = useMemo(
+    () => [
+      { name: "raw", path: "raw", isDir: true, children: rawTree },
+      { name: "wiki", path: "wiki", isDir: true, children: wikiTree },
       { name: "index.md", path: "index.md", isDir: false, children: [] },
-      ...subtree,
       { name: "log.md", path: "log.md", isDir: false, children: [] },
-    ];
-  }, [workspace.wikiFiles]);
+    ],
+    [rawTree, wikiTree],
+  );
 
 
   useEffect(() => {
@@ -955,44 +1051,33 @@ function App() {
         </div>
       </header>
 
-      <div className="app-body">
+      <div
+        ref={appBodyRef}
+        className="app-body"
+        style={{ gridTemplateColumns: bodyGridTemplateColumns }}
+      >
         <aside className="app-left">
-          <div className="sidebar-section">
-            <div className="sidebar-section-header">
-              <span>Raw</span>
-              <span className="sidebar-section-count">{rawSources.length}</span>
-            </div>
-            {rawSources.length === 0 ? (
-              <p className="sidebar-empty">No sources imported.</p>
-            ) : (
-              <TreeView
-                nodes={rawTree}
-                level={0}
-                expanded={expandedFolders}
-                toggleFolder={toggleFolder}
-                selectedPath={selectedPath}
-                onSelect={setSelectedPath}
-                onRemove={removeRawSource}
-                removeDisabled={Boolean(busy) || !canRemoveRawSources}
-              />
-            )}
-          </div>
-
-          <div className="sidebar-section">
-            <div className="sidebar-section-header">
-              <span>Wiki</span>
-              <span className="sidebar-section-count">{wikiPages.length + 2}</span>
-            </div>
-            <TreeView
-              nodes={wikiTree}
-              level={0}
-              expanded={expandedFolders}
-              toggleFolder={toggleFolder}
-              selectedPath={selectedPath}
-              onSelect={setSelectedPath}
-            />
-          </div>
+          <TreeView
+            nodes={workspaceTree}
+            level={0}
+            expanded={expandedFolders}
+            toggleFolder={toggleFolder}
+            selectedPath={selectedPath}
+            onSelect={setSelectedPath}
+            onRemove={removeRawSource}
+            removeDisabled={Boolean(busy) || !canRemoveRawSources}
+          />
+          {rawSources.length === 0 ? (
+            <p className="sidebar-empty">No sources imported yet.</p>
+          ) : null}
         </aside>
+
+        <button
+          type="button"
+          className="panel-resize-handle"
+          aria-label="Resize left panel"
+          onPointerDown={(event) => startPanelResize("left", event)}
+        />
 
         <section className="app-center">
           <div className="center-header">
@@ -1088,6 +1173,13 @@ function App() {
             )}
           </div>
         </section>
+
+        <button
+          type="button"
+          className="panel-resize-handle"
+          aria-label="Resize right panel"
+          onPointerDown={(event) => startPanelResize("right", event)}
+        />
 
         <aside className="app-right">
           {error ? <div className="banner banner-error">{error}</div> : null}
@@ -1686,7 +1778,7 @@ type TreeViewProps = {
 
 function TreeView(props: TreeViewProps) {
   return (
-    <ul className="tree" style={props.level === 0 ? undefined : { paddingLeft: 0 }}>
+    <ul className={`tree ${props.level === 0 ? "tree-root" : "tree-nested"}`}>
       {props.nodes.map((node) => (
         <TreeItem key={node.path} node={node} {...props} />
       ))}
@@ -1704,12 +1796,12 @@ function TreeItem({
   onRemove,
   removeDisabled,
 }: TreeViewProps & { node: TreeNode }) {
-  const indent = 6 + level * 12;
+  const indent = level === 0 ? 10 : 0;
 
   if (node.isDir) {
     const isOpen = expanded.has(node.path);
     return (
-      <li>
+      <li className="tree-item">
         <button
           type="button"
           className="tree-row tree-folder"
@@ -1737,10 +1829,12 @@ function TreeItem({
   }
 
   const isSelected = selectedPath === node.path;
-  const fileIndent = indent + 12;
+  const fileIndent = level === 0 ? 30 : 24;
+  const fileDisplay = getFileDisplayParts(node.name);
+  const canRemove = Boolean(onRemove && node.path.startsWith("raw/"));
 
   return (
-    <li>
+    <li className="tree-item">
       <div
         className={`tree-row tree-file-row ${isSelected ? "selected" : ""}`}
         style={{ paddingLeft: fileIndent }}
@@ -1753,19 +1847,25 @@ function TreeItem({
             onClick={() => onSelect(node.path)}
             title={node.path}
           >
-            {node.name}
+            <span className="tree-file-label">{fileDisplay.label}</span>
+            {fileDisplay.extension ? (
+              <span className="tree-file-ext">{fileDisplay.extension}</span>
+            ) : null}
           </button>
         ) : (
           <span className="tree-name" title={node.path}>
-            {node.name}
+            <span className="tree-file-label">{fileDisplay.label}</span>
+            {fileDisplay.extension ? (
+              <span className="tree-file-ext">{fileDisplay.extension}</span>
+            ) : null}
           </span>
         )}
-        {onRemove ? (
+        {canRemove ? (
           <button
             type="button"
             className="tree-icon-btn ghost"
             disabled={removeDisabled}
-            onClick={() => onRemove(node.path)}
+            onClick={() => onRemove?.(node.path)}
             title="Remove"
           >
             ×
@@ -1774,6 +1874,17 @@ function TreeItem({
       </div>
     </li>
   );
+}
+
+function getFileDisplayParts(fileName: string): { label: string; extension: string | null } {
+  const dotIndex = fileName.lastIndexOf(".");
+  if (dotIndex <= 0 || dotIndex === fileName.length - 1) {
+    return { label: fileName, extension: null };
+  }
+  return {
+    label: fileName.slice(0, dotIndex),
+    extension: fileName.slice(dotIndex + 1).toUpperCase(),
+  };
 }
 
 function MarkdownDocument({
