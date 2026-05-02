@@ -736,7 +736,7 @@ function App() {
       <main className="app">
         <div className="empty-state">
           <div className="empty-state-card">
-            <h1>AI Study Wiki Builder</h1>
+            <h1>Maple</h1>
             <p>Open or create a workspace to start.</p>
             <div className="empty-state-actions">
               <button
@@ -1225,7 +1225,7 @@ function GraphView({
           graphData={graphData}
           width={size.width}
           height={size.height}
-          backgroundColor="#1e1e1e"
+          backgroundColor="#fbfaf6"
           nodeRelSize={4}
           linkColor={(link) => {
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1233,10 +1233,10 @@ function GraphView({
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             const tgt = (link.target as any)?.id ?? link.target;
             if (hoverNode && (src === hoverNode || tgt === hoverNode)) {
-              return "rgba(167, 139, 250, 0.7)";
+              return "rgba(224, 78, 26, 0.7)";
             }
-            if (hoverNode) return "rgba(180, 180, 180, 0.05)";
-            return "rgba(180, 180, 180, 0.18)";
+            if (hoverNode) return "rgba(0, 0, 0, 0.04)";
+            return "rgba(0, 0, 0, 0.18)";
           }}
           linkWidth={(link) => {
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1276,13 +1276,13 @@ function GraphView({
             ctx.beginPath();
             ctx.arc(n.x, n.y, radius, 0, 2 * Math.PI);
             if (isHovered || isSelected) {
-              ctx.fillStyle = "#a78bfa";
+              ctx.fillStyle = "#e04e1a";
             } else if (isHighlighted) {
-              ctx.fillStyle = "#c4b3fc";
+              ctx.fillStyle = "#f4815b";
             } else if (isDimmed) {
-              ctx.fillStyle = "rgba(156, 163, 175, 0.35)";
+              ctx.fillStyle = "rgba(107, 114, 128, 0.3)";
             } else {
-              ctx.fillStyle = "#9ca3af";
+              ctx.fillStyle = "#6b7280";
             }
             ctx.fill();
 
@@ -1292,13 +1292,13 @@ function GraphView({
               ctx.textAlign = "center";
               ctx.textBaseline = "top";
               if (isHovered || isSelected) {
-                ctx.fillStyle = "#c4b3fc";
+                ctx.fillStyle = "#c2421a";
               } else if (isHighlighted) {
-                ctx.fillStyle = "#a78bfa";
+                ctx.fillStyle = "#e04e1a";
               } else if (isDimmed) {
-                ctx.fillStyle = "rgba(107, 114, 128, 0.45)";
+                ctx.fillStyle = "rgba(107, 114, 128, 0.5)";
               } else {
-                ctx.fillStyle = "#9ca3af";
+                ctx.fillStyle = "#6b7280";
               }
               ctx.fillText(n.name, n.x, n.y + radius + 2);
             }
