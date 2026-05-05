@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Maple",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "identifier": "com.ahnchulwoo.maple",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -36,6 +36,7 @@
   "bundle": {
     "active": true,
     "targets": ["app", "dmg"],
+    "createUpdaterArtifacts": true,
     "publisher": "chulwoo ahn",
     "copyright": "Copyright 2026 chulwoo ahn. All rights reserved.",
     "category": "Education",
@@ -71,6 +72,14 @@
           "y": 185
         }
       }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDE1RUZFRDU4OThCNTY1RjgKUldUNFpiV1lXTzN2RmNBT1RwRkxjb250ZHZCQklwQUNrV1cxYkRhc3lCellhdVY4dmdIUXYyK20K",
+      "endpoints": [
+        "https://github.com/cwoo1090/maple/releases/latest/download/latest.json"
+      ]
     }
   }
 }

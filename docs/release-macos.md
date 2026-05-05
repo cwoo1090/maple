@@ -10,6 +10,9 @@ Maple's first publish path should be a direct-download `.dmg`. The Mac App Store
 - Developer ID Application certificate is installed in Keychain:
   - `Developer ID Application: chulwoo ahn (7UK3MMC4SB)`
 - Do not commit certificates, private keys, App Store Connect API keys, app-specific passwords, or notarization credentials.
+- Tauri updater private key is stored outside the repo:
+  - `/Users/ahnchulwoo/.tauri/maple-updater.key`
+  - Keep this file backed up and private. Losing it means already-installed apps cannot receive future in-app updates.
 
 ## Local Build Checks
 
@@ -33,6 +36,12 @@ export APPLE_SIGNING_IDENTITY="Developer ID Application: chulwoo ahn (7UK3MMC4SB
 npm run build:mac:app
 ```
 
+The macOS build scripts also use `TAURI_SIGNING_PRIVATE_KEY_PATH`, defaulting to:
+
+```text
+~/.tauri/maple-updater.key
+```
+
 The bundled app should appear under:
 
 ```text
@@ -47,6 +56,7 @@ Build a Developer ID signed DMG:
 cd prototype/app-shell
 export APPLE_SIGNING_IDENTITY="Developer ID Application: chulwoo ahn (7UK3MMC4SB)"
 npm run build:mac:dmg
+npm run release:latest-json
 ```
 
 The npm script sets `LC_ALL=en_US.UTF-8` and `LANG=en_US.UTF-8` because the DMG helper uses macOS Perl, which can fail under unsupported `C.UTF-8` shell locales.
@@ -57,6 +67,29 @@ The DMG should appear under:
 prototype/app-shell/src-tauri/target/release/bundle/dmg/
 ```
 
+The updater artifacts should appear under:
+
+```text
+prototype/app-shell/src-tauri/target/release/bundle/macos/Maple.app.tar.gz
+prototype/app-shell/src-tauri/target/release/bundle/macos/Maple.app.tar.gz.sig
+prototype/app-shell/src-tauri/target/release/bundle/macos/latest.json
+```
+
+Upload all of these to the GitHub Release for the same version:
+
+```bash
+gh release create v0.1.1 \
+  prototype/app-shell/src-tauri/target/release/bundle/dmg/Maple_0.1.1_aarch64.dmg \
+  prototype/app-shell/src-tauri/target/release/bundle/macos/Maple.app.tar.gz \
+  prototype/app-shell/src-tauri/target/release/bundle/macos/Maple.app.tar.gz.sig \
+  prototype/app-shell/src-tauri/target/release/bundle/macos/latest.json \
+  --repo cwoo1090/maple \
+  --title "Maple 0.1.1" \
+  --notes "Updater-enabled Maple beta."
+```
+
+The first updater-enabled build is `0.1.1`. Users on `0.1.0` still need to install `0.1.1` manually once. After that, newer releases can appear inside Maple.
+
 ## Signing And Notarization
 
 Keep signing credentials local. Prefer environment variables or Keychain profiles over committed config.
@@ -64,12 +97,12 @@ Keep signing credentials local. Prefer environment variables or Keychain profile
 Verify the signed DMG and the app inside it:
 
 ```bash
-hdiutil verify prototype/app-shell/src-tauri/target/release/bundle/dmg/Maple_0.1.0_aarch64.dmg
+hdiutil verify prototype/app-shell/src-tauri/target/release/bundle/dmg/Maple_0.1.1_aarch64.dmg
 
 rm -rf /tmp/maple-dmg-mount
 mkdir -p /tmp/maple-dmg-mount
 hdiutil attach -nobrowse -readonly -mountpoint /tmp/maple-dmg-mount \
-  prototype/app-shell/src-tauri/target/release/bundle/dmg/Maple_0.1.0_aarch64.dmg
+  prototype/app-shell/src-tauri/target/release/bundle/dmg/Maple_0.1.1_aarch64.dmg
 codesign --verify --deep --strict --verbose=2 /tmp/maple-dmg-mount/Maple.app
 hdiutil detach /tmp/maple-dmg-mount
 ```
@@ -83,7 +116,7 @@ xcrun notarytool store-credentials "Maple Notary"
 Then submit the DMG:
 
 ```bash
-xcrun notarytool submit path/to/Maple_0.1.0_aarch64.dmg \
+xcrun notarytool submit path/to/Maple_0.1.1_aarch64.dmg \
   --keychain-profile "Maple Notary" \
   --wait
 ```
@@ -91,8 +124,8 @@ xcrun notarytool submit path/to/Maple_0.1.0_aarch64.dmg \
 Staple the accepted notarization ticket:
 
 ```bash
-xcrun stapler staple path/to/Maple_0.1.0_aarch64.dmg
-xcrun stapler validate path/to/Maple_0.1.0_aarch64.dmg
+xcrun stapler staple path/to/Maple_0.1.1_aarch64.dmg
+xcrun stapler validate path/to/Maple_0.1.1_aarch64.dmg
 ```
 
 Before notarization, `spctl` may reject the DMG with `source=Insufficient Context`. That is expected for a signed-but-not-notarized Developer ID build.

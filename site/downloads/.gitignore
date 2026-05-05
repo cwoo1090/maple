@@ -1,0 +1,5 @@
+*.dmg
+*.zip
+*.app
+!README.md
+!checksums.txt

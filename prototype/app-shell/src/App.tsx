@@ -17,6 +17,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { documentDir } from "@tauri-apps/api/path";
 import { open } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { check, type DownloadEvent, type Update as TauriUpdate } from "@tauri-apps/plugin-updater";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import ReactMarkdown, { type Components } from "react-markdown";
 import rehypeKatex from "rehype-katex";
@@ -253,6 +254,15 @@ type BuildDraft = {
 } | null;
 
 type RightPanelMode = "explore" | "maintain";
+type AppUpdateStatus =
+  | "idle"
+  | "checking"
+  | "up-to-date"
+  | "available"
+  | "downloading"
+  | "installing"
+  | "restarting"
+  | "error";
 
 type MaintainCommand =
   | "wiki_healthcheck"
@@ -920,6 +930,10 @@ function App() {
   const [exploreWebSearchEnabled, setExploreWebSearchEnabled] = useState(false);
   const [providers, setProviders] = useState<ProviderInfo[]>([]);
   const [appSettings, setAppSettings] = useState<AppSettings | null>(null);
+  const [appUpdate, setAppUpdate] = useState<TauriUpdate | null>(null);
+  const [appUpdateStatus, setAppUpdateStatus] = useState<AppUpdateStatus>("idle");
+  const [appUpdateDownloaded, setAppUpdateDownloaded] = useState(0);
+  const [appUpdateContentLength, setAppUpdateContentLength] = useState<number | null>(null);
   const [openedChangedFiles, setOpenedChangedFiles] = useState<Set<string>>(() => new Set());
   const [interruptedOp, setInterruptedOp] = useState<InterruptedCheck | null>(null);
   const [dragOver, setDragOver] = useState(false);
@@ -1657,6 +1671,13 @@ function App() {
     return () => {
       cancelled = true;
     };
+  }, []);
+
+  useEffect(() => {
+    const timerId = window.setTimeout(() => {
+      void checkForAppUpdate({ silent: true });
+    }, 4000);
+    return () => window.clearTimeout(timerId);
   }, []);
 
   useEffect(() => {
@@ -3222,6 +3243,133 @@ function App() {
     }
   }
 
+  function resetAppUpdateProgress() {
+    setAppUpdateDownloaded(0);
+    setAppUpdateContentLength(null);
+  }
+
+  async function checkForAppUpdate(options: { silent?: boolean } = {}) {
+    const silent = options.silent ?? false;
+    if (
+      appUpdateStatus === "checking" ||
+      appUpdateStatus === "downloading" ||
+      appUpdateStatus === "installing" ||
+      appUpdateStatus === "restarting"
+    ) {
+      return;
+    }
+
+    setAppUpdateStatus("checking");
+    resetAppUpdateProgress();
+
+    try {
+      const update = await check({ timeout: 15_000 });
+      if (update) {
+        setAppUpdate(update);
+        setAppUpdateStatus("available");
+        return;
+      }
+
+      setAppUpdate(null);
+      if (silent) {
+        setAppUpdateStatus("idle");
+      } else {
+        setAppUpdateStatus("up-to-date");
+        window.setTimeout(() => {
+          setAppUpdateStatus((status) => (status === "up-to-date" ? "idle" : status));
+        }, 3500);
+      }
+    } catch (err) {
+      setAppUpdate(null);
+      if (silent) {
+        setAppUpdateStatus("idle");
+        return;
+      }
+      setAppUpdateStatus("error");
+      setError(`Failed to check for updates: ${String(err)}`);
+    }
+  }
+
+  async function installAppUpdate() {
+    let update = appUpdate;
+    if (!update) {
+      setAppUpdateStatus("checking");
+      try {
+        update = await check({ timeout: 15_000 });
+      } catch (err) {
+        setAppUpdateStatus("error");
+        setError(`Failed to check for updates: ${String(err)}`);
+        return;
+      }
+      if (!update) {
+        setAppUpdateStatus("up-to-date");
+        window.setTimeout(() => {
+          setAppUpdateStatus((status) => (status === "up-to-date" ? "idle" : status));
+        }, 3500);
+        return;
+      }
+      setAppUpdate(update);
+    }
+
+    resetAppUpdateProgress();
+    setAppUpdateStatus("downloading");
+    setError(null);
+
+    try {
+      await update.downloadAndInstall((event: DownloadEvent) => {
+        if (event.event === "Started") {
+          setAppUpdateDownloaded(0);
+          setAppUpdateContentLength(event.data.contentLength ?? null);
+        } else if (event.event === "Progress") {
+          setAppUpdateDownloaded((downloaded) => downloaded + event.data.chunkLength);
+        } else if (event.event === "Finished") {
+          setAppUpdateStatus("installing");
+        }
+      });
+
+      setAppUpdateStatus("restarting");
+      await invoke("restart_app");
+    } catch (err) {
+      setAppUpdateStatus("error");
+      setError(`Failed to install update: ${String(err)}`);
+    }
+  }
+
+  const appUpdatePercent =
+    appUpdateContentLength && appUpdateContentLength > 0
+      ? Math.min(99, Math.round((appUpdateDownloaded / appUpdateContentLength) * 100))
+      : null;
+  const appUpdateLabel =
+    appUpdateStatus === "checking"
+      ? "Checking…"
+      : appUpdateStatus === "up-to-date"
+        ? "Up to date"
+        : appUpdateStatus === "downloading"
+          ? appUpdatePercent === null
+            ? "Downloading…"
+            : `Updating ${appUpdatePercent}%`
+          : appUpdateStatus === "installing"
+            ? "Installing…"
+            : appUpdateStatus === "restarting"
+              ? "Restarting…"
+              : appUpdateStatus === "error"
+                ? "Retry update"
+                : "Update";
+  const appUpdateTitle =
+    appUpdateStatus === "available" && appUpdate
+      ? `Install Maple ${appUpdate.version}`
+      : appUpdateStatus === "up-to-date"
+        ? "Maple is up to date"
+        : "Check for Maple updates";
+  const showAppUpdateButton =
+    appUpdateStatus !== "idle" &&
+    (appUpdateStatus !== "available" || Boolean(appUpdate));
+  const appUpdateBusy =
+    appUpdateStatus === "checking" ||
+    appUpdateStatus === "downloading" ||
+    appUpdateStatus === "installing" ||
+    appUpdateStatus === "restarting";
+
   void runner;
 
   if (!workspace.workspacePath) {
@@ -3537,9 +3685,36 @@ function App() {
                 Stop
               </button>
             ) : null}
+            {showAppUpdateButton ? (
+              <button
+                type="button"
+                className={`topbar-btn update ${appUpdateStatus === "available" ? "primary" : ""}`}
+                disabled={appUpdateBusy}
+                title={appUpdateTitle}
+                onClick={() => {
+                  if (appUpdate) {
+                    void installAppUpdate();
+                  } else {
+                    void checkForAppUpdate();
+                  }
+                }}
+              >
+                {appUpdateLabel}
+              </button>
+            ) : null}
             <details ref={topbarMenuRef} className="topbar-menu">
               <summary aria-label="More actions">⋯</summary>
               <div className="topbar-menu-items">
+                <button
+                  type="button"
+                  disabled={appUpdateBusy}
+                  onClick={() => {
+                    if (topbarMenuRef.current) topbarMenuRef.current.open = false;
+                    void checkForAppUpdate();
+                  }}
+                >
+                  Check for updates
+                </button>
                 <button
                   type="button"
                   onClick={() => {
@@ -3549,14 +3724,14 @@ function App() {
                 >
                   Settings…
                 </button>
-	                <button
-	                  type="button"
-	                  disabled={Boolean(finishReviewBlockedReason) || !hasPendingGeneratedChanges}
-	                  title={finishReviewBlockedReason ?? undefined}
-	                  onClick={() => {
-	                    if (topbarMenuRef.current) topbarMenuRef.current.open = false;
-	                    void finishGeneratedReview();
-	                  }}
+                <button
+                  type="button"
+                  disabled={Boolean(finishReviewBlockedReason) || !hasPendingGeneratedChanges}
+                  title={finishReviewBlockedReason ?? undefined}
+                  onClick={() => {
+                    if (topbarMenuRef.current) topbarMenuRef.current.open = false;
+                    void finishGeneratedReview();
+                  }}
                 >
                   Done reviewing
                 </button>

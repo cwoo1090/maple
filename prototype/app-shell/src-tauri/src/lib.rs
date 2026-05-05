@@ -4911,9 +4911,15 @@ not-json
     }
 }
 
+#[tauri::command]
+fn restart_app(app: AppHandle) {
+    app.restart();
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
@@ -4979,6 +4985,7 @@ pub fn run() {
             check_provider,
             install_provider,
             login_provider,
+            restart_app,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

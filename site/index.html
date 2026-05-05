@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="Download Maple, a local desktop app that turns sources into an AI-maintained wiki."
+    />
+    <title>Maple - Download the AI wiki builder</title>
+    <link rel="icon" href="assets/maple-icon.png" />
+    <link rel="apple-touch-icon" href="assets/maple-icon.png" />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="#top" aria-label="Maple home">
+        <img src="assets/maple-icon.png" alt="" />
+        <span>Maple</span>
+      </a>
+      <nav class="site-nav" aria-label="Primary navigation">
+        <a href="#download">Download</a>
+        <a href="#workflow">Workflow</a>
+        <a href="#privacy">Privacy</a>
+      </nav>
+    </header>
+
+    <main id="top">
+      <section class="hero" aria-labelledby="hero-title">
+        <div class="hero-inner">
+          <div class="hero-copy-block">
+            <p class="eyebrow">Local AI wiki builder</p>
+            <h1 id="hero-title">Maple</h1>
+            <p class="hero-copy">
+              Turn PDFs, notes, links, and research scraps into a local wiki
+              that you can review, explore, and keep on your Mac.
+            </p>
+            <div class="hero-actions">
+              <a
+                class="button primary"
+                href="https://github.com/cwoo1090/maple/releases/download/v0.1.1/Maple_0.1.1_aarch64.dmg"
+                download
+              >
+                Download for macOS
+              </a>
+              <a class="button secondary" href="#workflow">See how it works</a>
+            </div>
+            <p class="release-note">
+              Version 0.1.1 beta for Apple silicon Macs. Requires macOS 12 or
+              newer.
+            </p>
+          </div>
+          <figure class="hero-product-shot">
+            <img
+              src="assets/maple-workspace-explore.png"
+              alt="Maple desktop workspace showing a source tree, generated wiki page, and Explore Chat."
+              width="2346"
+              height="1514"
+            />
+          </figure>
+        </div>
+      </section>
+
+      <section class="download-band" id="download" aria-labelledby="download-title">
+        <div class="download-layout">
+          <div>
+            <p class="section-kicker">Direct download</p>
+            <h2 id="download-title">Get Maple for macOS</h2>
+            <p>
+              This first MVP is a direct-download desktop app. It uses local
+              files and your existing ChatGPT/Codex setup instead of accounts,
+              sync, or built-in API billing.
+            </p>
+          </div>
+          <div class="download-box">
+            <div class="download-meta">
+              <span>Maple 0.1.1 beta</span>
+              <span>10 MB</span>
+              <span>Apple silicon</span>
+            </div>
+            <a
+              class="button primary full"
+              href="https://github.com/cwoo1090/maple/releases/download/v0.1.1/Maple_0.1.1_aarch64.dmg"
+              download
+            >
+              Download DMG
+            </a>
+            <div class="checksum-row">
+              <code id="checksum-value"
+                >5f5c463df1d0a433c18f04f67e840d72ced3e288b555a9a80ad2311ecf1917aa</code
+              >
+              <button type="button" id="copy-checksum">Copy</button>
+            </div>
+            <p class="download-hint" id="copy-status" aria-live="polite">
+              SHA-256 checksum for the current local build.
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <section class="workflow-section" id="workflow" aria-labelledby="workflow-title">
+        <div class="section-heading">
+          <p class="section-kicker">Workflow</p>
+          <h2 id="workflow-title">From scattered sources to a maintained wiki</h2>
+        </div>
+        <div class="workflow-grid">
+          <article>
+            <span>1</span>
+            <h3>Create a wiki workspace</h3>
+            <p>Start with one topic, course, archive, project, or skill path.</p>
+          </article>
+          <article>
+            <span>2</span>
+            <h3>Import sources</h3>
+            <p>Add PDFs, Markdown, text notes, links, screenshots, or papers.</p>
+          </article>
+          <article>
+            <span>3</span>
+            <h3>Build wiki</h3>
+            <p>Use your AI subscription to compile summaries, concepts, and guides.</p>
+          </article>
+          <article>
+            <span>4</span>
+            <h3>Review changes</h3>
+            <p>See generated files before accepting updates to your wiki.</p>
+          </article>
+          <article>
+            <span>5</span>
+            <h3>Explore</h3>
+            <p>Read pages, follow links, ask questions, and improve the wiki over time.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="privacy-section" id="privacy" aria-labelledby="privacy-title">
+        <div class="privacy-copy">
+          <p class="section-kicker">Local first</p>
+          <h2 id="privacy-title">Your archive stays inspectable</h2>
+          <p>
+            Maple is built around plain local folders: sources stay immutable,
+            generated wiki pages are reviewable, and the workspace can be opened
+            outside the app when you need it.
+          </p>
+        </div>
+        <div class="principles">
+          <article>
+            <h3>No Maple account</h3>
+            <p>The MVP does not add app accounts, payments, or sync.</p>
+          </article>
+          <article>
+            <h3>Local file storage</h3>
+            <p>Workspaces use readable folders like sources, wiki, index.md, and log.md.</p>
+          </article>
+          <article>
+            <h3>Reviewable AI changes</h3>
+            <p>Generated edits are tracked so you can inspect what changed.</p>
+          </article>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <span>Maple</span>
+      <span>Copyright <span id="year">2026</span> chulwoo ahn.</span>
+    </footer>
+
+    <script src="script.js"></script>
+  </body>
+</html>

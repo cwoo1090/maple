@@ -47,3 +47,8 @@ workspace/
 - [Karpathy LLM Wiki Background](docs/karpathy-llm-wiki-background.md)
 - [Technical Spike](docs/technical-spike.md)
 - [macOS Release Checklist](docs/release-macos.md)
+
+## Download Site
+
+The static download page lives in [site](site/). Open `site/index.html` in a
+browser, or deploy that folder to a static host.

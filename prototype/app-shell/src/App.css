@@ -355,6 +355,10 @@ code {
   filter: brightness(0.95);
 }
 
+.topbar-btn.update {
+  min-width: 68px;
+}
+
 .topbar-btn.cancel {
   border-color: var(--danger-border);
   background: var(--danger-bg);
