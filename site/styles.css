@@ -120,21 +120,25 @@ code {
 }
 
 .hero {
-  position: relative;
-  min-height: 76vh;
   overflow: hidden;
   border-bottom: 1px solid var(--line);
   background:
-    linear-gradient(90deg, rgba(251, 250, 246, 0.98) 0%, rgba(251, 250, 246, 0.92) 38%, rgba(251, 250, 246, 0.28) 100%),
+    linear-gradient(90deg, rgba(251, 250, 246, 0.98) 0%, rgba(251, 250, 246, 0.86) 58%, rgba(251, 250, 246, 0.42) 100%),
     linear-gradient(135deg, var(--gold-soft), var(--forest-soft) 55%, var(--blue-soft));
 }
 
 .hero-inner {
-  position: relative;
-  z-index: 2;
-  width: min(1120px, calc(100% - 48px));
+  display: grid;
+  grid-template-columns: minmax(360px, 500px) minmax(0, 1fr);
+  gap: clamp(36px, 5vw, 84px);
+  align-items: center;
+  width: min(1560px, calc(100% - 96px));
   margin: 0 auto;
-  padding: 90px 0 72px;
+  padding: 92px 0 88px;
+}
+
+.hero-copy-block {
+  min-width: 0;
 }
 
 .eyebrow,
@@ -157,7 +161,7 @@ code {
 }
 
 .hero-copy {
-  max-width: 480px;
+  max-width: 540px;
   margin: 24px 0 0;
   color: var(--muted);
   font-size: 1.25rem;
@@ -224,18 +228,8 @@ code {
   font-size: 0.9rem;
 }
 
-.hero-backdrop {
-  position: absolute;
-  inset: 0;
-  z-index: 1;
-  pointer-events: none;
-}
-
 .hero-product-shot {
-  position: absolute;
-  top: 74px;
-  right: max(28px, calc((100vw - 1180px) / 2));
-  width: min(720px, 58vw);
+  width: 100%;
   margin: 0;
   overflow: hidden;
   border: 1px solid rgba(103, 94, 78, 0.28);
@@ -257,7 +251,6 @@ code {
 
 .download-layout,
 .privacy-section,
-.screenshots-section,
 .workflow-section {
   width: min(1120px, calc(100% - 48px));
   margin: 0 auto;
@@ -271,7 +264,6 @@ code {
 }
 
 .download-layout h2,
-.screenshots-section h2,
 .workflow-section h2,
 .privacy-copy h2 {
   margin: 0;
@@ -353,76 +345,6 @@ code {
   margin: 9px 0 0;
   color: var(--faint);
   font-size: 0.82rem;
-}
-
-.screenshots-section {
-  padding: 72px 0;
-  border-bottom: 1px solid var(--line);
-}
-
-.screenshot-showcase {
-  margin: 30px 0 0;
-  overflow: hidden;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: var(--paper-strong);
-  box-shadow: 0 18px 54px rgba(31, 26, 18, 0.1);
-}
-
-.screenshot-showcase img {
-  width: 100%;
-  height: auto;
-}
-
-.screenshot-grid {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 12px;
-  margin-top: 14px;
-}
-
-.screenshot-grid article {
-  overflow: hidden;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: var(--paper-strong);
-}
-
-.screenshot-crop {
-  aspect-ratio: 16 / 9;
-  overflow: hidden;
-  border-bottom: 1px solid var(--line);
-  background: #f4f1e9;
-}
-
-.screenshot-crop img {
-  width: 240%;
-  max-width: none;
-}
-
-.crop-sources img {
-  transform: translate(0, 0);
-}
-
-.crop-page img {
-  transform: translate(-25%, -5%);
-}
-
-.crop-chat img {
-  transform: translate(-58%, 0);
-}
-
-.screenshot-grid h3 {
-  margin: 18px 18px 8px;
-  font-size: 1.02rem;
-  line-height: 1.25;
-  letter-spacing: 0;
-}
-
-.screenshot-grid p {
-  margin: 0 18px 18px;
-  color: var(--muted);
-  font-size: 0.92rem;
 }
 
 .workflow-section {
@@ -521,17 +443,14 @@ code {
 }
 
 @media (max-width: 1040px) {
-  .hero {
-    min-height: 0;
-  }
-
   .hero-inner {
+    grid-template-columns: 1fr;
+    width: min(920px, calc(100% - 48px));
     padding-top: 70px;
   }
 
   .hero-product-shot {
-    right: -260px;
-    opacity: 0.5;
+    max-width: 920px;
   }
 
   .download-layout,
@@ -540,7 +459,6 @@ code {
   }
 
   .workflow-grid,
-  .screenshot-grid,
   .principles {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -568,7 +486,6 @@ code {
   .hero-inner,
   .download-layout,
   .privacy-section,
-  .screenshots-section,
   .workflow-section {
     width: min(100% - 32px, 1120px);
   }
@@ -579,11 +496,8 @@ code {
       linear-gradient(135deg, var(--gold-soft), var(--forest-soft) 55%, var(--blue-soft));
   }
 
-  .hero-backdrop {
-    display: none;
-  }
-
   .hero-inner {
+    gap: 28px;
     padding: 58px 0 50px;
   }
 
@@ -604,21 +518,18 @@ code {
   }
 
   .download-band,
-  .screenshots-section,
   .workflow-section,
   .privacy-section {
     padding: 48px 0;
   }
 
   .download-layout h2,
-  .screenshots-section h2,
   .workflow-section h2,
   .privacy-copy h2 {
     font-size: 1.85rem;
   }
 
   .workflow-grid,
-  .screenshot-grid,
   .principles {
     grid-template-columns: 1fr;
   }
