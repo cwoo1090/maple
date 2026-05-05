@@ -1,54 +1,13 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-
-export interface ProviderModel {
-  id: string;
-  label: string;
-  description?: string;
-  recommended?: boolean;
-}
-
-export interface ProviderInfo {
-  name: string;
-  label: string;
-  installCommand: string;
-  loginCommand: string;
-  defaultModel: string;
-  supportedModels: ProviderModel[];
-}
-
-export interface AppSettings {
-  provider: string;
-  models: Record<string, string>;
-}
-
-export interface ProviderStatus {
-  installed: boolean;
-  loggedIn: boolean;
-  statusText: string | null;
-  warnings: string[];
-  installPath: string | null;
-  version: string | null;
-}
-
-function parseProviderStatus(stdout: string): ProviderStatus | null {
-  const start = stdout.indexOf("{");
-  const end = stdout.lastIndexOf("}");
-  if (start === -1 || end <= start) return null;
-  try {
-    const parsed = JSON.parse(stdout.slice(start, end + 1));
-    return {
-      installed: Boolean(parsed?.installed?.installed),
-      loggedIn: Boolean(parsed?.auth?.loggedIn),
-      statusText: parsed?.auth?.statusText ?? null,
-      warnings: Array.isArray(parsed?.auth?.warnings) ? parsed.auth.warnings : [],
-      installPath: parsed?.installed?.path ?? null,
-      version: parsed?.installed?.version ?? null,
-    };
-  } catch (_error) {
-    return null;
-  }
-}
+import { openUrl } from "@tauri-apps/plugin-opener";
+import {
+  parseProviderStatus,
+  type AppSettings,
+  type NodeRuntimeStatus,
+  type ProviderInfo,
+  type ProviderStatus,
+} from "./ProviderSetup";
 
 type RunnerOutput = {
   success: boolean;
@@ -64,9 +23,25 @@ interface Props {
 export function Settings({ onClose }: Props) {
   const [providers, setProviders] = useState<ProviderInfo[]>([]);
   const [settings, setSettings] = useState<AppSettings | null>(null);
+  const [runtimeStatus, setRuntimeStatus] = useState<NodeRuntimeStatus | null>(null);
+  const [checkingRuntime, setCheckingRuntime] = useState(false);
   const [statuses, setStatuses] = useState<Record<string, ProviderStatus | null>>({});
   const [refreshing, setRefreshing] = useState<Record<string, boolean>>({});
   const [error, setError] = useState<string | null>(null);
+
+  const refreshRuntime = useCallback(async () => {
+    setCheckingRuntime(true);
+    try {
+      const status = await invoke<NodeRuntimeStatus>("check_node_runtime");
+      setRuntimeStatus(status);
+      return status;
+    } catch (err) {
+      setError(`Failed to check Node.js: ${String(err)}`);
+      return null;
+    } finally {
+      setCheckingRuntime(false);
+    }
+  }, []);
 
   const refreshStatus = useCallback(async (name: string) => {
     setRefreshing((prev) => ({ ...prev, [name]: true }));
@@ -92,8 +67,11 @@ export function Settings({ onClose }: Props) {
         if (cancelled) return;
         setProviders(list);
         setSettings(current);
-        for (const provider of list) {
-          refreshStatus(provider.name);
+        const runtime = await refreshRuntime();
+        if (runtime?.nodeInstalled) {
+          for (const provider of list) {
+            refreshStatus(provider.name);
+          }
         }
       } catch (err) {
         if (!cancelled) setError(String(err));
@@ -102,7 +80,33 @@ export function Settings({ onClose }: Props) {
     return () => {
       cancelled = true;
     };
-  }, [refreshStatus]);
+  }, [refreshRuntime, refreshStatus]);
+
+  async function handleRuntimeRecheck() {
+    const runtime = await refreshRuntime();
+    if (runtime?.nodeInstalled) {
+      for (const provider of providers) {
+        refreshStatus(provider.name);
+      }
+    }
+  }
+
+  async function handleOpenNodeDownload() {
+    try {
+      await openUrl(runtimeStatus?.installUrl || "https://nodejs.org/en/download");
+    } catch (err) {
+      setError(`Failed to open Node.js download: ${String(err)}`);
+    }
+  }
+
+  useEffect(() => {
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") onClose();
+    }
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [onClose]);
 
   async function handleSelectProvider(name: string) {
     try {
@@ -142,10 +146,16 @@ export function Settings({ onClose }: Props) {
 
   if (!settings) {
     return (
-      <div className="settings-overlay">
-        <div className="settings-panel">
+      <div
+        className="settings-overlay"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="settings-title"
+        onMouseDown={onClose}
+      >
+        <div className="settings-panel" onMouseDown={(event) => event.stopPropagation()}>
           <header className="settings-header">
-            <h2>Settings</h2>
+            <h2 id="settings-title">Settings</h2>
             <button type="button" onClick={onClose}>
               Close
             </button>
@@ -158,10 +168,16 @@ export function Settings({ onClose }: Props) {
   }
 
   return (
-    <div className="settings-overlay" onClick={onClose}>
-      <div className="settings-panel" onClick={(event) => event.stopPropagation()}>
+    <div
+      className="settings-overlay"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="settings-title"
+      onMouseDown={onClose}
+    >
+      <div className="settings-panel" onMouseDown={(event) => event.stopPropagation()}>
         <header className="settings-header">
-          <h2>Settings</h2>
+          <h2 id="settings-title">Settings</h2>
           <button type="button" onClick={onClose}>
             Close
           </button>
@@ -174,11 +190,40 @@ export function Settings({ onClose }: Props) {
             Claude Pro/Max subscription. Both run via local CLIs that you sign into once.
           </p>
 
+          {runtimeStatus && (!runtimeStatus.nodeInstalled || !runtimeStatus.npmInstalled) ? (
+            <div className="settings-runtime-warning">
+              <div>
+                <strong>
+                  {runtimeStatus.nodeInstalled ? "npm needed first" : "Node.js needed first"}
+                </strong>
+                <p>
+                  Maple installs AI helpers with npm, which comes with Node.js. Install Node.js,
+                  then recheck setup.
+                </p>
+                <span>
+                  {runtimeStatus.nodeInstalled ? "Node.js found" : "Node.js not found"} ·{" "}
+                  {runtimeStatus.npmInstalled ? "npm found" : "npm not found"}
+                </span>
+              </div>
+              <div className="settings-runtime-actions">
+                <button type="button" onClick={handleOpenNodeDownload}>
+                  Get Node.js
+                </button>
+                <button type="button" onClick={() => void handleRuntimeRecheck()}>
+                  {checkingRuntime ? "Checking…" : "Recheck"}
+                </button>
+              </div>
+            </div>
+          ) : null}
+
           {providers.map((provider) => {
             const status = statuses[provider.name];
             const active = settings.provider === provider.name;
             const selectedModel = settings.models[provider.name] || provider.defaultModel;
             const isRefreshing = Boolean(refreshing[provider.name]);
+            const providerInstallBlocked = Boolean(
+              status && !status.installed && (!runtimeStatus?.nodeInstalled || !runtimeStatus?.npmInstalled),
+            );
 
             return (
               <div
@@ -234,7 +279,12 @@ export function Settings({ onClose }: Props) {
                       Recheck
                     </button>
                     {status && !status.installed ? (
-                      <button type="button" onClick={() => handleInstall(provider.name)}>
+                      <button
+                        type="button"
+                        onClick={() => handleInstall(provider.name)}
+                        disabled={providerInstallBlocked}
+                        title={providerInstallBlocked ? "Install Node.js with npm first" : undefined}
+                      >
                         Install in Terminal
                       </button>
                     ) : null}

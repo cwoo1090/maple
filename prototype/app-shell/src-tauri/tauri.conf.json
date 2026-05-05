@@ -27,6 +27,7 @@
         "enable": true,
         "scope": [
           "$HOME/**",
+          "$HOME/**/.aiwiki/**",
           "$HOME/**/.studywiki/**"
         ]
       }

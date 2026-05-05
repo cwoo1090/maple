@@ -8,6 +8,7 @@ target/
 *.log
 .omx/
 .omc/
+.aiwiki/
 .studywiki/
 prototype/operation-runner/sample-workspace/
 .claude/

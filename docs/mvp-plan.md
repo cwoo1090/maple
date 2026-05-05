@@ -4,7 +4,7 @@
 
 Build the smallest desktop app that proves this workflow:
 
-> A non-technical learner can create a local wiki workspace, add study sources, build a structured wiki with Codex, study through wikilinks and graph navigation, and safely undo AI write operations.
+> A non-technical learner can create a local wiki workspace, add sources, build a structured wiki with Codex, explore through wikilinks and graph navigation, and safely undo AI write operations.
 
 See [`mvp-spec.md`](./mvp-spec.md) for the detailed product specification. This plan is the shorter execution-oriented version.
 
@@ -51,7 +51,7 @@ Recommended MVP stack:
 
 ```text
 workspace/
-  raw/
+  sources/
   wiki/
     concepts/
     summaries/
@@ -61,13 +61,13 @@ workspace/
   log.md
   schema.md
   AGENTS.md
-  .studywiki/
+  .aiwiki/
 ```
 
 Portable/shareable content:
 
 ```text
-raw/
+sources/
 wiki/
 index.md
 log.md
@@ -75,36 +75,38 @@ schema.md
 AGENTS.md
 ```
 
-`.studywiki/` is local app metadata for manifests, extraction caches, operations, and snapshots. It should be excluded from export/share.
+`.aiwiki/` is local app metadata for manifests, extraction caches, operations, and snapshots. It should be excluded from export/share.
 
-## Main App Modes
+## Main App Areas
 
-Use these user-facing tabs:
+Use these user-facing areas:
 
-- `Study`
-- `Sources`
-- `Wiki Health`
+- `Sources` in the left file panel
+- `Explore` in the right panel
+- `Maintain` in the right panel
 
 Use these user-facing action labels:
 
 - `Build wiki`
 - `Apply to wiki`
-- `Healthcheck wiki`
-- `Clean up wiki`
+- `Wiki healthcheck`
+- `Improve wiki`
+- `Organize sources`
+- `Update rules`
 - `Undo last operation`
 
-Avoid exposing "ingest", "lint", "diff", "Git", or terminal wording in the normal UX.
+Avoid exposing "ingest", "lint", "diff", "Git", terminal wording, `AGENTS.md`, `CLAUDE.md`, or `schema.md` in the normal UX.
 
 ## MVP Features
 
 ### 1. Workspace Creator
 
-- Ask only: "What are you studying?"
-- Suggest default location: `~/Documents/Study Wikis/<workspace-name>`.
+- Ask only: "What are you exploring?"
+- Suggest default location: `~/Documents/Maple Wikis/<workspace-name>`.
 - Allow the user to change location.
-- Generate `raw/`, `wiki/`, `index.md`, `log.md`, `schema.md`, `AGENTS.md`, and `.studywiki/`.
+- Generate `sources/`, `wiki/`, `index.md`, `log.md`, `schema.md`, `AGENTS.md`, and `.aiwiki/`.
 - Support opening an existing compatible workspace.
-- If an existing workspace lacks `.studywiki/`, add it without changing wiki content.
+- If an existing workspace lacks `.aiwiki/`, add it without changing wiki content.
 
 ### 2. Connect ChatGPT / Codex
 
@@ -126,11 +128,11 @@ codex login
 
 ### 3. Sources
 
-- Show `raw/` as a nested file tree, not a flat upload list.
+- Show `sources/` as a nested file tree, not a flat upload list.
 - Support drag/drop import.
 - Allow direct Finder-managed source files.
 - Support create folder, rename, move, delete with confirmation, reveal in Finder, and open in default app.
-- Detect pending raw changes anywhere under `raw/`.
+- Detect pending source changes anywhere under `sources/`.
 - Show pending states such as `new`, `modified`, `removed`, and `already built`.
 - Suggest bundles from folders, such as a lecture folder containing slides, transcript, and notes.
 - Let the user build all pending sources by default or selected files/folders.
@@ -157,7 +159,7 @@ Paste anything here
 
 The app infers title, filename, type, and save location. Optional fields can be hidden under advanced options.
 
-For web links, the app tries to extract readable content into a raw Markdown snapshot. If extraction fails, clearly tell the user to paste text manually, upload a PDF, or try another source. Do not pretend an uncaptured page has been ingested.
+For web links, the app tries to extract readable content into a source Markdown snapshot. If extraction fails, clearly tell the user to paste text manually, upload a PDF, or try another source. Do not pretend an uncaptured page has been ingested.
 
 ### 5. Build Wiki
 
@@ -171,7 +173,7 @@ When pending sources exist, emphasize:
 Build wiki should:
 
 - create a hidden snapshot first
-- read relevant raw sources and existing wiki context
+- use a thin prompt that scopes pending sources and lets the LLM read workspace context files as needed
 - create or update summaries
 - create or update concept pages
 - create or update guides
@@ -186,29 +188,29 @@ There is no accept/discard review step in MVP. Changes are applied, marked, and 
 
 ### 6. PDF Extraction And Visual Assets
 
-The app should prepare PDF context instead of relying on raw PDF handling alone:
+The app should prepare PDF context instead of relying on source PDF handling alone:
 
 - extract text when available
 - render pages/thumbnails
 - automatically detect visually important or low-text pages
-- cache helper files under `.studywiki/extracted/`
+- cache helper files under `.aiwiki/extracted/`
 - provide text plus selected page images to AI operations
 
 Build wiki should automatically create curated visual assets:
 
 ```text
-raw PDF/image
+source PDF/image
 -> selected derived PNGs in wiki/assets/<source-slug>/
 -> embedded in relevant wiki pages
--> captions cite original raw path + page/slide/figure
+-> captions cite original source path + page/slide/figure
 ```
 
-Do not dump every slide into the wiki. Use visuals only when they improve study.
+Do not dump every slide into the wiki. Use visuals only when they improve understanding.
 
-### 7. Study
+### 7. Explore
 
 - Chat is read-only by default.
-- Answers should use `index.md`, `wiki/`, and raw sources when needed.
+- Answers should use `index.md`, `wiki/`, and sources when needed.
 - The user can explicitly run `Apply to wiki`.
 - Apply to wiki uses the same snapshot, changed-file marking, permission validation, and undo model as Build wiki.
 - Wiki pages are read-only in the app for MVP.
@@ -243,7 +245,7 @@ Required behavior:
 - click node to open page
 - broken links shown distinctly
 
-Raw source nodes can come later.
+Source nodes can come later.
 
 ### 10. Connections Panel
 
@@ -255,14 +257,16 @@ When feasible, show a compact current-page neighborhood:
 
 This helps users move through the wiki without needing the full graph every time.
 
-### 11. Wiki Health
+### 11. Maintain
 
 User-facing actions:
 
-- `Healthcheck wiki`: read-only report
-- `Clean up wiki`: write operation with snapshot, changed-file marking, permission validation, and undo
+- `Wiki healthcheck`: rule-based lint/fix operation with snapshot, changed-file marking, permission validation, and undo
+- `Improve wiki`: user-directed wiki improvement, guide creation, and restructuring
+- `Organize sources`: user-directed source folder/file moves and renames without source content edits
+- `Update rules`: update durable workspace rules shown to the user as one rules surface
 
-Health checks should inspect:
+Wiki healthcheck should inspect:
 
 - orphan pages
 - broken wikilinks
@@ -285,12 +289,12 @@ All AI write operations use:
 - operation report
 - undo last operation
 
-Modes are permission boundaries:
+Operations are permission boundaries:
 
-- Study may write `wiki/**`, `index.md`, `log.md`, and `schema.md` only when explicitly requested.
-- Sources may organize `raw/` paths but should not edit raw file content.
-- Build wiki may write `wiki/**`, `index.md`, `log.md`, `schema.md`, `wiki/assets/**`, and `.studywiki/**`.
-- Wiki Health may inspect/fix wiki/control files but may not modify `raw/**`.
+- Explore may write `wiki/**`, `index.md`, `log.md`, and `schema.md` only when explicitly requested.
+- Organize sources may organize `sources/` paths but should not edit source file content.
+- Build wiki may write `wiki/**`, `index.md`, `log.md`, `schema.md`, `wiki/assets/**`, and `.aiwiki/**`.
+- Wiki healthcheck and Improve wiki may inspect/fix wiki/control files but may not modify `sources/**`.
 
 ## Technical Spike Before UI
 
@@ -308,20 +312,20 @@ Then test against a copy of `robot-hardware-wiki`, never the original.
 
 ## First Demo Acceptance Criteria
 
-- User can create a workspace from "What are you studying?"
+- User can create a workspace from "What are you exploring?"
 - User can choose default or custom workspace location.
 - App can detect Codex install/login and guide setup.
 - User can add at least PDF and pasted text sources.
-- App detects pending raw changes.
-- User can preview raw PDFs in app.
+- App detects pending source changes.
+- User can preview source PDFs in app.
 - User can click `Build wiki`.
 - Codex creates/updates wiki pages, `index.md`, and `log.md`.
 - App marks changed files after the operation.
 - User can undo the last operation.
 - Wiki reader renders Markdown, properties, images, math, and wikilinks.
 - Graph view works from wikilinks.
-- Study chat is read-only by default.
+- Explore chat is read-only by default.
 - User can explicitly `Apply to wiki`.
-- User can run `Healthcheck wiki`.
-- User can run `Clean up wiki`.
+- User can run `Wiki healthcheck`.
+- User can run `Improve wiki`, `Organize sources`, and `Update rules`.
 - App enforces mode permissions and blocks forbidden changes.

@@ -1,15 +1,21 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env, fs,
+    io::{Read, Seek, SeekFrom},
     path::{Component, Path, PathBuf},
-    process::Command,
-    sync::Mutex,
+    process::{Command, Stdio},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex,
+    },
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Manager, State};
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RunnerOutput {
     success: bool,
@@ -23,11 +29,14 @@ struct RunnerOutput {
 struct WorkspaceState {
     workspace_path: String,
     status: Option<Value>,
+    source_status: Option<Value>,
     changed_marker: Option<Value>,
     index_md: Option<String>,
     log_md: Option<String>,
+    schema_md: Option<String>,
     report_md: Option<String>,
-    raw_sources: Vec<String>,
+    root_files: Vec<String>,
+    source_files: Vec<String>,
     wiki_files: Vec<String>,
 }
 
@@ -36,11 +45,14 @@ impl WorkspaceState {
         Self {
             workspace_path: String::new(),
             status: None,
+            source_status: None,
             changed_marker: None,
             index_md: None,
             log_md: None,
+            schema_md: None,
             report_md: None,
-            raw_sources: Vec::new(),
+            root_files: Vec::new(),
+            source_files: Vec::new(),
             wiki_files: Vec::new(),
         }
     }
@@ -60,15 +72,184 @@ struct AppCommandResult {
     state: WorkspaceState,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ApplyChatResult {
+    runner: RunnerOutput,
+    state: WorkspaceState,
+    thread: ChatThread,
+}
+
 struct WorkspaceStore {
     path: Mutex<Option<PathBuf>>,
 }
+
+struct ProviderStatusCache {
+    entries: Mutex<HashMap<String, CachedProviderStatus>>,
+}
+
+#[derive(Clone)]
+struct CachedProviderStatus {
+    checked_at: Instant,
+    output: RunnerOutput,
+}
+
+const PROVIDER_STATUS_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+static LOCAL_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+const SOURCE_DIR: &str = "sources";
+const LEGACY_SOURCE_DIR: &str = "raw";
+const METADATA_DIR: &str = ".aiwiki";
+const LEGACY_METADATA_DIR: &str = ".studywiki";
+const EXPLORE_CHAT_OPERATION: &str = "explore-chat";
+const OPERATION_START_GRACE_MS: u128 = 15_000;
 
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct AppSettings {
     provider: String,
     models: HashMap<String, String>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ChatThread {
+    schema_version: u32,
+    id: String,
+    title: String,
+    created_at: String,
+    updated_at: String,
+    initial_context_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    operation_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    operation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    changed_files: Vec<ThreadChangedFile>,
+    messages: Vec<ChatThreadMessage>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ThreadChangedFile {
+    path: String,
+    status: String,
+    allowed: bool,
+    restored: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ChatThreadMessage {
+    id: String,
+    role: String,
+    text: String,
+    context_path: Option<String>,
+    provider: Option<String>,
+    model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    web_search_enabled: Option<bool>,
+    run_id: Option<String>,
+    status: Option<String>,
+    created_at: String,
+    completed_at: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatThreadSummary {
+    id: String,
+    title: String,
+    updated_at: String,
+    initial_context_path: Option<String>,
+    operation_type: Option<String>,
+    operation_id: Option<String>,
+    activity_operation_id: Option<String>,
+    message_count: usize,
+    preview: String,
+    activity_status: String,
+    activity_label: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatThreadIndex {
+    current_thread_id: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExploreChatHistoryItem {
+    role: String,
+    text: String,
+    context_path: Option<String>,
+    web_search_enabled: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExploreChatRunnerReport {
+    status: String,
+    provider: String,
+    model: String,
+    #[serde(default)]
+    web_search_enabled: bool,
+    selected_path: String,
+    question: Option<String>,
+    answer: String,
+    completed_at: String,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ApplyChatMessagePayload {
+    id: String,
+    role: String,
+    text: String,
+    context_path: Option<String>,
+    #[serde(default)]
+    web_search_enabled: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ApplyChatPayload {
+    scope: String,
+    target_path: String,
+    target_message_id: String,
+    instruction: String,
+    messages: Vec<ApplyChatMessagePayload>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MaintainOperationResult {
+    runner: Option<RunnerOutput>,
+    state: WorkspaceState,
+    thread: ChatThread,
+    error: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct NormalizedOperationEvent {
+    id: String,
+    kind: String,
+    title: String,
+    detail: Option<String>,
+    path: Option<String>,
+    status: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OperationProgress {
+    running: bool,
+    operation_id: Option<String>,
+    operation_type: Option<String>,
+    started_at: Option<String>,
+    events: Vec<NormalizedOperationEvent>,
+    stderr_tail: Option<String>,
+    error: Option<String>,
 }
 
 fn default_settings() -> AppSettings {
@@ -84,7 +265,9 @@ fn default_settings() -> AppSettings {
 fn normalize_settings(mut settings: AppSettings) -> AppSettings {
     match settings.models.get("codex").map(String::as_str) {
         Some("gpt-5-codex") | Some("gpt-5") | None => {
-            settings.models.insert("codex".to_string(), "gpt-5.5".to_string());
+            settings
+                .models
+                .insert("codex".to_string(), "gpt-5.5".to_string());
         }
         _ => {}
     }
@@ -122,8 +305,7 @@ fn write_settings(app: &AppHandle, settings: &AppSettings) -> Result<(), String>
     let path = settings_path(app)?;
     let json = serde_json::to_vec_pretty(settings)
         .map_err(|error| format!("Failed to serialize settings: {error}"))?;
-    fs::write(&path, json)
-        .map_err(|error| format!("Failed to write settings: {error}"))
+    fs::write(&path, json).map_err(|error| format!("Failed to write settings: {error}"))
 }
 
 #[tauri::command]
@@ -169,6 +351,18 @@ struct ProviderInfo {
     login_command: String,
     default_model: String,
     supported_models: Vec<ProviderModel>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NodeRuntimeStatus {
+    node_installed: bool,
+    npm_installed: bool,
+    node_path: Option<String>,
+    npm_path: Option<String>,
+    node_version: Option<String>,
+    npm_version: Option<String>,
+    install_url: String,
 }
 
 #[tauri::command]
@@ -232,31 +426,53 @@ async fn list_providers() -> Result<Vec<ProviderInfo>, String> {
 }
 
 #[tauri::command]
-async fn check_provider(name: String) -> Result<RunnerOutput, String> {
-    run_runner_with_args(&[
-        "check".to_string(),
-        "--provider".to_string(),
-        name,
-    ])
+async fn check_node_runtime() -> Result<NodeRuntimeStatus, String> {
+    Ok(node_runtime_status())
 }
 
 #[tauri::command]
-async fn install_provider(name: String) -> Result<RunnerOutput, String> {
+async fn check_provider(
+    name: String,
+    cache: State<'_, ProviderStatusCache>,
+) -> Result<RunnerOutput, String> {
+    let output = run_provider_check(&name)?;
+    cache_provider_status(&cache, &name, &output);
+    Ok(output)
+}
+
+#[tauri::command]
+async fn install_provider(
+    name: String,
+    cache: State<'_, ProviderStatusCache>,
+) -> Result<RunnerOutput, String> {
+    let runtime = node_runtime_status();
+    if !runtime.node_installed || !runtime.npm_installed {
+        return Err(
+            "Node.js with npm is required before installing an AI provider. Install Node.js first, then recheck."
+                .to_string(),
+        );
+    }
+
     let cmd = match name.as_str() {
         "codex" => "npm i -g @openai/codex",
         "claude" => "npm i -g @anthropic-ai/claude-code",
         other => return Err(format!("Unknown provider: {other}")),
     };
+    invalidate_provider_status(&cache, &name);
     open_terminal_with(cmd)
 }
 
 #[tauri::command]
-async fn login_provider(name: String) -> Result<RunnerOutput, String> {
+async fn login_provider(
+    name: String,
+    cache: State<'_, ProviderStatusCache>,
+) -> Result<RunnerOutput, String> {
     let cmd = match name.as_str() {
         "codex" => "codex login",
         "claude" => "claude",
         other => return Err(format!("Unknown provider: {other}")),
     };
+    invalidate_provider_status(&cache, &name);
     open_terminal_with(cmd)
 }
 
@@ -279,9 +495,1698 @@ fn open_terminal_with(command: &str) -> Result<RunnerOutput, String> {
     })
 }
 
+fn run_provider_check(name: &str) -> Result<RunnerOutput, String> {
+    if let Some(output) = simulated_provider_check(name) {
+        return Ok(output);
+    }
+
+    run_runner_with_args(&[
+        "check".to_string(),
+        "--provider".to_string(),
+        name.to_string(),
+    ])
+}
+
+fn simulated_provider_check(name: &str) -> Option<RunnerOutput> {
+    let (missing_env, logged_out_env, install_command, login_command) = match name {
+        "codex" => (
+            "MAPLE_SIMULATE_MISSING_CODEX",
+            "MAPLE_SIMULATE_CODEX_LOGGED_OUT",
+            "npm i -g @openai/codex",
+            "codex login",
+        ),
+        "claude" => (
+            "MAPLE_SIMULATE_MISSING_CLAUDE",
+            "MAPLE_SIMULATE_CLAUDE_LOGGED_OUT",
+            "npm i -g @anthropic-ai/claude-code",
+            "claude",
+        ),
+        _ => return None,
+    };
+
+    let missing = env_flag(missing_env);
+    let logged_out = env_flag(logged_out_env);
+    if !missing && !logged_out {
+        return None;
+    }
+
+    let stdout = serde_json::json!({
+        "provider": name,
+        "installed": {
+            "installed": !missing,
+            "path": if missing { Value::Null } else { Value::String(format!("simulated/{name}")) },
+            "version": if missing { Value::Null } else { Value::String("simulated".to_string()) }
+        },
+        "auth": {
+            "loggedIn": !missing && !logged_out,
+            "statusText": if missing {
+                Value::Null
+            } else if logged_out {
+                Value::String("Not signed in (simulated)".to_string())
+            } else {
+                Value::String("Signed in (simulated)".to_string())
+            },
+            "warnings": []
+        },
+        "installCommand": install_command,
+        "loginCommand": login_command
+    });
+
+    Some(RunnerOutput {
+        success: true,
+        code: Some(0),
+        stdout: format!(
+            "{}\n",
+            serde_json::to_string_pretty(&stdout).unwrap_or_else(|_| "{}".to_string())
+        ),
+        stderr: String::new(),
+    })
+}
+
+fn env_flag(name: &str) -> bool {
+    env::var(name)
+        .ok()
+        .map(|value| {
+            let normalized = value.trim().to_ascii_lowercase();
+            matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
+}
+
+fn cache_provider_status(cache: &ProviderStatusCache, name: &str, output: &RunnerOutput) {
+    if let Ok(mut entries) = cache.entries.lock() {
+        entries.insert(
+            name.to_string(),
+            CachedProviderStatus {
+                checked_at: Instant::now(),
+                output: output.clone(),
+            },
+        );
+    }
+}
+
+fn invalidate_provider_status(cache: &ProviderStatusCache, name: &str) {
+    if let Ok(mut entries) = cache.entries.lock() {
+        entries.remove(name);
+    }
+}
+
+fn cached_ready_provider_status(cache: &ProviderStatusCache, name: &str) -> Option<RunnerOutput> {
+    let entries = cache.entries.lock().ok()?;
+    let cached = entries.get(name)?;
+    if cached.checked_at.elapsed() > PROVIDER_STATUS_CACHE_TTL {
+        return None;
+    }
+    if provider_check_is_ready(&cached.output) {
+        Some(cached.output.clone())
+    } else {
+        None
+    }
+}
+
+fn ensure_provider_ready(cache: &ProviderStatusCache, name: &str) -> Result<(), String> {
+    if cached_ready_provider_status(cache, name).is_some() {
+        return Ok(());
+    }
+
+    let output = run_provider_check(name)?;
+    cache_provider_status(cache, name, &output);
+    parse_provider_ready(&output, name)
+}
+
+fn provider_check_is_ready(output: &RunnerOutput) -> bool {
+    parse_provider_ready(output, "provider").is_ok()
+}
+
+fn parse_provider_ready(output: &RunnerOutput, name: &str) -> Result<(), String> {
+    if !output.success {
+        let details = if output.stderr.trim().is_empty() {
+            output.stdout.trim()
+        } else {
+            output.stderr.trim()
+        };
+        return Err(format!("Failed to check {name} provider. {details}"));
+    }
+
+    let parsed: Value = serde_json::from_str(&output.stdout)
+        .map_err(|error| format!("Failed to parse {name} provider status: {error}"))?;
+    let installed = parsed
+        .get("installed")
+        .and_then(|installed| installed.get("installed"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let logged_in = parsed
+        .get("auth")
+        .and_then(|auth| auth.get("loggedIn"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let install_command = parsed
+        .get("installCommand")
+        .and_then(Value::as_str)
+        .unwrap_or("the provider install command");
+    let login_command = parsed
+        .get("loginCommand")
+        .and_then(Value::as_str)
+        .unwrap_or("the provider login command");
+
+    if !installed {
+        return Err(format!(
+            "{name} CLI is not installed. Run: {install_command}"
+        ));
+    }
+    if !logged_in {
+        return Err(format!(
+            "{name} login was not confirmed. Run: {login_command}"
+        ));
+    }
+
+    Ok(())
+}
+
+fn now_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0)
+}
+
+fn now_string() -> String {
+    now_millis().to_string()
+}
+
+fn make_local_id(prefix: &str) -> String {
+    let counter = LOCAL_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{prefix}-{}-{}-{counter}", now_millis(), std::process::id())
+}
+
+fn valid_local_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.')
+}
+
+fn chat_threads_dir(workspace: &Path) -> PathBuf {
+    workspace.join(METADATA_DIR).join("chat-threads")
+}
+
+fn legacy_chat_threads_dir(workspace: &Path) -> PathBuf {
+    workspace.join(LEGACY_METADATA_DIR).join("chat-threads")
+}
+
+fn chat_thread_dirs(workspace: &Path) -> Vec<PathBuf> {
+    vec![
+        chat_threads_dir(workspace),
+        legacy_chat_threads_dir(workspace),
+    ]
+}
+
+fn maintain_threads_dir(workspace: &Path) -> PathBuf {
+    workspace.join(METADATA_DIR).join("maintain-threads")
+}
+
+fn legacy_maintain_threads_dir(workspace: &Path) -> PathBuf {
+    workspace.join(LEGACY_METADATA_DIR).join("maintain-threads")
+}
+
+fn maintain_thread_dirs(workspace: &Path) -> Vec<PathBuf> {
+    vec![
+        maintain_threads_dir(workspace),
+        legacy_maintain_threads_dir(workspace),
+    ]
+}
+
+fn chat_thread_index_path(workspace: &Path) -> PathBuf {
+    chat_threads_dir(workspace).join("index.json")
+}
+
+fn legacy_chat_thread_index_path(workspace: &Path) -> PathBuf {
+    legacy_chat_threads_dir(workspace).join("index.json")
+}
+
+fn maintain_thread_index_path(workspace: &Path) -> PathBuf {
+    maintain_threads_dir(workspace).join("index.json")
+}
+
+fn legacy_maintain_thread_index_path(workspace: &Path) -> PathBuf {
+    legacy_maintain_threads_dir(workspace).join("index.json")
+}
+
+fn chat_thread_path(workspace: &Path, thread_id: &str) -> Result<PathBuf, String> {
+    if !valid_local_id(thread_id) {
+        return Err("Invalid chat thread id".to_string());
+    }
+    Ok(chat_threads_dir(workspace).join(format!("{thread_id}.json")))
+}
+
+fn chat_thread_paths(workspace: &Path, thread_id: &str) -> Result<Vec<PathBuf>, String> {
+    if !valid_local_id(thread_id) {
+        return Err("Invalid chat thread id".to_string());
+    }
+    Ok(vec![
+        chat_threads_dir(workspace).join(format!("{thread_id}.json")),
+        legacy_chat_threads_dir(workspace).join(format!("{thread_id}.json")),
+    ])
+}
+
+fn existing_chat_thread_path(workspace: &Path, thread_id: &str) -> Result<PathBuf, String> {
+    let paths = chat_thread_paths(workspace, thread_id)?;
+    Ok(first_existing_path(&paths).unwrap_or_else(|| paths[0].clone()))
+}
+
+fn chat_thread_file_exists(workspace: &Path, thread_id: &str) -> Result<bool, String> {
+    Ok(chat_thread_paths(workspace, thread_id)?
+        .iter()
+        .any(|path| path.exists()))
+}
+
+fn maintain_thread_path(workspace: &Path, thread_id: &str) -> Result<PathBuf, String> {
+    if !valid_local_id(thread_id) {
+        return Err("Invalid maintain thread id".to_string());
+    }
+    Ok(maintain_threads_dir(workspace).join(format!("{thread_id}.json")))
+}
+
+fn maintain_thread_paths(workspace: &Path, thread_id: &str) -> Result<Vec<PathBuf>, String> {
+    if !valid_local_id(thread_id) {
+        return Err("Invalid maintain thread id".to_string());
+    }
+    Ok(vec![
+        maintain_threads_dir(workspace).join(format!("{thread_id}.json")),
+        legacy_maintain_threads_dir(workspace).join(format!("{thread_id}.json")),
+    ])
+}
+
+fn existing_maintain_thread_path(workspace: &Path, thread_id: &str) -> Result<PathBuf, String> {
+    let paths = maintain_thread_paths(workspace, thread_id)?;
+    Ok(first_existing_path(&paths).unwrap_or_else(|| paths[0].clone()))
+}
+
+fn read_chat_index(workspace: &Path) -> ChatThreadIndex {
+    let path = first_existing_path(&[
+        chat_thread_index_path(workspace),
+        legacy_chat_thread_index_path(workspace),
+    ])
+    .unwrap_or_else(|| chat_thread_index_path(workspace));
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<ChatThreadIndex>(&text).ok())
+        .unwrap_or(ChatThreadIndex {
+            current_thread_id: None,
+        })
+}
+
+fn read_maintain_index(workspace: &Path) -> ChatThreadIndex {
+    let path = first_existing_path(&[
+        maintain_thread_index_path(workspace),
+        legacy_maintain_thread_index_path(workspace),
+    ])
+    .unwrap_or_else(|| maintain_thread_index_path(workspace));
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<ChatThreadIndex>(&text).ok())
+        .unwrap_or(ChatThreadIndex {
+            current_thread_id: None,
+        })
+}
+
+fn write_chat_index(workspace: &Path, index: &ChatThreadIndex) -> Result<(), String> {
+    let dir = chat_threads_dir(workspace);
+    fs::create_dir_all(&dir)
+        .map_err(|error| format!("Failed to create chat thread directory: {error}"))?;
+    let json = serde_json::to_vec_pretty(index)
+        .map_err(|error| format!("Failed to serialize chat index: {error}"))?;
+    fs::write(chat_thread_index_path(workspace), json)
+        .map_err(|error| format!("Failed to write chat index: {error}"))
+}
+
+fn write_maintain_index(workspace: &Path, index: &ChatThreadIndex) -> Result<(), String> {
+    let dir = maintain_threads_dir(workspace);
+    fs::create_dir_all(&dir)
+        .map_err(|error| format!("Failed to create maintain thread directory: {error}"))?;
+    let json = serde_json::to_vec_pretty(index)
+        .map_err(|error| format!("Failed to serialize maintain index: {error}"))?;
+    fs::write(maintain_thread_index_path(workspace), json)
+        .map_err(|error| format!("Failed to write maintain index: {error}"))
+}
+
+fn read_thread_file(workspace: &Path, thread_id: &str) -> Result<ChatThread, String> {
+    let path = existing_chat_thread_path(workspace, thread_id)?;
+    let text = fs::read_to_string(&path)
+        .map_err(|error| format!("Failed to read chat thread {thread_id}: {error}"))?;
+    let mut thread =
+        serde_json::from_str::<ChatThread>(&normalize_legacy_workspace_references(&text))
+            .map_err(|error| format!("Failed to parse chat thread {thread_id}: {error}"))?;
+    if healthcheck_chat_thread(workspace, &mut thread) {
+        write_thread_file(workspace, &thread)?;
+    }
+    Ok(thread)
+}
+
+fn write_thread_file(workspace: &Path, thread: &ChatThread) -> Result<(), String> {
+    let dir = chat_threads_dir(workspace);
+    fs::create_dir_all(&dir)
+        .map_err(|error| format!("Failed to create chat thread directory: {error}"))?;
+    let json = serde_json::to_vec_pretty(thread)
+        .map_err(|error| format!("Failed to serialize chat thread: {error}"))?;
+    fs::write(chat_thread_path(workspace, &thread.id)?, json)
+        .map_err(|error| format!("Failed to write chat thread {}: {error}", thread.id))
+}
+
+fn newest_chat_thread_except(
+    workspace: &Path,
+    excluded_thread_id: Option<&str>,
+) -> Result<Option<ChatThread>, String> {
+    let mut threads = Vec::new();
+    let mut seen = HashSet::new();
+    for dir in chat_thread_dirs(workspace) {
+        if !dir.exists() {
+            continue;
+        }
+
+        for entry in
+            fs::read_dir(&dir).map_err(|error| format!("Failed to read chat threads: {error}"))?
+        {
+            let entry = entry.map_err(|error| error.to_string())?;
+            let path = entry.path();
+            if path.file_name().and_then(|name| name.to_str()) == Some("index.json") {
+                continue;
+            }
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(thread_id) = path.file_stem().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            if excluded_thread_id == Some(thread_id) || !seen.insert(thread_id.to_string()) {
+                continue;
+            }
+            if let Ok(thread) = read_thread_file(workspace, thread_id) {
+                threads.push(thread);
+            }
+        }
+    }
+
+    threads.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    Ok(threads.into_iter().next())
+}
+
+fn create_default_current_thread(workspace: &Path) -> Result<ChatThread, String> {
+    let thread = make_chat_thread(Some("index.md".to_string()));
+    write_thread_file(workspace, &thread)?;
+    write_chat_index(
+        workspace,
+        &ChatThreadIndex {
+            current_thread_id: Some(thread.id.clone()),
+        },
+    )?;
+    Ok(thread)
+}
+
+fn newest_maintain_thread_except(
+    workspace: &Path,
+    excluded_thread_id: Option<&str>,
+) -> Result<Option<ChatThread>, String> {
+    let mut threads = Vec::new();
+    let mut seen = HashSet::new();
+    for dir in maintain_thread_dirs(workspace) {
+        if !dir.exists() {
+            continue;
+        }
+
+        for entry in fs::read_dir(&dir)
+            .map_err(|error| format!("Failed to read maintain threads: {error}"))?
+        {
+            let entry = entry.map_err(|error| error.to_string())?;
+            let path = entry.path();
+            if path.file_name().and_then(|name| name.to_str()) == Some("index.json") {
+                continue;
+            }
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(thread_id) = path.file_stem().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            if excluded_thread_id == Some(thread_id) || !seen.insert(thread_id.to_string()) {
+                continue;
+            }
+            if let Ok(thread) = read_maintain_thread_file(workspace, thread_id) {
+                threads.push(thread);
+            }
+        }
+    }
+
+    threads.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    Ok(threads.into_iter().next())
+}
+
+fn create_default_current_maintain_thread(workspace: &Path) -> Result<ChatThread, String> {
+    let thread = make_maintain_thread();
+    write_maintain_thread_file(workspace, &thread)?;
+    write_maintain_index(
+        workspace,
+        &ChatThreadIndex {
+            current_thread_id: Some(thread.id.clone()),
+        },
+    )?;
+    Ok(thread)
+}
+
+fn read_maintain_thread_file(workspace: &Path, thread_id: &str) -> Result<ChatThread, String> {
+    let path = existing_maintain_thread_path(workspace, thread_id)?;
+    let text = fs::read_to_string(&path)
+        .map_err(|error| format!("Failed to read maintain thread {thread_id}: {error}"))?;
+    serde_json::from_str::<ChatThread>(&normalize_legacy_workspace_references(&text))
+        .map_err(|error| format!("Failed to parse maintain thread {thread_id}: {error}"))
+}
+
+fn write_maintain_thread_file(workspace: &Path, thread: &ChatThread) -> Result<(), String> {
+    let dir = maintain_threads_dir(workspace);
+    fs::create_dir_all(&dir)
+        .map_err(|error| format!("Failed to create maintain thread directory: {error}"))?;
+    let json = serde_json::to_vec_pretty(thread)
+        .map_err(|error| format!("Failed to serialize maintain thread: {error}"))?;
+    fs::write(maintain_thread_path(workspace, &thread.id)?, json)
+        .map_err(|error| format!("Failed to write maintain thread {}: {error}", thread.id))
+}
+
+fn make_chat_thread(initial_context_path: Option<String>) -> ChatThread {
+    let now = now_string();
+    let title = initial_context_path
+        .as_ref()
+        .and_then(|path| path.split('/').last().map(str::to_string))
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "New chat".to_string());
+    ChatThread {
+        schema_version: 1,
+        id: make_local_id("thread"),
+        title,
+        created_at: now.clone(),
+        updated_at: now,
+        initial_context_path,
+        operation_type: None,
+        operation_id: None,
+        changed_files: Vec::new(),
+        messages: Vec::new(),
+    }
+}
+
+fn make_maintain_thread() -> ChatThread {
+    let now = now_string();
+    ChatThread {
+        schema_version: 1,
+        id: make_local_id("maintain-thread"),
+        title: "New maintenance".to_string(),
+        created_at: now.clone(),
+        updated_at: now,
+        initial_context_path: None,
+        operation_type: None,
+        operation_id: None,
+        changed_files: Vec::new(),
+        messages: Vec::new(),
+    }
+}
+
+fn ensure_current_thread(workspace: &Path) -> Result<ChatThread, String> {
+    fs::create_dir_all(chat_threads_dir(workspace))
+        .map_err(|error| format!("Failed to create chat thread directory: {error}"))?;
+    let index = read_chat_index(workspace);
+    if let Some(thread_id) = index.current_thread_id.as_deref() {
+        if let Ok(thread) = read_thread_file(workspace, thread_id) {
+            return Ok(thread);
+        }
+    }
+
+    if let Some(thread) = newest_chat_thread_except(workspace, None)? {
+        write_chat_index(
+            workspace,
+            &ChatThreadIndex {
+                current_thread_id: Some(thread.id.clone()),
+            },
+        )?;
+        return Ok(thread);
+    }
+
+    create_default_current_thread(workspace)
+}
+
+fn read_requested_or_new_chat_thread(
+    workspace: &Path,
+    thread_id: Option<String>,
+    initial_context_path: Option<String>,
+) -> Result<ChatThread, String> {
+    let Some(id) = thread_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    else {
+        return ensure_current_thread(workspace);
+    };
+
+    match read_thread_file(workspace, &id) {
+        Ok(thread) => Ok(thread),
+        Err(error) => {
+            if chat_thread_file_exists(workspace, &id)? {
+                Err(error)
+            } else {
+                Ok(make_chat_thread(initial_context_path))
+            }
+        }
+    }
+}
+
+fn ensure_current_maintain_thread(workspace: &Path) -> Result<ChatThread, String> {
+    fs::create_dir_all(maintain_threads_dir(workspace))
+        .map_err(|error| format!("Failed to create maintain thread directory: {error}"))?;
+    let index = read_maintain_index(workspace);
+    if let Some(thread_id) = index.current_thread_id.as_deref() {
+        if let Ok(thread) = read_maintain_thread_file(workspace, thread_id) {
+            return Ok(thread);
+        }
+    }
+
+    if let Some(thread) = newest_maintain_thread_except(workspace, None)? {
+        write_maintain_index(
+            workspace,
+            &ChatThreadIndex {
+                current_thread_id: Some(thread.id.clone()),
+            },
+        )?;
+        return Ok(thread);
+    }
+
+    create_default_current_maintain_thread(workspace)
+}
+
+#[derive(Clone)]
+struct ThreadActivityContext {
+    active_changed_marker: Option<Value>,
+    running_marker: Option<Value>,
+}
+
+struct ThreadActivity {
+    status: String,
+    label: String,
+    operation_id: Option<String>,
+}
+
+fn thread_activity_context(workspace: &Path) -> ThreadActivityContext {
+    ThreadActivityContext {
+        active_changed_marker: read_current_changed_marker(workspace),
+        running_marker: read_workspace_running_marker(workspace),
+    }
+}
+
+fn chat_thread_summary(
+    workspace: &Path,
+    thread: &ChatThread,
+    context: &ThreadActivityContext,
+) -> ChatThreadSummary {
+    let latest_status_message = thread
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.status.is_some());
+    let latest_status = latest_status_message
+        .and_then(|message| message.status.as_deref())
+        .unwrap_or("");
+    let latest_text = latest_status_message
+        .map(|message| message.text.trim())
+        .unwrap_or("");
+    let activity = resolve_thread_activity(workspace, thread, context, latest_status, latest_text);
+
+    let preview = thread
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user" || message.role == "assistant")
+        .map(|message| {
+            let text = message.text.trim();
+            if text.chars().count() > 80 {
+                format!("{}...", text.chars().take(80).collect::<String>())
+            } else {
+                text.to_string()
+            }
+        })
+        .unwrap_or_default();
+
+    ChatThreadSummary {
+        id: thread.id.clone(),
+        title: thread.title.clone(),
+        updated_at: thread.updated_at.clone(),
+        initial_context_path: thread.initial_context_path.clone(),
+        operation_type: thread.operation_type.clone(),
+        operation_id: thread.operation_id.clone(),
+        activity_operation_id: activity.operation_id,
+        message_count: thread.messages.len(),
+        preview,
+        activity_status: activity.status,
+        activity_label: activity.label,
+    }
+}
+
+fn resolve_thread_activity(
+    workspace: &Path,
+    thread: &ChatThread,
+    context: &ThreadActivityContext,
+    latest_status: &str,
+    latest_text: &str,
+) -> ThreadActivity {
+    if let Some(operation_id) = thread.operation_id.as_deref() {
+        return operation_thread_activity(
+            workspace,
+            thread,
+            context,
+            operation_id,
+            latest_status,
+            latest_text,
+        );
+    }
+
+    if let Some(message) = latest_streaming_assistant_message(thread) {
+        return explore_streaming_activity(workspace, message);
+    }
+
+    fallback_thread_activity(
+        thread,
+        latest_status,
+        latest_text,
+        context.active_changed_marker.as_ref(),
+    )
+}
+
+fn operation_thread_activity(
+    workspace: &Path,
+    thread: &ChatThread,
+    context: &ThreadActivityContext,
+    operation_id: &str,
+    latest_status: &str,
+    latest_text: &str,
+) -> ThreadActivity {
+    if let Some(report) = read_operation_report(workspace, operation_id) {
+        let status = report
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("completed");
+        if operation_report_status_is_failed(status) {
+            return make_thread_activity("failed", "Failed", Some(operation_id.to_string()));
+        }
+        if thread_has_pending_review(thread, latest_text, context.active_changed_marker.as_ref()) {
+            return make_thread_activity("review", "Review", Some(operation_id.to_string()));
+        }
+        return make_thread_activity("finished", "Finished", Some(operation_id.to_string()));
+    }
+
+    if let Some(marker) = context.running_marker.as_ref() {
+        if marker_operation_id(marker) == Some(operation_id.to_string()) {
+            let status = if running_marker_process_is_running(marker) {
+                "running"
+            } else {
+                "failed"
+            };
+            let label = if status == "running" {
+                "Running"
+            } else {
+                "Failed"
+            };
+            return make_thread_activity(status, label, Some(operation_id.to_string()));
+        }
+    }
+
+    fallback_thread_activity(
+        thread,
+        latest_status,
+        latest_text,
+        context.active_changed_marker.as_ref(),
+    )
+}
+
+fn explore_streaming_activity(workspace: &Path, message: &ChatThreadMessage) -> ThreadActivity {
+    let Some(run_id) = message.run_id.as_deref() else {
+        return make_thread_activity("running", "Running", None);
+    };
+
+    if let Some(report) = read_explore_chat_report(workspace, run_id) {
+        let status = if operation_report_status_is_failed(&report.status) {
+            "failed"
+        } else {
+            "finished"
+        };
+        let label = if status == "failed" {
+            "Failed"
+        } else {
+            "Finished"
+        };
+        return make_thread_activity(status, label, Some(run_id.to_string()));
+    }
+
+    if let Some(marker) = read_chat_running_marker(workspace, run_id) {
+        let status = if running_marker_process_is_running(&marker) {
+            "running"
+        } else {
+            "failed"
+        };
+        let label = if status == "running" {
+            "Running"
+        } else {
+            "Failed"
+        };
+        return make_thread_activity(status, label, Some(run_id.to_string()));
+    }
+
+    if streaming_message_is_past_start_grace(message) {
+        make_thread_activity("failed", "Failed", Some(run_id.to_string()))
+    } else {
+        make_thread_activity("running", "Running", Some(run_id.to_string()))
+    }
+}
+
+fn fallback_thread_activity(
+    thread: &ChatThread,
+    latest_status: &str,
+    latest_text: &str,
+    active_marker: Option<&Value>,
+) -> ThreadActivity {
+    if latest_status == "failed" {
+        return make_thread_activity("failed", "Failed", thread.operation_id.clone());
+    }
+
+    if thread_has_pending_review(thread, latest_text, active_marker) {
+        return make_thread_activity(
+            "review",
+            "Review",
+            thread
+                .operation_id
+                .clone()
+                .or_else(|| changed_marker_operation_id(active_marker)),
+        );
+    }
+
+    if thread.messages.is_empty() {
+        make_thread_activity("empty", "New", thread.operation_id.clone())
+    } else {
+        make_thread_activity("finished", "Finished", thread.operation_id.clone())
+    }
+}
+
+fn make_thread_activity(status: &str, label: &str, operation_id: Option<String>) -> ThreadActivity {
+    ThreadActivity {
+        status: status.to_string(),
+        label: label.to_string(),
+        operation_id,
+    }
+}
+
+fn latest_streaming_assistant_message(thread: &ChatThread) -> Option<&ChatThreadMessage> {
+    thread.messages.iter().rev().find(|message| {
+        message.role == "assistant" && message.status.as_deref() == Some("streaming")
+    })
+}
+
+fn streaming_message_is_past_start_grace(message: &ChatThreadMessage) -> bool {
+    message
+        .created_at
+        .parse::<u128>()
+        .map(|created_at| now_millis().saturating_sub(created_at) > OPERATION_START_GRACE_MS)
+        .unwrap_or(false)
+}
+
+fn operation_report_status_is_failed(status: &str) -> bool {
+    matches!(
+        status,
+        "failed"
+            | "runner_failed"
+            | "provider_failed"
+            | "timed_out"
+            | "cancelled"
+            | "turn_budget_exceeded"
+            | "completed_without_wiki_content"
+    ) || status.ends_with("_failed")
+}
+
+fn thread_has_pending_review(
+    thread: &ChatThread,
+    latest_text: &str,
+    active_marker: Option<&Value>,
+) -> bool {
+    if !changed_marker_has_pending_review(active_marker) {
+        return false;
+    }
+
+    let active_operation_id = changed_marker_operation_id(active_marker);
+    if let (Some(thread_operation_id), Some(marker_operation_id)) = (
+        thread.operation_id.as_deref(),
+        active_operation_id.as_deref(),
+    ) {
+        return thread_operation_id == marker_operation_id;
+    }
+
+    if thread.operation_id.is_some() {
+        return false;
+    }
+
+    let active_operation_type = normalized_operation_type(active_marker, None);
+    active_operation_type.as_deref() == Some("apply-chat")
+        && (latest_text.starts_with("Wiki update ready to review")
+            || latest_text.contains("ready to review."))
+}
+
+fn changed_marker_has_pending_review(marker: Option<&Value>) -> bool {
+    let Some(marker) = marker else {
+        return false;
+    };
+    if marker.get("undoneAt").is_some() {
+        return false;
+    }
+    marker
+        .get("changedFiles")
+        .or_else(|| marker.get("allChangedFiles"))
+        .and_then(Value::as_array)
+        .is_some_and(|files| files.iter().any(is_reviewable_generated_change))
+}
+
+fn read_current_changed_marker(workspace: &Path) -> Option<Value> {
+    first_existing_path(&[
+        workspace
+            .join(METADATA_DIR)
+            .join("changed")
+            .join("last-operation.json"),
+        workspace
+            .join(LEGACY_METADATA_DIR)
+            .join("changed")
+            .join("last-operation.json"),
+    ])
+    .and_then(|path| read_json_if_exists_normalized(&path))
+}
+
+fn read_workspace_running_marker(workspace: &Path) -> Option<Value> {
+    first_existing_path(&[
+        workspace
+            .join(METADATA_DIR)
+            .join("running")
+            .join("operation.json"),
+        workspace
+            .join(LEGACY_METADATA_DIR)
+            .join("running")
+            .join("operation.json"),
+    ])
+    .and_then(|path| read_json_if_exists_normalized(&path))
+}
+
+fn read_chat_running_marker(workspace: &Path, run_id: &str) -> Option<Value> {
+    if !valid_local_id(run_id) {
+        return None;
+    }
+    first_existing_path(&[
+        workspace
+            .join(METADATA_DIR)
+            .join("chat")
+            .join(run_id)
+            .join("running.json"),
+        workspace
+            .join(LEGACY_METADATA_DIR)
+            .join("chat")
+            .join(run_id)
+            .join("running.json"),
+    ])
+    .and_then(|path| read_json_if_exists_normalized(&path))
+}
+
+fn read_operation_report(workspace: &Path, operation_id: &str) -> Option<Value> {
+    if !valid_local_id(operation_id) {
+        return None;
+    }
+    first_existing_path(&[
+        workspace
+            .join(METADATA_DIR)
+            .join("operations")
+            .join(operation_id)
+            .join("report.json"),
+        workspace
+            .join(LEGACY_METADATA_DIR)
+            .join("operations")
+            .join(operation_id)
+            .join("report.json"),
+    ])
+    .and_then(|path| read_json_if_exists_normalized(&path))
+}
+
+fn marker_operation_id(marker: &Value) -> Option<String> {
+    marker
+        .get("operationId")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn running_marker_process_is_running(marker: &Value) -> bool {
+    let Some(pid) = marker.get("pid").and_then(Value::as_u64) else {
+        return true;
+    };
+    process_id_is_running(pid)
+}
+
+#[cfg(unix)]
+fn process_id_is_running(pid: u64) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn process_id_is_running(_pid: u64) -> bool {
+    true
+}
+
+fn read_explore_chat_report(workspace: &Path, run_id: &str) -> Option<ExploreChatRunnerReport> {
+    if !valid_local_id(run_id) {
+        return None;
+    }
+    let report_path = first_existing_path(&[
+        workspace
+            .join(METADATA_DIR)
+            .join("chat")
+            .join(run_id)
+            .join("report.json"),
+        workspace
+            .join(LEGACY_METADATA_DIR)
+            .join("chat")
+            .join(run_id)
+            .join("report.json"),
+    ])?;
+    let text = fs::read_to_string(report_path).ok()?;
+    serde_json::from_str::<ExploreChatRunnerReport>(&normalize_legacy_workspace_references(&text))
+        .ok()
+}
+
+fn healthcheck_chat_thread(workspace: &Path, thread: &mut ChatThread) -> bool {
+    let mut changed = false;
+    let assistant_runs: Vec<(usize, String, String)> = thread
+        .messages
+        .iter()
+        .enumerate()
+        .filter_map(|(index, message)| {
+            if message.role != "assistant" {
+                return None;
+            }
+            Some((index, message.id.clone(), message.run_id.clone()?))
+        })
+        .collect();
+
+    for (assistant_index, assistant_id, run_id) in assistant_runs {
+        let duplicate_user_index = thread
+            .messages
+            .iter()
+            .enumerate()
+            .find(|(index, message)| {
+                *index != assistant_index && message.role == "user" && message.id == assistant_id
+            })
+            .map(|(index, _)| index);
+
+        let Some(user_index) = duplicate_user_index else {
+            continue;
+        };
+
+        if let Some(report) = read_explore_chat_report(workspace, &run_id) {
+            if let Some(question) = report.question.as_deref().map(str::trim) {
+                if !question.is_empty() && thread.messages[user_index].text != question {
+                    thread.messages[user_index].text = question.to_string();
+                }
+            }
+            if !report.selected_path.is_empty()
+                && thread.messages[user_index].context_path.as_deref()
+                    != Some(report.selected_path.as_str())
+            {
+                thread.messages[user_index].context_path = Some(report.selected_path.clone());
+            }
+            if thread.messages[user_index].provider.is_none() {
+                thread.messages[user_index].provider = Some(report.provider.clone());
+            }
+            if thread.messages[user_index].model.is_none() {
+                thread.messages[user_index].model = Some(report.model.clone());
+            }
+            if thread.messages[user_index].web_search_enabled.is_none() {
+                thread.messages[user_index].web_search_enabled = Some(report.web_search_enabled);
+            }
+        }
+
+        thread.messages[user_index].id = make_local_id("msg");
+        changed = true;
+    }
+
+    let mut seen = HashSet::new();
+    for message in thread.messages.iter_mut() {
+        if seen.insert(message.id.clone()) {
+            continue;
+        }
+        if message.role == "assistant" && message.status.as_deref() == Some("streaming") {
+            continue;
+        }
+
+        let mut replacement = make_local_id("msg");
+        while seen.contains(&replacement) {
+            replacement = make_local_id("msg");
+        }
+        message.id = replacement.clone();
+        seen.insert(replacement);
+        changed = true;
+    }
+
+    if changed {
+        thread.updated_at = now_string();
+    }
+    changed
+}
+
+fn extract_json_from_runner_stdout<T: for<'de> Deserialize<'de>>(
+    stdout: &str,
+) -> Result<T, String> {
+    let start = stdout
+        .find('{')
+        .ok_or_else(|| "Runner stdout did not include JSON.".to_string())?;
+    let end = stdout
+        .rfind('}')
+        .ok_or_else(|| "Runner stdout did not include complete JSON.".to_string())?;
+    serde_json::from_str::<T>(&stdout[start..=end])
+        .map_err(|error| format!("Failed to parse runner JSON: {error}"))
+}
+
+fn build_history_json(thread: &ChatThread) -> Result<String, String> {
+    let mut items: Vec<ExploreChatHistoryItem> = thread
+        .messages
+        .iter()
+        .filter(|message| {
+            (message.role == "user" || message.role == "assistant")
+                && message.status.as_deref() != Some("streaming")
+                && !message.text.trim().is_empty()
+        })
+        .rev()
+        .take(6)
+        .cloned()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|message| {
+            let text = if message.text.chars().count() > 2000 {
+                format!(
+                    "{}\n\n[truncated]",
+                    message.text.chars().take(2000).collect::<String>()
+                )
+            } else {
+                message.text
+            };
+            ExploreChatHistoryItem {
+                role: message.role,
+                text,
+                context_path: message.context_path,
+                web_search_enabled: message.web_search_enabled.unwrap_or(false),
+            }
+        })
+        .collect();
+    if items.len() > 6 {
+        items = items.split_off(items.len() - 6);
+    }
+    serde_json::to_string(&items).map_err(|error| format!("Failed to serialize history: {error}"))
+}
+
+fn extract_partial_answer_from_events(events: &str) -> Option<String> {
+    let mut best = None;
+    let mut claude_text_delta = String::new();
+    for line in events.lines() {
+        let Ok(event) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if event.get("type").and_then(Value::as_str) == Some("stream_event") {
+            if let Some(delta) = event
+                .get("event")
+                .and_then(|event| event.get("delta"))
+                .filter(|delta| delta.get("type").and_then(Value::as_str) == Some("text_delta"))
+                .and_then(|delta| delta.get("text"))
+                .and_then(Value::as_str)
+            {
+                claude_text_delta.push_str(delta);
+                if !claude_text_delta.trim().is_empty() {
+                    best = Some(claude_text_delta.clone());
+                }
+            }
+        }
+        if event.get("type").and_then(Value::as_str) == Some("item.completed") {
+            if let Some(item) = event.get("item") {
+                if item.get("type").and_then(Value::as_str) == Some("agent_message") {
+                    if let Some(text) = item.get("text").and_then(Value::as_str) {
+                        best = Some(text.to_string());
+                    }
+                }
+            }
+        }
+        if event.get("type").and_then(Value::as_str) == Some("assistant") {
+            if let Some(content) = event
+                .get("message")
+                .and_then(|message| message.get("content"))
+                .and_then(Value::as_array)
+            {
+                let text = content
+                    .iter()
+                    .filter_map(|part| part.get("text").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join("");
+                if !text.trim().is_empty() {
+                    best = Some(text);
+                }
+            }
+        }
+        if event.get("type").and_then(Value::as_str) == Some("result") {
+            if let Some(text) = event.get("result").and_then(Value::as_str) {
+                if !text.trim().is_empty() {
+                    best = Some(text.to_string());
+                }
+            }
+        }
+    }
+    best
+}
+
+fn truncate_for_feed(text: &str, max_chars: usize) -> String {
+    let text = text.trim();
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    format!("{}...", text.chars().take(max_chars).collect::<String>())
+}
+
+fn relative_to_workspace_for_feed(workspace: &Path, input_path: &str) -> String {
+    let trimmed = input_path.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let path = PathBuf::from(trimmed);
+    if path.is_absolute() {
+        if let Ok(relative) = path.strip_prefix(workspace) {
+            return normalize_legacy_workspace_references(
+                &relative.to_string_lossy().replace('\\', "/"),
+            );
+        }
+    }
+    normalize_legacy_workspace_references(&trimmed.replace('\\', "/"))
+}
+
+fn read_text_tail(path: &Path, max_bytes: u64) -> Result<Option<String>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let mut file = fs::File::open(path)
+        .map_err(|error| format!("Failed to open {}: {error}", path.display()))?;
+    let len = file
+        .metadata()
+        .map_err(|error| format!("Failed to stat {}: {error}", path.display()))?
+        .len();
+    if len > max_bytes {
+        file.seek(SeekFrom::Start(len - max_bytes))
+            .map_err(|error| format!("Failed to seek {}: {error}", path.display()))?;
+    }
+    let mut text = String::new();
+    file.read_to_string(&mut text)
+        .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
+    if len > max_bytes {
+        if let Some(index) = text.find('\n') {
+            text = text[index + 1..].to_string();
+        }
+    }
+    Ok(Some(text))
+}
+
+fn feed_event(
+    id: String,
+    kind: &str,
+    title: &str,
+    detail: Option<String>,
+    path: Option<String>,
+    status: Option<String>,
+) -> NormalizedOperationEvent {
+    NormalizedOperationEvent {
+        id,
+        kind: kind.to_string(),
+        title: title.to_string(),
+        detail,
+        path,
+        status,
+    }
+}
+
+fn normalize_operation_events(events: &str, workspace: &Path) -> Vec<NormalizedOperationEvent> {
+    let mut normalized = Vec::new();
+    let mut seen_text_delta = false;
+    let mut seen_message_start = false;
+
+    for (index, line) in events.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(event) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        let event_type = event.get("type").and_then(Value::as_str).unwrap_or("");
+        let fallback_id = format!("line-{index}");
+
+        match event_type {
+            "thread.started" => normalized.push(feed_event(
+                fallback_id,
+                "status",
+                "Started AI session",
+                None,
+                None,
+                Some("completed".to_string()),
+            )),
+            "turn.started" => normalized.push(feed_event(
+                fallback_id,
+                "status",
+                "Started AI turn",
+                None,
+                None,
+                Some("completed".to_string()),
+            )),
+            "turn.completed" => normalized.push(feed_event(
+                fallback_id,
+                "status",
+                "AI turn completed",
+                None,
+                None,
+                Some("completed".to_string()),
+            )),
+            "turn.failed" => {
+                let detail = event
+                    .get("error")
+                    .and_then(|value| value.get("message"))
+                    .and_then(Value::as_str)
+                    .map(|text| truncate_for_feed(text, 240));
+                normalized.push(feed_event(
+                    fallback_id,
+                    "error",
+                    "AI turn failed",
+                    detail,
+                    None,
+                    Some("failed".to_string()),
+                ));
+            }
+            "error" => {
+                let detail = event
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .map(|text| truncate_for_feed(text, 240));
+                normalized.push(feed_event(
+                    fallback_id,
+                    "error",
+                    "Provider error",
+                    detail,
+                    None,
+                    Some("failed".to_string()),
+                ));
+            }
+            "result" => {
+                let subtype = event
+                    .get("subtype")
+                    .and_then(Value::as_str)
+                    .unwrap_or("completed");
+                let detail = event
+                    .get("result")
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.trim().is_empty())
+                    .map(|text| truncate_for_feed(text, 240));
+                normalized.push(feed_event(
+                    fallback_id,
+                    "result",
+                    "Operation finished",
+                    detail,
+                    None,
+                    Some(subtype.to_string()),
+                ));
+            }
+            "assistant" => {
+                if let Some(content) = event
+                    .get("message")
+                    .and_then(|message| message.get("content"))
+                    .and_then(Value::as_array)
+                {
+                    let text = content
+                        .iter()
+                        .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+                        .filter_map(|part| part.get("text").and_then(Value::as_str))
+                        .collect::<Vec<_>>()
+                        .join("");
+                    if !text.trim().is_empty() {
+                        normalized.push(feed_event(
+                            fallback_id,
+                            "message",
+                            "AI message",
+                            Some(truncate_for_feed(&text, 240)),
+                            None,
+                            Some("completed".to_string()),
+                        ));
+                    }
+                }
+            }
+            "stream_event" => {
+                let stream_type = event
+                    .get("event")
+                    .and_then(|event| event.get("type"))
+                    .and_then(Value::as_str);
+                if stream_type == Some("message_start") && !seen_message_start {
+                    seen_message_start = true;
+                    normalized.push(feed_event(
+                        "stream-message-start".to_string(),
+                        "status",
+                        "Started response",
+                        None,
+                        None,
+                        Some("completed".to_string()),
+                    ));
+                }
+                let delta_type = event
+                    .get("event")
+                    .and_then(|event| event.get("delta"))
+                    .and_then(|delta| delta.get("type"))
+                    .and_then(Value::as_str);
+                if delta_type == Some("text_delta") {
+                    seen_text_delta = true;
+                }
+            }
+            "item.started" | "item.completed" => {
+                let Some(item) = event.get("item") else {
+                    continue;
+                };
+                let item_id = item
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&fallback_id);
+                let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+                let status = if event_type == "item.started" {
+                    "in_progress"
+                } else {
+                    item.get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or("completed")
+                };
+                match item_type {
+                    "command_execution" => {
+                        let command = item
+                            .get("command")
+                            .and_then(Value::as_str)
+                            .map(|text| truncate_for_feed(text, 180));
+                        let exit_code = item.get("exit_code").and_then(Value::as_i64);
+                        let title = if event_type == "item.started" {
+                            "Running command"
+                        } else if exit_code.unwrap_or(0) == 0 {
+                            "Command completed"
+                        } else {
+                            "Command failed"
+                        };
+                        normalized.push(feed_event(
+                            format!("{item_id}-{status}"),
+                            "command",
+                            title,
+                            command,
+                            None,
+                            Some(status.to_string()),
+                        ));
+                    }
+                    "file_change" => {
+                        if let Some(changes) = item.get("changes").and_then(Value::as_array) {
+                            for (change_index, change) in changes.iter().enumerate() {
+                                let path = change
+                                    .get("path")
+                                    .and_then(Value::as_str)
+                                    .map(|path| relative_to_workspace_for_feed(workspace, path))
+                                    .filter(|path| !path.is_empty());
+                                let kind = change
+                                    .get("kind")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("changed");
+                                let title = match kind {
+                                    "create" | "add" | "added" => "File added",
+                                    "delete" | "deleted" | "remove" => "File removed",
+                                    _ => "File changed",
+                                };
+                                normalized.push(feed_event(
+                                    format!("{item_id}-{status}-{change_index}"),
+                                    "file",
+                                    title,
+                                    Some(kind.to_string()),
+                                    path,
+                                    Some(status.to_string()),
+                                ));
+                            }
+                        }
+                    }
+                    "agent_message" => {
+                        if let Some(text) = item.get("text").and_then(Value::as_str) {
+                            if !text.trim().is_empty() {
+                                normalized.push(feed_event(
+                                    format!("{item_id}-{status}"),
+                                    "message",
+                                    "AI message",
+                                    Some(truncate_for_feed(text, 240)),
+                                    None,
+                                    Some(status.to_string()),
+                                ));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if seen_text_delta {
+        normalized.push(feed_event(
+            "stream-text-delta".to_string(),
+            "status",
+            "Writing answer",
+            None,
+            None,
+            Some("in_progress".to_string()),
+        ));
+    }
+
+    let mut seen = HashSet::new();
+    let mut deduped = Vec::new();
+    for event in normalized.into_iter().rev() {
+        if seen.insert(event.id.clone()) {
+            deduped.push(event);
+        }
+        if deduped.len() >= 80 {
+            break;
+        }
+    }
+    deduped.reverse();
+    deduped
+}
+
+fn read_operation_marker(path: &Path) -> Result<Option<Value>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text = fs::read_to_string(path)
+        .map_err(|error| format!("Failed to read operation marker: {error}"))?;
+    serde_json::from_str::<Value>(&normalize_legacy_workspace_references(&text))
+        .map(Some)
+        .map_err(|error| format!("Failed to parse operation marker: {error}"))
+}
+
+fn marker_string(marker: Option<&Value>, key: &str) -> Option<String> {
+    marker
+        .and_then(|value| value.get(key))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn normalized_operation_type(marker: Option<&Value>, fallback: Option<&str>) -> Option<String> {
+    marker_string(marker, "type")
+        .or_else(|| fallback.map(str::to_string))
+        .map(|value| {
+            if value == "study-chat" || value == "side-chat" {
+                EXPLORE_CHAT_OPERATION.to_string()
+            } else {
+                value
+            }
+        })
+}
+
+fn progress_from_event_paths(
+    workspace: &Path,
+    running: bool,
+    operation_id: Option<String>,
+    operation_type: Option<String>,
+    started_at: Option<String>,
+    events_path: Option<PathBuf>,
+    stderr_path: Option<PathBuf>,
+    error: Option<String>,
+) -> Result<OperationProgress, String> {
+    let events_text = if let Some(path) = events_path {
+        read_text_tail(&path, 128 * 1024)?.unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let stderr_tail = if let Some(path) = stderr_path {
+        read_text_tail(&path, 20 * 1024)?
+    } else {
+        None
+    };
+
+    Ok(OperationProgress {
+        running,
+        operation_id,
+        operation_type,
+        started_at,
+        events: normalize_operation_events(&events_text, workspace),
+        stderr_tail: stderr_tail.map(|text| truncate_for_feed(&text, 2_000)),
+        error,
+    })
+}
+
+fn refresh_streaming_messages(workspace: &Path, thread: &mut ChatThread) -> Result<bool, String> {
+    let mut changed = false;
+    let mut should_save = false;
+
+    for message in thread.messages.iter_mut() {
+        if message.role != "assistant" || message.status.as_deref() != Some("streaming") {
+            continue;
+        }
+        let Some(run_id) = message.run_id.clone() else {
+            continue;
+        };
+        let chat_dir = first_existing_path(&[
+            workspace.join(METADATA_DIR).join("chat").join(&run_id),
+            workspace
+                .join(LEGACY_METADATA_DIR)
+                .join("chat")
+                .join(&run_id),
+        ])
+        .unwrap_or_else(|| workspace.join(METADATA_DIR).join("chat").join(&run_id));
+        let report_path = chat_dir.join("report.json");
+
+        if report_path.exists() {
+            let report_text = fs::read_to_string(&report_path)
+                .map_err(|error| format!("Failed to read chat report: {error}"))?;
+            let report: ExploreChatRunnerReport =
+                serde_json::from_str(&normalize_legacy_workspace_references(&report_text))
+                    .map_err(|error| format!("Failed to parse chat report: {error}"))?;
+            message.text = if report.status == "completed" {
+                report.answer
+            } else {
+                format!("Explore Chat failed with status: {}.", report.status)
+            };
+            message.status = Some(if report.status == "completed" {
+                "completed".to_string()
+            } else {
+                "failed".to_string()
+            });
+            message.provider = Some(report.provider);
+            message.model = Some(report.model);
+            message.web_search_enabled = Some(report.web_search_enabled);
+            message.context_path = if report.selected_path.is_empty() {
+                message.context_path.clone()
+            } else {
+                Some(report.selected_path)
+            };
+            message.completed_at = Some(report.completed_at);
+            changed = true;
+            should_save = true;
+            continue;
+        }
+
+        let events_path = chat_dir.join("events.jsonl");
+        if events_path.exists() {
+            if let Ok(events) = fs::read_to_string(events_path) {
+                if let Some(partial) = extract_partial_answer_from_events(&events) {
+                    if partial != message.text {
+                        message.text = partial;
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+
+    if should_save {
+        thread.updated_at = now_string();
+        write_thread_file(workspace, thread)?;
+    }
+
+    Ok(changed || should_save)
+}
+
+fn finish_explore_chat_run(
+    workspace: &Path,
+    thread_id: &str,
+    assistant_message_id: &str,
+    result: Result<RunnerOutput, String>,
+) -> Result<(), String> {
+    let mut thread = read_thread_file(workspace, thread_id)?;
+    let now = now_string();
+    let message = thread
+        .messages
+        .iter_mut()
+        .find(|message| message.id == assistant_message_id && message.role == "assistant")
+        .ok_or_else(|| "Assistant message was missing from chat thread.".to_string())?;
+
+    match result {
+        Ok(output) => {
+            match extract_json_from_runner_stdout::<ExploreChatRunnerReport>(&output.stdout) {
+                Ok(report) if report.status == "completed" && !report.answer.trim().is_empty() => {
+                    message.text = report.answer;
+                    message.status = Some("completed".to_string());
+                    message.provider = Some(report.provider);
+                    message.model = Some(report.model);
+                    message.web_search_enabled = Some(report.web_search_enabled);
+                    if !report.selected_path.is_empty() {
+                        message.context_path = Some(report.selected_path);
+                    }
+                    message.completed_at = Some(report.completed_at);
+                }
+                Ok(report) => {
+                    message.text = format!("Explore Chat failed with status: {}.", report.status);
+                    message.status = Some("failed".to_string());
+                    message.provider = Some(report.provider);
+                    message.model = Some(report.model);
+                    message.web_search_enabled = Some(report.web_search_enabled);
+                    message.completed_at = Some(report.completed_at);
+                }
+                Err(error) => {
+                    message.text = if output.stderr.trim().is_empty() {
+                        format!("Explore Chat failed: {error}")
+                    } else {
+                        output.stderr.trim().to_string()
+                    };
+                    message.status = Some("failed".to_string());
+                    message.completed_at = Some(now.clone());
+                }
+            }
+        }
+        Err(error) => {
+            message.text = error;
+            message.status = Some("failed".to_string());
+            message.completed_at = Some(now.clone());
+        }
+    }
+
+    thread.updated_at = now;
+    write_thread_file(workspace, &thread)
+}
+
 #[tauri::command]
 async fn set_workspace(
     workspace_path: String,
+    initialize_root_files: Option<bool>,
     state: State<'_, WorkspaceStore>,
 ) -> Result<WorkspaceState, String> {
     let path = PathBuf::from(&workspace_path);
@@ -291,6 +2196,9 @@ async fn set_workspace(
     fs::create_dir_all(&path)
         .map_err(|error| format!("Failed to create workspace directory: {error}"))?;
     init_workspace_dirs(&path)?;
+    if initialize_root_files.unwrap_or(false) {
+        initialize_workspace_files(&path)?;
+    }
     let canonical = path
         .canonicalize()
         .map_err(|error| format!("Failed to resolve workspace path: {error}"))?;
@@ -313,6 +2221,352 @@ async fn load_workspace_state(state: State<'_, WorkspaceStore>) -> Result<Worksp
 }
 
 #[tauri::command]
+async fn list_chat_threads(
+    state: State<'_, WorkspaceStore>,
+) -> Result<Vec<ChatThreadSummary>, String> {
+    let workspace = current_workspace(&state)?;
+    let activity_context = thread_activity_context(&workspace);
+    fs::create_dir_all(chat_threads_dir(&workspace))
+        .map_err(|error| format!("Failed to create chat thread directory: {error}"))?;
+    let mut summaries = Vec::new();
+    let mut seen = HashSet::new();
+    for dir in chat_thread_dirs(&workspace) {
+        if !dir.exists() {
+            continue;
+        }
+        for entry in
+            fs::read_dir(dir).map_err(|error| format!("Failed to read chat threads: {error}"))?
+        {
+            let entry = entry.map_err(|error| error.to_string())?;
+            let path = entry.path();
+            if path.file_name().and_then(|name| name.to_str()) == Some("index.json") {
+                continue;
+            }
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            if let Some(thread_id) = path.file_stem().and_then(|value| value.to_str()) {
+                if seen.insert(thread_id.to_string()) {
+                    if let Ok(mut thread) = read_thread_file(&workspace, thread_id) {
+                        let _ = refresh_streaming_messages(&workspace, &mut thread);
+                        summaries.push(chat_thread_summary(&workspace, &thread, &activity_context));
+                    }
+                }
+            }
+        }
+    }
+    summaries.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    Ok(summaries)
+}
+
+#[tauri::command]
+async fn read_current_chat_thread(state: State<'_, WorkspaceStore>) -> Result<ChatThread, String> {
+    let workspace = current_workspace(&state)?;
+    let mut thread = ensure_current_thread(&workspace)?;
+    let _ = refresh_streaming_messages(&workspace, &mut thread)?;
+    Ok(thread)
+}
+
+#[tauri::command]
+async fn read_chat_thread(
+    thread_id: String,
+    state: State<'_, WorkspaceStore>,
+) -> Result<ChatThread, String> {
+    let workspace = current_workspace(&state)?;
+    let mut thread = read_thread_file(&workspace, &thread_id)?;
+    let _ = refresh_streaming_messages(&workspace, &mut thread)?;
+    Ok(thread)
+}
+
+#[tauri::command]
+async fn create_chat_thread(
+    initial_context_path: String,
+    state: State<'_, WorkspaceStore>,
+) -> Result<ChatThread, String> {
+    let workspace = current_workspace(&state)?;
+    let initial_context_path = if initial_context_path.trim().is_empty() {
+        None
+    } else {
+        Some(initial_context_path)
+    };
+    let thread = make_chat_thread(initial_context_path);
+    write_thread_file(&workspace, &thread)?;
+    write_chat_index(
+        &workspace,
+        &ChatThreadIndex {
+            current_thread_id: Some(thread.id.clone()),
+        },
+    )?;
+    Ok(thread)
+}
+
+#[tauri::command]
+async fn set_current_chat_thread(
+    thread_id: String,
+    state: State<'_, WorkspaceStore>,
+) -> Result<ChatThread, String> {
+    let workspace = current_workspace(&state)?;
+    let mut thread = read_thread_file(&workspace, &thread_id)?;
+    write_chat_index(
+        &workspace,
+        &ChatThreadIndex {
+            current_thread_id: Some(thread.id.clone()),
+        },
+    )?;
+    let _ = refresh_streaming_messages(&workspace, &mut thread)?;
+    Ok(thread)
+}
+
+#[tauri::command]
+async fn delete_chat_thread(
+    thread_id: String,
+    state: State<'_, WorkspaceStore>,
+) -> Result<ChatThread, String> {
+    let workspace = current_workspace(&state)?;
+    for path in chat_thread_paths(&workspace, &thread_id)? {
+        if path.exists() {
+            fs::remove_file(&path)
+                .map_err(|error| format!("Failed to delete chat thread: {error}"))?;
+        }
+    }
+    let mut index = read_chat_index(&workspace);
+    if index.current_thread_id.as_deref() == Some(thread_id.as_str()) {
+        if let Some(thread) = newest_chat_thread_except(&workspace, Some(&thread_id))? {
+            index.current_thread_id = Some(thread.id.clone());
+            write_chat_index(&workspace, &index)?;
+            return Ok(thread);
+        }
+
+        return create_default_current_thread(&workspace);
+    }
+    ensure_current_thread(&workspace)
+}
+
+#[tauri::command]
+async fn list_maintain_threads(
+    state: State<'_, WorkspaceStore>,
+) -> Result<Vec<ChatThreadSummary>, String> {
+    let workspace = current_workspace(&state)?;
+    let activity_context = thread_activity_context(&workspace);
+    fs::create_dir_all(maintain_threads_dir(&workspace))
+        .map_err(|error| format!("Failed to create maintain thread directory: {error}"))?;
+    let mut summaries = Vec::new();
+    let mut seen = HashSet::new();
+    for dir in maintain_thread_dirs(&workspace) {
+        if !dir.exists() {
+            continue;
+        }
+        for entry in fs::read_dir(dir)
+            .map_err(|error| format!("Failed to read maintain threads: {error}"))?
+        {
+            let entry = entry.map_err(|error| error.to_string())?;
+            let path = entry.path();
+            if path.file_name().and_then(|name| name.to_str()) == Some("index.json") {
+                continue;
+            }
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            if let Some(thread_id) = path.file_stem().and_then(|value| value.to_str()) {
+                if seen.insert(thread_id.to_string()) {
+                    if let Ok(thread) = read_maintain_thread_file(&workspace, thread_id) {
+                        summaries.push(chat_thread_summary(&workspace, &thread, &activity_context));
+                    }
+                }
+            }
+        }
+    }
+    summaries.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    Ok(summaries)
+}
+
+#[tauri::command]
+async fn read_current_maintain_thread(
+    state: State<'_, WorkspaceStore>,
+) -> Result<ChatThread, String> {
+    let workspace = current_workspace(&state)?;
+    ensure_current_maintain_thread(&workspace)
+}
+
+#[tauri::command]
+async fn create_maintain_thread(state: State<'_, WorkspaceStore>) -> Result<ChatThread, String> {
+    let workspace = current_workspace(&state)?;
+    let thread = make_maintain_thread();
+    write_maintain_thread_file(&workspace, &thread)?;
+    write_maintain_index(
+        &workspace,
+        &ChatThreadIndex {
+            current_thread_id: Some(thread.id.clone()),
+        },
+    )?;
+    Ok(thread)
+}
+
+#[tauri::command]
+async fn set_current_maintain_thread(
+    thread_id: String,
+    state: State<'_, WorkspaceStore>,
+) -> Result<ChatThread, String> {
+    let workspace = current_workspace(&state)?;
+    let thread = read_maintain_thread_file(&workspace, &thread_id)?;
+    write_maintain_index(
+        &workspace,
+        &ChatThreadIndex {
+            current_thread_id: Some(thread.id.clone()),
+        },
+    )?;
+    Ok(thread)
+}
+
+#[tauri::command]
+async fn delete_maintain_thread(
+    thread_id: String,
+    state: State<'_, WorkspaceStore>,
+) -> Result<ChatThread, String> {
+    let workspace = current_workspace(&state)?;
+    for path in maintain_thread_paths(&workspace, &thread_id)? {
+        if path.exists() {
+            fs::remove_file(&path)
+                .map_err(|error| format!("Failed to delete maintain thread: {error}"))?;
+        }
+    }
+    let mut index = read_maintain_index(&workspace);
+    if index.current_thread_id.as_deref() == Some(thread_id.as_str()) {
+        if let Some(thread) = newest_maintain_thread_except(&workspace, Some(&thread_id))? {
+            index.current_thread_id = Some(thread.id.clone());
+            write_maintain_index(&workspace, &index)?;
+            return Ok(thread);
+        }
+
+        return create_default_current_maintain_thread(&workspace);
+    }
+    ensure_current_maintain_thread(&workspace)
+}
+
+#[tauri::command]
+async fn read_workspace_operation_progress(
+    state: State<'_, WorkspaceStore>,
+) -> Result<OperationProgress, String> {
+    let workspace = current_workspace(&state)?;
+    let metadata_dir = if workspace
+        .join(METADATA_DIR)
+        .join("running")
+        .join("operation.json")
+        .exists()
+    {
+        METADATA_DIR
+    } else {
+        LEGACY_METADATA_DIR
+    };
+    let marker_path = workspace
+        .join(metadata_dir)
+        .join("running")
+        .join("operation.json");
+    let marker = match read_operation_marker(&marker_path) {
+        Ok(marker) => marker,
+        Err(error) => {
+            return progress_from_event_paths(
+                &workspace,
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(error),
+            )
+        }
+    };
+    let operation_id = marker_string(marker.as_ref(), "operationId");
+    let operation_type = normalized_operation_type(marker.as_ref(), None);
+    let started_at = marker_string(marker.as_ref(), "startedAt");
+    let operation_dir = operation_id
+        .as_ref()
+        .map(|id| workspace.join(metadata_dir).join("operations").join(id));
+    let events_path = operation_dir.as_ref().map(|dir| dir.join("events.jsonl"));
+    let stderr_path = operation_dir.as_ref().map(|dir| dir.join("stderr.log"));
+    let report_exists = operation_id
+        .as_deref()
+        .and_then(|id| read_operation_report(&workspace, id))
+        .is_some();
+    let running = marker
+        .as_ref()
+        .is_some_and(|marker| !report_exists && running_marker_process_is_running(marker));
+    let error = if marker.is_some() && !report_exists && !running {
+        Some("Operation stopped before writing a report.".to_string())
+    } else {
+        None
+    };
+
+    progress_from_event_paths(
+        &workspace,
+        running,
+        operation_id,
+        operation_type,
+        started_at,
+        events_path,
+        stderr_path,
+        error,
+    )
+}
+
+#[tauri::command]
+async fn read_chat_run_progress(
+    run_id: String,
+    state: State<'_, WorkspaceStore>,
+) -> Result<OperationProgress, String> {
+    if !valid_local_id(&run_id) {
+        return Err("Invalid chat run id".to_string());
+    }
+    let workspace = current_workspace(&state)?;
+    let chat_dir = first_existing_path(&[
+        workspace.join(METADATA_DIR).join("chat").join(&run_id),
+        workspace
+            .join(LEGACY_METADATA_DIR)
+            .join("chat")
+            .join(&run_id),
+    ])
+    .unwrap_or_else(|| workspace.join(METADATA_DIR).join("chat").join(&run_id));
+    let marker_path = chat_dir.join("running.json");
+    let marker = match read_operation_marker(&marker_path) {
+        Ok(marker) => marker,
+        Err(error) => {
+            return progress_from_event_paths(
+                &workspace,
+                false,
+                Some(run_id),
+                Some(EXPLORE_CHAT_OPERATION.to_string()),
+                None,
+                Some(chat_dir.join("events.jsonl")),
+                Some(chat_dir.join("stderr.log")),
+                Some(error),
+            )
+        }
+    };
+
+    let report_exists = read_explore_chat_report(&workspace, &run_id).is_some();
+    let running = marker
+        .as_ref()
+        .is_some_and(|marker| !report_exists && running_marker_process_is_running(marker));
+    let error = if marker.is_some() && !report_exists && !running {
+        Some("Explore Chat stopped before writing a report.".to_string())
+    } else {
+        None
+    };
+
+    progress_from_event_paths(
+        &workspace,
+        running,
+        Some(run_id),
+        normalized_operation_type(marker.as_ref(), Some(EXPLORE_CHAT_OPERATION)),
+        marker_string(marker.as_ref(), "startedAt"),
+        Some(chat_dir.join("events.jsonl")),
+        Some(chat_dir.join("stderr.log")),
+        error,
+    )
+}
+
+#[tauri::command]
 async fn read_workspace_file(
     relative_path: String,
     state: State<'_, WorkspaceStore>,
@@ -321,10 +2575,13 @@ async fn read_workspace_file(
     let normalized_path = normalize_workspace_relative_path(&relative_path)?;
     let normalized = normalized_path.to_string_lossy().replace('\\', "/");
 
-    if normalized != "index.md"
-        && normalized != "log.md"
+    let is_root_file = normalized_path.components().count() == 1;
+    let is_readable_root_markdown =
+        is_root_file && !should_hide_workspace_file(&normalized) && normalized.ends_with(".md");
+
+    if !is_readable_root_markdown
         && !normalized.starts_with("wiki/")
-        && !normalized.starts_with("raw/")
+        && !normalized.starts_with("sources/")
     {
         return Err("Only workspace files can be read by the app preview".to_string());
     }
@@ -365,9 +2622,7 @@ async fn check_soffice(state: State<'_, WorkspaceStore>) -> Result<AppCommandRes
 }
 
 #[tauri::command]
-async fn install_libreoffice(
-    state: State<'_, WorkspaceStore>,
-) -> Result<AppCommandResult, String> {
+async fn install_libreoffice(state: State<'_, WorkspaceStore>) -> Result<AppCommandResult, String> {
     let runner = open_terminal_with("brew install --cask libreoffice")?;
     let workspace_state = match current_workspace_optional(&state) {
         Some(path) => load_state_at(&path)?,
@@ -412,8 +2667,8 @@ async fn convert_pptx_to_pdf(
     if !(lower.ends_with(".pptx") || lower.ends_with(".ppt")) {
         return Err("Only .pptx/.ppt files can be converted".to_string());
     }
-    if !normalized.starts_with("raw/") {
-        return Err("Only raw sources can be converted".to_string());
+    if !normalized.starts_with(&format!("{SOURCE_DIR}/")) {
+        return Err("Only sources can be converted".to_string());
     }
 
     let workspace_root = workspace
@@ -434,12 +2689,12 @@ async fn convert_pptx_to_pdf(
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    let raw_stem = source_canonical
+    let source_stem = source_canonical
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("slide")
         .to_string();
-    let safe_stem: String = raw_stem
+    let safe_stem: String = source_stem
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
@@ -450,11 +2705,11 @@ async fn convert_pptx_to_pdf(
         })
         .collect();
 
-    let cache_dir = workspace.join(".studywiki").join("cache").join("pptx");
+    let cache_dir = workspace.join(METADATA_DIR).join("cache").join("pptx");
     fs::create_dir_all(&cache_dir)
         .map_err(|error| format!("Failed to create cache directory: {error}"))?;
     let cached_pdf = cache_dir.join(format!("{safe_stem}-{mtime_secs}.pdf"));
-    let cached_relative = format!(".studywiki/cache/pptx/{safe_stem}-{mtime_secs}.pdf");
+    let cached_relative = format!("{METADATA_DIR}/cache/pptx/{safe_stem}-{mtime_secs}.pdf");
 
     if cached_pdf.exists() {
         return Ok(cached_relative);
@@ -479,7 +2734,7 @@ async fn convert_pptx_to_pdf(
         return Err(format!("soffice failed: {stderr}"));
     }
 
-    let produced = cache_dir.join(format!("{raw_stem}.pdf"));
+    let produced = cache_dir.join(format!("{source_stem}.pdf"));
     if !produced.exists() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -502,6 +2757,7 @@ async fn reset_sample_workspace(
     state: State<'_, WorkspaceStore>,
 ) -> Result<AppCommandResult, String> {
     let workspace = current_workspace(&state)?;
+    ensure_no_pending_generated_changes(&workspace)?;
     let runner = run_runner(&workspace, "create-sample", &["--force"])?;
     Ok(AppCommandResult {
         runner: Some(runner),
@@ -515,12 +2771,13 @@ async fn import_sources(
     state: State<'_, WorkspaceStore>,
 ) -> Result<AppCommandResult, String> {
     let workspace = current_workspace(&state)?;
-    let raw_dir = workspace.join("raw");
-    fs::create_dir_all(&raw_dir)
-        .map_err(|error| format!("Failed to create raw source directory: {error}"))?;
+    ensure_no_pending_generated_changes(&workspace)?;
+    let source_dir = workspace.join(SOURCE_DIR);
+    fs::create_dir_all(&source_dir)
+        .map_err(|error| format!("Failed to create source directory: {error}"))?;
 
     for source_path in source_paths {
-        import_source_file(&raw_dir, &source_path)?;
+        import_source_file(&source_dir, &source_path)?;
     }
 
     Ok(AppCommandResult {
@@ -530,38 +2787,49 @@ async fn import_sources(
 }
 
 #[tauri::command]
-async fn remove_raw_source(
+async fn mark_sources_ingested(
+    state: State<'_, WorkspaceStore>,
+) -> Result<AppCommandResult, String> {
+    let workspace = current_workspace(&state)?;
+    ensure_no_pending_generated_changes(&workspace)?;
+    let runner = run_runner(&workspace, "baseline-sources", &[])?;
+    Ok(AppCommandResult {
+        runner: Some(runner),
+        state: load_state_at(&workspace)?,
+    })
+}
+
+#[tauri::command]
+async fn remove_source_file(
     relative_path: String,
     state: State<'_, WorkspaceStore>,
 ) -> Result<AppCommandResult, String> {
     let workspace = current_workspace(&state)?;
 
-    if has_pending_generated_changes(&workspace) {
-        return Err("Undo or reset generated changes before removing raw sources.".to_string());
-    }
+    ensure_no_pending_generated_changes(&workspace)?;
 
     let normalized_path = normalize_workspace_relative_path(&relative_path)?;
     let normalized = normalized_path.to_string_lossy().replace('\\', "/");
 
-    if !normalized.starts_with("raw/") {
-        return Err("Only files under raw/ can be removed as sources.".to_string());
+    if !normalized.starts_with("sources/") {
+        return Err("Only files under sources/ can be removed as sources.".to_string());
     }
 
-    let raw_root = workspace
-        .join("raw")
+    let source_root = workspace
+        .join(SOURCE_DIR)
         .canonicalize()
-        .map_err(|error| format!("Failed to resolve raw source directory: {error}"))?;
+        .map_err(|error| format!("Failed to resolve source directory: {error}"))?;
     let full_path = workspace.join(&normalized_path);
     let file_path = full_path
         .canonicalize()
         .map_err(|error| format!("Failed to resolve {normalized}: {error}"))?;
 
-    if !file_path.starts_with(&raw_root) {
-        return Err("Raw source path escaped the raw source directory.".to_string());
+    if !file_path.starts_with(&source_root) {
+        return Err("Source path escaped the source directory.".to_string());
     }
 
     if !file_path.is_file() {
-        return Err("Only raw source files can be removed.".to_string());
+        return Err("Only source files can be removed.".to_string());
     }
 
     fs::remove_file(&file_path)
@@ -574,30 +2842,521 @@ async fn remove_raw_source(
 }
 
 #[tauri::command]
-async fn build_wiki(
-    app: AppHandle,
+async fn keep_generated_changes(
     state: State<'_, WorkspaceStore>,
 ) -> Result<AppCommandResult, String> {
     let workspace = current_workspace(&state)?;
-    let settings = read_settings(&app);
-    let provider = settings.provider.clone();
-    let model = settings
-        .models
-        .get(&provider)
+    let marker_path = first_existing_path(&[
+        workspace
+            .join(METADATA_DIR)
+            .join("changed")
+            .join("last-operation.json"),
+        workspace
+            .join(LEGACY_METADATA_DIR)
+            .join("changed")
+            .join("last-operation.json"),
+    ])
+    .unwrap_or_else(|| {
+        workspace
+            .join(METADATA_DIR)
+            .join("changed")
+            .join("last-operation.json")
+    });
+    let mut marker = read_json_if_exists_normalized(&marker_path)
+        .ok_or_else(|| "No generated changes are waiting for review.".to_string())?;
+
+    if marker.get("undoneAt").is_some() {
+        return Err("The last operation was already undone.".to_string());
+    }
+
+    let reviewed_files = marker
+        .get("changedFiles")
+        .and_then(Value::as_array)
         .cloned()
+        .unwrap_or_default();
+
+    if reviewed_files.is_empty() {
+        return Ok(AppCommandResult {
+            runner: None,
+            state: load_state_at(&workspace)?,
+        });
+    }
+
+    let object = marker
+        .as_object_mut()
+        .ok_or_else(|| "Generated change marker is invalid.".to_string())?;
+    object.insert("reviewedAt".to_string(), Value::String(now_string()));
+    object.insert(
+        "reviewedChangedFiles".to_string(),
+        Value::Array(reviewed_files),
+    );
+    object.insert("changedFiles".to_string(), Value::Array(Vec::new()));
+
+    let active_marker_path = workspace
+        .join(METADATA_DIR)
+        .join("changed")
+        .join("last-operation.json");
+    fs::create_dir_all(active_marker_path.parent().unwrap())
+        .map_err(|error| format!("Failed to create change marker directory: {error}"))?;
+    fs::write(
+        &active_marker_path,
+        serde_json::to_vec_pretty(&marker)
+            .map_err(|error| format!("Failed to serialize change marker: {error}"))?,
+    )
+    .map_err(|error| format!("Failed to update change marker: {error}"))?;
+
+    let marker_text_path = workspace
+        .join(METADATA_DIR)
+        .join("changed")
+        .join("last-operation.txt");
+    fs::write(
+        &marker_text_path,
+        render_reviewed_change_marker_text(&marker),
+    )
+    .map_err(|error| format!("Failed to update change marker summary: {error}"))?;
+
+    Ok(AppCommandResult {
+        runner: None,
+        state: load_state_at(&workspace)?,
+    })
+}
+
+fn render_reviewed_change_marker_text(marker: &Value) -> String {
+    let get_text = |key: &str| marker.get(key).and_then(Value::as_str).unwrap_or("");
+    let mut lines = vec![
+        format!("Operation: {}", get_text("operationId")),
+        format!("Status: {}", get_text("status")),
+        format!("Completed: {}", get_text("completedAt")),
+        format!("Reviewed: {}", get_text("reviewedAt")),
+        format!("Report: {}", get_text("reportMarkdownPath")),
+        String::new(),
+        "Pending changed files: none".to_string(),
+    ];
+
+    let reviewed_files = marker
+        .get("reviewedChangedFiles")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    if !reviewed_files.is_empty() {
+        lines.push(String::new());
+        lines.push("Reviewed files:".to_string());
+        for file in reviewed_files {
+            let status = file
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("changed");
+            let path = file.get("path").and_then(Value::as_str).unwrap_or("");
+            if !path.is_empty() {
+                lines.push(format!("- {status}: {path}"));
+            }
+        }
+    }
+
+    lines.push(String::new());
+    lines.join("\n")
+}
+
+#[tauri::command]
+async fn build_wiki(
+    app: AppHandle,
+    instruction: Option<String>,
+    workspace_context: Option<String>,
+    force: Option<bool>,
+    provider: Option<String>,
+    model: Option<String>,
+    state: State<'_, WorkspaceStore>,
+    provider_cache: State<'_, ProviderStatusCache>,
+) -> Result<AppCommandResult, String> {
+    let workspace = current_workspace(&state)?;
+    ensure_no_pending_generated_changes(&workspace)?;
+    let settings = read_settings(&app);
+    let provider = provider
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| settings.provider.clone());
+    ensure_provider_ready(&provider_cache, &provider)?;
+    let model = model
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| settings.models.get(&provider).cloned())
         .unwrap_or_else(|| match provider.as_str() {
             "claude" => "claude-sonnet-4-6".to_string(),
             _ => "gpt-5.5".to_string(),
         });
-    let runner = run_runner(
-        &workspace,
-        "build",
-        &["--provider", &provider, "--model", &model],
-    )?;
+    let mut args = vec![
+        "build".to_string(),
+        workspace.to_string_lossy().to_string(),
+        "--provider".to_string(),
+        provider,
+        "--model".to_string(),
+        model,
+        "--skip-provider-check".to_string(),
+    ];
+    if let Some(instruction) = instruction.map(|value| value.trim().to_string()) {
+        if !instruction.is_empty() {
+            args.push("--instruction".to_string());
+            args.push(instruction);
+        }
+    }
+    if let Some(workspace_context) = workspace_context.map(|value| value.trim().to_string()) {
+        if !workspace_context.is_empty() {
+            args.push("--workspace-context".to_string());
+            args.push(workspace_context);
+        }
+    }
+    if force.unwrap_or(false) {
+        args.push("--force".to_string());
+    }
+
+    runner_root()?;
+    node_executable()?;
+    let runner_args = args.clone();
+    thread::spawn(move || {
+        let _ = run_runner_with_args(&runner_args);
+    });
+
+    Ok(AppCommandResult {
+        runner: Some(RunnerOutput {
+            success: true,
+            code: Some(0),
+            stdout: "Build wiki started in background.\n".to_string(),
+            stderr: String::new(),
+        }),
+        state: load_state_at(&workspace)?,
+    })
+}
+
+#[tauri::command]
+async fn wiki_healthcheck(
+    app: AppHandle,
+    instruction: Option<String>,
+    state: State<'_, WorkspaceStore>,
+) -> Result<AppCommandResult, String> {
+    run_maintenance_command(&app, &state, "wiki-healthcheck", instruction, false, None)
+}
+
+#[tauri::command]
+async fn improve_wiki(
+    app: AppHandle,
+    instruction: String,
+    state: State<'_, WorkspaceStore>,
+) -> Result<AppCommandResult, String> {
+    run_maintenance_command(&app, &state, "improve-wiki", Some(instruction), true, None)
+}
+
+#[tauri::command]
+async fn organize_sources(
+    app: AppHandle,
+    instruction: String,
+    state: State<'_, WorkspaceStore>,
+) -> Result<AppCommandResult, String> {
+    run_maintenance_command(
+        &app,
+        &state,
+        "organize-sources",
+        Some(instruction),
+        true,
+        None,
+    )
+}
+
+#[tauri::command]
+async fn update_wiki_rules(
+    app: AppHandle,
+    instruction: String,
+    state: State<'_, WorkspaceStore>,
+) -> Result<AppCommandResult, String> {
+    run_maintenance_command(&app, &state, "update-rules", Some(instruction), true, None)
+}
+
+fn run_maintenance_command(
+    app: &AppHandle,
+    state: &State<'_, WorkspaceStore>,
+    command: &str,
+    instruction: Option<String>,
+    require_instruction: bool,
+    operation_id: Option<&str>,
+) -> Result<AppCommandResult, String> {
+    let workspace = current_workspace(state)?;
+    ensure_no_pending_generated_changes(&workspace)?;
+    let settings = read_settings(app);
+    let provider = settings.provider.clone();
+    let model =
+        settings
+            .models
+            .get(&provider)
+            .cloned()
+            .unwrap_or_else(|| match provider.as_str() {
+                "claude" => "claude-sonnet-4-6".to_string(),
+                _ => "gpt-5.5".to_string(),
+            });
+    let instruction = instruction.unwrap_or_default().trim().to_string();
+    if require_instruction && instruction.is_empty() {
+        return Err("Add an instruction first.".to_string());
+    }
+    let mut args = vec![
+        command.to_string(),
+        workspace.to_string_lossy().to_string(),
+        "--provider".to_string(),
+        provider,
+        "--model".to_string(),
+        model,
+    ];
+    if !instruction.is_empty() {
+        args.push("--instruction".to_string());
+        args.push(instruction);
+    }
+    if let Some(operation_id) = operation_id {
+        args.push("--operation-id".to_string());
+        args.push(operation_id.to_string());
+    }
+    let runner = run_runner_with_args(&args)?;
     Ok(AppCommandResult {
         runner: Some(runner),
         state: load_state_at(&workspace)?,
     })
+}
+
+fn maintain_command_config(command: &str) -> Result<(&'static str, &'static str, bool), String> {
+    match command {
+        "wiki_healthcheck" | "wiki-healthcheck" => {
+            Ok(("wiki-healthcheck", "Wiki healthcheck", false))
+        }
+        "improve_wiki" | "improve-wiki" => Ok(("improve-wiki", "Improve wiki", true)),
+        "organize_sources" | "organize-sources" => {
+            Ok(("organize-sources", "Organize sources", true))
+        }
+        "update_wiki_rules" | "update-rules" => Ok(("update-rules", "Update wiki rules", true)),
+        _ => Err("Unknown maintenance command.".to_string()),
+    }
+}
+
+fn changed_marker_operation_id(marker: Option<&Value>) -> Option<String> {
+    marker
+        .and_then(|marker| marker.get("operationId"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn changed_files_from_marker(marker: Option<&Value>) -> Vec<ThreadChangedFile> {
+    marker
+        .and_then(|marker| marker.get("changedFiles"))
+        .and_then(Value::as_array)
+        .map(|files| {
+            files
+                .iter()
+                .filter_map(|file| {
+                    let path = file.get("path").and_then(Value::as_str)?;
+                    Some(ThreadChangedFile {
+                        path: path.to_string(),
+                        status: file
+                            .get("status")
+                            .and_then(Value::as_str)
+                            .unwrap_or("modified")
+                            .to_string(),
+                        allowed: file.get("allowed").and_then(Value::as_bool).unwrap_or(true),
+                        restored: file
+                            .get("restored")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn fallback_state(workspace: &Path) -> WorkspaceState {
+    let mut state = WorkspaceState::empty();
+    state.workspace_path = workspace.display().to_string();
+    state
+}
+
+#[tauri::command]
+async fn run_maintain_thread_operation(
+    app: AppHandle,
+    thread_id: String,
+    command: String,
+    instruction: Option<String>,
+    state: State<'_, WorkspaceStore>,
+) -> Result<MaintainOperationResult, String> {
+    let workspace = current_workspace(&state)?;
+    let (runner_command, label, require_instruction) = maintain_command_config(&command)?;
+    ensure_no_pending_generated_changes(&workspace)?;
+    let settings = read_settings(&app);
+    let provider = settings.provider.clone();
+    let model =
+        settings
+            .models
+            .get(&provider)
+            .cloned()
+            .unwrap_or_else(|| match provider.as_str() {
+                "claude" => "claude-sonnet-4-6".to_string(),
+                _ => "gpt-5.5".to_string(),
+            });
+    let trimmed_instruction = instruction.unwrap_or_default().trim().to_string();
+    if require_instruction && trimmed_instruction.is_empty() {
+        return Err("Add an instruction first.".to_string());
+    }
+
+    let mut thread = read_maintain_thread_file(&workspace, &thread_id)?;
+    if thread.operation_type.is_some() {
+        return Err("This maintenance chat already belongs to an operation. Start another chat for a new task.".to_string());
+    }
+
+    let now = now_string();
+    let operation_id = make_local_id("op");
+    let user_text = if trimmed_instruction.is_empty() {
+        label.to_string()
+    } else {
+        format!("{label}\n\n{trimmed_instruction}")
+    };
+    thread.title = label.to_string();
+    thread.operation_type = Some(runner_command.to_string());
+    thread.operation_id = Some(operation_id.clone());
+    thread.messages.push(ChatThreadMessage {
+        id: make_local_id("msg"),
+        role: "user".to_string(),
+        text: user_text,
+        context_path: None,
+        provider: Some(provider.clone()),
+        model: Some(model.clone()),
+        web_search_enabled: None,
+        run_id: None,
+        status: Some("completed".to_string()),
+        created_at: now.clone(),
+        completed_at: Some(now.clone()),
+    });
+    thread.updated_at = now.clone();
+    write_maintain_thread_file(&workspace, &thread)?;
+    write_maintain_index(
+        &workspace,
+        &ChatThreadIndex {
+            current_thread_id: Some(thread.id.clone()),
+        },
+    )?;
+
+    let result = run_maintenance_command(
+        &app,
+        &state,
+        runner_command,
+        Some(trimmed_instruction),
+        require_instruction,
+        Some(operation_id.as_str()),
+    );
+    let completed_at = now_string();
+
+    match result {
+        Ok(result) => {
+            let marker_operation_id =
+                changed_marker_operation_id(result.state.changed_marker.as_ref());
+            let marker_matches_operation =
+                marker_operation_id.as_deref() == Some(operation_id.as_str());
+            let changed_files = if marker_matches_operation {
+                changed_files_from_marker(result.state.changed_marker.as_ref())
+            } else {
+                Vec::new()
+            };
+            let changed_count = changed_files.len();
+            let total_changed_count = result
+                .state
+                .changed_marker
+                .as_ref()
+                .and_then(|marker| marker.get("changeSummary"))
+                .and_then(|summary| summary.get("totalChangedFiles"))
+                .and_then(Value::as_u64)
+                .map(|count| count as usize)
+                .unwrap_or(changed_count);
+            let runner_success = result
+                .runner
+                .as_ref()
+                .map(|runner| runner.success)
+                .unwrap_or(false);
+            let code = result.runner.as_ref().and_then(|runner| runner.code);
+            let summary = if runner_success {
+                if changed_count == 0 {
+                    format!("{label} finished. No reviewable file changes were reported.")
+                } else {
+                    let report_note = if total_changed_count != changed_count {
+                        format!(
+                            " {total_changed_count} filesystem change(s) were recorded in the report."
+                        )
+                    } else {
+                        String::new()
+                    };
+                    format!(
+                        "{label} finished. {changed_count} generated change(s) ready to review.{report_note}"
+                    )
+                }
+            } else {
+                format!(
+                    "{label} finished with code {}. Check the operation feed and report before keeping changes.",
+                    code.map(|value| value.to_string())
+                        .unwrap_or_else(|| "unknown".to_string())
+                )
+            };
+
+            thread.operation_type = Some(runner_command.to_string());
+            thread.operation_id = Some(operation_id);
+            thread.changed_files = changed_files;
+            thread.messages.push(ChatThreadMessage {
+                id: make_local_id("msg"),
+                role: "assistant".to_string(),
+                text: summary,
+                context_path: None,
+                provider: Some(provider),
+                model: Some(model),
+                web_search_enabled: None,
+                run_id: None,
+                status: Some(if runner_success {
+                    "completed".to_string()
+                } else {
+                    "failed".to_string()
+                }),
+                created_at: completed_at.clone(),
+                completed_at: Some(completed_at.clone()),
+            });
+            thread.updated_at = completed_at;
+            write_maintain_thread_file(&workspace, &thread)?;
+
+            Ok(MaintainOperationResult {
+                runner: result.runner,
+                state: result.state,
+                thread,
+                error: None,
+            })
+        }
+        Err(error) => {
+            let workspace_state =
+                load_state_at(&workspace).unwrap_or_else(|_| fallback_state(&workspace));
+            thread.operation_type = Some(runner_command.to_string());
+            thread.operation_id = Some(operation_id);
+            thread.messages.push(ChatThreadMessage {
+                id: make_local_id("msg"),
+                role: "assistant".to_string(),
+                text: format!("{label} could not start: {error}"),
+                context_path: None,
+                provider: Some(provider),
+                model: Some(model),
+                web_search_enabled: None,
+                run_id: None,
+                status: Some("failed".to_string()),
+                created_at: completed_at.clone(),
+                completed_at: Some(completed_at.clone()),
+            });
+            thread.updated_at = completed_at;
+            write_maintain_thread_file(&workspace, &thread)?;
+
+            Ok(MaintainOperationResult {
+                runner: None,
+                state: workspace_state,
+                thread,
+                error: Some(error),
+            })
+        }
+    }
 }
 
 #[tauri::command]
@@ -605,7 +3364,9 @@ async fn ask_wiki(
     app: AppHandle,
     question: String,
     selected_path: String,
+    history_json: Option<String>,
     state: State<'_, WorkspaceStore>,
+    provider_cache: State<'_, ProviderStatusCache>,
 ) -> Result<RunnerOutput, String> {
     let workspace = current_workspace(&state)?;
     let question = question.trim().to_string();
@@ -614,17 +3375,20 @@ async fn ask_wiki(
     }
     let settings = read_settings(&app);
     let provider = settings.provider.clone();
-    let model = settings
-        .models
-        .get(&provider)
-        .cloned()
-        .unwrap_or_else(|| match provider.as_str() {
-            "claude" => "claude-sonnet-4-6".to_string(),
-            _ => "gpt-5.5".to_string(),
-        });
+    ensure_provider_ready(&provider_cache, &provider)?;
+    let history_json = history_json.unwrap_or_default();
+    let model =
+        settings
+            .models
+            .get(&provider)
+            .cloned()
+            .unwrap_or_else(|| match provider.as_str() {
+                "claude" => "claude-sonnet-4-6".to_string(),
+                _ => "gpt-5.5".to_string(),
+            });
     run_runner(
         &workspace,
-        "ask",
+        EXPLORE_CHAT_OPERATION,
         &[
             "--provider",
             &provider,
@@ -634,14 +3398,345 @@ async fn ask_wiki(
             &question,
             "--selected-path",
             &selected_path,
+            "--history-json",
+            &history_json,
+            "--skip-provider-check",
         ],
     )
 }
 
 #[tauri::command]
-async fn undo_last_operation(
+async fn start_explore_chat(
+    app: AppHandle,
+    thread_id: Option<String>,
+    question: String,
+    selected_path: String,
+    web_search_enabled: bool,
     state: State<'_, WorkspaceStore>,
-) -> Result<AppCommandResult, String> {
+    provider_cache: State<'_, ProviderStatusCache>,
+) -> Result<ChatThread, String> {
+    let workspace = current_workspace(&state)?;
+    let question = question.trim().to_string();
+    if question.is_empty() {
+        return Err("Ask a question first.".to_string());
+    }
+
+    let settings = read_settings(&app);
+    let provider = settings.provider.clone();
+    ensure_provider_ready(&provider_cache, &provider)?;
+    let model =
+        settings
+            .models
+            .get(&provider)
+            .cloned()
+            .unwrap_or_else(|| match provider.as_str() {
+                "claude" => "claude-sonnet-4-6".to_string(),
+                _ => "gpt-5.5".to_string(),
+            });
+
+    let mut thread =
+        read_requested_or_new_chat_thread(&workspace, thread_id, Some(selected_path.clone()))?;
+    let history_json = build_history_json(&thread)?;
+    let now = now_string();
+    let user_message_id = make_local_id("msg");
+    let assistant_message_id = make_local_id("msg");
+    let run_id = make_local_id("run");
+
+    if thread.messages.is_empty() {
+        thread.title = if question.chars().count() > 40 {
+            format!("{}...", question.chars().take(40).collect::<String>())
+        } else {
+            question.clone()
+        };
+    }
+
+    thread.messages.push(ChatThreadMessage {
+        id: user_message_id,
+        role: "user".to_string(),
+        text: question.clone(),
+        context_path: Some(selected_path.clone()),
+        provider: Some(provider.clone()),
+        model: Some(model.clone()),
+        web_search_enabled: Some(web_search_enabled),
+        run_id: None,
+        status: Some("completed".to_string()),
+        created_at: now.clone(),
+        completed_at: Some(now.clone()),
+    });
+    thread.messages.push(ChatThreadMessage {
+        id: assistant_message_id.clone(),
+        role: "assistant".to_string(),
+        text: String::new(),
+        context_path: Some(selected_path.clone()),
+        provider: Some(provider.clone()),
+        model: Some(model.clone()),
+        web_search_enabled: Some(web_search_enabled),
+        run_id: Some(run_id.clone()),
+        status: Some("streaming".to_string()),
+        created_at: now.clone(),
+        completed_at: None,
+    });
+    thread.updated_at = now;
+    write_thread_file(&workspace, &thread)?;
+    write_chat_index(
+        &workspace,
+        &ChatThreadIndex {
+            current_thread_id: Some(thread.id.clone()),
+        },
+    )?;
+
+    let runner_workspace = workspace.clone();
+    let runner_thread_id = thread.id.clone();
+    let runner_assistant_message_id = assistant_message_id;
+    let mut runner_args = vec![
+        EXPLORE_CHAT_OPERATION.to_string(),
+        workspace.to_string_lossy().to_string(),
+        "--provider".to_string(),
+        provider,
+        "--model".to_string(),
+        model,
+        "--question".to_string(),
+        question,
+        "--selected-path".to_string(),
+        selected_path,
+        "--history-json".to_string(),
+        history_json,
+        "--chat-id".to_string(),
+        run_id,
+        "--skip-provider-check".to_string(),
+    ];
+    if web_search_enabled {
+        runner_args.push("--web-search".to_string());
+    }
+
+    thread::spawn(move || {
+        let result = run_runner_with_args(&runner_args);
+        let _ = finish_explore_chat_run(
+            &runner_workspace,
+            &runner_thread_id,
+            &runner_assistant_message_id,
+            result,
+        );
+    });
+
+    Ok(thread)
+}
+
+#[tauri::command]
+async fn apply_chat_to_wiki(
+    app: AppHandle,
+    thread_id: String,
+    scope: String,
+    target_message_id: String,
+    target_path: String,
+    instruction: String,
+    message_ids: Vec<String>,
+    state: State<'_, WorkspaceStore>,
+    provider_cache: State<'_, ProviderStatusCache>,
+) -> Result<ApplyChatResult, String> {
+    let workspace = current_workspace(&state)?;
+    ensure_no_pending_generated_changes(&workspace)?;
+    let settings = read_settings(&app);
+    let provider = settings.provider.clone();
+    ensure_provider_ready(&provider_cache, &provider)?;
+    let model =
+        settings
+            .models
+            .get(&provider)
+            .cloned()
+            .unwrap_or_else(|| match provider.as_str() {
+                "claude" => "claude-sonnet-4-6".to_string(),
+                _ => "gpt-5.5".to_string(),
+            });
+
+    let thread = read_thread_file(&workspace, &thread_id)?;
+    let selected_messages: Vec<ApplyChatMessagePayload> = thread
+        .messages
+        .iter()
+        .filter(|message| message_ids.iter().any(|id| id == &message.id))
+        .filter(|message| message.role == "user" || message.role == "assistant")
+        .filter(|message| {
+            message.status.as_deref() != Some("streaming")
+                && message.status.as_deref() != Some("failed")
+                && !message.text.trim().is_empty()
+        })
+        .map(|message| ApplyChatMessagePayload {
+            id: message.id.clone(),
+            role: message.role.clone(),
+            text: message.text.clone(),
+            context_path: message.context_path.clone(),
+            web_search_enabled: message.web_search_enabled.unwrap_or(false),
+        })
+        .collect();
+
+    if selected_messages.is_empty() {
+        return Err("Choose at least one chat message to apply.".to_string());
+    }
+
+    let payload = ApplyChatPayload {
+        scope,
+        target_path,
+        target_message_id,
+        instruction,
+        messages: selected_messages,
+    };
+    let payload_id = make_local_id("apply-payload");
+    let payload_path = chat_threads_dir(&workspace).join(format!("{payload_id}.json"));
+    fs::create_dir_all(chat_threads_dir(&workspace))
+        .map_err(|error| format!("Failed to create chat thread directory: {error}"))?;
+    fs::write(
+        &payload_path,
+        serde_json::to_vec_pretty(&payload)
+            .map_err(|error| format!("Failed to serialize apply payload: {error}"))?,
+    )
+    .map_err(|error| format!("Failed to write apply payload: {error}"))?;
+    let payload_relative = payload_path
+        .strip_prefix(&workspace)
+        .map_err(|error| error.to_string())?
+        .to_string_lossy()
+        .replace('\\', "/");
+    let operation_id = make_local_id("op");
+    let started_at = now_string();
+    let mut pending_thread =
+        read_thread_file(&workspace, &thread_id).unwrap_or_else(|_| thread.clone());
+    pending_thread.operation_type = Some("apply-chat".to_string());
+    pending_thread.operation_id = Some(operation_id.clone());
+    pending_thread.updated_at = started_at;
+    write_thread_file(&workspace, &pending_thread)?;
+
+    let runner_result = run_runner(
+        &workspace,
+        "apply-chat",
+        &[
+            "--provider",
+            &provider,
+            "--model",
+            &model,
+            "--payload-file",
+            &payload_relative,
+            "--operation-id",
+            &operation_id,
+            "--skip-provider-check",
+        ],
+    );
+    let _ = fs::remove_file(&payload_path);
+    let runner = match runner_result {
+        Ok(runner) => runner,
+        Err(error) => {
+            let now = now_string();
+            let mut latest_thread =
+                read_thread_file(&workspace, &thread_id).unwrap_or(pending_thread);
+            latest_thread.operation_type = Some("apply-chat".to_string());
+            latest_thread.operation_id = Some(operation_id);
+            latest_thread.messages.push(ChatThreadMessage {
+                id: make_local_id("msg"),
+                role: "system".to_string(),
+                text: format!("Wiki update could not start: {error}"),
+                context_path: None,
+                provider: Some(provider),
+                model: Some(model),
+                web_search_enabled: None,
+                run_id: None,
+                status: Some("failed".to_string()),
+                created_at: now.clone(),
+                completed_at: Some(now.clone()),
+            });
+            latest_thread.updated_at = now;
+            write_thread_file(&workspace, &latest_thread)?;
+            return Err(error);
+        }
+    };
+
+    let workspace_state = load_state_at(&workspace)?;
+    let marker = workspace_state.changed_marker.clone();
+    let marker_matches_operation =
+        changed_marker_operation_id(marker.as_ref()).as_deref() == Some(operation_id.as_str());
+    let status = marker
+        .as_ref()
+        .filter(|_| marker_matches_operation)
+        .and_then(|marker| marker.get("status"))
+        .and_then(Value::as_str)
+        .unwrap_or(if runner.success {
+            "completed_without_changes"
+        } else {
+            "failed"
+        });
+    let changed_count = marker
+        .as_ref()
+        .filter(|_| marker_matches_operation)
+        .and_then(|marker| marker.get("changedFiles"))
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let total_changed_count = marker
+        .as_ref()
+        .filter(|_| marker_matches_operation)
+        .and_then(|marker| marker.get("changeSummary"))
+        .and_then(|summary| summary.get("totalChangedFiles"))
+        .and_then(Value::as_u64)
+        .map(|count| count as usize)
+        .unwrap_or(changed_count);
+    let now = now_string();
+    let summary = if runner.success {
+        if changed_count == 0 {
+            format!("Wiki update completed. No reviewable wiki changes were reported. Status: {status}.")
+        } else {
+            let report_note = if total_changed_count != changed_count {
+                format!(" {total_changed_count} filesystem change(s) recorded in the report.")
+            } else {
+                String::new()
+            };
+            format!(
+                "Wiki update ready to review: {changed_count} wiki change(s). Status: {status}.{report_note}"
+            )
+        }
+    } else {
+        format!(
+            "Wiki update failed with code {}.",
+            runner
+                .code
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        )
+    };
+    let mut latest_thread =
+        read_thread_file(&workspace, &thread_id).unwrap_or_else(|_| thread.clone());
+    latest_thread.operation_type = Some("apply-chat".to_string());
+    latest_thread.operation_id = Some(operation_id);
+    latest_thread.changed_files = if marker_matches_operation {
+        changed_files_from_marker(marker.as_ref())
+    } else {
+        Vec::new()
+    };
+    latest_thread.messages.push(ChatThreadMessage {
+        id: make_local_id("msg"),
+        role: "system".to_string(),
+        text: summary,
+        context_path: None,
+        provider: Some(provider),
+        model: Some(model),
+        web_search_enabled: None,
+        run_id: None,
+        status: Some(if runner.success {
+            "completed".to_string()
+        } else {
+            "failed".to_string()
+        }),
+        created_at: now.clone(),
+        completed_at: Some(now.clone()),
+    });
+    latest_thread.updated_at = now;
+    write_thread_file(&workspace, &latest_thread)?;
+
+    Ok(ApplyChatResult {
+        runner,
+        state: workspace_state,
+        thread: latest_thread,
+    })
+}
+
+#[tauri::command]
+async fn undo_last_operation(state: State<'_, WorkspaceStore>) -> Result<AppCommandResult, String> {
     let workspace = current_workspace(&state)?;
     let runner = run_runner(&workspace, "undo", &[])?;
     Ok(AppCommandResult {
@@ -694,13 +3789,171 @@ fn current_workspace_optional(state: &State<'_, WorkspaceStore>) -> Option<PathB
     state.path.lock().unwrap().clone()
 }
 
+fn migrate_legacy_workspace(workspace: &Path) -> Result<(), String> {
+    if !workspace.exists() {
+        return Ok(());
+    }
+    migrate_legacy_source_directory(workspace)?;
+    migrate_legacy_metadata_directory(workspace)?;
+    migrate_snapshot_source_directories(workspace)?;
+    Ok(())
+}
+
+fn migrate_legacy_source_directory(workspace: &Path) -> Result<(), String> {
+    let active = workspace.join(SOURCE_DIR);
+    let legacy = workspace.join(LEGACY_SOURCE_DIR);
+    if !legacy.exists() {
+        return Ok(());
+    }
+
+    if !active.exists() {
+        fs::rename(&legacy, &active).map_err(|error| {
+            format!(
+                "Failed to migrate {} to {}: {error}",
+                legacy.display(),
+                active.display()
+            )
+        })?;
+        return Ok(());
+    }
+
+    if !active.is_dir() || !legacy.is_dir() {
+        return Ok(());
+    }
+
+    let active_empty = is_dir_empty_ignoring_ds_store(&active)?;
+    let legacy_empty = is_dir_empty_ignoring_ds_store(&legacy)?;
+    if active_empty {
+        fs::remove_dir_all(&active)
+            .map_err(|error| format!("Failed to replace empty sources directory: {error}"))?;
+        fs::rename(&legacy, &active).map_err(|error| {
+            format!(
+                "Failed to migrate {} to {}: {error}",
+                legacy.display(),
+                active.display()
+            )
+        })?;
+    } else if legacy_empty {
+        fs::remove_dir_all(&legacy)
+            .map_err(|error| format!("Failed to remove empty legacy source directory: {error}"))?;
+    }
+
+    Ok(())
+}
+
+fn migrate_legacy_metadata_directory(workspace: &Path) -> Result<(), String> {
+    let active = workspace.join(METADATA_DIR);
+    let legacy = workspace.join(LEGACY_METADATA_DIR);
+    if !legacy.exists() {
+        return Ok(());
+    }
+
+    if legacy.join("running").join("operation.json").exists() {
+        return Ok(());
+    }
+
+    if !active.exists() {
+        fs::rename(&legacy, &active).map_err(|error| {
+            format!(
+                "Failed to migrate {} to {}: {error}",
+                legacy.display(),
+                active.display()
+            )
+        })?;
+        return Ok(());
+    }
+
+    if !active.is_dir() || !legacy.is_dir() {
+        return Ok(());
+    }
+
+    let active_empty = is_dir_empty_ignoring_ds_store(&active)?;
+    let legacy_empty = is_dir_empty_ignoring_ds_store(&legacy)?;
+    if active_empty {
+        fs::remove_dir_all(&active)
+            .map_err(|error| format!("Failed to replace empty metadata directory: {error}"))?;
+        fs::rename(&legacy, &active).map_err(|error| {
+            format!(
+                "Failed to migrate {} to {}: {error}",
+                legacy.display(),
+                active.display()
+            )
+        })?;
+    } else if legacy_empty {
+        fs::remove_dir_all(&legacy).map_err(|error| {
+            format!("Failed to remove empty legacy metadata directory: {error}")
+        })?;
+    }
+
+    Ok(())
+}
+
+fn migrate_snapshot_source_directories(workspace: &Path) -> Result<(), String> {
+    let snapshots = workspace.join(METADATA_DIR).join("snapshots");
+    if !snapshots.exists() {
+        return Ok(());
+    }
+
+    for entry in fs::read_dir(&snapshots)
+        .map_err(|error| format!("Failed to read snapshots directory: {error}"))?
+    {
+        let entry = entry.map_err(|error| error.to_string())?;
+        if !entry
+            .file_type()
+            .map_err(|error| error.to_string())?
+            .is_dir()
+        {
+            continue;
+        }
+        let tree = entry.path().join("tree");
+        if tree.exists() {
+            migrate_legacy_source_directory(&tree)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn is_dir_empty_ignoring_ds_store(path: &Path) -> Result<bool, String> {
+    let entries = fs::read_dir(path)
+        .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| error.to_string())?;
+        if entry.file_name().to_string_lossy() != ".DS_Store" {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn init_workspace_dirs(workspace: &Path) -> Result<(), String> {
-    for dir in ["raw", "wiki", ".studywiki"] {
+    migrate_legacy_workspace(workspace)?;
+    for dir in [
+        SOURCE_DIR,
+        "wiki",
+        METADATA_DIR,
+        ".aiwiki/chat-threads",
+        ".aiwiki/maintain-threads",
+    ] {
         let target = workspace.join(dir);
         fs::create_dir_all(&target)
             .map_err(|error| format!("Failed to create {}: {error}", target.display()))?;
     }
     Ok(())
+}
+
+fn initialize_workspace_files(workspace: &Path) -> Result<(), String> {
+    let runner = run_runner(workspace, "init-workspace", &[])?;
+    if runner.success {
+        return Ok(());
+    }
+
+    let detail = if !runner.stderr.trim().is_empty() {
+        runner.stderr.trim()
+    } else {
+        runner.stdout.trim()
+    };
+    Err(format!("Failed to initialize workspace files: {detail}"))
 }
 
 fn run_runner(
@@ -761,6 +4014,80 @@ fn node_executable() -> Result<PathBuf, String> {
     }
 
     Err("Failed to find Node.js. Install Node.js or launch the app from a shell where node is on PATH.".to_string())
+}
+
+fn node_runtime_status() -> NodeRuntimeStatus {
+    let path_env = runtime_path_env();
+    let simulate_missing_node = env_flag("MAPLE_SIMULATE_MISSING_NODE");
+    let simulate_missing_npm = simulate_missing_node || env_flag("MAPLE_SIMULATE_MISSING_NPM");
+    let node = if simulate_missing_node {
+        None
+    } else {
+        find_runtime_executable("node", &path_env)
+    };
+    let npm = if simulate_missing_npm {
+        None
+    } else {
+        find_runtime_executable("npm", &path_env)
+    };
+    NodeRuntimeStatus {
+        node_installed: node.is_some(),
+        npm_installed: npm.is_some(),
+        node_version: node.as_ref().and_then(|path| command_version(path)),
+        npm_version: npm.as_ref().and_then(|path| command_version(path)),
+        node_path: node.map(|path| path.display().to_string()),
+        npm_path: npm.map(|path| path.display().to_string()),
+        install_url: "https://nodejs.org/en/download".to_string(),
+    }
+}
+
+fn runtime_path_env() -> String {
+    let mut parts = Vec::new();
+
+    if let Some(shell_path) = login_shell_path() {
+        push_path_parts(&mut parts, &shell_path);
+    }
+
+    if let Ok(current_path) = env::var("PATH") {
+        push_path_parts(&mut parts, &current_path);
+    }
+
+    if let Some(node) = find_nvm_node() {
+        if let Some(parent) = node.parent() {
+            push_path_part(&mut parts, parent.display().to_string());
+        }
+    }
+
+    for part in [
+        "/opt/homebrew/bin",
+        "/opt/homebrew/sbin",
+        "/usr/local/bin",
+        "/usr/bin",
+        "/bin",
+        "/usr/sbin",
+        "/sbin",
+    ] {
+        push_path_part(&mut parts, part.to_string());
+    }
+
+    parts.join(":")
+}
+
+fn find_runtime_executable(binary: &str, path_env: &str) -> Option<PathBuf> {
+    find_executable_in_path(binary, Some(path_env))
+}
+
+fn command_version(path: &Path) -> Option<String> {
+    let output = Command::new(path).arg("--version").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
 }
 
 fn runner_path_env(node: &Path) -> String {
@@ -866,25 +4193,45 @@ fn login_shell_path() -> Option<String> {
 }
 
 fn load_state_at(workspace: &Path) -> Result<WorkspaceState, String> {
+    migrate_legacy_workspace(workspace)?;
     let status = run_runner(workspace, "status", &[])
         .ok()
         .and_then(|output| serde_json::from_str::<Value>(&output.stdout).ok());
-    let changed_marker_path = workspace.join(".studywiki/changed/last-operation.json");
-    let changed_marker = read_json_if_exists(&changed_marker_path);
+    let changed_marker_path = first_existing_path(&[
+        workspace
+            .join(METADATA_DIR)
+            .join("changed")
+            .join("last-operation.json"),
+        workspace
+            .join(LEGACY_METADATA_DIR)
+            .join("changed")
+            .join("last-operation.json"),
+    ]);
+    let changed_marker = changed_marker_path
+        .as_ref()
+        .and_then(|path| read_json_if_exists_normalized(path));
     let report_md = changed_marker
         .as_ref()
         .and_then(|marker| marker.get("reportMarkdownPath"))
         .and_then(Value::as_str)
-        .and_then(|relative| read_text_if_exists(&workspace.join(relative)));
+        .and_then(|relative| {
+            read_text_if_exists(&resolve_existing_workspace_path(workspace, relative))
+        });
 
     Ok(WorkspaceState {
         workspace_path: workspace.display().to_string(),
+        source_status: status
+            .as_ref()
+            .and_then(|value| value.get("sourceStatus"))
+            .cloned(),
         status,
         changed_marker,
         index_md: read_text_if_exists(&workspace.join("index.md")),
         log_md: read_text_if_exists(&workspace.join("log.md")),
+        schema_md: read_text_if_exists(&workspace.join("schema.md")),
         report_md,
-        raw_sources: list_raw_sources(workspace)?,
+        root_files: list_root_markdown_files(workspace)?,
+        source_files: list_source_files(workspace)?,
         wiki_files: list_wiki_files(workspace)?,
     })
 }
@@ -902,12 +4249,57 @@ fn read_text_if_exists(path: &Path) -> Option<String> {
     fs::read_to_string(path).ok()
 }
 
-fn read_json_if_exists(path: &Path) -> Option<Value> {
+fn read_json_if_exists_normalized(path: &Path) -> Option<Value> {
     let text = fs::read_to_string(path).ok()?;
-    serde_json::from_str(&text).ok()
+    serde_json::from_str(&normalize_legacy_workspace_references(&text)).ok()
 }
 
-fn import_source_file(raw_dir: &Path, source_path: &str) -> Result<(), String> {
+fn normalize_legacy_workspace_references(text: &str) -> String {
+    text.replace("studywiki-broken://", "aiwiki-broken://")
+        .replace(".studywiki/", ".aiwiki/")
+        .replace("study-chat", EXPLORE_CHAT_OPERATION)
+        .replace("side-chat", EXPLORE_CHAT_OPERATION)
+        .replace("raw/", "sources/")
+}
+
+fn denormalize_legacy_workspace_path(text: &str) -> Option<String> {
+    if text.starts_with(&format!("{METADATA_DIR}/")) {
+        return Some(format!(
+            "{LEGACY_METADATA_DIR}/{}",
+            &text[METADATA_DIR.len() + 1..]
+        ));
+    }
+    if text.starts_with(&format!("{SOURCE_DIR}/")) {
+        return Some(format!(
+            "{LEGACY_SOURCE_DIR}/{}",
+            &text[SOURCE_DIR.len() + 1..]
+        ));
+    }
+    None
+}
+
+fn resolve_existing_workspace_path(workspace: &Path, relative: &str) -> PathBuf {
+    let normalized = normalize_legacy_workspace_references(relative);
+    let mut candidates = vec![normalized.clone(), relative.to_string()];
+    if let Some(legacy) = denormalize_legacy_workspace_path(&normalized) {
+        candidates.push(legacy);
+    }
+
+    for candidate in candidates {
+        let path = workspace.join(candidate);
+        if path.exists() {
+            return path;
+        }
+    }
+
+    workspace.join(normalized)
+}
+
+fn first_existing_path(paths: &[PathBuf]) -> Option<PathBuf> {
+    paths.iter().find(|path| path.exists()).cloned()
+}
+
+fn import_source_file(source_dir: &Path, source_path: &str) -> Result<(), String> {
     let source = PathBuf::from(source_path);
     let source = source
         .canonicalize()
@@ -933,7 +4325,7 @@ fn import_source_file(raw_dir: &Path, source_path: &str) -> Result<(), String> {
     let file_name = source
         .file_name()
         .ok_or_else(|| format!("Source has no file name: {}", source.display()))?;
-    let direct_destination = raw_dir.join(file_name);
+    let direct_destination = source_dir.join(file_name);
     if direct_destination
         .canonicalize()
         .ok()
@@ -942,7 +4334,7 @@ fn import_source_file(raw_dir: &Path, source_path: &str) -> Result<(), String> {
         return Ok(());
     }
 
-    let destination = unique_destination(raw_dir, Path::new(file_name))?;
+    let destination = unique_destination(source_dir, Path::new(file_name))?;
 
     fs::copy(&source, &destination).map_err(|error| {
         format!(
@@ -962,13 +4354,13 @@ fn is_supported_source_extension(extension: &str) -> bool {
     )
 }
 
-fn unique_destination(raw_dir: &Path, file_name: &Path) -> Result<PathBuf, String> {
+fn unique_destination(source_dir: &Path, file_name: &Path) -> Result<PathBuf, String> {
     let stem = file_name
         .file_stem()
         .and_then(|value| value.to_str())
         .unwrap_or("source");
     let extension = file_name.extension().and_then(|value| value.to_str());
-    let mut candidate = raw_dir.join(file_name);
+    let mut candidate = source_dir.join(file_name);
 
     if !candidate.exists() {
         return Ok(candidate);
@@ -979,7 +4371,7 @@ fn unique_destination(raw_dir: &Path, file_name: &Path) -> Result<PathBuf, Strin
             Some(extension) if !extension.is_empty() => format!("{stem}-{index}.{extension}"),
             _ => format!("{stem}-{index}"),
         };
-        candidate = raw_dir.join(next_name);
+        candidate = source_dir.join(next_name);
         if !candidate.exists() {
             return Ok(candidate);
         }
@@ -992,7 +4384,17 @@ fn unique_destination(raw_dir: &Path, file_name: &Path) -> Result<PathBuf, Strin
 }
 
 fn has_pending_generated_changes(workspace: &Path) -> bool {
-    let marker = read_json_if_exists(&workspace.join(".studywiki/changed/last-operation.json"));
+    let marker = first_existing_path(&[
+        workspace
+            .join(METADATA_DIR)
+            .join("changed")
+            .join("last-operation.json"),
+        workspace
+            .join(LEGACY_METADATA_DIR)
+            .join("changed")
+            .join("last-operation.json"),
+    ])
+    .and_then(|path| read_json_if_exists_normalized(&path));
     let Some(marker) = marker else {
         return false;
     };
@@ -1003,8 +4405,58 @@ fn has_pending_generated_changes(workspace: &Path) -> bool {
 
     marker
         .get("changedFiles")
+        .or_else(|| marker.get("allChangedFiles"))
         .and_then(Value::as_array)
-        .is_some_and(|files| !files.is_empty())
+        .is_some_and(|files| files.iter().any(is_reviewable_generated_change))
+}
+
+fn ensure_no_pending_generated_changes(workspace: &Path) -> Result<(), String> {
+    if has_pending_generated_changes(workspace) {
+        return Err(
+            "Finish reviewing or undo generated changes before starting another workspace-changing action."
+                .to_string(),
+        );
+    }
+
+    Ok(())
+}
+
+fn is_reviewable_generated_change(change: &Value) -> bool {
+    if !change
+        .get("allowed")
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
+    {
+        return false;
+    }
+    if change
+        .get("restored")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return false;
+    }
+
+    let Some(path) = change.get("path").and_then(Value::as_str) else {
+        return false;
+    };
+
+    if change
+        .get("status")
+        .and_then(Value::as_str)
+        .is_some_and(|status| status == "deleted")
+    {
+        return false;
+    }
+
+    path != "index.md"
+        && path != "log.md"
+        && path != "schema.md"
+        && path != ".aiwiki"
+        && path != ".studywiki"
+        && !path.starts_with("wiki/assets/")
+        && !path.starts_with(".aiwiki/")
+        && !path.starts_with(".studywiki/")
 }
 
 fn normalize_workspace_relative_path(input: &str) -> Result<PathBuf, String> {
@@ -1029,14 +4481,14 @@ fn normalize_workspace_relative_path(input: &str) -> Result<PathBuf, String> {
     Ok(normalized)
 }
 
-fn list_raw_sources(workspace: &Path) -> Result<Vec<String>, String> {
-    let raw_root = workspace.join("raw");
+fn list_source_files(workspace: &Path) -> Result<Vec<String>, String> {
+    let source_root = workspace.join(SOURCE_DIR);
     let mut files = Vec::new();
-    if !raw_root.exists() {
+    if !source_root.exists() {
         return Ok(files);
     }
 
-    collect_files_with_prefix(&raw_root, &raw_root, "raw", &mut files)?;
+    collect_files_with_prefix(&source_root, &source_root, SOURCE_DIR, &mut files)?;
     files.sort();
     Ok(files)
 }
@@ -1051,6 +4503,49 @@ fn list_wiki_files(workspace: &Path) -> Result<Vec<String>, String> {
     collect_files_with_prefix(&wiki_root, &wiki_root, "wiki", &mut files)?;
     files.sort();
     Ok(files)
+}
+
+fn list_root_markdown_files(workspace: &Path) -> Result<Vec<String>, String> {
+    let mut files = Vec::new();
+    if !workspace.exists() {
+        return Ok(files);
+    }
+
+    let entries = fs::read_dir(workspace)
+        .map_err(|error| format!("Failed to read {}: {error}", workspace.display()))?;
+
+    for entry in entries {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if should_hide_workspace_file(&name) {
+            continue;
+        }
+
+        let path = entry.path();
+        let file_type = entry.file_type().map_err(|error| error.to_string())?;
+        if file_type.is_file() && path.extension().and_then(|value| value.to_str()) == Some("md") {
+            files.push(name.to_string());
+        }
+    }
+
+    files.sort_by(|a, b| {
+        root_file_sort_key(a)
+            .cmp(&root_file_sort_key(b))
+            .then_with(|| a.cmp(b))
+    });
+    Ok(files)
+}
+
+fn root_file_sort_key(name: &str) -> u8 {
+    match name {
+        "index.md" => 0,
+        "log.md" => 1,
+        "schema.md" => 2,
+        "AGENTS.md" => 3,
+        "CLAUDE.md" => 4,
+        _ => 10,
+    }
 }
 
 fn collect_files_with_prefix(
@@ -1092,6 +4587,313 @@ fn should_hide_workspace_file(name: &str) -> bool {
     name == ".DS_Store"
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{
+        chat_thread_summary, chat_threads_dir, extract_partial_answer_from_events,
+        make_chat_thread, normalize_operation_events, read_requested_or_new_chat_thread,
+        refresh_streaming_messages, thread_activity_context, ChatThreadMessage,
+    };
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    fn unique_test_workspace(prefix: &str) -> PathBuf {
+        let millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("{prefix}-{millis}-{}", std::process::id()))
+    }
+
+    fn write_operation_report(workspace: &Path, operation_id: &str, status: &str) {
+        let operation_dir = workspace
+            .join(".aiwiki")
+            .join("operations")
+            .join(operation_id);
+        fs::create_dir_all(&operation_dir).unwrap();
+        fs::write(
+            operation_dir.join("report.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "id": operation_id,
+                "type": "apply-chat",
+                "status": status
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn write_changed_marker(
+        workspace: &Path,
+        operation_id: &str,
+        changed_files: serde_json::Value,
+    ) {
+        let changed_dir = workspace.join(".aiwiki").join("changed");
+        fs::create_dir_all(&changed_dir).unwrap();
+        fs::write(
+            changed_dir.join("last-operation.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "operationId": operation_id,
+                "operationType": "apply-chat",
+                "status": "completed",
+                "changedFiles": changed_files
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn completed_message(text: &str) -> ChatThreadMessage {
+        ChatThreadMessage {
+            id: "msg-test".to_string(),
+            role: "system".to_string(),
+            text: text.to_string(),
+            context_path: None,
+            provider: None,
+            model: None,
+            web_search_enabled: None,
+            run_id: None,
+            status: Some("completed".to_string()),
+            created_at: "1000".to_string(),
+            completed_at: Some("1000".to_string()),
+        }
+    }
+
+    #[test]
+    fn extracts_claude_text_deltas_without_thinking() {
+        let events = r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"internal"}}}
+{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Hello"}}}
+{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":" world"}}}"#;
+
+        assert_eq!(
+            extract_partial_answer_from_events(events).as_deref(),
+            Some("Hello world")
+        );
+    }
+
+    #[test]
+    fn extracts_codex_completed_agent_message() {
+        let events = r#"{"type":"item.completed","item":{"type":"agent_message","text":"Done."}}"#;
+
+        assert_eq!(
+            extract_partial_answer_from_events(events).as_deref(),
+            Some("Done.")
+        );
+    }
+
+    #[test]
+    fn normalizes_codex_command_file_message_error_and_result_events() {
+        let events = r#"{"type":"item.started","item":{"id":"cmd-1","type":"command_execution","command":"npm run build"}}
+not-json
+{"type":"item.completed","item":{"id":"cmd-1","type":"command_execution","command":"npm run build","status":"completed","exit_code":0}}
+{"type":"item.completed","item":{"id":"file-1","type":"file_change","status":"completed","changes":[{"path":"/tmp/work/wiki/page.md","kind":"modify"}]}}
+{"type":"item.completed","item":{"id":"msg-1","type":"agent_message","status":"completed","text":"Updated the wiki page."}}
+{"type":"error","message":"provider failed"}
+{"type":"result","subtype":"success","result":"done"}"#;
+
+        let normalized = normalize_operation_events(events, Path::new("/tmp/work"));
+        assert!(normalized
+            .iter()
+            .any(|event| event.kind == "command" && event.title == "Command completed"));
+        assert!(normalized.iter().any(|event| {
+            event.kind == "file" && event.path.as_deref() == Some("wiki/page.md")
+        }));
+        assert!(normalized.iter().any(|event| event.kind == "message"
+            && event.detail.as_deref() == Some("Updated the wiki page.")));
+        assert!(normalized.iter().any(
+            |event| event.kind == "error" && event.detail.as_deref() == Some("provider failed")
+        ));
+        assert!(normalized
+            .iter()
+            .any(|event| event.kind == "result" && event.status.as_deref() == Some("success")));
+    }
+
+    #[test]
+    fn normalizes_claude_text_result_without_thinking_or_signatures() {
+        let events = r#"{"type":"stream_event","event":{"type":"message_start"}}
+{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"secret internal reasoning"}}}
+{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"signature_delta","signature":"hidden-signature"}}}
+{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Visible answer"}}}
+{"type":"result","subtype":"success","result":"final visible summary"}"#;
+
+        let normalized = normalize_operation_events(events, Path::new("/tmp/work"));
+        assert!(normalized
+            .iter()
+            .any(|event| event.title == "Started response"));
+        assert!(normalized
+            .iter()
+            .any(|event| event.title == "Writing answer"));
+        assert!(normalized.iter().any(|event| {
+            event.kind == "result" && event.detail.as_deref() == Some("final visible summary")
+        }));
+        let combined = normalized
+            .iter()
+            .map(|event| format!("{} {:?} {:?}", event.title, event.detail, event.path))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!combined.contains("secret internal reasoning"));
+        assert!(!combined.contains("hidden-signature"));
+    }
+
+    #[test]
+    fn malformed_jsonl_lines_are_tolerated() {
+        let events = "not-json\n\n{\"type\":\"turn.started\"}\n{bad";
+        let normalized = normalize_operation_events(events, Path::new("/tmp/work"));
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(normalized[0].title, "Started AI turn");
+    }
+
+    #[test]
+    fn chat_thread_summary_uses_operation_report_and_review_marker() {
+        let workspace = unique_test_workspace("maple-thread-activity-review");
+        fs::create_dir_all(&workspace).unwrap();
+
+        let mut thread = make_chat_thread(Some("wiki/page.md".to_string()));
+        thread.operation_type = Some("apply-chat".to_string());
+        thread.operation_id = Some("op-review".to_string());
+        thread.messages.push(completed_message(
+            "Wiki update ready to review: 1 wiki change.",
+        ));
+        write_operation_report(&workspace, "op-review", "completed");
+        write_changed_marker(
+            &workspace,
+            "op-review",
+            serde_json::json!([
+                {
+                    "path": "wiki/concepts/topic.md",
+                    "status": "modified",
+                    "allowed": true,
+                    "restored": false
+                }
+            ]),
+        );
+
+        let summary =
+            chat_thread_summary(&workspace, &thread, &thread_activity_context(&workspace));
+        assert_eq!(summary.activity_status, "review");
+        assert_eq!(summary.activity_operation_id.as_deref(), Some("op-review"));
+
+        write_changed_marker(&workspace, "op-review", serde_json::json!([]));
+        let summary =
+            chat_thread_summary(&workspace, &thread, &thread_activity_context(&workspace));
+        assert_eq!(summary.activity_status, "finished");
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn chat_thread_summary_reports_failed_and_stale_running_operations() {
+        let workspace = unique_test_workspace("maple-thread-activity-failed");
+        fs::create_dir_all(&workspace).unwrap();
+
+        let mut thread = make_chat_thread(Some("wiki/page.md".to_string()));
+        thread.operation_type = Some("apply-chat".to_string());
+        thread.operation_id = Some("op-fail".to_string());
+        thread
+            .messages
+            .push(completed_message("Wiki update started."));
+        write_operation_report(&workspace, "op-fail", "provider_failed");
+        let summary =
+            chat_thread_summary(&workspace, &thread, &thread_activity_context(&workspace));
+        assert_eq!(summary.activity_status, "failed");
+
+        thread.operation_id = Some("op-stale".to_string());
+        let running_dir = workspace.join(".aiwiki").join("running");
+        fs::create_dir_all(&running_dir).unwrap();
+        fs::write(
+            running_dir.join("operation.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "operationId": "op-stale",
+                "type": "apply-chat",
+                "pid": 999_999_999_u64
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let summary =
+            chat_thread_summary(&workspace, &thread, &thread_activity_context(&workspace));
+        assert_eq!(summary.activity_status, "failed");
+
+        write_operation_report(&workspace, "op-stale", "completed_without_changes");
+        let summary =
+            chat_thread_summary(&workspace, &thread, &thread_activity_context(&workspace));
+        assert_eq!(summary.activity_status, "finished");
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn refresh_streaming_messages_repairs_completed_explore_report() {
+        let workspace = unique_test_workspace("maple-chat-report-repair");
+        fs::create_dir_all(workspace.join(".aiwiki").join("chat").join("run-test")).unwrap();
+
+        fs::write(
+            workspace
+                .join(".aiwiki")
+                .join("chat")
+                .join("run-test")
+                .join("report.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "status": "completed",
+                "provider": "codex",
+                "model": "gpt-5.5",
+                "selectedPath": "wiki/page.md",
+                "webSearchEnabled": false,
+                "answer": "Done answer",
+                "completedAt": "2000"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut thread = make_chat_thread(Some("wiki/page.md".to_string()));
+        thread.messages.push(ChatThreadMessage {
+            id: "assistant-test".to_string(),
+            role: "assistant".to_string(),
+            text: String::new(),
+            context_path: Some("wiki/page.md".to_string()),
+            provider: None,
+            model: None,
+            web_search_enabled: None,
+            run_id: Some("run-test".to_string()),
+            status: Some("streaming".to_string()),
+            created_at: "1000".to_string(),
+            completed_at: None,
+        });
+
+        assert!(refresh_streaming_messages(&workspace, &mut thread).unwrap());
+        assert_eq!(thread.messages[0].status.as_deref(), Some("completed"));
+        assert_eq!(thread.messages[0].text, "Done answer");
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn missing_requested_chat_thread_starts_new_context_thread() {
+        let workspace = unique_test_workspace("maple-missing-chat-thread");
+        fs::create_dir_all(chat_threads_dir(&workspace)).unwrap();
+
+        let thread = read_requested_or_new_chat_thread(
+            &workspace,
+            Some("thread-missing".to_string()),
+            Some("sources/deck.pptx".to_string()),
+        )
+        .unwrap();
+
+        assert_ne!(thread.id, "thread-missing");
+        assert_eq!(
+            thread.initial_context_path.as_deref(),
+            Some("sources/deck.pptx")
+        );
+        assert!(thread.messages.is_empty());
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1101,21 +4903,46 @@ pub fn run() {
             app.manage(WorkspaceStore {
                 path: Mutex::new(None),
             });
+            app.manage(ProviderStatusCache {
+                entries: Mutex::new(HashMap::new()),
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             set_workspace,
             close_workspace,
             load_workspace_state,
+            list_chat_threads,
+            read_current_chat_thread,
+            read_chat_thread,
+            create_chat_thread,
+            set_current_chat_thread,
+            delete_chat_thread,
+            list_maintain_threads,
+            read_current_maintain_thread,
+            create_maintain_thread,
+            set_current_maintain_thread,
+            delete_maintain_thread,
+            read_workspace_operation_progress,
+            read_chat_run_progress,
             read_workspace_file,
             check_soffice,
             install_libreoffice,
             convert_pptx_to_pdf,
             reset_sample_workspace,
             import_sources,
-            remove_raw_source,
+            mark_sources_ingested,
+            remove_source_file,
+            keep_generated_changes,
             build_wiki,
+            wiki_healthcheck,
+            improve_wiki,
+            organize_sources,
+            update_wiki_rules,
             ask_wiki,
+            start_explore_chat,
+            apply_chat_to_wiki,
+            run_maintain_thread_operation,
             undo_last_operation,
             read_build_progress,
             cancel_build,
@@ -1125,6 +4952,7 @@ pub fn run() {
             set_provider,
             set_model,
             list_providers,
+            check_node_runtime,
             check_provider,
             install_provider,
             login_provider,

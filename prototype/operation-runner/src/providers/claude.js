@@ -103,12 +103,14 @@ function buildExecArgs(ctx) {
 
 function askExecArgs(ctx) {
   const maxTurns = ctx.maxTurns && ctx.maxTurns > 0 ? ctx.maxTurns : 8;
+  const tools = ctx.webSearch ? "Read,Grep,Glob,WebSearch,WebFetch" : "Read,Grep,Glob";
   return [
     "-p",
     "--output-format", "stream-json",
+    "--include-partial-messages",
     "--verbose",
     "--no-session-persistence",
-    "--tools", "Read,Grep,Glob",
+    "--tools", tools,
     "--add-dir", ctx.workspace,
     "--model", ctx.model,
     "--max-turns", String(maxTurns),
@@ -152,6 +154,7 @@ async function finalizeLastMessage(ctx) {
 module.exports = {
   name: "claude",
   binary: "claude",
+  supportsImageAttachments: false,
   defaultModel: "claude-sonnet-4-6",
   supportedModels: [
     { id: "claude-sonnet-4-6", label: "Sonnet 4.6", recommended: true },

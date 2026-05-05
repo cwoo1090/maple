@@ -52,12 +52,16 @@ function buildExecArgs(ctx) {
 }
 
 function askExecArgs(ctx) {
-  return buildExecArgs({
+  const args = buildExecArgs({
     ...ctx,
     sandbox: "read-only",
     ephemeral: true,
-    imageAttachments: [],
+    imageAttachments: ctx.imageAttachments || [],
   });
+  if (ctx.webSearch) {
+    args.unshift("--search");
+  }
+  return args;
 }
 
 function buildSpawnEnv(baseEnv) {
@@ -76,6 +80,7 @@ async function finalizeLastMessage() {
 module.exports = {
   name: "codex",
   binary: "codex",
+  supportsImageAttachments: true,
   defaultModel: "gpt-5.5",
   supportedModels: [
     { id: "gpt-5.5", label: "GPT-5.5", recommended: true },

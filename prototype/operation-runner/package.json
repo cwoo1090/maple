@@ -1,8 +1,8 @@
 {
-  "name": "study-wiki-operation-runner",
+  "name": "maple-operation-runner",
   "version": "0.1.0",
   "private": true,
-  "description": "Local operation runner spike for AI Study Wiki Builder.",
+  "description": "Local operation runner spike for Maple AI Wiki Builder.",
   "scripts": {
     "init": "node src/operation-runner.js create-sample",
     "check": "node src/operation-runner.js check-codex",

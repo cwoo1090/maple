@@ -4,12 +4,14 @@ This spike proves the local operation model before building the Tauri/React UI.
 
 It can:
 
-- create a sample study wiki workspace
+- create a sample Maple wiki workspace
 - check Codex CLI install/login
 - snapshot before an AI write operation
 - run one `codex exec` Build Wiki operation
+- run Maintain operations for wiki healthchecks, wiki organization, source organization, and wiki rules
+- track pending source changes with `.aiwiki/source-manifest.json`
 - detect changed files without Git
-- validate changed paths against the Build Wiki allowlist
+- validate changed paths against per-operation allowlists
 - mark/report changed files
 - undo the last operation
 
@@ -33,7 +35,7 @@ prototype/operation-runner/sample-workspace/
 Local runner metadata is stored under:
 
 ```text
-prototype/operation-runner/sample-workspace/.studywiki/
+prototype/operation-runner/sample-workspace/.aiwiki/
 ```
 
 ## Commands
@@ -41,7 +43,11 @@ prototype/operation-runner/sample-workspace/.studywiki/
 ```bash
 node src/operation-runner.js create-sample
 node src/operation-runner.js check-codex
-node src/operation-runner.js build
+node src/operation-runner.js build --instruction "Focus on exam review"
+node src/operation-runner.js wiki-healthcheck
+node src/operation-runner.js improve-wiki --instruction "Make guides beginner to advanced"
+node src/operation-runner.js organize-sources --instruction "Group sources by lecture week"
+node src/operation-runner.js update-rules --instruction "Add practice questions to every guide"
 node src/operation-runner.js status
 node src/operation-runner.js undo
 node src/operation-runner.js create-sample --force
@@ -53,7 +59,7 @@ Pass a workspace path as the first positional argument to target another compati
 node src/operation-runner.js build /path/to/workspace
 ```
 
-Use `--instruction "..."` to add one-off build guidance, or `--dry-run` to test snapshot/report plumbing without starting Codex.
+Use `--instruction "..."` to add one-off operation guidance, or `--dry-run` with `build` to test snapshot/report plumbing without starting Codex. Use `--force` with `build` to rebuild all current sources instead of only pending source changes.
 
 ## Build Wiki Allowlist
 
@@ -64,7 +70,7 @@ wiki/**
 index.md
 log.md
 schema.md
-.studywiki/**
+.aiwiki/**
 ```
 
-It must not modify `raw/**`. If Codex changes a forbidden path, the runner restores that path from the pre-operation snapshot and records it as blocked in the operation report.
+It must not modify `sources/**`. If Codex changes a forbidden path, the runner restores that path from the pre-operation snapshot and records it as blocked in the operation report.

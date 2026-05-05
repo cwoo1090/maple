@@ -1,13 +1,13 @@
-# AI Study Wiki Builder
+# Maple
 
-A desktop app concept for turning study sources into a local, AI-maintained learning wiki.
+A desktop app concept for turning sources into a local, AI-maintained wiki.
 
 The initial product direction is:
 
 - Target users: students and self-learners who are not familiar with open source tools, Obsidian, terminal workflows, or agent CLIs.
 - AI model access: use the user's ChatGPT subscription through OpenAI Codex, rather than charging for API usage in the first MVP.
 - Storage: plain local files, so the user's knowledge base is portable and inspectable.
-- Core workflow: add sources, build wiki, see changed files, undo if needed, and study from the compiled pages.
+- Core workflow: add sources, build wiki, explore the compiled pages, maintain the wiki structure, see changed files, and undo if needed.
 
 ## MVP Shape
 
@@ -18,14 +18,15 @@ Open app
 -> Add PDF / Markdown / text / links
 -> Build wiki
 -> See changed files
--> Study from the generated wiki
+-> Explore the generated wiki
+-> Run a wiki healthcheck or improve the wiki when it grows
 ```
 
 ## Suggested Folder Model
 
 ```text
 workspace/
-  raw/
+  sources/
   wiki/
     concepts/
     summaries/
@@ -35,7 +36,7 @@ workspace/
   log.md
   schema.md
   AGENTS.md
-  .studywiki/
+  .aiwiki/
 ```
 
 ## Project Docs

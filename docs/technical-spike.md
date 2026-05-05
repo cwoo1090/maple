@@ -24,7 +24,7 @@ This must be proven before investing in a full UI.
 ## Example Test Task
 
 ```text
-Read schema.md. Create a short summary page for raw/sample-note.md under wiki/summaries/.
+Read schema.md. Create a short summary page for sources/sample-note.md under wiki/summaries/.
 Update index.md and log.md.
 ```
 
@@ -49,7 +49,7 @@ codex exec \
 - Filesystem diff is reliable enough to identify changed files.
 - Hidden snapshots can undo the last operation.
 - Mode allowlists can catch and restore forbidden edits.
-- Raw source content can be protected even during source organization.
+- Source content can be protected even during source organization.
 - A copied real wiki, such as `robot-hardware-wiki`, behaves similarly to the sample workspace.
 
 ## Success Criteria

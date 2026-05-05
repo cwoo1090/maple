@@ -1,18 +1,18 @@
 # AGENTS.md
 
-This project is a desktop app concept for a non-technical student/self-learner audience.
+This project is a desktop app concept for a non-technical learner, personal archive, and small-team wiki audience.
 
 ## Product Direction
 
-Build an AI study wiki builder, not a generic markdown editor.
+Build Maple as an AI wiki builder, not a generic markdown editor.
 
 The app should make this workflow simple:
 
-1. Create a learning workspace.
-2. Import study sources.
+1. Create a wiki workspace.
+2. Import sources.
 3. Use ChatGPT/Codex to compile the sources into a local wiki.
 4. Review AI-generated changes.
-5. Study from the generated wiki.
+5. Explore the generated wiki.
 
 ## MVP Constraints
 
@@ -28,7 +28,7 @@ Use this workspace shape unless changed later:
 
 ```text
 workspace/
-  raw/
+  sources/
   wiki/
     concepts/
     summaries/
@@ -37,12 +37,12 @@ workspace/
   index.md
   log.md
   schema.md
+  .aiwiki/
 ```
 
 ## Engineering Notes
 
-- Raw imported sources should be treated as immutable.
+- Sources should be treated as immutable.
 - AI-generated changes should be reviewable before acceptance.
 - Prefer simple, boring architecture over plugin-heavy abstractions for the MVP.
 - Start with macOS if platform tradeoffs are needed; add Windows after the core spike works.
-

@@ -2,41 +2,43 @@
 
 ## Product
 
-AI Study Wiki Builder is a local desktop app that helps non-technical students and self-learners turn scattered study material into a maintained, source-grounded wiki.
+Maple is a local desktop app that helps non-technical learners, personal archivists, and small teams turn scattered source material into a maintained, source-grounded wiki.
 
-The product is not a generic Markdown editor, Obsidian replacement, or PDF chatbot. It is a friendlier app wrapper around the LLM Wiki pattern: raw sources stay immutable, while AI compiles and maintains summaries, concept pages, study guides, wikilinks, assets, `index.md`, `log.md`, and `schema.md`.
+The product is not a generic Markdown editor, Obsidian replacement, or PDF chatbot. It is a friendlier app wrapper around the LLM Wiki pattern: sources stay immutable, while AI compiles and maintains summaries, concept pages, guides, wikilinks, assets, `index.md`, `log.md`, and `schema.md`.
 
-The first concrete reference workflow is the existing `robot-hardware-wiki`: lecture slides, transcripts, notes, papers, and web material are dropped into `raw/`, then an LLM builds a structured wiki from them.
+The first concrete reference workflow is the existing `robot-hardware-wiki`: lecture slides, transcripts, notes, papers, and web material are dropped into `sources/`, then an LLM builds a structured wiki from them.
 
 ## Target User
 
 Primary users:
 
 - students preparing for exams or lectures
-- self-learners studying technical topics
+- self-learners exploring technical topics
 - project/research learners organizing sources over weeks
 
 They may have PDFs, lecture slides, links, transcripts, pasted notes, screenshots, papers, or ChatGPT conversations. They should not need to know Git, Obsidian setup, terminal workflows, open source agent tools, or prompt engineering.
 
 ## User-Facing Language
 
-Use "wiki" as the core noun.
+Use "wiki" as the core noun. Do not expose internal files such as `AGENTS.md`, `CLAUDE.md`, or `schema.md` in normal UI; call durable convention edits `Update rules`.
 
-Main tabs:
+Main areas:
 
-- `Study`
-- `Sources`
-- `Wiki Health`
+- `Sources` in the left file panel
+- `Explore` in the right panel
+- `Maintain` in the right panel
 
 Main action labels:
 
 - `Build wiki`, not `Ingest`
 - `Apply to wiki`
-- `Healthcheck wiki`
-- `Clean up wiki`
+- `Wiki healthcheck`
+- `Improve wiki`
+- `Organize sources`
+- `Update rules`
 - `Undo last operation`
 
-Internal operation names may still use `ingest`, `apply-chat`, and `lint`.
+Internal operation names may still use `build`, `apply-chat`, and `healthcheck`.
 
 ## Workspace Model
 
@@ -44,7 +46,7 @@ New workspaces use this structure:
 
 ```text
 workspace/
-  raw/
+  sources/
   wiki/
     concepts/
     summaries/
@@ -54,13 +56,13 @@ workspace/
   log.md
   schema.md
   AGENTS.md
-  .studywiki/
+  .aiwiki/
 ```
 
 Portable/shareable workspace contents:
 
 ```text
-raw/
+sources/
 wiki/
 index.md
 log.md
@@ -71,23 +73,23 @@ AGENTS.md
 Local app metadata:
 
 ```text
-.studywiki/
+.aiwiki/
 ```
 
-`.studywiki/` is hidden, regeneratable, and excluded from export/share. If the workspace is a Git repo, `.studywiki/` should be ignored.
+`.aiwiki/` is hidden, regeneratable, and excluded from export/share. If the workspace is a Git repo, `.aiwiki/` should be ignored.
 
 ## Workspace Creation
 
 The new workspace flow asks only one required question:
 
 ```text
-What are you studying?
+What are you exploring?
 ```
 
 The app suggests a default location:
 
 ```text
-~/Documents/Study Wikis/<workspace-name>
+~/Documents/Maple Wikis/<workspace-name>
 ```
 
 The user can change the location with a folder picker.
@@ -101,9 +103,9 @@ The app supports:
 - create new wiki workspace
 - open existing wiki workspace
 
-When opening an existing workspace, the app checks for expected files/folders such as `raw/`, `wiki/`, `index.md`, `log.md`, `schema.md`, and `AGENTS.md`.
+When opening an existing workspace, the app checks for expected files/folders such as `sources/`, `wiki/`, `index.md`, `log.md`, `schema.md`, and `AGENTS.md`.
 
-If `.studywiki/` is missing, the app may create it without changing wiki content. Existing `schema.md` and `AGENTS.md` are trusted by default. Updating workspace instructions should be an explicit optional maintenance action, not automatic.
+If `.aiwiki/` is missing, the app may create it without changing wiki content. Existing `schema.md` and `AGENTS.md` are trusted by default. Updating workspace instructions should be an explicit optional maintenance action, not automatic.
 
 ## Main Layout
 
@@ -111,10 +113,12 @@ The main workspace UI is a three-pane layout:
 
 ```text
 Left: workspace tree
-  raw sources
+  sources
   wiki pages
   pending source badges
   changed file badges
+  import source action
+  build wiki action
 
 Center: selected content
   PDF preview
@@ -124,27 +128,26 @@ Center: selected content
   graph view
 
 Right: mode-specific agent/action panel
-  Study chat
-  Sources/build controls
-  Wiki Health report/actions
+  Explore chat
+  Maintain actions
   operation status
   undo
 ```
 
 The app should feel like an agent workspace inspired by Codex CLI, but with non-technical guardrails and visible file/navigation UI.
 
-## Modes And Permissions
+## Areas And Permissions
 
-Modes are not just UI tabs. They are permission boundaries.
+Areas are the user-facing surfaces. AI write operations are permission boundaries.
 
-### Study
+### Explore
 
 Purpose: learn from the wiki and sources.
 
 Default behavior:
 
 - read-only chat
-- answer from `index.md`, `wiki/`, and `raw/` when needed
+- answer from `index.md`, `wiki/`, and `sources/` when needed
 - no file writes unless the user explicitly asks
 
 Allowed write targets when explicitly requested:
@@ -153,39 +156,39 @@ Allowed write targets when explicitly requested:
 - `index.md`
 - `log.md`
 - `schema.md`
-- `.studywiki/**`
+- `.aiwiki/**`
 
 Forbidden:
 
-- modifying `raw/**`
-- reorganizing raw files
+- modifying `sources/**`
+- reorganizing source files
 
 Common actions:
 
-- ask study questions
+- ask questions
 - render wiki pages
 - use graph/wikilinks
 - apply useful chat answer to wiki
-- make/update study guide
+- make/update guide
 - update `schema.md` only when the user expresses durable-rule intent such as "remember this rule" or "use this convention from now on"
 
 ### Sources
 
-Purpose: add, organize, preview, and build from raw sources.
+Purpose: add, preview, and build from sources in the left file panel.
 
 Allowed:
 
-- drag/drop import into `raw/`
-- paste text source into `raw/`
-- paste web link and capture readable Markdown into `raw/`
-- create raw folders
-- rename raw files/folders
-- move raw files/folders
-- delete raw files/folders with confirmation
-- organize pending raw files conversationally
+- drag/drop import into `sources/`
+- paste text source into `sources/`
+- paste web link and capture readable Markdown into `sources/`
+- create source folders
+- rename source files/folders
+- move source files/folders
+- delete source files/folders with confirmation
+- organize pending source files conversationally
 - run `Build wiki`
 
-Raw content remains immutable. In Sources mode, raw path changes are allowed, but raw file content edits are not.
+Source content remains immutable. In Sources mode, source path changes are allowed, but source file content edits are not.
 
 Build wiki may write:
 
@@ -194,32 +197,50 @@ Build wiki may write:
 - `log.md`
 - `schema.md`
 - `wiki/assets/**`
-- `.studywiki/**`
+- `.aiwiki/**`
 
-The user can give optional build instructions, but no instruction is required.
+The user can give optional build instructions in the Build wiki modal, but no instruction is required.
 
-### Wiki Health
+### Maintain
 
-Purpose: inspect and improve wiki structure.
+Purpose: check wiki health, improve wiki content and structure, and update durable workspace rules.
 
 Actions:
 
-- `Healthcheck wiki`: read-only report
-- `Clean up wiki`: write operation
+- `Wiki healthcheck`: conservative rule-based lint/fix operation
+- `Improve wiki`: user-directed wiki improvement, guide creation, and restructuring
+- `Organize sources`: user-directed source file/folder moves and renames
+- `Update rules`: update durable workspace rules
 
-Allowed write targets for cleanup:
+Allowed write targets for `Wiki healthcheck` and `Improve wiki`:
 
 - `wiki/**`
 - `index.md`
 - `log.md`
+- `.aiwiki/**`
+
+Allowed write targets for `Organize sources`:
+
+- source path moves and renames under `sources/**`
+- `wiki/**`
+- `index.md`
+- `log.md`
+- `.aiwiki/**`
+
+Allowed write targets for `Update rules`:
+
 - `schema.md`
-- `.studywiki/**`
+- `AGENTS.md`
+- `CLAUDE.md`
+- `log.md`
+- `.aiwiki/**`
 
 Forbidden:
 
-- modifying or reorganizing `raw/**`
+- editing source file contents
+- exposing `schema.md`, `AGENTS.md`, or `CLAUDE.md` as user-facing concepts
 
-Health checks may inspect:
+Wiki healthcheck may inspect and fix:
 
 - orphan pages
 - missing links
@@ -231,22 +252,22 @@ Health checks may inspect:
 - weak summaries
 - contradictions or unresolved warnings
 
-## Mode Mismatch Behavior
+## Area Mismatch Behavior
 
-If the user asks for an action outside the current mode, the assistant should explain the boundary and offer to switch.
+If the user asks for an action outside the current area, the assistant should explain the boundary and offer the right action.
 
-Example in Study:
+Example in Explore:
 
 ```text
-That changes raw source organization, which belongs in Sources.
-Switch to Sources and prepare a move plan?
+That changes source organization, which belongs in Maintain.
+Open Maintain and run Organize sources?
 ```
 
-Example in Wiki Health:
+Example in Maintain:
 
 ```text
-Adding sources belongs in Sources.
-Switch to Sources?
+Adding sources belongs in the left Sources area.
+Use Import sources?
 ```
 
 The app should also enforce permissions after operations. Prompt rules are advisory; filesystem validation is authoritative.
@@ -319,7 +340,7 @@ Every workspace should contain `AGENTS.md` and `schema.md`.
 `AGENTS.md`:
 
 - provides durable agent instructions
-- tells Codex/other agents to treat `raw/` as immutable
+- tells Codex/other agents to treat `sources/` as immutable
 - tells agents to read `schema.md` and `index.md`
 - defines normal query as read-only
 - requires `index.md` and `log.md` updates after wiki changes
@@ -331,18 +352,18 @@ Every workspace should contain `AGENTS.md` and `schema.md`.
 - defines citation/linking/style rules
 - can evolve as the user teaches the wiki
 
-Study, Sources, and Wiki Health may edit `schema.md`, but only with clear intent or when a durable convention must be updated.
+Explore and Build wiki may edit `schema.md` only with clear durable-rule intent. Update rules is the primary user-facing way to update `schema.md`; the app may sync `AGENTS.md` and `CLAUDE.md` afterward.
 
 ## Source Management
 
-`raw/` is a real nested file tree, not a flat upload bucket.
+`sources/` is a real nested file tree, not a flat upload bucket.
 
 The app supports:
 
 - drag/drop files into the app
 - adding files directly in Finder
-- nested folders under `raw/`
-- in-app raw tree
+- nested folders under `sources/`
+- in-app source tree
 - create folder
 - rename
 - move
@@ -351,9 +372,9 @@ The app supports:
 - open in default app
 - select files/folders to build from
 
-The app detects new/changed/removed raw files anywhere under `raw/`.
+The app detects new/changed/removed source files anywhere under `sources/`.
 
-Possible raw states:
+Possible source states:
 
 - `new`
 - `modified`
@@ -361,13 +382,13 @@ Possible raw states:
 - `unchanged`
 - `already built`
 
-Because raw files are supposed to be immutable, modified already-built raw files should be flagged carefully. The app may suggest importing the changed file as a new version.
+Because source files are supposed to be immutable, modified already-built source files should be flagged carefully. The app may suggest importing the changed file as a new version.
 
 ## Pending Sources And Build Wiki
 
-The app treats `raw/` as a source inbox.
+The app treats `sources/` as a source inbox.
 
-When raw changes are detected, the Sources tab should emphasize that new material is ready:
+When source changes are detected, the left Sources area should emphasize that new material is ready:
 
 ```text
 5 new sources ready
@@ -383,7 +404,7 @@ Build options:
 Suggested bundles are inferred from folders. For example:
 
 ```text
-raw/lectures/lecture-04/
+sources/lectures/lecture-04/
   slides.pdf
   transcript.md
   notes.md
@@ -397,7 +418,7 @@ Optional instruction box:
 Optional: tell the AI what to focus on.
 ```
 
-No instruction is required. The app should use workspace name, path, filenames, `schema.md`, `index.md`, and `log.md` as context.
+No instruction is required. The operation prompt should stay thin: list pending source changes, include optional user instruction, and tell the LLM to read local workspace files such as `schema.md`, `index.md`, and `log.md` as needed.
 
 ## Source Capture
 
@@ -420,7 +441,7 @@ Paste anything here
 [Save source]
 ```
 
-The app infers title, filename, type, and save location. If a raw folder is selected, save there. Otherwise save to `raw/inbox/`.
+The app infers title, filename, type, and save location. If a source folder is selected, save there. Otherwise save to `sources/inbox/`.
 
 Optional advanced fields may be collapsed:
 
@@ -438,7 +459,7 @@ Flow:
 
 1. User pastes URL.
 2. App tries to fetch readable content.
-3. If extraction succeeds, save a raw Markdown snapshot with URL metadata.
+3. If extraction succeeds, save a source Markdown snapshot with URL metadata.
 4. If extraction fails, show a clear message and ask the user to paste text manually, upload a PDF, or try another source.
 
 Do not pretend the link was ingested if content was not captured.
@@ -454,7 +475,7 @@ The app may still accept external clipped Markdown files if users already have t
 
 ## Source Preview
 
-The center pane should preview raw files directly like Obsidian:
+The center pane should preview source files directly like Obsidian:
 
 - PDF: in-app PDF viewer
 - Markdown: rendered read-only
@@ -472,19 +493,19 @@ PDF viewer should include at least:
 
 ## PDF And Visual Extraction
 
-The app should not rely on raw PDF magic.
+The app should not rely on source PDF magic.
 
 PDF handling:
 
 1. Extract text when available.
 2. Render pages/thumbnails.
 3. Automatically detect visually important or low-text pages.
-4. Cache extracted helper files under `.studywiki/extracted/`.
+4. Cache extracted helper files under `.aiwiki/extracted/`.
 5. Provide extracted text and selected page images to AI operations.
 
 Do not ask users to manually select visual pages in the normal flow.
 
-Sources tab may show extraction status:
+The Sources area may show extraction status:
 
 ```text
 slides.pdf
@@ -500,26 +521,26 @@ Build wiki should automatically create curated visual assets when useful.
 Workflow:
 
 ```text
-raw PDF/image
+source PDF/image
 -> app/Codex identifies useful visuals
 -> derived PNGs saved to wiki/assets/<source-slug>/
 -> wiki pages embed selected visuals
--> captions cite original raw path + page/slide/figure
+-> captions cite original source path + page/slide/figure
 ```
 
 Rules:
 
-- never modify `raw/`
+- never modify `sources/`
 - do not dump every slide into the wiki
-- use visuals only when they improve study
+- use visuals only when they improve understanding
 - derived assets belong in `wiki/assets/`
-- wiki captions cite original raw sources, not `.studywiki` cache files
+- wiki captions cite original sources, not `.aiwiki` cache files
 
 Example:
 
 ```md
 ![Three-phase inverter space-vector states](../assets/lecture-03-motor-driver/slide-08-three-phase-inverter-space-vectors.png)
-_Figure: three half-bridges create eight useful switch states. Source: `raw/lectures/lecture-03/slides.pdf`, slide 8._
+_Figure: three half-bridges create eight useful switch states. Source: `sources/lectures/lecture-03/slides.pdf`, slide 8._
 ```
 
 ## Wiki Reader
@@ -572,7 +593,7 @@ Views:
 - local graph centered on current page as default
 - global graph as a tab/view
 
-Raw source nodes are deferred or optional later.
+Source nodes are deferred or optional later.
 
 ## Connections Panel
 
@@ -607,21 +628,24 @@ Markings should persist for the active/latest operation until cleared or replace
 
 The app uses hidden snapshots, not Git, for MVP undo.
 
-Before each AI write operation, save enough state under `.studywiki/snapshots/` to restore the previous wiki/control-file state.
+Before each AI write operation, save enough state under `.aiwiki/snapshots/` to restore the previous wiki/control-file state.
 
 Undo last operation:
 
 - restores previous versions of changed wiki/control files
 - removes files created by the operation
-- does not touch `raw/` for wiki operations
-- for raw organization operations, restores the prior raw paths when possible
+- does not touch `sources/` for wiki operations
+- for source organization operations, restores the prior source paths when possible
 
 Use hidden snapshots for:
 
 - Build wiki
 - Apply to wiki
-- Clean up wiki
-- raw organization operations
+- Wiki healthcheck
+- Improve wiki
+- Organize sources
+- Update rules
+- source organization operations
 
 Do not expose Git concepts such as stage, commit, reset, or branch to normal users.
 
@@ -640,16 +664,16 @@ MVP approach:
 
 Examples:
 
-- Study modifying `raw/**` is forbidden.
-- Wiki Health modifying `raw/**` is forbidden.
-- Sources may move/rename raw files, but raw file content hash changes are forbidden unless the user explicitly imports/replaces a source.
+- Explore modifying `sources/**` is forbidden.
+- Wiki healthcheck and Improve wiki modifying `sources/**` are forbidden.
+- Organize sources may move/rename source files, but source file content hash changes are forbidden unless the user explicitly imports/replaces a source.
 
 If blocked:
 
 ```text
 The assistant tried to change files outside this mode's permission.
 Blocked changes:
-- raw/lectures/lecture-02/transcript.md
+- sources/lectures/lecture-02/transcript.md
 Restored blocked files.
 ```
 
@@ -660,7 +684,7 @@ If time allows in MVP, add simple export.
 Export creates a `.zip` that includes:
 
 ```text
-raw/
+sources/
 wiki/
 index.md
 log.md
@@ -671,7 +695,7 @@ AGENTS.md
 Exclude:
 
 ```text
-.studywiki/
+.aiwiki/
 .git/
 .omx/
 .DS_Store
@@ -725,20 +749,20 @@ Do not build in MVP:
 
 ## First Demo Acceptance Criteria
 
-- User can create a workspace by answering "What are you studying?"
+- User can create a workspace by answering "What are you exploring?"
 - User can choose default or custom workspace location.
 - User can connect ChatGPT/Codex through guided setup.
-- User can add raw sources, including at least PDF and pasted text.
-- App detects pending raw changes.
-- User can preview raw PDFs in app.
+- User can add sources, including at least PDF and pasted text.
+- App detects pending source changes.
+- User can preview source PDFs in app.
 - User can click `Build wiki`.
 - Codex creates/updates wiki pages, `index.md`, and `log.md`.
 - App marks changed files after the operation.
 - User can undo the last operation.
 - Wiki reader renders Markdown, properties, images, and wikilinks.
 - Graph view works from wikilinks.
-- Study chat is read-only by default.
+- Explore chat is read-only by default.
 - User can explicitly `Apply to wiki`.
-- User can run `Healthcheck wiki`.
-- User can run `Clean up wiki` with snapshot and undo.
+- User can run `Wiki healthcheck`.
+- User can run `Improve wiki`, `Organize sources`, and `Update rules` with snapshot and undo.
 - App enforces mode permissions and blocks forbidden changes.

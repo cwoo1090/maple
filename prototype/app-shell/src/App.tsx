@@ -1,6 +1,19 @@
-import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
+import {
+  Children,
+  cloneElement,
+  Fragment,
+  isValidElement,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type MouseEvent as ReactMouseEvent,
+  type PointerEvent as ReactPointerEvent,
+  type ReactNode,
+} from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { documentDir } from "@tauri-apps/api/path";
 import { open } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -14,8 +27,25 @@ import * as pdfjsLib from "pdfjs-dist";
 import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.mjs?url";
 import ForceGraph2D from "react-force-graph-2d";
 import { forceCollide } from "d3-force";
+import {
+  AlertTriangle,
+  CheckCircle2,
+  HelpCircle,
+  Info,
+  Lightbulb,
+  Quote,
+  XCircle,
+  type LucideIcon,
+  Globe,
+} from "lucide-react";
 import "katex/dist/katex.min.css";
 import "./App.css";
+import {
+  ProviderSetupCard,
+  useProviderSetup,
+  type AppSettings,
+  type ProviderInfo,
+} from "./ProviderSetup";
 import { Settings } from "./Settings";
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
@@ -30,19 +60,43 @@ type ChangedFile = {
 type WorkspaceState = {
   workspacePath: string;
   status: unknown | null;
+  sourceStatus: SourceStatus | null;
   changedMarker: {
     operationId?: string;
+    operationType?: string;
     status?: string;
     completedAt?: string;
     undoneAt?: string;
     changedFiles?: ChangedFile[];
+    allChangedFiles?: ChangedFile[];
     note?: string;
   } | null;
   indexMd: string | null;
   logMd: string | null;
+  schemaMd: string | null;
   reportMd: string | null;
-  rawSources: string[];
+  rootFiles: string[];
+  sourceFiles: string[];
   wikiFiles: string[];
+};
+
+type SourceState = "new" | "modified" | "removed" | "unchanged";
+
+type SourceStatusFile = {
+  path: string;
+  state: SourceState;
+  size?: number;
+  mtimeMs?: number;
+  sha256?: string;
+};
+
+type SourceStatus = {
+  pendingCount: number;
+  lastBuiltAt?: string | null;
+  manifestPath?: string;
+  manifestExists?: boolean;
+  inferredManifest?: boolean;
+  files: SourceStatusFile[];
 };
 
 type RunnerOutput = {
@@ -92,43 +146,203 @@ function extractSofficeStatusFromRunner(runner: RunnerOutput | null): SofficeSta
   return null;
 }
 
-type ChatMessage = {
-  id: string;
-  kind:
-    | "user"
-    | "codex_thought"
-    | "codex_message"
-    | "codex_command"
-    | "codex_file_change"
-    | "system";
-  text?: string;
-  cmd?: string;
-  cmdStatus?: "running" | "done" | "failed";
-  filePath?: string;
-  fileKind?: string;
-  severity?: "info" | "warn" | "success" | "error";
-};
-
-type StudyChatMessage = {
+type ExploreChatMessage = {
   id: string;
   role: "user" | "assistant" | "system";
   text: string;
+  contextPath?: string;
+  provider?: string;
+  model?: string;
+  webSearchEnabled?: boolean;
+  runId?: string;
+  status?: "completed" | "streaming" | "failed";
+  createdAt?: string;
+  completedAt?: string;
 };
 
-type StudyChatReport = {
-  status: string;
+type ChatThread = {
+  schemaVersion: number;
+  id: string;
+  title: string;
+  createdAt: string;
+  updatedAt: string;
+  initialContextPath?: string | null;
+  operationType?: string | null;
+  operationId?: string | null;
+  changedFiles?: ChangedFile[];
+  messages: ExploreChatMessage[];
+};
+
+type ChatThreadSummary = {
+  id: string;
+  title: string;
+  updatedAt: string;
+  initialContextPath?: string | null;
+  operationType?: string | null;
+  operationId?: string | null;
+  activityOperationId?: string | null;
+  messageCount: number;
+  preview: string;
+  activityStatus?: ThreadActivityStatus;
+  activityLabel?: string;
+};
+
+type ThreadActivityStatus = "empty" | "running" | "finished" | "review" | "failed";
+
+type SeenThreadMap = Record<string, string>;
+
+type ApplyChatResult = {
+  runner: RunnerOutput;
+  state: WorkspaceState;
+  thread: ChatThread;
+};
+
+type OperationFeedEvent = {
+  id: string;
+  kind: "status" | "message" | "command" | "file" | "error" | "result";
+  title: string;
+  detail?: string | null;
+  path?: string | null;
+  status?: string | null;
+};
+
+type OperationProgress = {
+  running: boolean;
+  operationId?: string | null;
+  operationType?: string | null;
+  startedAt?: string | null;
+  events: OperationFeedEvent[];
+  stderrTail?: string | null;
+  error?: string | null;
+};
+
+type MaintainOperationResult = {
+  runner: RunnerOutput | null;
+  state: WorkspaceState;
+  thread: ChatThread;
+  error?: string | null;
+};
+
+type ApplyScope = "this-answer" | "question-and-answer" | "recent-chat" | "selected-messages";
+
+type ApplyDraft = {
+  messageId: string;
+  scope: ApplyScope;
+  instruction: string;
+  selectedIds: Set<string>;
+} | null;
+
+type WikiUpdateRun = {
+  id: string;
+  threadId: string;
+  operationId?: string | null;
+  scope: ApplyScope;
+  messageCount: number;
+  targetPath: string;
+  instruction: string;
+  startedAt: string;
+} | null;
+
+type BuildDraft = {
+  instruction: string;
+  workspaceContext: string;
+  requiresWorkspaceContext: boolean;
+  force: boolean;
   provider: string;
   model: string;
-  selectedPath: string;
-  question: string;
-  answer: string;
+} | null;
+
+type RightPanelMode = "explore" | "maintain";
+
+type MaintainCommand =
+  | "wiki_healthcheck"
+  | "improve_wiki"
+  | "organize_sources"
+  | "update_wiki_rules";
+
+type MaintainTaskId = "healthcheck" | "improveWiki" | "organizeSources" | "updateRules";
+type MaintainStage = "choose" | "compose" | "running" | "done";
+
+type MaintainTaskConfig = {
+  id: MaintainTaskId;
+  label: string;
+  summary: string;
+  guidanceLabel: string;
+  command: MaintainCommand;
+  busyLabel: string;
+  actionLabel: string;
+  explanation: string;
+  placeholder: string;
+  requiresInstruction: boolean;
+  runningSteps: string[];
 };
 
-type BuildProgress = {
-  running: boolean;
-  marker?: { operationId?: string; pid?: number; startedAt?: string; type?: string };
-  events?: string;
-};
+const RULE_FILE_GUIDES = [
+  {
+    path: "schema.md",
+    title: "schema.md",
+    description:
+      "Wiki rules: page structure, citations, links, naming, explore style, guide format, and healthcheck behavior.",
+  },
+  {
+    path: "AGENTS.md",
+    title: "AGENTS.md",
+    description:
+      "ChatGPT/Codex rules: when the AI may edit files, what stays read-only, and how it should use this workspace.",
+  },
+  {
+    path: "CLAUDE.md",
+    title: "CLAUDE.md",
+    description: "Claude rules: the same workspace behavior rules for Claude Code.",
+  },
+];
+
+type CenterTab =
+  | {
+      id: string;
+      kind: "workspace";
+      title: string;
+      path: string;
+    }
+  | {
+      id: string;
+      kind: "report";
+      title: string;
+      operationId: string;
+      content: string;
+    }
+  | {
+      id: string;
+      kind: "graph";
+      title: string;
+    };
+
+const APPLY_SCOPE_OPTIONS: Array<{ value: ApplyScope; label: string }> = [
+  { value: "question-and-answer", label: "Current Q&A" },
+  { value: "selected-messages", label: "Choose messages" },
+];
+
+const WIKI_UPDATE_STEPS = [
+  "Collecting selected chat",
+  "Reading wiki context",
+  "Applying wiki edits",
+  "Preparing review snapshot",
+  "Writing update summary",
+];
+const BUILD_WIKI_STEPS = [
+  "Reading source changes",
+  "Extracting source content",
+  "Asking AI to compile the wiki",
+  "Organizing wiki pages",
+  "Preparing review snapshot",
+];
+const BUILD_WIKI_STEP_INTERVAL_MS = 4600;
+const MAINTAIN_STEP_INTERVAL_MS = 4600;
+const DEFAULT_WIKI_UPDATE_USER_MESSAGE = "Update this wiki using the selected chat.";
+const DEFAULT_WIKI_UPDATE_ASSISTANT_INTRO =
+  "I'll update this wiki using the selected chat and current wiki context.";
+const INSTRUCTED_WIKI_UPDATE_ASSISTANT_INTRO =
+  "I'll update this wiki using your instruction, the selected chat, and current wiki context.";
 
 type InterruptedCheck = {
   interrupted: boolean;
@@ -149,64 +363,24 @@ function parseRunnerJson<T>(runner: RunnerOutput | null): T | null {
   }
 }
 
-function parseEventsToMessages(jsonl: string): ChatMessage[] {
-  if (!jsonl) return [];
-  const lines = jsonl.split("\n").filter((l) => l.trim().length > 0);
-  const messages: ChatMessage[] = [];
-  for (let i = 0; i < lines.length; i++) {
-    let event: { type?: string; item?: Record<string, unknown> };
-    try {
-      event = JSON.parse(lines[i]);
-    } catch (_error) {
-      continue;
-    }
-    if (event.type !== "item.completed") continue;
-    const item = event.item;
-    if (!item) continue;
-    const itemType = item.type as string | undefined;
-    const baseId = `evt-${i}`;
-    if (itemType === "reasoning" && typeof item.text === "string" && item.text.length > 0) {
-      messages.push({ id: baseId, kind: "codex_thought", text: item.text });
-    } else if (
-      itemType === "agent_message" &&
-      typeof item.text === "string" &&
-      item.text.length > 0
-    ) {
-      messages.push({ id: baseId, kind: "codex_message", text: item.text });
-    } else if (itemType === "command_execution" && typeof item.command === "string") {
-      const exit = item.exit_code as number | undefined;
-      if (exit === 0 || exit === undefined) continue;
-      messages.push({
-        id: baseId,
-        kind: "codex_command",
-        cmd: item.command.length > 240 ? `${item.command.slice(0, 240)}…` : item.command,
-        cmdStatus: exit === 0 || exit === undefined ? "done" : "failed",
-      });
-    } else if (itemType === "file_change" && Array.isArray(item.changes)) {
-      const changes = item.changes as Array<{ path?: string; kind?: string }>;
-      for (let c = 0; c < changes.length; c++) {
-        const change = changes[c];
-        if (change?.path) {
-          messages.push({
-            id: `${baseId}-${c}`,
-            kind: "codex_file_change",
-            filePath: change.path,
-            fileKind: change.kind || "changed",
-          });
-        }
-      }
-    }
-  }
-  return messages;
-}
-
 const IMAGE_EXT_REGEX = /\.(apng|avif|gif|jpe?g|png|svg|webp)$/i;
 const PDF_EXT_REGEX = /\.pdf$/i;
 const PPTX_EXT_REGEX = /\.pptx?$/i;
-const LEFT_PANEL_WIDTH_KEY = "studywiki.leftPanelWidth";
-const RIGHT_PANEL_WIDTH_KEY = "studywiki.rightPanelWidth";
+const LEFT_PANEL_WIDTH_KEY = "maple.leftPanelWidth";
+const RIGHT_PANEL_WIDTH_KEY = "maple.rightPanelWidth";
+const LEFT_PANEL_COLLAPSED_KEY = "maple.leftPanelCollapsed";
+const RIGHT_PANEL_COLLAPSED_KEY = "maple.rightPanelCollapsed";
+const SEEN_CHAT_THREADS_KEY = "maple.seenChatThreads";
+const SEEN_MAINTAIN_THREADS_KEY = "maple.seenMaintainThreads";
+const LEGACY_LEFT_PANEL_WIDTH_KEY = "studywiki.leftPanelWidth";
+const LEGACY_RIGHT_PANEL_WIDTH_KEY = "studywiki.rightPanelWidth";
+const LEGACY_LEFT_PANEL_COLLAPSED_KEY = "studywiki.leftPanelCollapsed";
+const LEGACY_RIGHT_PANEL_COLLAPSED_KEY = "studywiki.rightPanelCollapsed";
 const DEFAULT_LEFT_PANEL_WIDTH = 260;
 const DEFAULT_RIGHT_PANEL_WIDTH = 320;
+const COLLAPSED_LEFT_HEADER_WIDTH = 128;
+const COLLAPSED_RIGHT_HEADER_WIDTH = 112;
+const COLLAPSED_RIGHT_HEADER_BUSY_WIDTH = 148;
 const MIN_LEFT_PANEL_WIDTH = 180;
 const MAX_LEFT_PANEL_WIDTH = 480;
 const MIN_RIGHT_PANEL_WIDTH = 260;
@@ -214,8 +388,103 @@ const MAX_RIGHT_PANEL_WIDTH = 560;
 const MIN_CENTER_PANEL_WIDTH = 420;
 const RESIZE_HANDLE_WIDTH = 1;
 
+const MAINTAIN_TASKS: MaintainTaskConfig[] = [
+  {
+    id: "healthcheck",
+    label: "Wiki healthcheck",
+    summary: "Check broken links, stale index entries, weak pages, and missing citations.",
+    guidanceLabel: "Optional focus",
+    command: "wiki_healthcheck",
+    busyLabel: "Running healthcheck",
+    actionLabel: "Run healthcheck",
+    explanation:
+      "I will check the wiki against the healthcheck rules and fix conservative issues like obvious broken links, stale index entries, weak pages, and missing citations.",
+    placeholder: "Optional focus, for example: Check citation quality in the summaries.",
+    requiresInstruction: false,
+    runningSteps: [
+      "Reading workspace rules",
+      "Checking wiki structure",
+      "Applying conservative fixes",
+      "Validating changed paths",
+      "Writing operation report",
+    ],
+  },
+  {
+    id: "improveWiki",
+    label: "Improve wiki",
+    summary: "Create guides, improve structure, connect pages, and reshape wiki content.",
+    guidanceLabel: "Needs instruction",
+    command: "improve_wiki",
+    busyLabel: "Improving wiki",
+    actionLabel: "Improve wiki",
+    explanation:
+      "Tell me how the wiki should develop. I can create guides, improve structure, connect pages, and reshape content around that direction.",
+    placeholder: "Example: Create a beginner-friendly learning guide from the whole wiki.",
+    requiresInstruction: true,
+    runningSteps: [
+      "Reading workspace rules",
+      "Mapping current wiki structure",
+      "Improving pages, guides, and links",
+      "Validating changed paths",
+      "Writing operation report",
+    ],
+  },
+  {
+    id: "organizeSources",
+    label: "Organize sources",
+    summary: "Move or rename source files without changing their contents.",
+    guidanceLabel: "Needs instruction",
+    command: "organize_sources",
+    busyLabel: "Organizing sources",
+    actionLabel: "Organize sources",
+    explanation:
+      "Tell me how sources should be grouped or renamed. I will move files without changing their contents and update wiki citations that point to them.",
+    placeholder: "Example: Group slides, notes, and transcripts by lecture week.",
+    requiresInstruction: true,
+    runningSteps: [
+      "Reading workspace rules",
+      "Mapping source paths",
+      "Moving or renaming sources",
+      "Validating source file hashes",
+      "Writing operation report",
+    ],
+  },
+  {
+    id: "updateRules",
+    label: "Update rules",
+    summary: "Save durable workspace preferences for future wiki work.",
+    guidanceLabel: "Needs instruction",
+    command: "update_wiki_rules",
+    busyLabel: "Updating rules",
+    actionLabel: "Update rules",
+    explanation:
+      "Rules are saved instructions this workspace asks the AI to follow. Tell me a rule to remember for future build, explore, and maintenance tasks.",
+    placeholder: "Example: Add practice questions to every guide.",
+    requiresInstruction: true,
+    runningSteps: [
+      "Reading current rules",
+      "Interpreting your preference",
+      "Updating durable rules",
+      "Validating changed paths",
+      "Writing operation report",
+    ],
+  },
+];
+
+const MAINTAIN_TASK_BY_ID = Object.fromEntries(
+  MAINTAIN_TASKS.map((task) => [task.id, task]),
+) as Record<MaintainTaskId, MaintainTaskConfig>;
+
+const MAINTAIN_TASK_ID_BY_OPERATION: Record<string, MaintainTaskId> = {
+  "wiki-healthcheck": "healthcheck",
+  "improve-wiki": "improveWiki",
+  "organize-sources": "organizeSources",
+  "update-rules": "updateRules",
+};
+
 type LinkGraphEntry = { outbound: string[]; backlinks: string[] };
 type LinkGraph = Record<string, LinkGraphEntry>;
+type WorkspaceDocumentTarget = { path: string; anchor: string | null };
 
 function makeWorkspaceAssetUrl(workspacePath: string, relativePath: string): string {
   const absolute = `${workspacePath.replace(/\/$/, "")}/${relativePath}`;
@@ -225,19 +494,311 @@ function makeWorkspaceAssetUrl(workspacePath: string, relativePath: string): str
     : `file://${absolute}`;
 }
 
+function displayFileName(path: string): string {
+  return path.split("/").filter(Boolean).pop() || path;
+}
+
+function resolveWorkspaceDocumentReference(
+  reference: string,
+  currentPath: string,
+  availableDocuments: string[],
+): WorkspaceDocumentTarget | null {
+  const trimmed = reference.trim().replace(/^`([^`]+)`$/, "$1").trim();
+  if (!trimmed || isExternalUrl(trimmed) || trimmed.startsWith("#")) {
+    return null;
+  }
+
+  const hashIndex = trimmed.indexOf("#");
+  const pathPart = hashIndex === -1 ? trimmed : trimmed.slice(0, hashIndex);
+  const anchor = hashIndex === -1 ? null : trimmed.slice(hashIndex + 1) || null;
+  const decodedPath = safeDecode(pathPart.split("?")[0]);
+  const directPath = normalizeWorkspacePath(decodedPath);
+  if (directPath && availableDocuments.includes(directPath)) {
+    return { path: directPath, anchor };
+  }
+
+  const relativePath = resolveWorkspacePath(currentPath, decodedPath);
+  if (relativePath && availableDocuments.includes(relativePath)) {
+    return { path: relativePath, anchor };
+  }
+
+  const targetName = decodedPath.split("/").filter(Boolean).pop()?.toLowerCase();
+  if (!targetName) {
+    return null;
+  }
+
+  if (/\.[a-z0-9]+$/i.test(targetName)) {
+    const nameMatches = availableDocuments.filter(
+      (documentPath) => displayFileName(documentPath).toLowerCase() === targetName,
+    );
+    return nameMatches.length === 1 ? { path: nameMatches[0], anchor } : null;
+  }
+
+  if (!/^[\w가-힣.-]+$/u.test(targetName)) {
+    return null;
+  }
+
+  const wikiResolved = resolveWikiLinkTarget(currentPath, trimmed, availableDocuments);
+  if (!wikiResolved) {
+    return null;
+  }
+
+  const resolvedHashIndex = wikiResolved.indexOf("#");
+  return {
+    path: resolvedHashIndex === -1 ? wikiResolved : wikiResolved.slice(0, resolvedHashIndex),
+    anchor: resolvedHashIndex === -1 ? null : wikiResolved.slice(resolvedHashIndex + 1) || null,
+  };
+}
+
+function parseTimestampMs(value: string | null | undefined): number | null {
+  const timestamp = value?.trim();
+  if (!timestamp) return null;
+
+  const numericValue = Number(timestamp);
+  if (Number.isFinite(numericValue)) {
+    return numericValue;
+  }
+
+  const parsedValue = Date.parse(timestamp);
+  return Number.isFinite(parsedValue) ? parsedValue : null;
+}
+
+function displayChatThreadTimestamp(updatedAt: string): string {
+  const timestampMs = parseTimestampMs(updatedAt);
+  if (timestampMs === null) return "";
+  const date = new Date(timestampMs);
+  return date.toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
+function displayChatThreadPreview(thread: ChatThreadSummary): string {
+  if (thread.preview) return thread.preview;
+  const base =
+    thread.messageCount === 0
+      ? "No messages yet"
+      : displayFileName(thread.initialContextPath || "");
+  const timestamp = displayChatThreadTimestamp(thread.updatedAt);
+  return timestamp ? `${base} - ${timestamp}` : base;
+}
+
+function latestChatContextPath(thread: ChatThread): string | null {
+  const latestMessageContext = thread.messages
+    .slice()
+    .reverse()
+    .find((message) => Boolean(message.contextPath?.trim()))?.contextPath;
+  return latestMessageContext?.trim() || thread.initialContextPath?.trim() || null;
+}
+
+function displayMaintainThreadPreview(thread: ChatThreadSummary): string {
+  if (thread.preview) return thread.preview;
+  const base = thread.operationType
+    ? operationTypeLabel(thread.operationType)
+    : "No operation yet";
+  const timestamp = displayChatThreadTimestamp(thread.updatedAt);
+  return timestamp ? `${base} - ${timestamp}` : base;
+}
+
+function normalizeThreadActivityStatus(
+  status: string | null | undefined,
+): ThreadActivityStatus {
+  if (
+    status === "running" ||
+    status === "finished" ||
+    status === "review" ||
+    status === "failed" ||
+    status === "empty"
+  ) {
+    return status;
+  }
+  return "empty";
+}
+
+function defaultThreadActivityLabel(status: ThreadActivityStatus): string {
+  switch (status) {
+    case "running":
+      return "Running";
+    case "finished":
+      return "Finished";
+    case "review":
+      return "Review";
+    case "failed":
+      return "Failed";
+    default:
+      return "New";
+  }
+}
+
+function seenThreadStorageKey(baseKey: string, workspacePath: string): string {
+  return `${baseKey}:${encodeURIComponent(workspacePath)}`;
+}
+
+function initialSeenThreadMap(summaries: ChatThreadSummary[]): SeenThreadMap {
+  return Object.fromEntries(summaries.map((thread) => [thread.id, thread.updatedAt]));
+}
+
+function readSeenThreadMap(
+  baseKey: string,
+  workspacePath: string,
+  summaries: ChatThreadSummary[],
+): SeenThreadMap {
+  if (!workspacePath) return {};
+  const key = seenThreadStorageKey(baseKey, workspacePath);
+  const stored = window.localStorage.getItem(key);
+  if (!stored) {
+    const initial = initialSeenThreadMap(summaries);
+    window.localStorage.setItem(key, JSON.stringify(initial));
+    return initial;
+  }
+
+  try {
+    const parsed = JSON.parse(stored);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    return Object.fromEntries(
+      Object.entries(parsed).filter(
+        (entry): entry is [string, string] =>
+          typeof entry[0] === "string" && typeof entry[1] === "string",
+      ),
+    );
+  } catch (_error) {
+    return {};
+  }
+}
+
+function writeSeenThreadMap(
+  baseKey: string,
+  workspacePath: string,
+  seen: SeenThreadMap,
+) {
+  if (!workspacePath) return;
+  window.localStorage.setItem(
+    seenThreadStorageKey(baseKey, workspacePath),
+    JSON.stringify(seen),
+  );
+}
+
+function isMissingChatThreadError(error: unknown): boolean {
+  return /Failed to read chat thread .*(No such file|os error 2)/i.test(String(error));
+}
+
+function displayProviderName(provider: ProviderInfo): string {
+  if (provider.name === "codex") return "ChatGPT";
+  if (provider.name === "claude") return "Claude";
+  return provider.label;
+}
+
+function sourceStateLabel(state: SourceState): string {
+  switch (state) {
+    case "new":
+      return "New";
+    case "modified":
+      return "Modified";
+    case "removed":
+      return "Removed";
+    default:
+      return "Unchanged";
+  }
+}
+
 function clampNumber(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max);
 }
 
 function readStoredPanelWidth(
   key: string,
+  legacyKey: string,
   fallback: number,
   min: number,
   max: number,
 ): number {
-  const stored = Number(window.localStorage.getItem(key));
+  const storedText = window.localStorage.getItem(key) ?? window.localStorage.getItem(legacyKey);
+  if (storedText === null) return fallback;
+  const stored = Number(storedText);
   if (!Number.isFinite(stored)) return fallback;
   return clampNumber(stored, min, max);
+}
+
+function readStoredPanelCollapsed(key: string, legacyKey: string): boolean {
+  return (window.localStorage.getItem(key) ?? window.localStorage.getItem(legacyKey)) === "true";
+}
+
+function mergeOperationProgress(
+  previous: OperationProgress | null | undefined,
+  next: OperationProgress,
+): OperationProgress {
+  if (!previous) return next;
+  const sameOperation =
+    next.operationId && previous.operationId && next.operationId === previous.operationId;
+  const justFinishedWithoutMarker = previous.running && !next.running && !next.operationId;
+  if (!sameOperation && !justFinishedWithoutMarker) return next;
+  return {
+    ...next,
+    operationId: next.operationId ?? previous.operationId,
+    operationType: next.operationType ?? previous.operationType,
+    startedAt: next.startedAt ?? previous.startedAt,
+    events: next.events.length > 0 ? next.events : previous.events,
+    stderrTail: next.stderrTail ?? previous.stderrTail,
+  };
+}
+
+function maintainTaskIdFromOperationType(operationType?: string | null): MaintainTaskId | null {
+  return operationType ? MAINTAIN_TASK_ID_BY_OPERATION[operationType] ?? null : null;
+}
+
+function operationTypeLabel(operationType?: string | null): string {
+  const taskId = maintainTaskIdFromOperationType(operationType);
+  if (taskId) return MAINTAIN_TASK_BY_ID[taskId].label;
+  if (operationType === "build-wiki") return "Build wiki";
+  if (operationType === "apply-chat") return "Update wiki from chat";
+  if (
+    operationType === "explore-chat" ||
+    operationType === "study-chat" ||
+    operationType === "side-chat"
+  ) {
+    return "Explore Chat";
+  }
+  return "Operation";
+}
+
+function isGenericMaintainCompletionMessage(text: string): boolean {
+  const normalized = text.trim();
+  return (
+    /^.+ finished\. \d+ file\(s\) changed and are ready to review\.$/.test(normalized) ||
+    /^.+ finished\. \d+ wiki change\(s\) ready to review\./.test(normalized) ||
+    /^.+ finished\. \d+ generated change\(s\) ready to review\./.test(normalized) ||
+    /^.+ finished\. No reviewable file changes were reported\.$/.test(normalized)
+  );
+}
+
+function workspaceCenterTab(path: string): CenterTab {
+  return {
+    id: `workspace:${path}`,
+    kind: "workspace",
+    title: displayFileName(path),
+    path,
+  };
+}
+
+function graphCenterTab(): CenterTab {
+  return {
+    id: "graph",
+    kind: "graph",
+    title: "Graph",
+  };
+}
+
+function reportCenterTab(operationId: string, content: string): CenterTab {
+  return {
+    id: `report:${operationId}`,
+    kind: "report",
+    title: "Operation report",
+    operationId,
+    content,
+  };
 }
 
 type CommandName =
@@ -245,23 +806,63 @@ type CommandName =
   | "install_libreoffice"
   | "reset_sample_workspace"
   | "build_wiki"
+  | "wiki_healthcheck"
+  | "improve_wiki"
+  | "organize_sources"
+  | "update_wiki_rules"
   | "undo_last_operation"
+  | "keep_generated_changes"
   | "cancel_build"
   | "discard_interrupted_operation";
+
+type BlockedAction =
+  | "build"
+  | "maintain"
+  | "update-wiki"
+  | "explore"
+  | "review"
+  | "undo"
+  | "reset"
+  | "source-import"
+  | "source-remove";
 
 const emptyState: WorkspaceState = {
   workspacePath: "",
   status: null,
+  sourceStatus: null,
   changedMarker: null,
   indexMd: null,
   logMd: null,
+  schemaMd: null,
   reportMd: null,
-  rawSources: [],
+  rootFiles: [],
+  sourceFiles: [],
   wikiFiles: [],
 };
 
+function isPendingReviewChange(file: ChangedFile): boolean {
+  return file.allowed !== false && !file.restored && isManualReviewPath(file.path, file.status);
+}
+
+function isManualReviewPath(path: string, status?: string): boolean {
+  if (status === "deleted") return false;
+  if (path === "index.md" || path === "log.md" || path === "schema.md") return false;
+  if (path.startsWith("wiki/assets/")) return false;
+  if (path === ".aiwiki" || path.startsWith(".aiwiki/")) return false;
+  if (path === ".studywiki" || path.startsWith(".studywiki/")) return false;
+  return true;
+}
+
 function App() {
   const appBodyRef = useRef<HTMLDivElement | null>(null);
+  const exploreChatMessagesRef = useRef<HTMLDivElement | null>(null);
+  const topbarWorkspaceMenuRef = useRef<HTMLDetailsElement | null>(null);
+  const topbarMenuRef = useRef<HTMLDetailsElement | null>(null);
+  const chatHistoryButtonRef = useRef<HTMLButtonElement | null>(null);
+  const chatHistoryPopoverRef = useRef<HTMLDivElement | null>(null);
+  const maintainHistoryButtonRef = useRef<HTMLButtonElement | null>(null);
+  const maintainHistoryPopoverRef = useRef<HTMLDivElement | null>(null);
+  const centerConnectionsRef = useRef<HTMLDivElement | null>(null);
   const [workspace, setWorkspace] = useState<WorkspaceState>(emptyState);
   const [runner, setRunner] = useState<RunnerOutput | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
@@ -275,19 +876,66 @@ function App() {
   const [sofficeStatus, setSofficeStatus] = useState<SofficeStatus | null>(null);
   const [sofficeInstalling, setSofficeInstalling] = useState(false);
   const [sofficeInstallStartedAt, setSofficeInstallStartedAt] = useState<number | null>(null);
-  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
-  const [studyChatMessages, setStudyChatMessages] = useState<StudyChatMessage[]>([]);
-  const [studyQuestion, setStudyQuestion] = useState("");
+  const [chatThread, setChatThread] = useState<ChatThread | null>(null);
+  const currentChatThreadIdRef = useRef<string | null>(null);
+  currentChatThreadIdRef.current = chatThread?.id ?? null;
+  const [chatThreads, setChatThreads] = useState<ChatThreadSummary[]>([]);
+  const [chatHistoryOpen, setChatHistoryOpen] = useState(false);
+  const [seenChatThreadUpdates, setSeenChatThreadUpdates] = useState<SeenThreadMap>({});
+  const [maintainThread, setMaintainThread] = useState<ChatThread | null>(null);
+  const [maintainThreads, setMaintainThreads] = useState<ChatThreadSummary[]>([]);
+  const [maintainHistoryOpen, setMaintainHistoryOpen] = useState(false);
+  const [seenMaintainThreadUpdates, setSeenMaintainThreadUpdates] = useState<SeenThreadMap>({});
+  const [applyDraft, setApplyDraft] = useState<ApplyDraft>(null);
+  const [buildDraft, setBuildDraft] = useState<BuildDraft>(null);
+  const [rightPanelMode, setRightPanelMode] = useState<RightPanelMode>("explore");
+  const [maintainStage, setMaintainStage] = useState<MaintainStage>("choose");
+  const [selectedMaintainTaskId, setSelectedMaintainTaskId] = useState<MaintainTaskId | null>(null);
+  const [maintainInstruction, setMaintainInstruction] = useState("");
+  const [buildStatusStep, setBuildStatusStep] = useState(0);
+  const [maintainStatusStep, setMaintainStatusStep] = useState(0);
+  const [maintainLastResult, setMaintainLastResult] = useState<{
+    taskId: MaintainTaskId;
+    success: boolean;
+    code: number | null;
+  } | null>(null);
+  const [wikiUpdateBusy, setWikiUpdateBusy] = useState(false);
+  const [wikiUpdateRun, setWikiUpdateRun] = useState<WikiUpdateRun>(null);
+  const [wikiUpdateStatusStep, setWikiUpdateStatusStep] = useState(0);
+  const [workspaceOperationProgress, setWorkspaceOperationProgress] =
+    useState<OperationProgress | null>(null);
+  const [backgroundBuildActive, setBackgroundBuildActive] = useState(false);
+  const [backgroundBuildStartedAt, setBackgroundBuildStartedAt] = useState<number | null>(null);
+  const handledBuildOperationIdRef = useRef<string | null>(null);
+  const autoFinishedReviewOperationIdRef = useRef<string | null>(null);
+  const [chatRunProgressById, setChatRunProgressById] = useState<Record<string, OperationProgress>>(
+    {},
+  );
+  const [openFeedIds, setOpenFeedIds] = useState<Set<string>>(() => new Set());
+  const [buildFeedOpen, setBuildFeedOpen] = useState(true);
+  const [wikiUpdateFeedOpen, setWikiUpdateFeedOpen] = useState(true);
+  const [maintainFeedOpen, setMaintainFeedOpen] = useState(true);
+  const [chatStatusStep, setChatStatusStep] = useState(0);
+  const [exploreQuestion, setExploreQuestion] = useState("");
+  const [exploreWebSearchEnabled, setExploreWebSearchEnabled] = useState(false);
+  const [providers, setProviders] = useState<ProviderInfo[]>([]);
+  const [appSettings, setAppSettings] = useState<AppSettings | null>(null);
+  const [openedChangedFiles, setOpenedChangedFiles] = useState<Set<string>>(() => new Set());
   const [interruptedOp, setInterruptedOp] = useState<InterruptedCheck | null>(null);
   const [dragOver, setDragOver] = useState(false);
   const [linkGraph, setLinkGraph] = useState<LinkGraph>({});
   const [connectionsOpen, setConnectionsOpen] = useState(false);
   const [pendingAnchor, setPendingAnchor] = useState<string | null>(null);
   const [viewMode, setViewMode] = useState<"page" | "graph">("page");
+  const [centerTabs, setCenterTabs] = useState<CenterTab[]>(() => [
+    workspaceCenterTab("index.md"),
+  ]);
+  const [activeCenterTabId, setActiveCenterTabId] = useState("workspace:index.md");
   const [showSettings, setShowSettings] = useState(false);
   const [leftPanelWidth, setLeftPanelWidth] = useState(() =>
     readStoredPanelWidth(
       LEFT_PANEL_WIDTH_KEY,
+      LEGACY_LEFT_PANEL_WIDTH_KEY,
       DEFAULT_LEFT_PANEL_WIDTH,
       MIN_LEFT_PANEL_WIDTH,
       MAX_LEFT_PANEL_WIDTH,
@@ -296,10 +944,17 @@ function App() {
   const [rightPanelWidth, setRightPanelWidth] = useState(() =>
     readStoredPanelWidth(
       RIGHT_PANEL_WIDTH_KEY,
+      LEGACY_RIGHT_PANEL_WIDTH_KEY,
       DEFAULT_RIGHT_PANEL_WIDTH,
       MIN_RIGHT_PANEL_WIDTH,
       MAX_RIGHT_PANEL_WIDTH,
     ),
+  );
+  const [leftPanelCollapsed, setLeftPanelCollapsed] = useState(() =>
+    readStoredPanelCollapsed(LEFT_PANEL_COLLAPSED_KEY, LEGACY_LEFT_PANEL_COLLAPSED_KEY),
+  );
+  const [rightPanelCollapsed, setRightPanelCollapsed] = useState(() =>
+    readStoredPanelCollapsed(RIGHT_PANEL_COLLAPSED_KEY, LEGACY_RIGHT_PANEL_COLLAPSED_KEY),
   );
   const [pptxRender, setPptxRender] = useState<{
     sourcePath: string;
@@ -307,11 +962,222 @@ function App() {
     pdfPath?: string;
     error?: string;
   } | null>(null);
-  const isBuilding = busy === "Building wiki";
-  const isAskingWiki = busy === "Asking wiki";
+  const exploreChatMessages = chatThread?.messages ?? [];
+  const latestExploreChatMessage = exploreChatMessages[exploreChatMessages.length - 1];
+  const runningChatSummaryCount = useMemo(
+    () =>
+      chatThreads.filter(
+        (thread) => normalizeThreadActivityStatus(thread.activityStatus) === "running",
+      ).length,
+    [chatThreads],
+  );
+  const runningMaintainSummaryCount = useMemo(
+    () =>
+      maintainThreads.filter(
+        (thread) => normalizeThreadActivityStatus(thread.activityStatus) === "running",
+      ).length,
+    [maintainThreads],
+  );
+  const currentChatSummary = chatThreads.find((thread) => thread.id === chatThread?.id);
+  const chatSummaryWikiUpdateRunning = Boolean(
+    currentChatSummary &&
+      normalizeThreadActivityStatus(currentChatSummary.activityStatus) === "running" &&
+      currentChatSummary.operationType === "apply-chat",
+  );
+  const workspaceWikiUpdateRunning = Boolean(
+    workspaceOperationProgress?.running && workspaceOperationProgress.operationType === "apply-chat",
+  );
+  const isWikiUpdateRunning =
+    wikiUpdateBusy || chatSummaryWikiUpdateRunning || workspaceWikiUpdateRunning;
+  const activeExploreRunId = exploreChatMessages
+    .slice()
+    .reverse()
+    .find((message) => message.role === "assistant" && message.status === "streaming" && message.runId)
+    ?.runId;
+  const buildOperationRunning = Boolean(
+    workspaceOperationProgress?.running && workspaceOperationProgress.operationType === "build-wiki",
+  );
+  const isStartingBuild = busy === "Starting wiki build";
+  const isBuilding = isStartingBuild || backgroundBuildActive || buildOperationRunning;
+  const workspaceBuildProgressActive =
+    workspaceOperationProgress?.operationType === "build-wiki" &&
+    workspaceOperationProgress.running;
+  const workspaceBuildProgressFailed = Boolean(
+    workspaceOperationProgress?.operationType === "build-wiki" &&
+      (workspaceOperationProgress.error ||
+        workspaceOperationProgress.events.some(
+          (event) =>
+            event.kind === "error" || event.status === "failed" || event.status === "error",
+        )),
+  );
+  const showBuildOperationFeed =
+    isStartingBuild ||
+    workspaceBuildProgressActive ||
+    (backgroundBuildActive && workspaceOperationProgress?.running !== false) ||
+    workspaceBuildProgressFailed;
+  const isAskingWiki = exploreChatMessages.some((message) => message.status === "streaming");
+  const isStartingExplore = busy === "Starting chat";
+  const exploreBusy = isStartingExplore || isAskingWiki;
+  const currentMaintainTaskId =
+    selectedMaintainTaskId ?? maintainTaskIdFromOperationType(maintainThread?.operationType);
+  const selectedMaintainTask = currentMaintainTaskId
+    ? MAINTAIN_TASK_BY_ID[currentMaintainTaskId]
+    : null;
+  const currentMaintainSummary = maintainThreads.find((thread) => thread.id === maintainThread?.id);
+  const currentMaintainSummaryRunning =
+    normalizeThreadActivityStatus(currentMaintainSummary?.activityStatus) === "running";
+  const workspaceMaintainOperationRunning = Boolean(
+    selectedMaintainTask &&
+      workspaceOperationProgress?.running &&
+      maintainThread?.operationType &&
+      workspaceOperationProgress.operationType === maintainThread.operationType &&
+      (!maintainThread.operationId ||
+        workspaceOperationProgress.operationId === maintainThread.operationId),
+  );
+  const isMaintainOperationRunning = Boolean(
+    selectedMaintainTask &&
+      (busy === selectedMaintainTask.busyLabel ||
+        currentMaintainSummaryRunning ||
+        workspaceMaintainOperationRunning),
+  );
+  const workspaceWriteBusy =
+    isBuilding || isMaintainOperationRunning || isWikiUpdateRunning;
+  const blockingUiBusy = Boolean(
+    busy && !isStartingBuild && !isStartingExplore && !isMaintainOperationRunning,
+  );
+  const writeActionBlocked = workspaceWriteBusy || exploreBusy || blockingUiBusy;
+  const anyOperationBusy = writeActionBlocked;
+  const activeWorkspaceWriteLabel = isBuilding
+    ? "Build wiki"
+    : isWikiUpdateRunning
+      ? "Update wiki from chat"
+      : isMaintainOperationRunning && selectedMaintainTask
+        ? selectedMaintainTask.label
+        : null;
+  const activeOperationLabel = activeWorkspaceWriteLabel ?? (exploreBusy ? "Explore Chat" : busy);
+  const changedFiles =
+    workspace.changedMarker?.changedFiles ?? workspace.changedMarker?.allChangedFiles ?? [];
+  const reviewableChangedFiles = changedFiles.filter(isPendingReviewChange);
+  const hasPendingGeneratedChanges =
+    reviewableChangedFiles.length > 0 && !workspace.changedMarker?.undoneAt;
 
-  const changedFiles = workspace.changedMarker?.changedFiles ?? [];
-  const rawSources = workspace.rawSources ?? [];
+  function actionPhrase(action: BlockedAction): string {
+    switch (action) {
+      case "build":
+        return "building the wiki";
+      case "maintain":
+        return "running Maintain";
+      case "update-wiki":
+        return "updating the wiki";
+      case "explore":
+        return "asking chat";
+      case "review":
+        return "finishing review";
+      case "undo":
+        return "undoing the last operation";
+      case "reset":
+        return "resetting the sample workspace";
+      case "source-import":
+        return "importing sources";
+      case "source-remove":
+        return "removing sources";
+    }
+    return "continuing";
+  }
+
+  function getBlockedReason(action: BlockedAction): string | null {
+    if (action === "explore") {
+      if (exploreBusy) {
+        return "Explore Chat is already answering. Wait for it to finish before asking another question.";
+      }
+      if (blockingUiBusy && activeOperationLabel) {
+        return `${activeOperationLabel} is running. Wait for it to finish before asking chat.`;
+      }
+      return null;
+    }
+
+    if (activeWorkspaceWriteLabel) {
+      if (action === "build") {
+        return activeWorkspaceWriteLabel === "Build wiki"
+          ? "Build wiki is already running."
+          : `${activeWorkspaceWriteLabel} is running. Wait for it to finish before building the wiki.`;
+      }
+      if (action === "maintain") {
+        return `${activeWorkspaceWriteLabel} is running. Wait for it to finish before running Maintain.`;
+      }
+      if (action === "update-wiki") {
+        return `${activeWorkspaceWriteLabel} is running. Chat can answer, but wiki changes can be applied after it finishes.`;
+      }
+      return `${activeWorkspaceWriteLabel} is running. Wait for it to finish before ${actionPhrase(action)}.`;
+    }
+
+    if (exploreBusy) {
+      return `Explore Chat is answering. Wait for it to finish before ${actionPhrase(action)}.`;
+    }
+
+    if (blockingUiBusy && activeOperationLabel) {
+      return `${activeOperationLabel} is running. Wait for it to finish before ${actionPhrase(action)}.`;
+    }
+
+    if (hasPendingGeneratedChanges && action !== "review" && action !== "undo") {
+      return "Finish reviewing or undo generated changes before starting another workspace-changing action.";
+    }
+
+    return null;
+  }
+
+  const buildBlockedReason = getBlockedReason("build");
+  const maintainBlockedReason = getBlockedReason("maintain");
+  const updateWikiBlockedReason = getBlockedReason("update-wiki");
+  const exploreBlockedReason = getBlockedReason("explore");
+  const reviewBlockedReason = getBlockedReason("review");
+  const undoBlockedReason = getBlockedReason("undo");
+  const resetBlockedReason = getBlockedReason("reset");
+  const sourceImportBlockedReason = getBlockedReason("source-import");
+  const sourceRemoveBlockedReason = getBlockedReason("source-remove");
+  const workspaceUpdateExploreNotice = activeWorkspaceWriteLabel
+    ? "A workspace update is running. Chat can answer from the current saved files, but may not include changes still being generated."
+    : null;
+  const showRightTopbarStop = isMaintainOperationRunning || isWikiUpdateRunning;
+  const isRightTopbarBusy = showRightTopbarStop;
+  const maintainCanRun = Boolean(
+    workspace.workspacePath &&
+      maintainThread &&
+      !maintainThread.operationType &&
+      selectedMaintainTask &&
+      !maintainBlockedReason &&
+      (!selectedMaintainTask.requiresInstruction || maintainInstruction.trim()),
+  );
+
+  const maintainOperationIsCurrent = Boolean(
+    maintainThread?.operationId &&
+      workspace.changedMarker?.operationId &&
+      maintainThread.operationId === workspace.changedMarker.operationId,
+  );
+  const maintainThreadMessages = maintainThread?.messages ?? [];
+  const visibleMaintainThreadMessages = useMemo(
+    () =>
+      maintainThread?.operationType
+        ? maintainThreadMessages.filter(
+            (message, index) =>
+              index !== maintainThreadMessages.length - 1 ||
+              message.role !== "assistant" ||
+              !isGenericMaintainCompletionMessage(message.text),
+          )
+        : maintainThreadMessages,
+    [maintainThread?.operationType, maintainThreadMessages],
+  );
+  const maintainContextLabel = maintainThread?.operationType
+    ? operationTypeLabel(maintainThread.operationType)
+    : "New task";
+  const sourceStatus = workspace.sourceStatus;
+  const pendingSourceFiles = useMemo(
+    () => (sourceStatus?.files ?? []).filter((file) => file.state !== "unchanged"),
+    [sourceStatus?.files],
+  );
+  const pendingSourceCount = sourceStatus?.pendingCount ?? pendingSourceFiles.length;
+  const rootFiles = workspace.rootFiles ?? [];
+  const sourceFiles = workspace.sourceFiles ?? [];
   const wikiPages = useMemo(
     () => workspace.wikiFiles.filter((file) => file.endsWith(".md")),
     [workspace.wikiFiles],
@@ -323,20 +1189,151 @@ function App() {
       ),
     [workspace.wikiFiles],
   );
-  const availableDocuments = useMemo(
-    () => ["index.md", ...workspace.wikiFiles, ...workspace.rawSources, "log.md"],
-    [workspace.wikiFiles, workspace.rawSources],
+  const sidebarWikiFiles = useMemo(
+    () => workspace.wikiFiles.filter((file) => !file.startsWith("wiki/assets/")),
+    [workspace.wikiFiles],
   );
-  const canUndo = changedFiles.length > 0 && !workspace.changedMarker?.undoneAt;
-  const hasPendingGeneratedChanges = canUndo;
-  const canRemoveRawSources = changedFiles.length === 0 || Boolean(workspace.changedMarker?.undoneAt);
+  const maintainChangedFiles =
+    maintainThread?.operationType && !maintainOperationIsCurrent
+      ? (maintainThread.changedFiles ?? [])
+      : reviewableChangedFiles;
+  const reviewedChangedCount = reviewableChangedFiles.filter(
+    (file) => openedChangedFiles.has(file.path) || selectedPath === file.path,
+  ).length;
+  const unreviewedChangedFiles = useMemo(
+    () =>
+      reviewableChangedFiles.filter(
+        (file) => !openedChangedFiles.has(file.path) && selectedPath !== file.path,
+      ),
+    [openedChangedFiles, reviewableChangedFiles, selectedPath],
+  );
+  const finishReviewBlockedReason = reviewBlockedReason;
+  const availableDocuments = useMemo(
+    () => Array.from(new Set([...rootFiles, ...workspace.wikiFiles, ...workspace.sourceFiles])),
+    [rootFiles, workspace.wikiFiles, workspace.sourceFiles],
+  );
+  const activeCenterTab = useMemo(
+    () => centerTabs.find((tab) => tab.id === activeCenterTabId) ?? centerTabs[0],
+    [activeCenterTabId, centerTabs],
+  );
+  const activeReportContent =
+    activeCenterTab?.kind === "report" ? activeCenterTab.content : null;
+  const canUndo = hasPendingGeneratedChanges;
+  const hasPendingSourceChanges = pendingSourceCount > 0;
+  const looksLikeExistingWikiImport = Boolean(
+    workspace.workspacePath &&
+      sourceStatus &&
+      !sourceStatus.manifestExists &&
+      !sourceStatus.lastBuiltAt &&
+      sourceFiles.length > 0 &&
+      wikiPages.length > 0 &&
+      pendingSourceFiles.length === sourceFiles.length &&
+      pendingSourceFiles.every((file) => file.state === "new"),
+  );
+  const shouldAskFirstBuildContext = Boolean(
+    workspace.workspacePath &&
+      sourceStatus &&
+      !sourceStatus.manifestExists &&
+      !sourceStatus.lastBuiltAt &&
+      wikiPages.length === 0,
+  );
+  const canRemoveSourceFiles = !hasPendingGeneratedChanges;
+  const pendingReviewOperationId = workspace.changedMarker?.operationId ?? null;
+  const changedFileMap = useMemo(() => {
+    const map = new Map<string, ChangedFile>();
+    for (const file of unreviewedChangedFiles) {
+      map.set(file.path, file);
+    }
+    return map;
+  }, [unreviewedChangedFiles]);
+  const activeProvider = useMemo(
+    () => providers.find((provider) => provider.name === appSettings?.provider) ?? providers[0],
+    [appSettings?.provider, providers],
+  );
+  const providerSetup = useProviderSetup(activeProvider?.name ?? null, Boolean(activeProvider));
+  const activeProviderReady = providerSetup.ready;
+  const activeModelId = activeProvider
+    ? appSettings?.models[activeProvider.name] || activeProvider.defaultModel
+    : "";
+  const activeModel = activeProvider?.supportedModels.find((model) => model.id === activeModelId);
+  const activeModelChoiceValue = activeProvider ? `${activeProvider.name}:${activeModelId}` : "";
+  const buildDraftProvider = buildDraft
+    ? providers.find((provider) => provider.name === buildDraft.provider) ?? activeProvider
+    : activeProvider;
+  const buildDraftModelId = buildDraftProvider
+    ? buildDraft?.model ||
+      appSettings?.models[buildDraftProvider.name] ||
+      buildDraftProvider.defaultModel
+    : "";
+  const buildDraftModel = buildDraftProvider?.supportedModels.find(
+    (model) => model.id === buildDraftModelId,
+  );
+  const buildModelChoiceValue = buildDraftProvider
+    ? `${buildDraftProvider.name}:${buildDraftModelId}`
+    : "";
+  const buildProviderSetup = useProviderSetup(
+    buildDraftProvider?.name ?? null,
+    Boolean(buildDraft && buildDraftProvider),
+  );
+  const selectedBuildProviderSetup =
+    buildDraftProvider?.name === activeProvider?.name ? providerSetup : buildProviderSetup;
+  const selectedBuildProviderReady =
+    buildDraftProvider?.name === activeProvider?.name
+      ? activeProviderReady
+      : buildProviderSetup.ready;
+  const chatRunningSteps = useMemo(() => {
+    const providerName = activeProvider ? displayProviderName(activeProvider) : "AI";
+    return [
+      "Preparing context",
+      "Reading selected page",
+      "Checking recent chat",
+      `Asking ${providerName}`,
+      "Writing answer",
+    ];
+  }, [activeProvider]);
+  const chatRunningLabel =
+    chatRunningSteps[chatStatusStep % chatRunningSteps.length] ?? "Thinking";
+  const buildRunningLabel =
+    BUILD_WIKI_STEPS[buildStatusStep % BUILD_WIKI_STEPS.length] ?? "Building wiki";
+  const buildFallbackActiveStep = Math.min(buildStatusStep, BUILD_WIKI_STEPS.length - 1);
+  const maintainRunningSteps = selectedMaintainTask?.runningSteps ?? [];
+  const maintainActiveStep = maintainRunningSteps.length
+    ? Math.min(maintainStatusStep, maintainRunningSteps.length - 1)
+    : 0;
+  const maintainRunningLabel =
+    (maintainRunningSteps.length
+      ? maintainRunningSteps[maintainStatusStep % maintainRunningSteps.length]
+      : null) ??
+    selectedMaintainTask?.busyLabel ??
+    "Maintaining wiki";
+  const wikiUpdateActiveStep = Math.min(wikiUpdateStatusStep, WIKI_UPDATE_STEPS.length - 1);
+  const wikiUpdateRunningLabel = WIKI_UPDATE_STEPS[wikiUpdateActiveStep] ?? "Updating wiki";
   const statusLabel = useMemo(() => {
+    if (isBuilding) return "Building wiki";
+    if (isMaintainOperationRunning && selectedMaintainTask) return selectedMaintainTask.busyLabel;
+    if (isWikiUpdateRunning) return "Updating wiki";
+    if (exploreBusy) return isStartingExplore ? "Starting chat" : "Explore Chat";
     if (busy) return busy;
     if (workspace.changedMarker?.undoneAt) return "Undone";
-    if (changedFiles.length > 0) return "Changes ready";
-    if (workspace.indexMd) return "Clean";
+    if (reviewableChangedFiles.length > 0) {
+      if (unreviewedChangedFiles.length === 0) return "Generated changes reviewed";
+      return `${unreviewedChangedFiles.length} generated change${unreviewedChangedFiles.length === 1 ? "" : "s"} to review`;
+    }
+    if (workspace.indexMd) return null;
     return "Not loaded";
-  }, [busy, changedFiles.length, workspace.changedMarker?.undoneAt, workspace.indexMd]);
+  }, [
+    busy,
+    exploreBusy,
+    isBuilding,
+    isMaintainOperationRunning,
+    isStartingExplore,
+    reviewableChangedFiles.length,
+    selectedMaintainTask,
+    unreviewedChangedFiles.length,
+    isWikiUpdateRunning,
+    workspace.changedMarker?.undoneAt,
+    workspace.indexMd,
+  ]);
 
   const workspaceName = useMemo(() => {
     if (!workspace.workspacePath) return "";
@@ -350,9 +1347,20 @@ function App() {
   );
 
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(
-    () => new Set(["raw", "wiki"]),
+    () => new Set(["sources", "wiki"]),
   );
-  const bodyGridTemplateColumns = `${leftPanelWidth}px ${RESIZE_HANDLE_WIDTH}px minmax(${MIN_CENTER_PANEL_WIDTH}px, 1fr) ${RESIZE_HANDLE_WIDTH}px ${rightPanelWidth}px`;
+  const bodyGridTemplateColumns = `${
+    leftPanelCollapsed ? 0 : leftPanelWidth
+  }px ${leftPanelCollapsed ? 0 : RESIZE_HANDLE_WIDTH}px minmax(${MIN_CENTER_PANEL_WIDTH}px, 1fr) ${
+    rightPanelCollapsed ? 0 : RESIZE_HANDLE_WIDTH
+  }px ${rightPanelCollapsed ? 0 : rightPanelWidth}px`;
+  const topbarGridTemplateColumns = `${leftPanelCollapsed ? COLLAPSED_LEFT_HEADER_WIDTH : leftPanelWidth}px minmax(${MIN_CENTER_PANEL_WIDTH}px, 1fr) ${
+    rightPanelCollapsed
+      ? isRightTopbarBusy
+        ? COLLAPSED_RIGHT_HEADER_BUSY_WIDTH
+        : COLLAPSED_RIGHT_HEADER_WIDTH
+      : rightPanelWidth
+  }px`;
 
   function startPanelResize(
     panel: "left" | "right",
@@ -360,6 +1368,9 @@ function App() {
   ) {
     const body = appBodyRef.current;
     if (!body) return;
+    if ((panel === "left" && leftPanelCollapsed) || (panel === "right" && rightPanelCollapsed)) {
+      return;
+    }
 
     event.preventDefault();
     event.currentTarget.setPointerCapture(event.pointerId);
@@ -368,9 +1379,13 @@ function App() {
     document.body.classList.add("panel-resizing");
 
     function resizePanel(moveEvent: PointerEvent) {
-      const availableWidth = rect.width - MIN_CENTER_PANEL_WIDTH - RESIZE_HANDLE_WIDTH * 2;
+      const leftFootprint = leftPanelCollapsed ? 0 : leftPanelWidth + RESIZE_HANDLE_WIDTH;
+      const rightFootprint = rightPanelCollapsed ? 0 : rightPanelWidth + RESIZE_HANDLE_WIDTH;
       if (panel === "left") {
-        const maxLeft = Math.min(MAX_LEFT_PANEL_WIDTH, availableWidth - rightPanelWidth);
+        const maxLeft = Math.min(
+          MAX_LEFT_PANEL_WIDTH,
+          rect.width - MIN_CENTER_PANEL_WIDTH - RESIZE_HANDLE_WIDTH - rightFootprint,
+        );
         const nextLeft = clampNumber(
           moveEvent.clientX - rect.left,
           MIN_LEFT_PANEL_WIDTH,
@@ -381,7 +1396,10 @@ function App() {
         return;
       }
 
-      const maxRight = Math.min(MAX_RIGHT_PANEL_WIDTH, availableWidth - leftPanelWidth);
+      const maxRight = Math.min(
+        MAX_RIGHT_PANEL_WIDTH,
+        rect.width - MIN_CENTER_PANEL_WIDTH - RESIZE_HANDLE_WIDTH - leftFootprint,
+      );
       const nextRight = clampNumber(
         rect.right - moveEvent.clientX,
         MIN_RIGHT_PANEL_WIDTH,
@@ -403,6 +1421,32 @@ function App() {
     window.addEventListener("pointercancel", stopResize);
   }
 
+  function toggleLeftPanelCollapsed() {
+    setLeftPanelCollapsed((collapsed) => {
+      const next = !collapsed;
+      window.localStorage.setItem(LEFT_PANEL_COLLAPSED_KEY, String(next));
+      return next;
+    });
+  }
+
+  function toggleRightPanelCollapsed() {
+    setRightPanelCollapsed((collapsed) => {
+      const next = !collapsed;
+      window.localStorage.setItem(RIGHT_PANEL_COLLAPSED_KEY, String(next));
+      return next;
+    });
+  }
+
+  function toggleWindowMaximize() {
+    getCurrentWindow().toggleMaximize().catch(() => {});
+  }
+
+  function startWindowDrag(event: ReactMouseEvent<HTMLElement>) {
+    if (event.button !== 0 || event.detail > 1) return;
+    event.preventDefault();
+    getCurrentWindow().startDragging().catch(() => {});
+  }
+
   function toggleFolder(path: string) {
     setExpandedFolders((prev) => {
       const next = new Set(prev);
@@ -412,18 +1456,162 @@ function App() {
     });
   }
 
-  const rawTree = useMemo(() => buildTree(rawSources, "raw/"), [rawSources]);
-  const wikiTree = useMemo(() => buildTree(workspace.wikiFiles, "wiki/"), [workspace.wikiFiles]);
+  function openWorkspaceFile(path: string) {
+    const tab = workspaceCenterTab(path);
+    setSelectedPath(path);
+    setViewMode("page");
+    setActiveCenterTabId(tab.id);
+    setCenterTabs((prev) => {
+      if (prev.some((item) => item.id === tab.id)) return prev;
+      return [...prev, tab];
+    });
+    if (!changedFileMap.has(path)) return;
+    setOpenedChangedFiles((prev) => {
+      if (prev.has(path)) return prev;
+      const next = new Set(prev);
+      next.add(path);
+      return next;
+    });
+  }
+
+  function canOpenDocumentReference(reference: string | null | undefined, currentPath = selectedPath) {
+    return Boolean(
+      reference && resolveWorkspaceDocumentReference(reference, currentPath, availableDocuments),
+    );
+  }
+
+  function openDocumentReference(reference: string | null | undefined, currentPath = selectedPath) {
+    if (!reference) return false;
+    const target = resolveWorkspaceDocumentReference(reference, currentPath, availableDocuments);
+    if (!target) return false;
+    openWorkspaceFile(target.path);
+    setPendingAnchor(target.anchor);
+    return true;
+  }
+
+  function openWorkspaceDocument(path: string, anchor: string | null = null) {
+    openWorkspaceFile(path);
+    setPendingAnchor(anchor);
+  }
+
+  function openGraphTab() {
+    const tab = graphCenterTab();
+    setViewMode("graph");
+    setActiveCenterTabId(tab.id);
+    setCenterTabs((prev) => {
+      if (prev.some((item) => item.id === tab.id)) return prev;
+      return [...prev, tab];
+    });
+  }
+
+  function openReportTab() {
+    if (!workspace.reportMd) return;
+    const operationId =
+      maintainThread?.operationId ??
+      workspace.changedMarker?.operationId ??
+      `report-${Date.now()}`;
+    const tab = reportCenterTab(operationId, workspace.reportMd);
+    setViewMode("page");
+    setActiveCenterTabId(tab.id);
+    setCenterTabs((prev) => {
+      const withoutExisting = prev.filter((item) => item.id !== tab.id);
+      return [...withoutExisting, tab];
+    });
+  }
+
+  function markChatThreadSeen(thread: Pick<ChatThread, "id" | "updatedAt">) {
+    if (!workspace.workspacePath) return;
+    setSeenChatThreadUpdates((current) => {
+      if (current[thread.id] === thread.updatedAt) return current;
+      const next = { ...current, [thread.id]: thread.updatedAt };
+      writeSeenThreadMap(SEEN_CHAT_THREADS_KEY, workspace.workspacePath, next);
+      return next;
+    });
+  }
+
+  function markMaintainThreadSeen(thread: Pick<ChatThread, "id" | "updatedAt">) {
+    if (!workspace.workspacePath) return;
+    setSeenMaintainThreadUpdates((current) => {
+      if (current[thread.id] === thread.updatedAt) return current;
+      const next = { ...current, [thread.id]: thread.updatedAt };
+      writeSeenThreadMap(SEEN_MAINTAIN_THREADS_KEY, workspace.workspacePath, next);
+      return next;
+    });
+  }
+
+  async function refreshChatHistorySummaries() {
+    const summaries = await invoke<ChatThreadSummary[]>("list_chat_threads");
+    setChatThreads(summaries);
+    return summaries;
+  }
+
+  async function refreshMaintainHistorySummaries() {
+    const summaries = await invoke<ChatThreadSummary[]>("list_maintain_threads");
+    setMaintainThreads(summaries);
+    return summaries;
+  }
+
+  function activateCenterTab(tab: CenterTab) {
+    setActiveCenterTabId(tab.id);
+    if (tab.kind === "workspace") {
+      setSelectedPath(tab.path);
+      setViewMode("page");
+    } else if (tab.kind === "graph") {
+      setViewMode("graph");
+    } else {
+      setViewMode("page");
+    }
+  }
+
+  function closeCenterTab(tabId: string) {
+    setCenterTabs((prev) => {
+      const index = prev.findIndex((tab) => tab.id === tabId);
+      if (index === -1) return prev;
+      const next = prev.filter((tab) => tab.id !== tabId);
+      if (next.length === 0) {
+        const fallback = workspaceCenterTab("index.md");
+        setActiveCenterTabId(fallback.id);
+        setSelectedPath("index.md");
+        setViewMode("page");
+        return [fallback];
+      }
+      if (activeCenterTabId === tabId) {
+        const fallback = next[Math.max(0, index - 1)];
+        setActiveCenterTabId(fallback.id);
+        if (fallback.kind === "workspace") {
+          setSelectedPath(fallback.path);
+          setViewMode("page");
+        } else if (fallback.kind === "graph") {
+          setViewMode("graph");
+        } else {
+          setViewMode("page");
+        }
+      }
+      return next;
+    });
+  }
+
+  const sourceTree = useMemo(() => buildTree(sourceFiles, "sources/"), [sourceFiles]);
+  const wikiTree = useMemo(() => buildTree(sidebarWikiFiles, "wiki/"), [sidebarWikiFiles]);
+  const rootFileNodes = useMemo(
+    () =>
+      rootFiles.map((file, index) => ({
+        name: file,
+        path: file,
+        isDir: false,
+        children: [],
+        sectionStart: index === 0,
+      })),
+    [rootFiles],
+  );
   const workspaceTree = useMemo(
     () => [
-      { name: "raw", path: "raw", isDir: true, children: rawTree },
-      { name: "wiki", path: "wiki", isDir: true, children: wikiTree },
-      { name: "index.md", path: "index.md", isDir: false, children: [] },
-      { name: "log.md", path: "log.md", isDir: false, children: [] },
+      { name: "sources", path: "sources", isDir: true, children: sourceTree },
+      { name: "wiki", path: "wiki", isDir: true, children: wikiTree, sectionStart: true },
+      ...rootFileNodes,
     ],
-    [rawTree, wikiTree],
+    [sourceTree, rootFileNodes, wikiTree],
   );
-
 
   useEffect(() => {
     const saved = localStorage.getItem("workspacePath");
@@ -445,30 +1633,492 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (!isBuilding) return;
-    const intervalId = setInterval(async () => {
+    setOpenedChangedFiles(new Set());
+  }, [
+    workspace.workspacePath,
+    workspace.changedMarker?.operationId,
+    workspace.changedMarker?.completedAt,
+    workspace.changedMarker?.undoneAt,
+  ]);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
       try {
-        const runner = await invoke<RunnerOutput>("read_build_progress");
-        const progress = parseRunnerJson<BuildProgress>(runner);
-        if (progress?.events) {
-          const codexMessages = parseEventsToMessages(progress.events);
-          setChatMessages((prev) => {
-            const userMessages = prev.filter((m) => m.kind === "user" || m.kind === "system");
-            return [...userMessages, ...codexMessages];
-          });
-        }
+        const [providerList, settings] = await Promise.all([
+          invoke<ProviderInfo[]>("list_providers"),
+          invoke<AppSettings>("get_settings"),
+        ]);
+        if (cancelled) return;
+        setProviders(providerList);
+        setAppSettings(settings);
       } catch (_error) {}
-    }, 1500);
-    return () => clearInterval(intervalId);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    function targetIsInside(target: EventTarget | null, elements: Array<HTMLElement | null>) {
+      return target instanceof Node && elements.some((element) => element?.contains(target));
+    }
+
+    function closeTopbarMenus(target?: EventTarget | null) {
+      if (
+        topbarWorkspaceMenuRef.current?.open &&
+        !targetIsInside(target ?? null, [topbarWorkspaceMenuRef.current])
+      ) {
+        topbarWorkspaceMenuRef.current.open = false;
+      }
+      if (
+        topbarMenuRef.current?.open &&
+        !targetIsInside(target ?? null, [topbarMenuRef.current])
+      ) {
+        topbarMenuRef.current.open = false;
+      }
+    }
+
+    function handlePointerDown(event: PointerEvent) {
+      closeTopbarMenus(event.target);
+      if (
+        chatHistoryOpen &&
+        !targetIsInside(event.target, [chatHistoryButtonRef.current, chatHistoryPopoverRef.current])
+      ) {
+        setChatHistoryOpen(false);
+      }
+      if (
+        maintainHistoryOpen &&
+        !targetIsInside(event.target, [
+          maintainHistoryButtonRef.current,
+          maintainHistoryPopoverRef.current,
+        ])
+      ) {
+        setMaintainHistoryOpen(false);
+      }
+      if (connectionsOpen && !targetIsInside(event.target, [centerConnectionsRef.current])) {
+        setConnectionsOpen(false);
+      }
+    }
+
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key !== "Escape") return;
+      closeTopbarMenus();
+      setChatHistoryOpen(false);
+      setMaintainHistoryOpen(false);
+      setConnectionsOpen(false);
+    }
+
+    document.addEventListener("pointerdown", handlePointerDown);
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", handlePointerDown);
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [chatHistoryOpen, connectionsOpen, maintainHistoryOpen]);
+
+  useEffect(() => {
+    if (!workspace.workspacePath) {
+      setChatThread(null);
+      setChatThreads([]);
+      setSeenChatThreadUpdates({});
+      setMaintainThread(null);
+      setMaintainThreads([]);
+      setSeenMaintainThreadUpdates({});
+      setWorkspaceOperationProgress(null);
+      setBackgroundBuildActive(false);
+      setBackgroundBuildStartedAt(null);
+      handledBuildOperationIdRef.current = null;
+      setChatRunProgressById({});
+      return;
+    }
+    setBackgroundBuildActive(false);
+    setBackgroundBuildStartedAt(null);
+    handledBuildOperationIdRef.current = null;
+    setCenterTabs([workspaceCenterTab("index.md")]);
+    setActiveCenterTabId("workspace:index.md");
+    setSelectedPath("index.md");
+    setViewMode("page");
+    let cancelled = false;
+    (async () => {
+      try {
+        const [thread, summaries, maintainThread, maintainSummaries] = await Promise.all([
+          invoke<ChatThread>("read_current_chat_thread"),
+          invoke<ChatThreadSummary[]>("list_chat_threads"),
+          invoke<ChatThread>("read_current_maintain_thread"),
+          invoke<ChatThreadSummary[]>("list_maintain_threads"),
+        ]);
+        if (cancelled) return;
+        setChatThread(thread);
+        setChatThreads(summaries);
+        setMaintainThread(maintainThread);
+        setMaintainThreads(maintainSummaries);
+        const seenChats = readSeenThreadMap(
+          SEEN_CHAT_THREADS_KEY,
+          workspace.workspacePath,
+          summaries,
+        );
+        const seenMaintain = readSeenThreadMap(
+          SEEN_MAINTAIN_THREADS_KEY,
+          workspace.workspacePath,
+          maintainSummaries,
+        );
+        seenChats[thread.id] = thread.updatedAt;
+        seenMaintain[maintainThread.id] = maintainThread.updatedAt;
+        writeSeenThreadMap(SEEN_CHAT_THREADS_KEY, workspace.workspacePath, seenChats);
+        writeSeenThreadMap(SEEN_MAINTAIN_THREADS_KEY, workspace.workspacePath, seenMaintain);
+        setSeenChatThreadUpdates(seenChats);
+        setSeenMaintainThreadUpdates(seenMaintain);
+        const taskId = maintainTaskIdFromOperationType(maintainThread.operationType);
+        const maintainSummary = maintainSummaries.find((summary) => summary.id === maintainThread.id);
+        const maintainStatus = normalizeThreadActivityStatus(maintainSummary?.activityStatus);
+        setSelectedMaintainTaskId(taskId);
+        setMaintainStage(maintainStatus === "running" ? "running" : taskId ? "done" : "choose");
+      } catch (err) {
+        if (!cancelled) setError(`Failed to load chat history: ${String(err)}`);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [workspace.workspacePath]);
+
+  useEffect(() => {
+    if (!chatThread?.id || !isAskingWiki) return;
+    const intervalId = window.setInterval(async () => {
+      try {
+        const thread = await invoke<ChatThread>("read_chat_thread", {
+          threadId: chatThread.id,
+        });
+        setChatThread(thread);
+        if (!thread.messages.some((message) => message.status === "streaming")) {
+          markChatThreadSeen(thread);
+          await refreshChatHistorySummaries();
+        }
+      } catch (err) {
+        if (isMissingChatThreadError(err)) {
+          await recoverMissingChatThread().catch((recoverErr) => {
+            setError(`Failed to recover chat history: ${String(recoverErr)}`);
+          });
+        } else {
+          setError(`Failed to read chat progress: ${String(err)}`);
+        }
+      }
+    }, 700);
+    return () => window.clearInterval(intervalId);
+  }, [chatThread?.id, isAskingWiki]);
+
+  useEffect(() => {
+    if (
+      !workspace.workspacePath ||
+      !chatHistoryOpen ||
+      (runningChatSummaryCount === 0 && !wikiUpdateBusy && !isAskingWiki)
+    ) {
+      return;
+    }
+    let cancelled = false;
+    const readSummaries = async () => {
+      try {
+        const summaries = await invoke<ChatThreadSummary[]>("list_chat_threads");
+        if (!cancelled) setChatThreads(summaries);
+      } catch (err) {
+        if (!cancelled) setError(`Failed to refresh chat history: ${String(err)}`);
+      }
+    };
+    const intervalId = window.setInterval(readSummaries, 900);
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+    };
+  }, [workspace.workspacePath, chatHistoryOpen, runningChatSummaryCount, wikiUpdateBusy, isAskingWiki]);
+
+  useEffect(() => {
+    if (
+      !workspace.workspacePath ||
+      !maintainHistoryOpen ||
+      (runningMaintainSummaryCount === 0 && !isMaintainOperationRunning)
+    ) {
+      return;
+    }
+    let cancelled = false;
+    const readSummaries = async () => {
+      try {
+        const summaries = await invoke<ChatThreadSummary[]>("list_maintain_threads");
+        if (!cancelled) setMaintainThreads(summaries);
+      } catch (err) {
+        if (!cancelled) setError(`Failed to refresh maintain history: ${String(err)}`);
+      }
+    };
+    const intervalId = window.setInterval(readSummaries, 900);
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+    };
+  }, [
+    workspace.workspacePath,
+    maintainHistoryOpen,
+    runningMaintainSummaryCount,
+    isMaintainOperationRunning,
+  ]);
+
+  useEffect(() => {
+    if (!workspace.workspacePath) return;
+    if (!isBuilding && !isWikiUpdateRunning && !isMaintainOperationRunning) {
+      return;
+    }
+    let cancelled = false;
+    const readProgress = async () => {
+      try {
+        const progress = await invoke<OperationProgress>("read_workspace_operation_progress");
+        if (cancelled) return;
+        setWorkspaceOperationProgress((previous) => mergeOperationProgress(previous, progress));
+      } catch (err) {
+        if (!cancelled) setError(`Failed to read operation progress: ${String(err)}`);
+      }
+    };
+    void readProgress();
+    const intervalId = window.setInterval(readProgress, 900);
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+    };
+  }, [
+    workspace.workspacePath,
+    isBuilding,
+    isWikiUpdateRunning,
+    isMaintainOperationRunning,
+  ]);
+
+  useEffect(() => {
+    if (maintainStage !== "running") return;
+    if (selectedMaintainTask && busy === selectedMaintainTask.busyLabel) return;
+    if (currentMaintainSummaryRunning || workspaceMaintainOperationRunning) return;
+    setMaintainStage(currentMaintainTaskId ? "done" : "choose");
+  }, [
+    busy,
+    currentMaintainSummaryRunning,
+    currentMaintainTaskId,
+    maintainStage,
+    selectedMaintainTask,
+    workspaceMaintainOperationRunning,
+  ]);
+
+  useEffect(() => {
+    const progress = workspaceOperationProgress;
+    if (!backgroundBuildActive) return;
+    if (!progress || progress.operationType !== "build-wiki" || progress.running) return;
+    if (!progress.operationId || handledBuildOperationIdRef.current === progress.operationId) return;
+
+    let cancelled = false;
+    handledBuildOperationIdRef.current = progress.operationId;
+
+    (async () => {
+      try {
+        const state = await invoke<WorkspaceState>("load_workspace_state");
+        if (cancelled) return;
+        setWorkspace(state);
+        const nextPath = chooseDocumentAfterCommand("build_wiki", state);
+        if (nextPath) {
+          openWorkspaceFile(nextPath);
+        }
+      } catch (err) {
+        if (!cancelled) setError(`Failed to refresh completed build: ${String(err)}`);
+      } finally {
+        if (!cancelled) {
+          setBackgroundBuildActive(false);
+          setBackgroundBuildStartedAt(null);
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    backgroundBuildActive,
+    workspaceOperationProgress?.operationId,
+    workspaceOperationProgress?.operationType,
+    workspaceOperationProgress?.running,
+  ]);
+
+  useEffect(() => {
+    if (!backgroundBuildActive || !backgroundBuildStartedAt) return;
+    if (workspaceOperationProgress?.operationId || workspaceOperationProgress?.running) return;
+
+    let cancelled = false;
+    const timeoutId = window.setTimeout(async () => {
+      try {
+        const progress = await invoke<OperationProgress>("read_workspace_operation_progress");
+        if (cancelled) return;
+        setWorkspaceOperationProgress((previous) => mergeOperationProgress(previous, progress));
+        if (progress.operationId || progress.running) return;
+        setBackgroundBuildActive(false);
+        setBackgroundBuildStartedAt(null);
+        const state = await invoke<WorkspaceState>("load_workspace_state");
+        if (!cancelled) {
+          setWorkspace(state);
+          setError("Build wiki stopped before progress was reported. Check the operation setup and try again.");
+        }
+      } catch (err) {
+        if (cancelled) return;
+        setBackgroundBuildActive(false);
+        setBackgroundBuildStartedAt(null);
+        setError(`Failed to read background build progress: ${String(err)}`);
+      }
+    }, 10_000);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timeoutId);
+    };
+  }, [
+    backgroundBuildActive,
+    backgroundBuildStartedAt,
+    workspaceOperationProgress?.operationId,
+    workspaceOperationProgress?.running,
+  ]);
+
+  useEffect(() => {
+    if (!workspace.workspacePath || !activeExploreRunId) return;
+    setOpenFeedIds((previous) => {
+      if (previous.has(activeExploreRunId)) return previous;
+      const next = new Set(previous);
+      next.add(activeExploreRunId);
+      return next;
+    });
+    let cancelled = false;
+    const readProgress = async () => {
+      try {
+        const progress = await invoke<OperationProgress>("read_chat_run_progress", {
+          runId: activeExploreRunId,
+        });
+        if (cancelled) return;
+        setChatRunProgressById((previous) => ({
+          ...previous,
+          [activeExploreRunId]: mergeOperationProgress(previous[activeExploreRunId], progress),
+        }));
+      } catch (_err) {}
+    };
+    void readProgress();
+    const intervalId = window.setInterval(readProgress, 900);
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+    };
+  }, [activeExploreRunId, workspace.workspacePath]);
+
+  useEffect(() => {
+    if (!workspace.workspacePath || exploreChatMessages.length === 0) return;
+    const runIds = exploreChatMessages
+      .map((message) => message.runId)
+      .filter((runId): runId is string => Boolean(runId))
+      .slice(-6);
+    for (const runId of runIds) {
+      const progress = chatRunProgressById[runId];
+      const message = exploreChatMessages.find((item) => item.runId === runId);
+      if (progress && (!progress.running || message?.status === "streaming")) continue;
+      invoke<OperationProgress>("read_chat_run_progress", { runId })
+        .then((progress) => {
+          setChatRunProgressById((previous) => ({
+            ...previous,
+            [runId]: mergeOperationProgress(previous[runId], progress),
+          }));
+        })
+        .catch(() => {});
+    }
+  }, [chatRunProgressById, exploreChatMessages, workspace.workspacePath]);
+
+  useEffect(() => {
+    if (!isAskingWiki) {
+      setChatStatusStep(0);
+      return;
+    }
+
+    const intervalId = window.setInterval(() => {
+      setChatStatusStep((step) => step + 1);
+    }, 2600);
+    return () => window.clearInterval(intervalId);
+  }, [isAskingWiki]);
+
+  useEffect(() => {
+    if (!isBuilding) {
+      setBuildStatusStep(0);
+      return;
+    }
+
+    const intervalId = window.setInterval(() => {
+      setBuildStatusStep((step) => step + 1);
+    }, BUILD_WIKI_STEP_INTERVAL_MS);
+    return () => window.clearInterval(intervalId);
   }, [isBuilding]);
 
-  const hasPptxInRaw = useMemo(
-    () => rawSources.some((s) => s.toLowerCase().endsWith(".pptx")),
-    [rawSources],
+  useEffect(() => {
+    if (!isMaintainOperationRunning) {
+      setMaintainStatusStep(0);
+      return;
+    }
+
+    const intervalId = window.setInterval(() => {
+      setMaintainStatusStep((step) => step + 1);
+    }, MAINTAIN_STEP_INTERVAL_MS);
+    return () => window.clearInterval(intervalId);
+  }, [isMaintainOperationRunning]);
+
+  useEffect(() => {
+    if (!wikiUpdateBusy) {
+      setWikiUpdateStatusStep(0);
+      return;
+    }
+
+    const intervalId = window.setInterval(() => {
+      setWikiUpdateStatusStep((step) => Math.min(step + 1, WIKI_UPDATE_STEPS.length - 1));
+    }, 2200);
+    return () => window.clearInterval(intervalId);
+  }, [wikiUpdateBusy]);
+
+  useEffect(() => {
+    if (exploreChatMessages.length === 0 && !wikiUpdateRun) return;
+    const frameId = requestAnimationFrame(() => {
+      const messagesEl = exploreChatMessagesRef.current;
+      if (!messagesEl) return;
+      messagesEl.scrollTo({
+        top: messagesEl.scrollHeight,
+        behavior: isAskingWiki || wikiUpdateBusy ? "smooth" : "auto",
+      });
+    });
+    return () => cancelAnimationFrame(frameId);
+  }, [
+    chatThread?.id,
+    isAskingWiki,
+    latestExploreChatMessage?.id,
+    latestExploreChatMessage?.status,
+    latestExploreChatMessage?.text,
+    exploreChatMessages.length,
+    wikiUpdateBusy,
+    wikiUpdateRun,
+    wikiUpdateStatusStep,
+    workspaceOperationProgress?.events.length,
+    activeExploreRunId ? chatRunProgressById[activeExploreRunId]?.events.length : 0,
+  ]);
+
+  useEffect(() => {
+    if (!applyDraft) return;
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape" && !wikiUpdateBusy) {
+        setApplyDraft(null);
+      }
+    }
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [applyDraft, wikiUpdateBusy]);
+
+  const hasPptxInSources = useMemo(
+    () => sourceFiles.some((s) => s.toLowerCase().endsWith(".pptx")),
+    [sourceFiles],
   );
 
   useEffect(() => {
-    if (!hasPptxInRaw) return;
+    if (!hasPptxInSources) return;
     if (sofficeStatus) return;
     invoke<AppCommandResult>("check_soffice")
       .then((result) => {
@@ -476,7 +2126,7 @@ function App() {
         if (status) setSofficeStatus(status);
       })
       .catch(() => {});
-  }, [hasPptxInRaw, sofficeStatus]);
+  }, [hasPptxInSources, sofficeStatus]);
 
   useEffect(() => {
     if (!sofficeInstalling) return;
@@ -503,8 +2153,9 @@ function App() {
 
   useEffect(() => {
     if (!availableDocuments.includes(selectedPath)) {
-      setSelectedPath("index.md");
+      openWorkspaceFile("index.md");
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [availableDocuments, selectedPath]);
 
   useEffect(() => {
@@ -688,6 +2339,24 @@ function App() {
     };
   }, [selectedPath, workspace.workspacePath, sofficeStatus]);
 
+  async function refreshWorkspaceOperationProgressOnce() {
+    try {
+      const progress = await invoke<OperationProgress>("read_workspace_operation_progress");
+      setWorkspaceOperationProgress((previous) => mergeOperationProgress(previous, progress));
+    } catch (_err) {}
+  }
+
+  async function refreshChatThreadSummaries() {
+    try {
+      const [summaries, maintainSummaries] = await Promise.all([
+        invoke<ChatThreadSummary[]>("list_chat_threads"),
+        invoke<ChatThreadSummary[]>("list_maintain_threads"),
+      ]);
+      setChatThreads(summaries);
+      setMaintainThreads(maintainSummaries);
+    } catch (_err) {}
+  }
+
   async function runCommand(command: CommandName, label: string) {
     setBusy(label);
     setError(null);
@@ -707,47 +2376,12 @@ function App() {
         setSofficeInstalling(true);
         setSofficeInstallStartedAt(Date.now());
       }
-      if (command === "build_wiki") {
-        const marker = result.state.changedMarker;
-        const status = marker?.status;
-        const fileCount = marker?.changedFiles?.length ?? 0;
-        const summary =
-          status === "completed"
-            ? { text: `Build complete — ${fileCount} file(s) changed.`, severity: "success" as const }
-            : status === "completed_with_forbidden_edits_restored"
-              ? {
-                  text: `Build finished. Some forbidden edits were restored. ${fileCount} allowed file(s) changed.`,
-                  severity: "warn" as const,
-                }
-              : status === "completed_without_wiki_content"
-                ? {
-                    text: "Build finished but produced no wiki page or index/log update. Consider undo and retry.",
-                    severity: "warn" as const,
-                  }
-                : status === "cancelled"
-                  ? { text: "Build cancelled. Snapshot restored.", severity: "warn" as const }
-                  : status === "timed_out"
-                    ? {
-                        text: "Build timed out after 15 minutes. Snapshot restored.",
-                        severity: "warn" as const,
-                      }
-                    : {
-                        text: `Build finished with status: ${status || "unknown"}.`,
-                        severity: "warn" as const,
-                      };
-        setChatMessages((prev) => [
-          ...prev,
-          {
-            id: `sys-${Date.now()}`,
-            kind: "system",
-            text: summary.text,
-            severity: summary.severity,
-          },
-        ]);
-      }
       const nextPath = chooseDocumentAfterCommand(command, result.state);
       if (nextPath) {
-        setSelectedPath(nextPath);
+        openWorkspaceFile(nextPath);
+      }
+      if (command === "keep_generated_changes" || command === "undo_last_operation") {
+        await refreshChatThreadSummaries();
       }
       if (result.runner && !result.runner.success) {
         setError(`Operation exited with code ${result.runner.code ?? "unknown"}.`);
@@ -755,88 +2389,726 @@ function App() {
     } catch (err) {
       setError(String(err));
     } finally {
+      await refreshWorkspaceOperationProgressOnce();
       setBusy(null);
     }
   }
 
-  async function startBuildWiki() {
-    setChatMessages([
-      {
-        id: `user-${Date.now()}`,
-        kind: "user",
-        text: "Build wiki",
-      },
-    ]);
-    await runCommand("build_wiki", "Building wiki");
-  }
-
-  async function askStudyChat() {
-    const question = studyQuestion.trim();
-    if (!question) return;
-
-    const userMessage: StudyChatMessage = {
-      id: `study-user-${Date.now()}`,
-      role: "user",
-      text: question,
-    };
-    setStudyChatMessages((prev) => [...prev, userMessage]);
-    setStudyQuestion("");
-    setBusy("Asking wiki");
+  async function finishGeneratedReview(label = "Finishing review", silent = false) {
+    if (finishReviewBlockedReason) {
+      setError(finishReviewBlockedReason);
+      return;
+    }
+    if (!silent) {
+      setBusy(label);
+    }
     setError(null);
 
     try {
-      const result = await invoke<RunnerOutput>("ask_wiki", {
-        question,
-        selectedPath,
+      const result = await invoke<AppCommandResult>("keep_generated_changes");
+      setRunner(result.runner);
+      setWorkspace(result.state);
+      setOpenedChangedFiles(new Set());
+      await refreshChatThreadSummaries();
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      await refreshWorkspaceOperationProgressOnce();
+      if (!silent) {
+        setBusy(null);
+      }
+    }
+  }
+
+  useEffect(() => {
+    if (!hasPendingGeneratedChanges || reviewableChangedFiles.length === 0) return;
+    if (unreviewedChangedFiles.length > 0 || reviewBlockedReason) return;
+
+    const reviewKey =
+      pendingReviewOperationId ??
+      `${workspace.changedMarker?.completedAt ?? "pending"}:${reviewableChangedFiles
+        .map((file) => file.path)
+        .join("|")}`;
+    if (autoFinishedReviewOperationIdRef.current === reviewKey) return;
+    autoFinishedReviewOperationIdRef.current = reviewKey;
+
+    void finishGeneratedReview("Finishing review", true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    hasPendingGeneratedChanges,
+    pendingReviewOperationId,
+    reviewBlockedReason,
+    reviewedChangedCount,
+    reviewableChangedFiles.length,
+    unreviewedChangedFiles.length,
+    workspace.changedMarker?.completedAt,
+  ]);
+
+  function openBuildWiki(force = false) {
+    if (buildBlockedReason) {
+      setError(buildBlockedReason);
+      return;
+    }
+    const provider = activeProvider ?? providers[0];
+    setBuildDraft({
+      instruction: "",
+      workspaceContext: "",
+      requiresWorkspaceContext: !force && shouldAskFirstBuildContext,
+      force,
+      provider: provider?.name ?? "",
+      model: provider ? appSettings?.models[provider.name] || provider.defaultModel : "",
+    });
+  }
+
+  async function startBuildWiki() {
+    if (!buildDraft) return;
+    if (buildBlockedReason) {
+      setError(buildBlockedReason);
+      return;
+    }
+    if (buildDraft.requiresWorkspaceContext && !buildDraft.workspaceContext.trim()) {
+      setError("Tell Maple what this wiki is for before building.");
+      return;
+    }
+    const draft = buildDraft;
+    const draftProvider =
+      providers.find((provider) => provider.name === draft.provider) ?? activeProvider;
+    if (!draftProvider) {
+      setError("Choose an AI model before building the wiki.");
+      return;
+    }
+    const draftModel =
+      draft.model || appSettings?.models[draftProvider.name] || draftProvider.defaultModel;
+    const draftProviderSetup =
+      draftProvider.name === activeProvider?.name ? providerSetup : buildProviderSetup;
+    const draftProviderReady =
+      draftProvider.name === activeProvider?.name ? activeProviderReady : buildProviderSetup.ready;
+    if (!draftProviderReady) {
+      setError(
+        `${displayProviderName(draftProvider)} setup is needed before building the wiki.`,
+      );
+      void draftProviderSetup.refresh();
+      return;
+    }
+    setBusy("Starting wiki build");
+    setError(null);
+    setWorkspaceOperationProgress(null);
+    handledBuildOperationIdRef.current = null;
+    setBuildFeedOpen(true);
+    setBuildDraft(null);
+
+    try {
+      const result = await invoke<AppCommandResult>("build_wiki", {
+        instruction: draft.instruction,
+        workspaceContext: draft.requiresWorkspaceContext ? draft.workspaceContext.trim() : null,
+        force: draft.force,
+        provider: draftProvider.name,
+        model: draftModel,
       });
-      const report = parseRunnerJson<StudyChatReport>(result);
-      if (report?.status === "completed" && report.answer.trim()) {
-        setStudyChatMessages((prev) => [
-          ...prev,
-          {
-            id: `study-assistant-${Date.now()}`,
-            role: "assistant",
-            text: report.answer.trim(),
-          },
-        ]);
+      setRunner(result.runner);
+      setWorkspace(result.state);
+      if (result.runner && !result.runner.success) {
+        setError(`Operation exited with code ${result.runner.code ?? "unknown"}.`);
+        setBackgroundBuildActive(false);
+        setBackgroundBuildStartedAt(null);
       } else {
-        const status = report?.status || `code ${result.code ?? "unknown"}`;
-        setStudyChatMessages((prev) => [
-          ...prev,
-          {
-            id: `study-system-${Date.now()}`,
-            role: "system",
-            text: `Study Chat failed with status: ${status}.`,
-          },
-        ]);
-        if (!result.success) {
-          setError(`Study Chat exited with code ${result.code ?? "unknown"}.`);
-        }
+        setBackgroundBuildActive(true);
+        setBackgroundBuildStartedAt(Date.now());
       }
     } catch (err) {
-      setStudyChatMessages((prev) => [
-        ...prev,
-        {
-          id: `study-system-${Date.now()}`,
-          role: "system",
-          text: String(err),
-        },
-      ]);
+      setError(String(err));
+      setBackgroundBuildActive(false);
+      setBackgroundBuildStartedAt(null);
+    } finally {
+      await refreshWorkspaceOperationProgressOnce();
+      setBusy(null);
+    }
+  }
+
+  async function keepExistingWikiAsBaseline() {
+    if (!workspace.workspacePath || anyOperationBusy) return;
+    if (buildBlockedReason) {
+      setError(buildBlockedReason);
+      return;
+    }
+    setBusy("Importing existing wiki");
+    setError(null);
+
+    try {
+      const result = await invoke<AppCommandResult>("mark_sources_ingested");
+      setRunner(result.runner);
+      setWorkspace(result.state);
+      setBuildDraft(null);
+    } catch (err) {
       setError(String(err));
     } finally {
       setBusy(null);
     }
   }
 
-  async function cancelRunningBuild() {
+  function selectMaintainTask(taskId: MaintainTaskId) {
+    if (maintainBlockedReason || maintainThread?.operationType) return;
+    setSelectedMaintainTaskId(taskId);
+    setMaintainInstruction("");
+    setMaintainLastResult(null);
+    setMaintainStage("compose");
+  }
+
+  async function createNewMaintainThread() {
+    if (anyOperationBusy || !workspace.workspacePath) return;
+    if (maintainThread && maintainThread.messages.length === 0 && !maintainThread.operationType) {
+      setSelectedMaintainTaskId(null);
+      setMaintainInstruction("");
+      setMaintainLastResult(null);
+      setMaintainStage("choose");
+      setMaintainHistoryOpen(false);
+      return;
+    }
     try {
-      await invoke<AppCommandResult>("cancel_build");
+      const thread = await invoke<ChatThread>("create_maintain_thread");
+      setMaintainThread(thread);
+      markMaintainThreadSeen(thread);
+      setSelectedMaintainTaskId(null);
+      setMaintainInstruction("");
+      setMaintainLastResult(null);
+      setMaintainStage("choose");
+      setMaintainHistoryOpen(false);
+      await refreshMaintainHistorySummaries();
+    } catch (err) {
+      setError(`Failed to create maintain chat: ${String(err)}`);
+    }
+  }
+
+  async function openMaintainThread(threadId: string) {
+    if (anyOperationBusy) return;
+    try {
+      const thread = await invoke<ChatThread>("set_current_maintain_thread", { threadId });
+      setMaintainThread(thread);
+      markMaintainThreadSeen(thread);
+      const taskId = maintainTaskIdFromOperationType(thread.operationType);
+      const summary = maintainThreads.find((item) => item.id === thread.id);
+      const status = normalizeThreadActivityStatus(summary?.activityStatus);
+      setSelectedMaintainTaskId(taskId);
+      setMaintainInstruction("");
+      setMaintainLastResult(null);
+      setMaintainStage(status === "running" ? "running" : taskId ? "done" : "choose");
+      setMaintainHistoryOpen(false);
+    } catch (err) {
+      setError(`Failed to open maintain chat: ${String(err)}`);
+    }
+  }
+
+  async function deleteCurrentMaintainThread() {
+    if (!maintainThread || anyOperationBusy) return;
+    try {
+      const thread = await invoke<ChatThread>("delete_maintain_thread", {
+        threadId: maintainThread.id,
+      });
+      setMaintainThread(thread);
+      markMaintainThreadSeen(thread);
+      const taskId = maintainTaskIdFromOperationType(thread.operationType);
+      setSelectedMaintainTaskId(taskId);
+      setMaintainInstruction("");
+      setMaintainLastResult(null);
+      setMaintainStage(taskId ? "done" : "choose");
+      await refreshMaintainHistorySummaries();
+    } catch (err) {
+      setError(`Failed to delete maintain chat: ${String(err)}`);
+    }
+  }
+
+  function resetMaintainFlow() {
+    setSelectedMaintainTaskId(null);
+    setMaintainInstruction("");
+    setMaintainLastResult(null);
+    setMaintainStage("choose");
+  }
+
+  async function runMaintainCommand() {
+    if (!selectedMaintainTask || !maintainThread) return;
+    if (maintainBlockedReason) {
+      setError(maintainBlockedReason);
+      return;
+    }
+    if (!activeProviderReady) {
+      setError(
+        `${activeProvider ? displayProviderName(activeProvider) : "AI"} setup is needed before running maintenance.`,
+      );
+      void providerSetup.refresh();
+      return;
+    }
+    if (maintainThread.operationType) {
+      setError("Start another maintain chat for a new task.");
+      return;
+    }
+    const trimmedInstruction = maintainInstruction.trim();
+    if (selectedMaintainTask.requiresInstruction && !trimmedInstruction) {
+      setError("Add an instruction first.");
+      return;
+    }
+    setBusy(selectedMaintainTask.busyLabel);
+    setError(null);
+    setWorkspaceOperationProgress(null);
+    setMaintainFeedOpen(true);
+    setMaintainLastResult(null);
+    setMaintainStage("running");
+
+    try {
+      const result = await invoke<MaintainOperationResult>("run_maintain_thread_operation", {
+        threadId: maintainThread.id,
+        command: selectedMaintainTask.command,
+        instruction: trimmedInstruction || null,
+      });
+      setRunner(result.runner);
+      setWorkspace(result.state);
+      setMaintainThread(result.thread);
+      markMaintainThreadSeen(result.thread);
+      setMaintainInstruction("");
+      setMaintainLastResult({
+        taskId: selectedMaintainTask.id,
+        success: Boolean(result.runner?.success),
+        code: result.runner?.code ?? null,
+      });
+      setMaintainStage("done");
+      await refreshMaintainHistorySummaries();
+      const nextPath = chooseDocumentAfterCommand(selectedMaintainTask.command, result.state);
+      if (nextPath) {
+        openWorkspaceFile(nextPath);
+      }
+      if (result.error) {
+        setError(result.error);
+      } else if (result.runner && !result.runner.success) {
+        setError(`Operation exited with code ${result.runner.code ?? "unknown"}.`);
+      }
+    } catch (err) {
+      setError(String(err));
+      setMaintainLastResult({
+        taskId: selectedMaintainTask.id,
+        success: false,
+        code: null,
+      });
+      setMaintainStage("done");
+      const thread = await invoke<ChatThread>("read_current_maintain_thread").catch(() => null);
+      if (thread) {
+        setMaintainThread(thread);
+        markMaintainThreadSeen(thread);
+      }
+    } finally {
+      await refreshWorkspaceOperationProgressOnce();
+      setBusy(null);
+    }
+  }
+
+  async function selectChatModelChoice(value: string) {
+    const [provider, ...modelParts] = value.split(":");
+    const modelId = modelParts.join(":");
+    if (!provider || !modelId) return;
+
+    try {
+      let updated = appSettings;
+      if (!updated || updated.provider !== provider) {
+        updated = await invoke<AppSettings>("set_provider", { name: provider });
+      }
+      if (updated.models[provider] !== modelId) {
+        updated = await invoke<AppSettings>("set_model", { provider, modelId });
+      }
+      setAppSettings({ provider: updated.provider, models: { ...updated.models } });
+    } catch (err) {
+      setError(`Failed to update model: ${String(err)}`);
+    }
+  }
+
+  async function selectBuildModelChoice(value: string) {
+    const [provider, ...modelParts] = value.split(":");
+    const modelId = modelParts.join(":");
+    if (!provider || !modelId) return;
+
+    setBuildDraft((prev) => (prev ? { ...prev, provider, model: modelId } : prev));
+
+    try {
+      let updated = appSettings;
+      if (!updated || updated.provider !== provider) {
+        updated = await invoke<AppSettings>("set_provider", { name: provider });
+      }
+      if (updated.models[provider] !== modelId) {
+        updated = await invoke<AppSettings>("set_model", { provider, modelId });
+      }
+      setAppSettings({ provider: updated.provider, models: { ...updated.models } });
+    } catch (err) {
+      setError(`Failed to update build model: ${String(err)}`);
+    }
+  }
+
+  async function recoverMissingChatThread() {
+    const [thread, summaries] = await Promise.all([
+      invoke<ChatThread>("read_current_chat_thread"),
+      invoke<ChatThreadSummary[]>("list_chat_threads"),
+    ]);
+    setChatThread(thread);
+    setChatThreads(summaries);
+    markChatThreadSeen(thread);
+    setApplyDraft(null);
+    setWikiUpdateRun(null);
+    setChatHistoryOpen(false);
+    setError(null);
+    return thread;
+  }
+
+  async function askExploreChat() {
+    if (exploreBlockedReason || !workspace.workspacePath) return;
+    if (!activeProviderReady) {
+      setError(
+        `${activeProvider ? displayProviderName(activeProvider) : "AI"} setup is needed before asking chat.`,
+      );
+      void providerSetup.refresh();
+      return;
+    }
+    const question = exploreQuestion.trim();
+    if (!question) return;
+    setBusy("Starting chat");
+    setError(null);
+
+    try {
+      const thread = await invoke<ChatThread>("start_explore_chat", {
+        threadId: chatThread?.id ?? null,
+        question,
+        selectedPath,
+        webSearchEnabled: exploreWebSearchEnabled,
+      });
+      setExploreQuestion("");
+      setChatThread(thread);
+      markChatThreadSeen(thread);
+      await refreshChatHistorySummaries();
+    } catch (err) {
+      if (!chatThread?.id || !isMissingChatThreadError(err)) {
+        setError(String(err));
+        return;
+      }
+
+      try {
+        const freshThread = await invoke<ChatThread>("create_chat_thread", {
+          initialContextPath: selectedPath,
+        });
+        const thread = await invoke<ChatThread>("start_explore_chat", {
+          threadId: freshThread.id,
+          question,
+          selectedPath,
+          webSearchEnabled: exploreWebSearchEnabled,
+        });
+        setExploreQuestion("");
+        setChatThread(thread);
+        markChatThreadSeen(thread);
+        setApplyDraft(null);
+        setWikiUpdateRun(null);
+        setChatHistoryOpen(false);
+        await refreshChatHistorySummaries();
+        setError(null);
+      } catch (retryErr) {
+        setError(String(retryErr));
+      }
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function createNewChat() {
+    if (blockingUiBusy || !workspace.workspacePath) return;
+    if (
+      chatThread &&
+      chatThread.messages.length === 0 &&
+      !chatThread.operationType &&
+      (chatThread.initialContextPath ?? "") === selectedPath
+    ) {
+      setChatHistoryOpen(false);
+      return;
+    }
+    try {
+      const thread = await invoke<ChatThread>("create_chat_thread", {
+        initialContextPath: selectedPath,
+      });
+      setChatThread(thread);
+      markChatThreadSeen(thread);
+      setApplyDraft(null);
+      setChatHistoryOpen(false);
+      await refreshChatHistorySummaries();
+    } catch (err) {
+      setError(`Failed to create chat: ${String(err)}`);
+    }
+  }
+
+  async function toggleChatHistory() {
+    setMaintainHistoryOpen(false);
+    setChatHistoryOpen((value) => !value);
+    if (!chatHistoryOpen) {
+      await refreshChatHistorySummaries().catch((err) => {
+        setError(`Failed to refresh chat history: ${String(err)}`);
+      });
+    }
+  }
+
+  async function openChatThread(threadId: string) {
+    if (blockingUiBusy) return;
+    try {
+      const thread = await invoke<ChatThread>("set_current_chat_thread", { threadId });
+      setChatThread(thread);
+      markChatThreadSeen(thread);
+      const contextPath = latestChatContextPath(thread);
+      if (contextPath && availableDocuments.includes(contextPath)) {
+        openWorkspaceFile(contextPath);
+      }
+      setApplyDraft(null);
+      setChatHistoryOpen(false);
+    } catch (err) {
+      if (isMissingChatThreadError(err)) {
+        await recoverMissingChatThread().catch((recoverErr) => {
+          setError(`Failed to recover chat history: ${String(recoverErr)}`);
+        });
+      } else {
+        setError(`Failed to open chat: ${String(err)}`);
+      }
+    }
+  }
+
+  async function toggleMaintainHistory() {
+    setChatHistoryOpen(false);
+    setMaintainHistoryOpen((value) => !value);
+    if (!maintainHistoryOpen) {
+      await refreshMaintainHistorySummaries().catch((err) => {
+        setError(`Failed to refresh maintain history: ${String(err)}`);
+      });
+    }
+  }
+
+  async function deleteCurrentChat() {
+    if (!chatThread) return;
+    if (exploreBusy || wikiUpdateBusy || blockingUiBusy) return;
+    try {
+      const thread = await invoke<ChatThread>("delete_chat_thread", {
+        threadId: chatThread.id,
+      });
+      setChatThread(thread);
+      markChatThreadSeen(thread);
+      setApplyDraft(null);
+      setWikiUpdateRun((current) => (current?.threadId === chatThread.id ? null : current));
+      await refreshChatHistorySummaries();
+    } catch (err) {
+      if (isMissingChatThreadError(err)) {
+        await recoverMissingChatThread().catch((recoverErr) => {
+          setError(`Failed to recover chat history: ${String(recoverErr)}`);
+        });
+      } else {
+        setError(`Failed to delete chat: ${String(err)}`);
+      }
+    }
+  }
+
+  function canApplyMessage(message: ExploreChatMessage): boolean {
+    if (!message.text.trim()) return false;
+    if (message.role === "user") return true;
+    return (
+      message.role === "assistant" &&
+      message.status !== "streaming" &&
+      message.status !== "failed"
+    );
+  }
+
+  function defaultApplyMessageIds(messageId: string, scope: ApplyScope): Set<string> {
+    if (!chatThread) return new Set([messageId]);
+    const message = chatThread.messages.find((item) => item.id === messageId);
+    if (!message) return new Set([messageId]);
+    if (scope === "this-answer") {
+      return new Set(canApplyMessage(message) ? [message.id] : []);
+    }
+    const index = chatThread.messages.findIndex((item) => item.id === messageId);
+    if (scope === "recent-chat") {
+      return new Set(
+        chatThread.messages
+          .slice(0, index + 1)
+          .filter(canApplyMessage)
+          .slice(-8)
+          .map((item) => item.id),
+      );
+    }
+    const previousUser = chatThread.messages
+      .slice(0, index)
+      .reverse()
+      .find((item) => item.role === "user");
+    return new Set(
+      [previousUser, message]
+        .filter((item): item is ExploreChatMessage => Boolean(item))
+        .filter(canApplyMessage)
+        .map((item) => item.id),
+    );
+  }
+
+  function openApplyDraft(messageId: string) {
+    if (updateWikiBlockedReason) return;
+    const scope: ApplyScope = "question-and-answer";
+    setApplyDraft({
+      messageId,
+      scope,
+      instruction: "",
+      selectedIds: defaultApplyMessageIds(messageId, scope),
+    });
+  }
+
+  function openLatestApplyDraft() {
+    if (updateWikiBlockedReason || !chatThread) return;
+    const latestAssistant = chatThread.messages
+      .slice()
+      .reverse()
+      .find(
+        (message) =>
+          message.role === "assistant" &&
+          message.status !== "streaming" &&
+          message.status !== "failed" &&
+          Boolean(message.text.trim()),
+      );
+    if (!latestAssistant) {
+      setError("Ask the chat before updating the wiki.");
+      return;
+    }
+    openApplyDraft(latestAssistant.id);
+  }
+
+  function updateApplyScope(scope: ApplyScope) {
+    setApplyDraft((prev) =>
+      prev
+        ? {
+            ...prev,
+            scope,
+            selectedIds: defaultApplyMessageIds(prev.messageId, scope),
+          }
+        : prev,
+    );
+  }
+
+  function toggleApplyMessage(messageId: string) {
+    setApplyDraft((prev) => {
+      if (!prev) return prev;
+      const selectedIds = new Set(prev.selectedIds);
+      if (selectedIds.has(messageId)) selectedIds.delete(messageId);
+      else selectedIds.add(messageId);
+      return { ...prev, selectedIds };
+    });
+  }
+
+  function appendLocalSystemMessage(
+    threadId: string,
+    text: string,
+    status: "completed" | "failed" = "completed",
+  ) {
+    const now = new Date().toISOString();
+    setChatThread((current) => {
+      if (!current || current.id !== threadId) return current;
+      return {
+        ...current,
+        updatedAt: now,
+        messages: [
+          ...current.messages,
+          {
+            id: `local-${Date.now()}`,
+            role: "system",
+            text,
+            status,
+            createdAt: now,
+            completedAt: now,
+          },
+        ],
+      };
+    });
+  }
+
+  async function applyChatToWiki() {
+    if (!chatThread || !applyDraft || updateWikiBlockedReason) return;
+    if (!activeProviderReady) {
+      setError(
+        `${activeProvider ? displayProviderName(activeProvider) : "AI"} setup is needed before updating the wiki.`,
+      );
+      void providerSetup.refresh();
+      return;
+    }
+    const draft = applyDraft;
+    const threadId = chatThread.id;
+    const targetMessage = chatThread.messages.find((message) => message.id === draft.messageId);
+    const targetPath = targetMessage?.contextPath || selectedPath;
+    const messageIds =
+      draft.scope === "selected-messages"
+        ? Array.from(draft.selectedIds)
+        : Array.from(defaultApplyMessageIds(draft.messageId, draft.scope));
+    if (messageIds.length === 0) {
+      setError("Choose at least one message to apply.");
+      return;
+    }
+    setWikiUpdateBusy(true);
+    setWikiUpdateRun({
+      id: `wiki-update-${Date.now()}`,
+      threadId,
+      scope: draft.scope,
+      messageCount: messageIds.length,
+      targetPath,
+      instruction: draft.instruction.trim(),
+      startedAt: new Date().toISOString(),
+    });
+    setWikiUpdateStatusStep(0);
+    setWorkspaceOperationProgress(null);
+    setWikiUpdateFeedOpen(true);
+    setApplyDraft(null);
+    setError(null);
+    try {
+      const result = await invoke<ApplyChatResult>("apply_chat_to_wiki", {
+        threadId,
+        scope: draft.scope,
+        targetMessageId: draft.messageId,
+        targetPath,
+        instruction: draft.instruction,
+        messageIds,
+      });
+      setRunner(result.runner);
+      setWorkspace(result.state);
+      const operationId = result.state.changedMarker?.operationId ?? null;
+      setWikiUpdateRun((current) =>
+        current?.threadId === threadId ? { ...current, operationId } : current,
+      );
+      const completedThreadIsCurrent = currentChatThreadIdRef.current === result.thread.id;
+      setChatThread((current) => (current?.id === result.thread.id ? result.thread : current));
+      if (completedThreadIsCurrent) {
+        markChatThreadSeen(result.thread);
+      }
+      await refreshChatHistorySummaries();
+      if (!result.runner.success) {
+        setError(`Wiki update exited with code ${result.runner.code ?? "unknown"}.`);
+      }
+    } catch (err) {
+      const message = String(err);
+      setError(message);
+      appendLocalSystemMessage(threadId, `Wiki update failed before changes were written: ${message}`, "failed");
+    } finally {
+      await refreshWorkspaceOperationProgressOnce();
+      setWikiUpdateBusy(false);
+    }
+  }
+
+  async function cancelRunningOperation() {
+    try {
+      const result = await invoke<AppCommandResult>("cancel_build");
+      setRunner(result.runner);
+      setWorkspace(result.state);
+      await Promise.all([refreshWorkspaceOperationProgressOnce(), refreshChatThreadSummaries()]);
     } catch (err) {
       setError(String(err));
     }
   }
 
   async function importDroppedFiles(paths: string[]) {
+    if (sourceImportBlockedReason) {
+      setError(sourceImportBlockedReason);
+      return;
+    }
+    if (!canRemoveSourceFiles) {
+      setError("Finish reviewing or undo generated changes before importing more sources.");
+      return;
+    }
     const supported = paths.filter((p) =>
       /\.(pdf|pptx|ppt|md|txt|png|jpe?g|webp|gif)$/i.test(p),
     );
@@ -860,6 +3132,7 @@ function App() {
   }
 
   async function importSourceFiles() {
+    if (sourceImportBlockedReason || !canRemoveSourceFiles) return;
     setError(null);
 
     try {
@@ -868,7 +3141,7 @@ function App() {
         directory: false,
         filters: [
           {
-            name: "Study sources",
+            name: "Sources",
             extensions: ["pdf", "pptx", "ppt", "md", "txt", "png", "jpg", "jpeg", "webp", "gif"],
           },
         ],
@@ -890,12 +3163,13 @@ function App() {
     }
   }
 
-  async function removeRawSource(relativePath: string) {
+  async function removeSourceFile(relativePath: string) {
+    if (sourceRemoveBlockedReason || !canRemoveSourceFiles) return;
     setBusy("Removing source");
     setError(null);
 
     try {
-      const result = await invoke<AppCommandResult>("remove_raw_source", { relativePath });
+      const result = await invoke<AppCommandResult>("remove_source_file", { relativePath });
       setRunner(result.runner);
       setWorkspace(result.state);
     } catch (err) {
@@ -905,7 +3179,7 @@ function App() {
     }
   }
 
-  async function pickWorkspace(title: string) {
+  async function pickWorkspace(title: string, initializeRootFiles = false) {
     setError(null);
     let defaultPath: string | undefined;
     try {
@@ -917,6 +3191,7 @@ function App() {
     try {
       const state = await invoke<WorkspaceState>("set_workspace", {
         workspacePath: path,
+        initializeRootFiles,
       });
       localStorage.setItem("workspacePath", path);
       setWorkspace(state);
@@ -960,7 +3235,7 @@ function App() {
               <button
                 type="button"
                 className="primary"
-                onClick={() => pickWorkspace("Create new workspace")}
+                onClick={() => pickWorkspace("Create new workspace", true)}
               >
                 Create new workspace
               </button>
@@ -978,114 +3253,499 @@ function App() {
     );
   }
 
+  const applyMessages = chatThread?.messages.filter(canApplyMessage) ?? [];
+  const applySelectedCount = applyDraft
+    ? applyDraft.scope === "selected-messages"
+      ? applyDraft.selectedIds.size
+      : defaultApplyMessageIds(applyDraft.messageId, applyDraft.scope).size
+    : 0;
+  const latestCompletedAssistantMessage = exploreChatMessages
+    .slice()
+    .reverse()
+    .find(
+      (message) =>
+        message.role === "assistant" &&
+        message.status !== "streaming" &&
+        message.status !== "failed" &&
+        Boolean(message.text.trim()),
+    );
+  const canOpenWikiUpdateDraft = Boolean(
+    workspace.workspacePath && latestCompletedAssistantMessage && !updateWikiBlockedReason,
+  );
+  const currentWikiUpdateRun =
+    wikiUpdateRun && wikiUpdateRun.threadId === chatThread?.id ? wikiUpdateRun : null;
+  const showExploreChatMessages = exploreChatMessages.length > 0 || Boolean(currentWikiUpdateRun);
+  const wikiUpdateScopeLabel = currentWikiUpdateRun
+    ? (APPLY_SCOPE_OPTIONS.find((option) => option.value === currentWikiUpdateRun.scope)?.label ??
+      "Selected chat")
+    : "";
+  const wikiUpdateInstruction = currentWikiUpdateRun?.instruction.trim() ?? "";
+  const wikiUpdateUserMessage =
+    wikiUpdateInstruction || DEFAULT_WIKI_UPDATE_USER_MESSAGE;
+  const wikiUpdateAssistantIntro = wikiUpdateInstruction
+    ? INSTRUCTED_WIKI_UPDATE_ASSISTANT_INTRO
+    : DEFAULT_WIKI_UPDATE_ASSISTANT_INTRO;
+  const wikiUpdateProgressMeta = currentWikiUpdateRun
+    ? [
+        `${currentWikiUpdateRun.messageCount} message${
+          currentWikiUpdateRun.messageCount === 1 ? "" : "s"
+        }`,
+        wikiUpdateScopeLabel,
+      ].filter(Boolean)
+    : [];
+  const canShowWikiUpdateReport = Boolean(
+    currentWikiUpdateRun?.operationId &&
+      workspace.reportMd &&
+      workspace.changedMarker?.operationId === currentWikiUpdateRun.operationId &&
+      (!workspace.changedMarker.operationType ||
+        workspace.changedMarker.operationType === "apply-chat"),
+  );
+  const wikiUpdateStartedAtMs = currentWikiUpdateRun
+    ? parseTimestampMs(currentWikiUpdateRun.startedAt)
+    : null;
+  const wikiUpdateInsertIndex =
+    currentWikiUpdateRun && wikiUpdateStartedAtMs !== null
+      ? exploreChatMessages.findIndex((message) => {
+          const messageCreatedAtMs = parseTimestampMs(message.createdAt);
+          return messageCreatedAtMs !== null && messageCreatedAtMs > wikiUpdateStartedAtMs;
+        })
+      : -1;
+  const wikiUpdateRunBlock = currentWikiUpdateRun ? (
+    <Fragment key={`wiki-update-${currentWikiUpdateRun.id}`}>
+      <div className="explore-chat-msg explore-chat-msg-user explore-chat-update-request">
+        {wikiUpdateUserMessage}
+      </div>
+      <div className="explore-chat-msg explore-chat-msg-assistant explore-chat-update-intro">
+        <p>{wikiUpdateAssistantIntro}</p>
+      </div>
+      <div
+        className="explore-chat-msg explore-chat-msg-assistant explore-chat-operation"
+        aria-live="polite"
+      >
+        <OperationFeedPanel
+          progress={workspaceOperationProgress}
+          title="Update wiki"
+          meta={wikiUpdateProgressMeta}
+          fallbackSteps={WIKI_UPDATE_STEPS}
+          fallbackActiveIndex={wikiUpdateActiveStep}
+          open={wikiUpdateFeedOpen}
+          onToggle={() => setWikiUpdateFeedOpen((open) => !open)}
+          onOpenPath={openDocumentReference}
+          canOpenPath={canOpenDocumentReference}
+        />
+        {canShowWikiUpdateReport ? (
+          <div className="explore-chat-operation-actions">
+            <button type="button" onClick={openReportTab}>
+              Show report
+            </button>
+          </div>
+        ) : null}
+      </div>
+    </Fragment>
+  ) : null;
+  function getExploreThreadActivity(thread: ChatThreadSummary): {
+    status: ThreadActivityStatus;
+    label: string;
+  } {
+    if (wikiUpdateBusy && wikiUpdateRun?.threadId === thread.id) {
+      return { status: "running", label: "Updating wiki" };
+    }
+    if (chatThread?.id === thread.id && isAskingWiki) {
+      return { status: "running", label: "Exploring" };
+    }
+    const status = normalizeThreadActivityStatus(thread.activityStatus);
+    return { status, label: thread.activityLabel || defaultThreadActivityLabel(status) };
+  }
+
+  function getMaintainThreadActivity(thread: ChatThreadSummary): {
+    status: ThreadActivityStatus;
+    label: string;
+  } {
+    if (maintainThread?.id === thread.id && isMaintainOperationRunning && selectedMaintainTask) {
+      return { status: "running", label: selectedMaintainTask.label };
+    }
+    const status = normalizeThreadActivityStatus(thread.activityStatus);
+    return { status, label: thread.activityLabel || defaultThreadActivityLabel(status) };
+  }
+
+  function shouldShowThreadMarker(
+    thread: ChatThreadSummary,
+    activity: { status: ThreadActivityStatus },
+    currentThreadId: string | null | undefined,
+    seenUpdates: SeenThreadMap,
+  ): boolean {
+    if (activity.status === "running") return true;
+    if (activity.status === "empty") return false;
+    return thread.id !== currentThreadId && seenUpdates[thread.id] !== thread.updatedAt;
+  }
+
+  function shouldShowExploreThreadMarker(
+    thread: ChatThreadSummary,
+    activity: { status: ThreadActivityStatus },
+  ): boolean {
+    return shouldShowThreadMarker(thread, activity, chatThread?.id, seenChatThreadUpdates);
+  }
+
+  function shouldShowMaintainThreadMarker(
+    thread: ChatThreadSummary,
+    activity: { status: ThreadActivityStatus },
+  ): boolean {
+    return shouldShowThreadMarker(thread, activity, maintainThread?.id, seenMaintainThreadUpdates);
+  }
+
+  const centerHeaderPathParts = activeCenterTab?.kind === "report"
+    ? ["Operation report"]
+    : viewMode === "graph"
+      ? ["Graph"]
+      : selectedPath.split("/").filter(Boolean);
+  const centerHeaderTitle = centerHeaderPathParts.join(" / ");
+
   return (
     <main className="app">
-      <header className="app-topbar">
-        <div className="topbar-left">
-          <details className="topbar-workspace-menu">
-            <summary>
-              <span className="topbar-workspace" title={workspace.workspacePath}>
-                {workspaceName || workspace.workspacePath}
-              </span>
-              <span className="topbar-workspace-chevron">⌄</span>
-            </summary>
-            <div className="topbar-workspace-dropdown">
-              <p className="topbar-workspace-dropdown-path">{workspace.workspacePath}</p>
-              <button type="button" onClick={switchWorkspace}>
-                Switch workspace…
-              </button>
-            </div>
-          </details>
-          <span className={`topbar-status-pill ${busy ? "active" : ""}`}>{statusLabel}</span>
-        </div>
-        <div className="topbar-right">
-          <button
-            type="button"
-            className="topbar-btn"
-            disabled={Boolean(busy) || !canRemoveRawSources}
-            onClick={importSourceFiles}
-          >
-            Import sources
-          </button>
-          {isBuilding ? (
-            <button type="button" className="topbar-btn cancel" onClick={cancelRunningBuild}>
-              Stop
-            </button>
-          ) : (
-            <button
-              type="button"
-              className="topbar-btn primary"
-              disabled={Boolean(busy)}
-              onClick={() => startBuildWiki()}
-            >
-              {hasPendingGeneratedChanges ? "Build again" : "Build wiki"}
-            </button>
-          )}
-          <details className="topbar-menu">
-            <summary aria-label="More actions">⋯</summary>
-            <div className="topbar-menu-items">
-              <button
-                type="button"
-                onClick={() => setShowSettings(true)}
-              >
-                Settings…
-              </button>
-              <button
-                type="button"
-                disabled={Boolean(busy) || !canUndo}
-                onClick={() => runCommand("undo_last_operation", "Undoing operation")}
-              >
-                Undo last build
-              </button>
-              {isSampleWorkspace ? (
+      <header
+        className="app-topbar"
+        style={{ gridTemplateColumns: topbarGridTemplateColumns } as React.CSSProperties}
+      >
+        <div className={`topbar-left ${leftPanelCollapsed ? "panel-collapsed" : ""}`}>
+          <div className="topbar-workspace-group">
+            <details ref={topbarWorkspaceMenuRef} className="topbar-workspace-menu">
+              <summary>
+                <span className="topbar-workspace" title={workspace.workspacePath}>
+                  {workspaceName || workspace.workspacePath}
+                </span>
+                <span className="topbar-workspace-chevron">⌄</span>
+              </summary>
+              <div className="topbar-workspace-dropdown">
+                <p className="topbar-workspace-dropdown-path">{workspace.workspacePath}</p>
                 <button
                   type="button"
-                  disabled={Boolean(busy)}
-                  onClick={() => runCommand("reset_sample_workspace", "Resetting sample")}
+                  onClick={() => {
+                    if (topbarWorkspaceMenuRef.current) topbarWorkspaceMenuRef.current.open = false;
+                    void switchWorkspace();
+                  }}
                 >
-                  Reset sample workspace
+                  Switch workspace…
                 </button>
-              ) : null}
+              </div>
+            </details>
+            {statusLabel ? (
+              <span className={`topbar-status-pill ${anyOperationBusy ? "active" : ""}`}>
+                {statusLabel}
+              </span>
+            ) : null}
+          </div>
+          <button
+            type="button"
+            className="panel-toggle-btn"
+            onClick={toggleLeftPanelCollapsed}
+            aria-expanded={!leftPanelCollapsed}
+            aria-label={leftPanelCollapsed ? "Show source panel" : "Hide source panel"}
+            title={leftPanelCollapsed ? "Show source panel" : "Hide source panel"}
+          >
+            <span
+              className={`panel-toggle-icon panel-toggle-icon-left ${
+                leftPanelCollapsed ? "collapsed" : ""
+              }`}
+              aria-hidden
+            />
+          </button>
+        </div>
+        <div className="topbar-center">
+          <div className="center-tab-strip" role="tablist" aria-label="Open workspace tabs">
+            {centerTabs.map((tab) => (
+              <button
+                key={tab.id}
+                type="button"
+                role="tab"
+                aria-selected={activeCenterTabId === tab.id}
+                className={`center-tab ${activeCenterTabId === tab.id ? "active" : ""}`}
+                onClick={() => activateCenterTab(tab)}
+                title={tab.kind === "workspace" ? tab.path : tab.title}
+              >
+                <span className="center-tab-title">{tab.title}</span>
+                <span
+                  role="button"
+                  tabIndex={0}
+                  className="center-tab-close"
+                  aria-label={`Close ${tab.title}`}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    closeCenterTab(tab.id);
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      closeCenterTab(tab.id);
+                    }
+                  }}
+                >
+                  ×
+                </span>
+              </button>
+            ))}
+          </div>
+          <div
+            className="topbar-drag-region"
+            data-tauri-drag-region
+            aria-hidden
+            onMouseDown={startWindowDrag}
+            onDoubleClick={toggleWindowMaximize}
+          />
+        </div>
+        <div
+          className={`topbar-right ${rightPanelCollapsed ? "panel-collapsed" : ""} ${
+            isRightTopbarBusy ? "is-busy" : ""
+          }`}
+        >
+          <button
+            type="button"
+            className="panel-toggle-btn"
+            onClick={toggleRightPanelCollapsed}
+            aria-expanded={!rightPanelCollapsed}
+            aria-label={rightPanelCollapsed ? "Show explore panel" : "Hide explore panel"}
+            title={rightPanelCollapsed ? "Show explore panel" : "Hide explore panel"}
+          >
+            <span
+              className={`panel-toggle-icon panel-toggle-icon-right ${
+                rightPanelCollapsed ? "collapsed" : ""
+              }`}
+              aria-hidden
+            />
+          </button>
+          {!rightPanelCollapsed ? (
+            <div className="right-panel-tabs" role="tablist" aria-label="Right panel">
+              <button
+                type="button"
+                className={rightPanelMode === "explore" ? "active" : ""}
+                onClick={() => setRightPanelMode("explore")}
+              >
+                Explore
+              </button>
+              <button
+                type="button"
+                className={rightPanelMode === "maintain" ? "active" : ""}
+                onClick={() => setRightPanelMode("maintain")}
+              >
+                Maintain
+              </button>
             </div>
-          </details>
+          ) : null}
+          <div className="topbar-command-actions">
+            {showRightTopbarStop ? (
+              <button type="button" className="topbar-btn cancel" onClick={cancelRunningOperation}>
+                Stop
+              </button>
+            ) : null}
+            <details ref={topbarMenuRef} className="topbar-menu">
+              <summary aria-label="More actions">⋯</summary>
+              <div className="topbar-menu-items">
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (topbarMenuRef.current) topbarMenuRef.current.open = false;
+                    setShowSettings(true);
+                  }}
+                >
+                  Settings…
+                </button>
+	                <button
+	                  type="button"
+	                  disabled={Boolean(finishReviewBlockedReason) || !hasPendingGeneratedChanges}
+	                  title={finishReviewBlockedReason ?? undefined}
+	                  onClick={() => {
+	                    if (topbarMenuRef.current) topbarMenuRef.current.open = false;
+	                    void finishGeneratedReview();
+	                  }}
+                >
+                  Done reviewing
+                </button>
+                <button
+                  type="button"
+                  disabled={Boolean(undoBlockedReason) || !canUndo}
+                  title={undoBlockedReason ?? undefined}
+                  onClick={() => {
+                    if (topbarMenuRef.current) topbarMenuRef.current.open = false;
+                    void runCommand("undo_last_operation", "Undoing operation");
+                  }}
+                >
+                  Undo last operation
+                </button>
+                {isSampleWorkspace ? (
+                  <button
+                    type="button"
+                    disabled={Boolean(resetBlockedReason)}
+                    title={resetBlockedReason ?? undefined}
+                    onClick={() => {
+                      if (topbarMenuRef.current) topbarMenuRef.current.open = false;
+                      void runCommand("reset_sample_workspace", "Resetting sample");
+                    }}
+                  >
+                    Reset sample workspace
+                  </button>
+                ) : null}
+              </div>
+            </details>
+          </div>
         </div>
       </header>
 
       <div
         ref={appBodyRef}
         className="app-body"
-        style={{ gridTemplateColumns: bodyGridTemplateColumns }}
+        style={{
+          gridTemplateColumns: bodyGridTemplateColumns,
+          "--right-panel-width": `${rightPanelCollapsed ? 0 : rightPanelWidth}px`,
+        } as React.CSSProperties}
       >
-        <aside className="app-left">
-          <TreeView
-            nodes={workspaceTree}
-            level={0}
-            expanded={expandedFolders}
-            toggleFolder={toggleFolder}
-            selectedPath={selectedPath}
-            onSelect={setSelectedPath}
-            onRemove={removeRawSource}
-            removeDisabled={Boolean(busy) || !canRemoveRawSources}
-          />
-          {rawSources.length === 0 ? (
-            <p className="sidebar-empty">No sources imported yet.</p>
+        <aside className={`app-left ${leftPanelCollapsed ? "collapsed" : ""}`}>
+          <div className="source-action-bar">
+            <button
+              type="button"
+              className="source-action-btn"
+              disabled={Boolean(sourceImportBlockedReason) || !canRemoveSourceFiles}
+              title={
+                sourceImportBlockedReason
+                  ? sourceImportBlockedReason
+                  : canRemoveSourceFiles
+                  ? "Import sources"
+                  : "Finish reviewing or undo generated changes before importing more sources."
+              }
+              onClick={importSourceFiles}
+            >
+              Import
+            </button>
+            {isBuilding ? (
+              <button type="button" className="source-action-btn danger" onClick={cancelRunningOperation}>
+                Stop
+              </button>
+            ) : (
+              <button
+                type="button"
+                className="source-action-btn primary"
+                disabled={Boolean(buildBlockedReason) || !hasPendingSourceChanges}
+                onClick={() => openBuildWiki(false)}
+                title={
+                  buildBlockedReason
+                    ? buildBlockedReason
+                    : hasPendingSourceChanges
+                    ? `${pendingSourceCount} pending source change(s)`
+                    : "No pending source changes"
+                }
+              >
+                Build wiki
+              </button>
+            )}
+          </div>
+          {showBuildOperationFeed ? (
+            <OperationFeedPanel
+              progress={workspaceOperationProgress}
+              title="Build wiki"
+              runningLabel={buildRunningLabel}
+              meta={[pendingSourceCount > 0 ? `${pendingSourceCount} source change(s)` : "Workspace build"]}
+              fallbackSteps={BUILD_WIKI_STEPS}
+              fallbackActiveIndex={isBuilding ? buildFallbackActiveStep : BUILD_WIKI_STEPS.length - 1}
+              open={buildFeedOpen}
+              onToggle={() => setBuildFeedOpen((open) => !open)}
+              onOpenPath={openDocumentReference}
+              canOpenPath={canOpenDocumentReference}
+              compact
+            />
+          ) : null}
+          <div className="sidebar-tree-scroll">
+            <TreeView
+              nodes={workspaceTree}
+              level={0}
+              expanded={expandedFolders}
+              toggleFolder={toggleFolder}
+              selectedPath={selectedPath}
+              changedFileMap={changedFileMap}
+              onSelect={openWorkspaceFile}
+              onRemove={removeSourceFile}
+              removeDisabled={Boolean(sourceRemoveBlockedReason) || !canRemoveSourceFiles}
+              removeDisabledReason={sourceRemoveBlockedReason}
+            />
+            {sourceFiles.length === 0 ? (
+              <p className="sidebar-empty">No sources imported yet.</p>
+            ) : null}
+          </div>
+          {hasPendingGeneratedChanges && unreviewedChangedFiles.length > 0 ? (
+            <div className="sidebar-review-panel" aria-label="Generated changes to review">
+              <div className="review-panel-header">
+                <strong>Review generated changes</strong>
+                <span>
+                  {reviewedChangedCount}/{reviewableChangedFiles.length} viewed
+                </span>
+              </div>
+              <div className="review-change-list">
+                {unreviewedChangedFiles.map((file) => (
+                  <button
+                    key={file.path}
+                    type="button"
+                    className="review-change-file"
+                    onClick={() => openWorkspaceFile(file.path)}
+                    title={`${file.path} (${file.status})`}
+                  >
+                    <span className="review-change-path">{displayFileName(file.path)}</span>
+                    <span className="review-change-state">Open</span>
+                  </button>
+                ))}
+              </div>
+              <div className="review-actions">
+                <button
+                  type="button"
+                  disabled={Boolean(finishReviewBlockedReason)}
+                  title={finishReviewBlockedReason ?? "Mark all remaining changes reviewed"}
+                  onClick={() => finishGeneratedReview()}
+                >
+                  Done reviewing
+                </button>
+                <button
+                  type="button"
+                  className="danger"
+                  disabled={Boolean(undoBlockedReason)}
+                  title={undoBlockedReason ?? undefined}
+                  onClick={() => runCommand("undo_last_operation", "Undoing operation")}
+                >
+                  Undo
+                </button>
+              </div>
+            </div>
           ) : null}
         </aside>
 
         <button
           type="button"
-          className="panel-resize-handle"
+          className={`panel-resize-handle ${leftPanelCollapsed ? "collapsed" : ""}`}
           aria-label="Resize left panel"
+          disabled={leftPanelCollapsed}
           onPointerDown={(event) => startPanelResize("left", event)}
         />
 
         <section className="app-center">
           <div className="center-header">
-            <span className="center-title">
-              {viewMode === "graph" ? "Graph view" : selectedPath}
-            </span>
+            <div
+              className="center-path"
+              title={centerHeaderTitle}
+              data-tauri-drag-region
+              onMouseDown={startWindowDrag}
+              onDoubleClick={toggleWindowMaximize}
+            >
+              {centerHeaderPathParts.map((part, index) => (
+                <span key={`${part}-${index}`} className="center-path-part">
+                  <span className={index === centerHeaderPathParts.length - 1 ? "current" : ""}>
+                    {part}
+                  </span>
+                  {index < centerHeaderPathParts.length - 1 ? (
+                    <span className="center-path-separator">/</span>
+                  ) : null}
+                </span>
+              ))}
+            </div>
             <div className="center-header-right">
-              {viewMode === "page" ? (
+              {activeReportContent ? (
+                <span className="center-subtitle">Read-only report</span>
+              ) : viewMode === "page" ? (
                 <span className="center-subtitle">
                   {IMAGE_EXT_REGEX.test(selectedPath)
                     ? "Image"
@@ -1094,8 +3754,8 @@ function App() {
                       : PPTX_EXT_REGEX.test(selectedPath)
                         ? "Slides"
                         : selectedPath.startsWith("wiki/")
-                          ? "Study page"
-                          : selectedPath.startsWith("raw/")
+                          ? "Wiki page"
+                          : selectedPath.startsWith("sources/")
                             ? "Source"
                             : "Workspace file"}
                 </span>
@@ -1104,27 +3764,97 @@ function App() {
                 <button
                   type="button"
                   className={`view-toggle-btn ${viewMode === "page" ? "active" : ""}`}
-                  onClick={() => setViewMode("page")}
+                  onClick={() => openWorkspaceFile(selectedPath)}
                 >
                   Page
                 </button>
                 <button
                   type="button"
                   className={`view-toggle-btn ${viewMode === "graph" ? "active" : ""}`}
-                  onClick={() => setViewMode("graph")}
+                  onClick={openGraphTab}
                 >
                   Graph
                 </button>
               </div>
             </div>
           </div>
+          {error ||
+          interruptedOp?.interrupted ||
+          (hasPptxInSources && sofficeInstalling) ||
+          (hasPptxInSources && sofficeStatus && !sofficeStatus.installed) ? (
+            <div className="center-notices">
+              {error ? <div className="banner banner-error">{error}</div> : null}
+
+              {interruptedOp?.interrupted ? (
+                <div className="banner banner-warn">
+                  <strong>Previous build was interrupted.</strong>
+                  <p>
+                    Operation <code>{interruptedOp.operationId}</code> didn't finish. Snapshot is intact.
+                  </p>
+                  <button
+                    type="button"
+                    disabled={Boolean(undoBlockedReason)}
+                    title={undoBlockedReason ?? undefined}
+                    onClick={async () => {
+                      await runCommand(
+                        "discard_interrupted_operation",
+                        "Discarding interrupted build",
+                      );
+                      setInterruptedOp(null);
+                    }}
+                  >
+                    Discard and restore
+                  </button>
+                </div>
+              ) : null}
+
+              {hasPptxInSources && sofficeInstalling ? (
+                <div className="banner banner-info">
+                  <strong>Watching for LibreOffice install…</strong>
+                  <p>
+                    Terminal will say <code>libreoffice was successfully installed!</code> when done. Typically 5–10 min.
+                    {sofficeInstallStartedAt
+                      ? ` (${Math.floor((Date.now() - sofficeInstallStartedAt) / 1000)}s elapsed)`
+                      : ""}
+                  </p>
+                </div>
+              ) : hasPptxInSources && sofficeStatus && !sofficeStatus.installed ? (
+                <div className="banner banner-warn">
+                  <strong>LibreOffice needed for .pptx files.</strong>
+                  <p>One-time install. Opens Terminal.</p>
+                  <button
+                    type="button"
+                    disabled={anyOperationBusy}
+                    title={activeOperationLabel ? `${activeOperationLabel} is running.` : undefined}
+                    onClick={() =>
+                      runCommand("install_libreoffice", "Opening Terminal to install LibreOffice")
+                    }
+                  >
+                    Install LibreOffice
+                  </button>
+                </div>
+              ) : null}
+            </div>
+          ) : null}
           <div className="center-body">
-            {viewMode === "graph" ? (
+            {activeReportContent ? (
+              <MarkdownDocument
+                content={activeReportContent}
+                currentPath="Operation report"
+                workspacePath={workspace.workspacePath}
+                availableDocuments={availableDocuments}
+                onOpenDocument={(path, anchor) => {
+                  openWorkspaceFile(path);
+                  setPendingAnchor(anchor ?? null);
+                }}
+                onOpenImage={setExpandedImage}
+              />
+            ) : viewMode === "graph" ? (
               <GraphView
                 linkGraph={linkGraph}
                 selectedPath={selectedPath}
                 onOpenNode={(path) => {
-                  setSelectedPath(path);
+                  openWorkspaceFile(path);
                   setPendingAnchor(null);
                   setViewMode("page");
                 }}
@@ -1152,7 +3882,7 @@ function App() {
                   <strong>Couldn't render slides.</strong>
                   <p>{pptxRender.error}</p>
                   {sofficeStatus && !sofficeStatus.installed ? (
-                    <p>Install LibreOffice from the right panel, then reopen this file.</p>
+                    <p>Install LibreOffice, then reopen this file.</p>
                   ) : null}
                 </div>
               ) : (
@@ -1165,250 +3895,733 @@ function App() {
                 workspacePath={workspace.workspacePath}
                 availableDocuments={availableDocuments}
                 onOpenDocument={(path, anchor) => {
-                  setSelectedPath(path);
+                  openWorkspaceFile(path);
                   setPendingAnchor(anchor ?? null);
                 }}
                 onOpenImage={setExpandedImage}
               />
             )}
+            {!activeReportContent &&
+            viewMode === "page" &&
+            selectedPath.endsWith(".md") &&
+            linkGraph[selectedPath] ? (
+              <div
+                ref={centerConnectionsRef}
+                className={`center-connections ${connectionsOpen ? "open" : ""}`}
+              >
+                <button
+                  type="button"
+                  className="center-connections-toggle"
+                  onClick={() => setConnectionsOpen((value) => !value)}
+                  aria-expanded={connectionsOpen}
+                >
+                  <span>{connectionsOpen ? "Hide connections" : "Connections"}</span>
+                  <span className="center-connections-count">
+                    {linkGraph[selectedPath].backlinks.length +
+                      linkGraph[selectedPath].outbound.length}
+                  </span>
+                </button>
+                {connectionsOpen ? (
+                  <div className="center-connections-body">
+                    {linkGraph[selectedPath].backlinks.length === 0 &&
+                    linkGraph[selectedPath].outbound.length === 0 ? (
+                      <p className="connections-empty">No connections to this page yet.</p>
+                    ) : (
+                      <>
+                        {linkGraph[selectedPath].backlinks.length > 0 ? (
+                          <>
+                            <div className="connections-label">
+                              Linked from ({linkGraph[selectedPath].backlinks.length})
+                            </div>
+                            <ul className="connections-list">
+                              {linkGraph[selectedPath].backlinks.map((path) => (
+                                <li key={`bl-${path}`}>
+                                  <button
+                                    type="button"
+                                    className="connection-link"
+                                    onClick={() => {
+                                      openWorkspaceFile(path);
+                                      setConnectionsOpen(false);
+                                    }}
+                                    title={path}
+                                  >
+                                    {displayFileName(path)}
+                                  </button>
+                                </li>
+                              ))}
+                            </ul>
+                          </>
+                        ) : null}
+                        {linkGraph[selectedPath].outbound.length > 0 ? (
+                          <>
+                            <div className="connections-label">
+                              Links from this page ({linkGraph[selectedPath].outbound.length})
+                            </div>
+                            <ul className="connections-list">
+                              {linkGraph[selectedPath].outbound.map((path) => (
+                                <li key={`out-${path}`}>
+                                  <button
+                                    type="button"
+                                    className="connection-link"
+                                    onClick={() => {
+                                      openWorkspaceFile(path);
+                                      setConnectionsOpen(false);
+                                    }}
+                                    title={path}
+                                  >
+                                    {displayFileName(path)}
+                                  </button>
+                                </li>
+                              ))}
+                            </ul>
+                          </>
+                        ) : null}
+                      </>
+                    )}
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
           </div>
         </section>
 
         <button
           type="button"
-          className="panel-resize-handle"
+          className={`panel-resize-handle ${rightPanelCollapsed ? "collapsed" : ""}`}
           aria-label="Resize right panel"
+          disabled={rightPanelCollapsed}
           onPointerDown={(event) => startPanelResize("right", event)}
         />
 
-        <aside className="app-right">
-          {error ? <div className="banner banner-error">{error}</div> : null}
-
-          {interruptedOp?.interrupted ? (
-            <div className="banner banner-warn">
-              <strong>Previous build was interrupted.</strong>
-              <p>
-                Operation <code>{interruptedOp.operationId}</code> didn't finish. Snapshot is intact.
-              </p>
-              <button
-                type="button"
-                disabled={Boolean(busy)}
-                onClick={async () => {
-                  await runCommand(
-                    "discard_interrupted_operation",
-                    "Discarding interrupted build",
-                  );
-                  setInterruptedOp(null);
+        <aside className={`app-right ${rightPanelCollapsed ? "collapsed" : ""}`}>
+          {rightPanelMode === "explore" ? (
+            <div className="explore-chat-shell">
+              <header className="explore-chat-header">
+                <div className="explore-chat-heading">
+                  <span className="explore-chat-title">Explore Chat</span>
+                  <span className="explore-chat-context" title={selectedPath}>
+                    {displayFileName(selectedPath)}
+                  </span>
+                </div>
+                <div className="explore-chat-header-actions">
+                  {isAskingWiki ? (
+                    <span className="explore-chat-state">{chatRunningLabel}</span>
+                  ) : wikiUpdateBusy ? (
+                    <span className="explore-chat-state">{wikiUpdateRunningLabel}</span>
+                  ) : activeWorkspaceWriteLabel ? (
+                    <span className="explore-chat-state">{activeWorkspaceWriteLabel} running</span>
+                  ) : null}
+                  <button
+                    type="button"
+                    className="explore-chat-header-btn"
+                    onClick={() => void createNewChat()}
+                    disabled={!workspace.workspacePath || blockingUiBusy}
+                    title="New chat"
+                  >
+                    +
+                  </button>
+                  <button
+                    ref={chatHistoryButtonRef}
+                    type="button"
+                    className="explore-chat-header-btn"
+                    onClick={() => void toggleChatHistory()}
+                    disabled={!workspace.workspacePath || blockingUiBusy}
+                    title="History"
+                  >
+                    History
+                  </button>
+                </div>
+                {chatHistoryOpen ? (
+                  <div ref={chatHistoryPopoverRef} className="explore-chat-history-popover">
+                    <div className="explore-chat-history-title">Chats</div>
+                    {chatThreads.length === 0 ? (
+                      <div className="explore-chat-history-empty">No saved chats yet.</div>
+                    ) : (
+                      <ul className="explore-chat-history-list">
+                        {chatThreads.map((thread) => {
+                          const activity = getExploreThreadActivity(thread);
+                          const showMarker = shouldShowExploreThreadMarker(thread, activity);
+                          return (
+                            <li key={thread.id}>
+                              <button
+                                type="button"
+                                className={`explore-chat-history-item${
+                                  thread.id === chatThread?.id ? " active" : ""
+                                } status-${activity.status}`}
+                                onClick={() => void openChatThread(thread.id)}
+                                disabled={blockingUiBusy}
+                                title={`${thread.title} - ${activity.label}`}
+                              >
+                                <span className="explore-chat-history-main">
+                                  <span className="explore-chat-history-name">{thread.title}</span>
+                                  {showMarker ? (
+                                    <span
+                                      className={`chat-thread-status-dot status-${activity.status}`}
+                                      aria-label={activity.label}
+                                      title={activity.label}
+                                    />
+                                  ) : null}
+                                </span>
+                                <span className="explore-chat-history-preview">
+                                  {displayChatThreadPreview(thread)}
+                                </span>
+                              </button>
+                            </li>
+                          );
+                        })}
+                      </ul>
+                    )}
+                    {chatThread ? (
+                      <button
+                        type="button"
+                        className="explore-chat-delete"
+                        onClick={() => void deleteCurrentChat()}
+                        disabled={exploreBusy || wikiUpdateBusy || blockingUiBusy}
+                        title={
+                          wikiUpdateBusy
+                            ? "Update wiki from chat is running. Wait for it to finish before deleting this chat."
+                            : exploreBlockedReason ?? "Delete current chat"
+                        }
+                      >
+                        Delete current chat
+                      </button>
+                    ) : null}
+                  </div>
+                ) : null}
+              </header>
+              {!showExploreChatMessages ? (
+                <div className="explore-chat-empty">Ask about this page.</div>
+              ) : (
+                <div className="explore-chat-messages" ref={exploreChatMessagesRef}>
+                  {exploreChatMessages.map((message, index) => (
+                    <Fragment key={message.id}>
+                      {index === wikiUpdateInsertIndex ? wikiUpdateRunBlock : null}
+                      <div
+                        className={`explore-chat-msg explore-chat-msg-${message.role}`}
+                      >
+                        {message.contextPath ? (
+                          canOpenDocumentReference(message.contextPath) ? (
+                            <button
+                              type="button"
+                              className="explore-chat-msg-context file-jump-link"
+                              onClick={() => openDocumentReference(message.contextPath ?? null)}
+                              title={message.contextPath}
+                            >
+                              {displayFileName(message.contextPath)}
+                            </button>
+                          ) : (
+                            <div className="explore-chat-msg-context" title={message.contextPath}>
+                              {displayFileName(message.contextPath)}
+                            </div>
+                          )
+                        ) : null}
+                        {message.role === "assistant" && message.runId ? (
+                          <OperationFeedPanel
+                            progress={chatRunProgressById[message.runId] ?? null}
+                            title="Runner events"
+                            fallbackSteps={chatRunningSteps}
+                            fallbackActiveIndex={Math.min(
+                              chatStatusStep,
+                              chatRunningSteps.length - 1,
+                            )}
+                            fallbackRunning={message.status === "streaming"}
+                            open={openFeedIds.has(message.runId)}
+                            onToggle={() =>
+                              setOpenFeedIds((previous) => {
+                                const next = new Set(previous);
+                                if (next.has(message.runId!)) next.delete(message.runId!);
+                                else next.add(message.runId!);
+                                return next;
+                              })
+                            }
+                            onOpenPath={(path) =>
+                              openDocumentReference(path, message.contextPath ?? selectedPath)
+                            }
+                            canOpenPath={(path) =>
+                              canOpenDocumentReference(path, message.contextPath ?? selectedPath)
+                            }
+                            compact
+                          />
+                        ) : null}
+                        {message.role === "assistant" ? (
+                          <WorkspaceAwareMarkdown
+                            content={message.text}
+                            currentPath={message.contextPath ?? selectedPath}
+                            availableDocuments={availableDocuments}
+                            onOpenDocument={openWorkspaceDocument}
+                          />
+                        ) : (
+                          message.text
+                        )}
+                      </div>
+                    </Fragment>
+                  ))}
+                  {currentWikiUpdateRun && wikiUpdateInsertIndex === -1
+                    ? wikiUpdateRunBlock
+                    : null}
+                  {isAskingWiki ? (
+                    <div className="chat-thinking" aria-live="polite">
+                      {chatRunningLabel}
+                    </div>
+                  ) : null}
+                </div>
+              )}
+            <form
+              className="explore-chat-composer"
+              onSubmit={(event) => {
+                event.preventDefault();
+                void askExploreChat();
+              }}
+            >
+              {!activeProviderReady ? (
+                <ProviderSetupCard
+                  provider={activeProvider}
+                  setup={providerSetup}
+                  context="chat"
+                  className="chat-provider-setup"
+                />
+              ) : null}
+              {workspaceUpdateExploreNotice ? (
+                <p className="explore-chat-workspace-note">{workspaceUpdateExploreNotice}</p>
+              ) : null}
+              <textarea
+                className="explore-chat-input"
+                value={exploreQuestion}
+                disabled={Boolean(exploreBlockedReason) || !activeProviderReady || !workspace.workspacePath}
+                placeholder={activeProviderReady ? "Ask about this page…" : "Set up AI first…"}
+                rows={3}
+                onChange={(event) => setExploreQuestion(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" && !event.shiftKey) {
+                    event.preventDefault();
+                    if (exploreBlockedReason || !activeProviderReady) {
+                      return;
+                    }
+                    void askExploreChat();
+                  }
                 }}
-              >
-                Discard and restore
-              </button>
-            </div>
-          ) : null}
-
-          {hasPptxInRaw && sofficeInstalling ? (
-            <div className="banner banner-info">
-              <strong>Watching for LibreOffice install…</strong>
-              <p>
-                Terminal will say <code>libreoffice was successfully installed!</code> when done. Typically 5–10 min.
-                {sofficeInstallStartedAt
-                  ? ` (${Math.floor((Date.now() - sofficeInstallStartedAt) / 1000)}s elapsed)`
-                  : ""}
-              </p>
-            </div>
-          ) : hasPptxInRaw && sofficeStatus && !sofficeStatus.installed ? (
-            <div className="banner banner-warn">
-              <strong>LibreOffice needed for .pptx files.</strong>
-              <p>One-time install. Opens Terminal.</p>
-              <button
-                type="button"
-                disabled={Boolean(busy)}
-                onClick={() =>
-                  runCommand("install_libreoffice", "Opening Terminal to install LibreOffice")
-                }
-              >
-                Install LibreOffice
-              </button>
-            </div>
-          ) : null}
-
-          <div className="right-section study-chat-section">
-            <div className="right-section-header">
-              <span>Study Chat</span>
-              <span className="right-section-meta">
-                {isAskingWiki ? "Thinking" : selectedPath}
-              </span>
-            </div>
-            {studyChatMessages.length === 0 ? (
-              <div className="right-empty">
-                Ask about the current page or workspace. Answers are read-only.
+              />
+                <div className="explore-chat-composer-footer">
+                  <div className="explore-chat-model-controls">
+                  {providers.length > 0 && appSettings && activeProvider ? (
+                    <span className="explore-chat-select-wrap explore-chat-model-select-wrap">
+                      <select
+                        className="explore-chat-select explore-chat-model-select"
+                        value={activeModelChoiceValue}
+                        disabled={exploreBusy || blockingUiBusy}
+                        onChange={(event) => void selectChatModelChoice(event.target.value)}
+                        aria-label="AI model"
+                        title={
+                          activeModel
+                            ? `${displayProviderName(activeProvider)} - ${activeModel.label}`
+                            : undefined
+                        }
+                      >
+                        {providers.map((provider) => (
+                          <optgroup key={provider.name} label={displayProviderName(provider)}>
+                            {provider.supportedModels.map((model) => (
+                              <option key={model.id} value={`${provider.name}:${model.id}`}>
+                                {model.label}
+                              </option>
+                            ))}
+                          </optgroup>
+                        ))}
+                      </select>
+                    </span>
+                  ) : activeModel ? (
+                    <span className="explore-chat-model-fallback">{activeModel.label}</span>
+                  ) : null}
+                  <button
+                    type="button"
+                    className={`explore-chat-web-toggle${
+                      exploreWebSearchEnabled ? " active" : ""
+                    }`}
+                    aria-label={
+                      exploreWebSearchEnabled ? "Disable web search" : "Enable web search"
+                    }
+                    aria-pressed={exploreWebSearchEnabled}
+                    title={
+                      exploreWebSearchEnabled
+                        ? "Web search on"
+                        : "Web search off"
+                    }
+                    disabled={exploreBusy || blockingUiBusy || !activeProviderReady}
+                    onClick={() => setExploreWebSearchEnabled((enabled) => !enabled)}
+                  >
+                    <Globe size={18} strokeWidth={2.2} aria-hidden="true" />
+                  </button>
+                </div>
+                <div className="explore-chat-composer-actions">
+                  <button
+                    type="button"
+                    className="explore-chat-update"
+                    onClick={openLatestApplyDraft}
+                    disabled={!canOpenWikiUpdateDraft}
+                    title={
+                      updateWikiBlockedReason
+                        ? updateWikiBlockedReason
+                        : latestCompletedAssistantMessage
+                        ? "Update wiki from the latest answer"
+                        : "Ask the chat before updating the wiki"
+                    }
+                  >
+                    Update wiki
+                  </button>
+                  <button
+                    type="submit"
+                    className="explore-chat-submit"
+                    disabled={
+                      Boolean(exploreBlockedReason) ||
+                      !activeProviderReady ||
+                      !workspace.workspacePath ||
+                      !exploreQuestion.trim()
+                    }
+                    title={exploreBlockedReason ?? "Ask"}
+                    aria-label="Ask"
+                  >
+                    ↑
+                  </button>
+                </div>
               </div>
-            ) : (
-              <div className="study-chat-messages">
-                {studyChatMessages.map((message) => (
+            </form>
+          </div>
+          ) : (
+            <div className="maintain-shell">
+              <header className="explore-chat-header maintain-chat-header">
+                <div className="explore-chat-heading">
+                  <span className="explore-chat-title">Maintain</span>
+                  <span className="explore-chat-context" title={maintainThread?.title || ""}>
+                    {maintainContextLabel}
+                  </span>
+                </div>
+                <div className="explore-chat-header-actions">
+                  <button
+                    type="button"
+                    className="explore-chat-header-btn"
+                    onClick={() => void createNewMaintainThread()}
+                    disabled={!workspace.workspacePath || anyOperationBusy}
+                    title={maintainBlockedReason ?? "New maintain chat"}
+                  >
+                    +
+                  </button>
+                  <button
+                    ref={maintainHistoryButtonRef}
+                    type="button"
+                    className="explore-chat-header-btn"
+                    onClick={() => void toggleMaintainHistory()}
+                    disabled={!workspace.workspacePath || anyOperationBusy}
+                    title={maintainBlockedReason ?? "History"}
+                  >
+                    History
+                  </button>
+                </div>
+                {maintainHistoryOpen ? (
+                  <div
+                    ref={maintainHistoryPopoverRef}
+                    className="explore-chat-history-popover maintain-history-popover"
+                  >
+                    <div className="explore-chat-history-title">Maintain chats</div>
+                    {maintainThreads.length === 0 ? (
+                      <div className="explore-chat-history-empty">No saved maintain chats yet.</div>
+                    ) : (
+                      <ul className="explore-chat-history-list">
+                        {maintainThreads.map((thread) => {
+                          const activity = getMaintainThreadActivity(thread);
+                          const showMarker = shouldShowMaintainThreadMarker(thread, activity);
+                          return (
+                            <li key={thread.id}>
+                              <button
+                                type="button"
+                                className={`explore-chat-history-item${
+                                  thread.id === maintainThread?.id ? " active" : ""
+                                } status-${activity.status}`}
+                                onClick={() => void openMaintainThread(thread.id)}
+                                disabled={anyOperationBusy}
+                                title={maintainBlockedReason ?? `${thread.title} - ${activity.label}`}
+                              >
+                                <span className="explore-chat-history-main">
+                                  <span className="explore-chat-history-name">{thread.title}</span>
+                                  {showMarker ? (
+                                    <span
+                                      className={`chat-thread-status-dot status-${activity.status}`}
+                                      aria-label={activity.label}
+                                      title={activity.label}
+                                    />
+                                  ) : null}
+                                </span>
+                                <span className="explore-chat-history-preview">
+                                  {displayMaintainThreadPreview(thread)}
+                                </span>
+                              </button>
+                            </li>
+                          );
+                        })}
+                      </ul>
+                    )}
+                    {maintainThread ? (
+                      <button
+                        type="button"
+                        className="explore-chat-delete"
+                        onClick={() => void deleteCurrentMaintainThread()}
+                        disabled={anyOperationBusy}
+                        title={maintainBlockedReason ?? "Delete current chat"}
+                      >
+                        Delete current chat
+                      </button>
+                    ) : null}
+                  </div>
+                ) : null}
+              </header>
+              <div className="maintain-chat-messages">
+                {visibleMaintainThreadMessages.map((message) => (
                   <div
                     key={message.id}
-                    className={`study-chat-msg study-chat-msg-${message.role}`}
+                    className={`maintain-message maintain-message-${message.role}`}
                   >
                     {message.role === "assistant" ? (
-                      <ReactMarkdown
-                        remarkPlugins={[remarkGfm, remarkMath]}
-                        rehypePlugins={[rehypeKatex]}
-                      >
-                        {message.text}
-                      </ReactMarkdown>
+                      <WorkspaceAwareMarkdown
+                        content={message.text}
+                        currentPath={selectedPath}
+                        availableDocuments={availableDocuments}
+                        onOpenDocument={openWorkspaceDocument}
+                      />
+                    ) : message.role === "user" ? (
+                      <MaintainUserMessage text={message.text} />
                     ) : (
                       message.text
                     )}
                   </div>
                 ))}
-                {isAskingWiki ? <div className="chat-thinking">Reading the wiki…</div> : null}
-              </div>
-            )}
-            <form
-              className="study-chat-form"
-              onSubmit={(event) => {
-                event.preventDefault();
-                void askStudyChat();
-              }}
-            >
-              <textarea
-                className="study-chat-input"
-                value={studyQuestion}
-                disabled={Boolean(busy) || !workspace.workspacePath}
-                placeholder="Ask about this page…"
-                rows={3}
-                onChange={(event) => setStudyQuestion(event.target.value)}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter" && !event.shiftKey) {
-                    event.preventDefault();
-                    void askStudyChat();
-                  }
-                }}
-              />
-              <button
-                type="submit"
-                className="study-chat-submit"
-                disabled={Boolean(busy) || !workspace.workspacePath || !studyQuestion.trim()}
-              >
-                Ask
-              </button>
-            </form>
-          </div>
 
-          <div className="right-section">
-            <div className="right-section-header">
-              <span>Activity</span>
-              <span className="right-section-meta">
-                {isBuilding ? "AI working" : chatMessages.length > 0 ? "Idle" : "—"}
-              </span>
-            </div>
-            {chatMessages.length === 0 && !isBuilding ? (
-              <div className="right-empty">
-                Click <strong>Build wiki</strong> to start. Build progress streams here.
-              </div>
-            ) : (
-              <div className="chat-messages">
-                {chatMessages.map((m) => (
-                  <ChatMessageView key={m.id} message={m} />
-                ))}
-                {isBuilding ? <div className="chat-thinking">Codex is thinking…</div> : null}
-              </div>
-            )}
-          </div>
+                {!maintainThread?.operationType && maintainStage === "choose" ? (
+                  <div className="maintain-message maintain-message-assistant">
+                    <p className="maintain-message-title">What do you want to do?</p>
+                    {maintainBlockedReason ? (
+                      <p className="maintain-message-note">{maintainBlockedReason}</p>
+                    ) : null}
+                  </div>
+                ) : null}
+                {!maintainThread?.operationType && maintainStage === "choose" ? (
+                  <div className="maintain-task-list" aria-label="Maintain actions">
+                    {MAINTAIN_TASKS.map((task) => (
+                      <button
+                        key={task.id}
+                        type="button"
+                        className="maintain-task-card"
+                        disabled={Boolean(maintainBlockedReason)}
+                        title={maintainBlockedReason ?? task.label}
+                        onClick={() => selectMaintainTask(task.id)}
+                      >
+                        <span className="maintain-task-card-copy">
+                          <span className="maintain-task-card-title">{task.label}</span>
+                          <span className="maintain-task-card-summary">{task.summary}</span>
+                        </span>
+                        <span className="maintain-task-card-meta">{task.guidanceLabel}</span>
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
 
-          {selectedPath.endsWith(".md") && linkGraph[selectedPath] ? (
-            <div className="right-section">
-              <button
-                type="button"
-                className="right-section-toggle"
-                onClick={() => setConnectionsOpen((v) => !v)}
-                aria-expanded={connectionsOpen}
-              >
-                <span className="right-section-chevron">{connectionsOpen ? "▾" : "▸"}</span>
-                <span>Connections</span>
-                <span className="right-section-meta">
-                  {linkGraph[selectedPath].backlinks.length +
-                    linkGraph[selectedPath].outbound.length}
-                </span>
-              </button>
-              {connectionsOpen ? (
-                linkGraph[selectedPath].backlinks.length === 0 &&
-                linkGraph[selectedPath].outbound.length === 0 ? (
-                  <p className="connections-empty">No connections to this page yet.</p>
-                ) : (
+                {!maintainThread?.operationType && selectedMaintainTask ? (
                   <>
-                    {linkGraph[selectedPath].backlinks.length > 0 ? (
-                      <>
-                        <div className="connections-label">
-                          Linked from ({linkGraph[selectedPath].backlinks.length})
-                        </div>
-                        <ul className="connections-list">
-                          {linkGraph[selectedPath].backlinks.map((path) => (
-                            <li key={`bl-${path}`}>
-                              <button
-                                type="button"
-                                className="connection-link"
-                                onClick={() => setSelectedPath(path)}
-                                title={path}
-                              >
-                                {path.replace(/^wiki\//, "")}
-                              </button>
-                            </li>
-                          ))}
-                        </ul>
-                      </>
+                    {maintainStage === "compose" ? (
+                      <button
+                        type="button"
+                        className="maintain-back-inline"
+                        onClick={resetMaintainFlow}
+                        disabled={Boolean(maintainBlockedReason)}
+                        title={maintainBlockedReason ?? "Back to choices"}
+                      >
+                        ← Back to choices
+                      </button>
                     ) : null}
-                    {linkGraph[selectedPath].outbound.length > 0 ? (
-                      <>
-                        <div className="connections-label">
-                          Links from this page ({linkGraph[selectedPath].outbound.length})
-                        </div>
-                        <ul className="connections-list">
-                          {linkGraph[selectedPath].outbound.map((path) => (
-                            <li key={`out-${path}`}>
-                              <button
-                                type="button"
-                                className="connection-link"
-                                onClick={() => setSelectedPath(path)}
-                                title={path}
-                              >
-                                {path.replace(/^wiki\//, "")}
-                              </button>
-                            </li>
-                          ))}
-                        </ul>
-                      </>
-                    ) : null}
-                  </>
-                )
-              ) : null}
-            </div>
-          ) : null}
 
-          {changedFiles.length > 0 ? (
-            <div className="right-section">
-              <div className="right-section-header">
-                <span>Changes</span>
-                <span className="right-section-meta">{changedFiles.length}</span>
+                    <div className="maintain-message maintain-message-user">
+                      <MaintainUserMessage text={selectedMaintainTask.label} />
+                    </div>
+
+                    <div className="maintain-message maintain-message-assistant">
+                      {maintainStage === "compose" ? (
+                        <>
+                          <p>{selectedMaintainTask.explanation}</p>
+                          {selectedMaintainTask.id === "updateRules" ? (
+                            <section
+                              className="maintain-rule-files"
+                              aria-label="Current rule files"
+                            >
+                              <p className="maintain-rule-files-title">Current rule files</p>
+                              {RULE_FILE_GUIDES.map((ruleFile) => {
+                                const canOpenRuleFile = availableDocuments.includes(
+                                  ruleFile.path,
+                                );
+                                return (
+                                  <div className="maintain-rule-file" key={ruleFile.path}>
+                                    <div className="maintain-rule-file-copy">
+                                      <span className="maintain-rule-file-name">
+                                        {ruleFile.title}
+                                      </span>
+                                      <span className="maintain-rule-file-description">
+                                        {ruleFile.description}
+                                      </span>
+                                    </div>
+                                    <button
+                                      type="button"
+                                      className="maintain-rule-file-action"
+                                      disabled={!canOpenRuleFile}
+                                      onClick={() => openWorkspaceFile(ruleFile.path)}
+                                    >
+                                      {canOpenRuleFile ? "Open" : "Missing"}
+                                    </button>
+                                  </div>
+                                );
+                              })}
+                            </section>
+                          ) : null}
+                          <p className="maintain-message-note">
+                            {maintainBlockedReason
+                              ? maintainBlockedReason
+                              : selectedMaintainTask.requiresInstruction
+                              ? "Add an instruction before I run this."
+                              : "You can add a focus, or run it with no extra instruction."}
+                          </p>
+                        </>
+                      ) : null}
+
+                      {maintainStage === "running" ? (
+                        <>
+                          <OperationFeedPanel
+                            progress={workspaceOperationProgress}
+                            title={selectedMaintainTask.label}
+                            runningLabel={maintainRunningLabel}
+                            meta={[selectedMaintainTask.busyLabel]}
+                            fallbackSteps={selectedMaintainTask.runningSteps}
+                            fallbackActiveIndex={maintainActiveStep}
+                            open={maintainFeedOpen}
+                            onToggle={() => setMaintainFeedOpen((open) => !open)}
+                            onOpenPath={openDocumentReference}
+                            canOpenPath={canOpenDocumentReference}
+                          />
+                        </>
+                      ) : null}
+                    </div>
+                  </>
+                ) : null}
+
+                {maintainThread?.operationType && maintainStage === "done" ? (
+                  <div className="maintain-message maintain-message-assistant">
+                    <p className="maintain-message-title">
+                      {maintainLastResult?.success === false
+                        ? "The operation needs review."
+                        : "Finished."}
+                    </p>
+                    <p>
+                      {maintainChangedFiles.length === 0
+                        ? "No reviewable generated changes were reported."
+                        : `${maintainChangedFiles.length} generated change${
+                            maintainChangedFiles.length === 1 ? "" : "s"
+                          } ready to review. Review or undo them from the left panel.`}
+                    </p>
+                    <div className="maintain-result-actions">
+                      <button
+                        type="button"
+                        onClick={() => void createNewMaintainThread()}
+                        disabled={anyOperationBusy}
+                        title={maintainBlockedReason ?? "Start another"}
+                      >
+                        Start another
+                      </button>
+                      {workspace.reportMd && maintainOperationIsCurrent ? (
+                        <button type="button" onClick={openReportTab}>
+                          Show report
+                        </button>
+                      ) : null}
+                    </div>
+                  </div>
+                ) : null}
               </div>
-              <ul className="changed-list">
-                {changedFiles.map((file) => (
-                  <li key={`${file.status}:${file.path}`}>
-                    <span className={`file-status ${file.status}`}>{file.status}</span>
-                    <span title={file.path}>{file.path}</span>
-                  </li>
-                ))}
-              </ul>
+
+              {maintainStage === "compose" &&
+              selectedMaintainTask &&
+              !maintainThread?.operationType ? (
+                <form
+                  className="maintain-composer"
+                  onSubmit={(event) => {
+                    event.preventDefault();
+                    void runMaintainCommand();
+                  }}
+                >
+                  {!activeProviderReady ? (
+                    <ProviderSetupCard
+                      provider={activeProvider}
+                      setup={providerSetup}
+                      context="maintain"
+                      className="maintain-provider-setup"
+                    />
+                  ) : null}
+                  <textarea
+                    className="maintain-input"
+                    value={maintainInstruction}
+                    rows={3}
+                    disabled={Boolean(maintainBlockedReason) || !activeProviderReady}
+                    title={maintainBlockedReason ?? undefined}
+                    placeholder={selectedMaintainTask.placeholder}
+                    onChange={(event) => setMaintainInstruction(event.target.value)}
+                  />
+                  <div className="maintain-composer-footer">
+                    <div className="explore-chat-model-controls maintain-model-controls">
+                      {providers.length > 0 && appSettings && activeProvider ? (
+                        <span className="explore-chat-select-wrap explore-chat-model-select-wrap">
+                          <select
+                            className="explore-chat-select explore-chat-model-select"
+                            value={activeModelChoiceValue}
+                            disabled={anyOperationBusy}
+                            onChange={(event) => void selectChatModelChoice(event.target.value)}
+                            aria-label="Maintain AI model"
+                            title={
+                              activeModel
+                                ? `${displayProviderName(activeProvider)} - ${activeModel.label}`
+                                : undefined
+                            }
+                          >
+                            {providers.map((provider) => (
+                              <optgroup key={provider.name} label={displayProviderName(provider)}>
+                                {provider.supportedModels.map((model) => (
+                                  <option key={model.id} value={`${provider.name}:${model.id}`}>
+                                    {model.label}
+                                  </option>
+                                ))}
+                              </optgroup>
+                            ))}
+                          </select>
+                        </span>
+                      ) : activeModel ? (
+                        <span className="explore-chat-model-fallback">{activeModel.label}</span>
+                      ) : null}
+                    </div>
+                    <button
+                      type="submit"
+                      className="maintain-primary"
+                      disabled={!maintainCanRun || !activeProviderReady}
+                      aria-label={selectedMaintainTask.actionLabel}
+                      title={maintainBlockedReason ?? selectedMaintainTask.actionLabel}
+                    >
+                      ↑
+                    </button>
+                  </div>
+                </form>
+              ) : null}
+
             </div>
-          ) : null}
+          )}
         </aside>
       </div>
 
       <footer className="app-statusbar">
-        <span className={`statusbar-pill ${statusLabel.toLowerCase().replace(/\s+/g, "-")}`}>
-          {statusLabel}
-        </span>
+        {statusLabel ? (
+          <span className={`statusbar-pill ${statusLabel.toLowerCase().replace(/\s+/g, "-")}`}>
+            {statusLabel}
+          </span>
+        ) : null}
         <span className="statusbar-meta">
           {wikiPages.length} pages · {imageAssets.length} assets
         </span>
@@ -1417,27 +4630,535 @@ function App() {
         </span>
       </footer>
 
-      {expandedImage ? (
-        <div className="image-lightbox" role="dialog" aria-modal="true">
-          <button type="button" className="lightbox-close" onClick={() => setExpandedImage(null)}>
-            Close
+        {expandedImage ? (
+          <div className="image-lightbox" role="dialog" aria-modal="true">
+            <button type="button" className="lightbox-close" onClick={() => setExpandedImage(null)}>
+              Close
           </button>
           <img src={expandedImage.src} alt={expandedImage.alt} />
-          {expandedImage.alt ? <p>{expandedImage.alt}</p> : null}
-        </div>
-      ) : null}
-
-      {dragOver ? (
-        <div className="drop-overlay" aria-hidden>
-          <div className="drop-overlay-card">
-            <strong>Drop to import</strong>
-            <p>PDF, PPTX, MD, TXT, or images</p>
+            {expandedImage.alt ? <p>{expandedImage.alt}</p> : null}
           </div>
+        ) : null}
+
+        {buildDraft ? (
+          <div
+            className="apply-modal-overlay"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="build-modal-title"
+            onMouseDown={() => {
+              if (!isStartingBuild) setBuildDraft(null);
+            }}
+          >
+            <div className="apply-modal build-modal" onMouseDown={(event) => event.stopPropagation()}>
+              <header className="apply-modal-header">
+                <div>
+                  <h2 id="build-modal-title">
+                    {buildDraft.requiresWorkspaceContext
+                      ? "Tell Maple what this wiki is for"
+                      : buildDraft.force
+                        ? "Build wiki again"
+                        : "Build wiki"}
+                  </h2>
+                  <p>
+                    {buildDraft.requiresWorkspaceContext
+                      ? "This helps Maple choose the right summaries, concepts, and guides."
+                      : buildDraft.force
+                        ? "Reprocess current sources using the workspace rules."
+                        : "Process pending source changes into the wiki."}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  className="apply-modal-close"
+                  onClick={() => setBuildDraft(null)}
+                  disabled={isStartingBuild}
+                >
+                  Close
+                </button>
+              </header>
+
+              <div className="build-source-summary">
+                {buildDraft.force ? (
+                  sourceFiles.length > 0 ? (
+                    <ul>
+                      {sourceFiles.slice(0, 12).map((path) => (
+                        <li key={path}>{path}</li>
+                      ))}
+                      {sourceFiles.length > 12 ? <li>{sourceFiles.length - 12} more source(s)</li> : null}
+                    </ul>
+                  ) : (
+                    <p>No sources found.</p>
+                  )
+                ) : pendingSourceFiles.length > 0 ? (
+                  (["new", "modified", "removed"] as SourceState[]).map((state) => {
+                    const files = pendingSourceFiles.filter((file) => file.state === state);
+                    if (!files.length) return null;
+                    return (
+                      <div key={state} className="source-group">
+                        <strong>{sourceStateLabel(state)}</strong>
+                        <ul>
+                          {files.map((file) => (
+                            <li key={`${state}-${file.path}`}>{file.path}</li>
+                          ))}
+                        </ul>
+                      </div>
+                    );
+                  })
+                ) : (
+                  <p>No pending source changes were detected.</p>
+                )}
+              </div>
+
+              {looksLikeExistingWikiImport && !buildDraft.force ? (
+                <section className="existing-wiki-choice" aria-label="Existing wiki import options">
+                  <div>
+                    <strong>Existing wiki detected</strong>
+                    <p>
+                      These sources look like they already belong to the current wiki. Keep the wiki as
+                      the baseline to mark them ingested without asking AI to rewrite everything.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    className="existing-wiki-choice-btn"
+                    onClick={() => void keepExistingWikiAsBaseline()}
+                    disabled={Boolean(buildBlockedReason) || anyOperationBusy}
+                    title={buildBlockedReason ?? (activeOperationLabel ? `${activeOperationLabel} is running.` : undefined)}
+                  >
+                    Keep current wiki
+                  </button>
+                </section>
+              ) : null}
+
+              <label className="build-model-field">
+                <span>AI model</span>
+                {providers.length > 0 && buildDraftProvider ? (
+                  <select
+                    className="build-model-select"
+                    value={buildModelChoiceValue}
+                    disabled={isStartingBuild || Boolean(buildBlockedReason)}
+                    onChange={(event) => void selectBuildModelChoice(event.target.value)}
+                    aria-label="Build wiki AI model"
+                    title={
+                      buildDraftModel
+                        ? `${displayProviderName(buildDraftProvider)} - ${buildDraftModel.label}`
+                        : undefined
+                    }
+                  >
+                    {providers.map((provider) => (
+                      <optgroup key={provider.name} label={displayProviderName(provider)}>
+                        {provider.supportedModels.map((model) => (
+                          <option key={model.id} value={`${provider.name}:${model.id}`}>
+                            {model.recommended ? `${model.label} (Recommended)` : model.label}
+                          </option>
+                        ))}
+                      </optgroup>
+                    ))}
+                  </select>
+                ) : activeModel ? (
+                  <span className="build-model-fallback">{activeModel.label}</span>
+                ) : null}
+              </label>
+
+              <label className="apply-note-field">
+                <span>
+                  {buildDraft.requiresWorkspaceContext
+                    ? "What are you building?"
+                    : "What should the AI focus on?"}
+                </span>
+                <textarea
+                  value={
+                    buildDraft.requiresWorkspaceContext
+                      ? buildDraft.workspaceContext
+                      : buildDraft.instruction
+                  }
+                  placeholder={
+                    buildDraft.requiresWorkspaceContext
+                      ? "Example: This is for my robotics class. I want a beginner-friendly study wiki with exam review guides, formulas explained step by step, and links between core concepts."
+                      : "Optional: emphasize formulas, create an exam guide, or focus on the selected lecture."
+                  }
+                  rows={buildDraft.requiresWorkspaceContext ? 5 : 4}
+                  required={buildDraft.requiresWorkspaceContext}
+                  aria-required={buildDraft.requiresWorkspaceContext}
+                  disabled={Boolean(buildBlockedReason)}
+                  title={buildBlockedReason ?? undefined}
+                  onChange={(event) =>
+                    setBuildDraft((prev) =>
+                      prev
+                        ? prev.requiresWorkspaceContext
+                          ? { ...prev, workspaceContext: event.target.value }
+                          : { ...prev, instruction: event.target.value }
+                        : prev,
+                    )
+                  }
+                />
+              </label>
+
+              {buildDraftProvider && !selectedBuildProviderReady ? (
+                <ProviderSetupCard
+                  provider={buildDraftProvider}
+                  setup={selectedBuildProviderSetup}
+                  context="build"
+                  className="build-provider-setup"
+                />
+              ) : null}
+
+              <footer className="apply-modal-actions">
+                <button
+                  type="button"
+                  className="apply-modal-secondary"
+                  onClick={() => setBuildDraft(null)}
+                  disabled={isStartingBuild}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  className="apply-modal-primary"
+                  onClick={() => void startBuildWiki()}
+                  disabled={
+                    Boolean(buildBlockedReason) ||
+                    !buildDraftProvider ||
+                    !buildDraftModelId ||
+                    !selectedBuildProviderReady ||
+                    (!buildDraft.force && pendingSourceFiles.length === 0) ||
+                    (buildDraft.requiresWorkspaceContext && !buildDraft.workspaceContext.trim())
+                  }
+                  title={buildBlockedReason ?? undefined}
+                >
+                  {looksLikeExistingWikiImport && !buildDraft.force ? "Rebuild from sources" : "Build wiki"}
+                </button>
+              </footer>
+            </div>
+          </div>
+        ) : null}
+
+        {applyDraft ? (
+          <div
+            className="apply-modal-overlay"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="apply-modal-title"
+            onMouseDown={() => {
+              if (!wikiUpdateBusy) setApplyDraft(null);
+            }}
+          >
+            <div className="apply-modal" onMouseDown={(event) => event.stopPropagation()}>
+              <header className="apply-modal-header">
+                <div>
+                  <h2 id="apply-modal-title">Update wiki</h2>
+                  <p>AI will update the wiki where it fits. You can review changes after.</p>
+                </div>
+                <button
+                  type="button"
+                  className="apply-modal-close"
+                  onClick={() => setApplyDraft(null)}
+                  disabled={wikiUpdateBusy}
+                >
+                  Close
+                </button>
+              </header>
+
+              <fieldset className="apply-scope-group">
+                <legend>Use</legend>
+                <div className="apply-scope-options">
+                  {APPLY_SCOPE_OPTIONS.map((option) => (
+                    <label
+                      key={option.value}
+                      className={`apply-scope-option${
+                        applyDraft.scope === option.value ? " selected" : ""
+                      }`}
+                    >
+                      <input
+                        type="radio"
+                        name="apply-scope"
+                        value={option.value}
+                        checked={applyDraft.scope === option.value}
+                        disabled={wikiUpdateBusy}
+                        onChange={() => updateApplyScope(option.value)}
+                      />
+                      <span>{option.label}</span>
+                    </label>
+                  ))}
+                </div>
+              </fieldset>
+
+              {applyDraft.scope === "selected-messages" ? (
+                <div className="apply-message-picker">
+                  {applyMessages.length === 0 ? (
+                    <p>No completed chat messages yet.</p>
+                  ) : (
+                    applyMessages.map((message) => (
+                      <label key={message.id} className="apply-message-option">
+                        <input
+                          type="checkbox"
+                          checked={applyDraft.selectedIds.has(message.id)}
+                          disabled={wikiUpdateBusy}
+                          onChange={() => toggleApplyMessage(message.id)}
+                        />
+                        <span className="apply-message-option-body">
+                          <span className="apply-message-option-meta">
+                            {message.role === "user" ? "You" : "AI"}
+                            {message.contextPath
+                              ? ` - ${displayFileName(message.contextPath)}`
+                              : ""}
+                          </span>
+                          <span className="apply-message-option-text">{message.text}</span>
+                        </span>
+                      </label>
+                    ))
+                  )}
+                </div>
+              ) : null}
+
+              <label className="apply-note-field">
+                <span>Note to AI</span>
+                <textarea
+                  value={applyDraft.instruction}
+                  placeholder="Optional: make this concise, add an example, or connect it to earlier notes."
+                  rows={4}
+                  disabled={wikiUpdateBusy}
+                  onChange={(event) =>
+                    setApplyDraft((prev) =>
+                      prev ? { ...prev, instruction: event.target.value } : prev,
+                    )
+                  }
+                />
+              </label>
+
+              <footer className="apply-modal-actions">
+                <button
+                  type="button"
+                  className="apply-modal-secondary"
+                  onClick={() => setApplyDraft(null)}
+                  disabled={wikiUpdateBusy}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  className="apply-modal-primary"
+                  onClick={() => void applyChatToWiki()}
+                  disabled={Boolean(updateWikiBlockedReason) || applySelectedCount === 0}
+                  title={updateWikiBlockedReason ?? undefined}
+                >
+                  Apply
+                </button>
+              </footer>
+            </div>
+          </div>
+        ) : null}
+
+        {dragOver ? (
+          <div className="drop-overlay" aria-hidden>
+            <div className="drop-overlay-card">
+              <strong>Drop to import</strong>
+              <p>PDF, PPTX, MD, TXT, or images</p>
+            </div>
+          </div>
+        ) : null}
+
+      {showSettings ? (
+        <Settings
+          onClose={() => {
+            setShowSettings(false);
+            void Promise.all([
+              invoke<ProviderInfo[]>("list_providers"),
+              invoke<AppSettings>("get_settings"),
+            ]).then(([providerList, settings]) => {
+              setProviders(providerList);
+              setAppSettings(settings);
+            }).catch(() => {});
+          }}
+        />
+      ) : null}
+    </main>
+  );
+}
+
+function OperationFeedPanel({
+  progress,
+  title,
+  meta,
+  runningLabel,
+  fallbackSteps = [],
+  fallbackActiveIndex = 0,
+  fallbackRunning = true,
+  open,
+  onToggle,
+  onOpenPath,
+  canOpenPath,
+  compact = false,
+}: {
+  progress: OperationProgress | null;
+  title: string;
+  meta?: string[];
+  runningLabel?: string;
+  fallbackSteps?: string[];
+  fallbackActiveIndex?: number;
+  fallbackRunning?: boolean;
+  open: boolean;
+  onToggle: () => void;
+  onOpenPath?: (path: string) => void;
+  canOpenPath?: (path: string) => boolean;
+  compact?: boolean;
+}) {
+  const events = progress?.events ?? [];
+  const latest = events[events.length - 1];
+  const running = progress?.running ?? (fallbackRunning && fallbackSteps.length > 0);
+  const latestInProgress = [...events].reverse().find((event) => event.status === "in_progress");
+  const stateLabel = progress?.error
+    ? "Error"
+    : running
+      ? latest?.status === "in_progress"
+        ? latest.title
+        : runningLabel ||
+          latestInProgress?.title ||
+          latest?.title ||
+          fallbackSteps[fallbackActiveIndex] ||
+          "Running"
+      : latest?.title || "Finished";
+  const showHeaderState = Boolean(stateLabel) && (!running || !runningLabel);
+  const visibleEvents = events.slice(-80);
+  const feedBodyRef = useRef<HTMLDivElement>(null);
+  const latestEventId = latest?.id ?? "";
+
+  useEffect(() => {
+    if (!open) return;
+    const feedBody = feedBodyRef.current;
+    if (!feedBody) return;
+
+    window.requestAnimationFrame(() => {
+      feedBody.scrollTop = feedBody.scrollHeight;
+    });
+  }, [latestEventId, open, progress?.error, visibleEvents.length]);
+
+  return (
+    <section className={`operation-feed-panel ${compact ? "compact" : ""}`}>
+      <button
+        type="button"
+        className="operation-feed-header"
+        onClick={onToggle}
+        aria-expanded={open}
+      >
+        <span className="operation-feed-title-block">
+          <span className="operation-feed-title">{title}</span>
+          {showHeaderState ? <span className="operation-feed-state">{stateLabel}</span> : null}
+        </span>
+        <span className="operation-feed-toggle">{open ? "Hide" : "Show"}</span>
+      </button>
+      {meta?.length ? (
+        <div className="operation-feed-meta">
+          {meta.map((item) =>
+            canOpenPath?.(item) ? (
+              <button
+                key={item}
+                type="button"
+                className="operation-feed-meta-item file-jump-link"
+                onClick={() => onOpenPath?.(item)}
+                title={item}
+              >
+                {item}
+              </button>
+            ) : (
+              <span key={item} className="operation-feed-meta-item">
+                {item}
+              </span>
+            ),
+          )}
         </div>
       ) : null}
+      {running && runningLabel ? (
+        <div className="operation-feed-running chat-thinking" role="status" aria-live="polite">
+          {runningLabel}
+        </div>
+      ) : null}
+      {open ? (
+        <div className="operation-feed-body" ref={feedBodyRef}>
+          {visibleEvents.length > 0 ? (
+            <ol className="operation-feed-list" aria-live={running ? "polite" : "off"}>
+              {visibleEvents.map((event) => (
+                <li
+                  key={event.id}
+                  className={`operation-feed-item kind-${event.kind} status-${
+                    event.status || "unknown"
+                  }`}
+                >
+                  <span className="operation-feed-dot" />
+                  <span className="operation-feed-copy">
+                    <span className="operation-feed-event-title">{event.title}</span>
+                    {event.path ? (
+                      canOpenPath?.(event.path) ? (
+                        <button
+                          type="button"
+                          className="operation-feed-path file-jump-link"
+                          onClick={() => onOpenPath?.(event.path!)}
+                          title={event.path}
+                        >
+                          {event.path}
+                        </button>
+                      ) : (
+                        <span className="operation-feed-path" title={event.path}>
+                          {event.path}
+                        </span>
+                      )
+                    ) : null}
+                    {event.detail ? (
+                      <span className="operation-feed-detail">{event.detail}</span>
+                    ) : null}
+                  </span>
+                </li>
+              ))}
+            </ol>
+          ) : fallbackSteps.length > 0 ? (
+            <ol className="operation-feed-list fallback" aria-live="polite">
+              {fallbackSteps.map((step, index) => {
+                const itemState =
+                  !running
+                    ? "completed"
+                    : index < fallbackActiveIndex
+                    ? "completed"
+                    : index === fallbackActiveIndex
+                      ? "in_progress"
+                      : "pending";
+                return (
+                  <li key={step} className={`operation-feed-item status-${itemState}`}>
+                    <span className="operation-feed-dot" />
+                    <span className="operation-feed-copy">
+                      <span className="operation-feed-event-title">{step}</span>
+                    </span>
+                  </li>
+                );
+              })}
+            </ol>
+          ) : (
+            <div className="operation-feed-empty">Waiting for runner events.</div>
+          )}
+          {progress?.error ? <div className="operation-feed-error">{progress.error}</div> : null}
+        </div>
+      ) : null}
+    </section>
+  );
+}
 
-      {showSettings ? <Settings onClose={() => setShowSettings(false)} /> : null}
-    </main>
+function MaintainUserMessage({ text }: { text: string }) {
+  const parts = text
+    .split(/\n+/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+  const context = parts.length > 1 ? parts[0] : null;
+  const body = context ? parts.slice(1).join("\n") : text.trim();
+
+  return (
+    <>
+      {context ? (
+        <div className="maintain-message-context" title={context}>
+          {context}
+        </div>
+      ) : null}
+      <div className="maintain-message-body">{body}</div>
+    </>
   );
 }
 
@@ -1680,51 +5401,12 @@ function PdfViewer({ src }: { src: string }) {
   );
 }
 
-function ChatMessageView({ message }: { message: ChatMessage }) {
-  if (message.kind === "user") {
-    return <div className="chat-msg chat-msg-user">{message.text}</div>;
-  }
-  if (message.kind === "codex_thought") {
-    return <div className="chat-msg chat-msg-thought">{message.text}</div>;
-  }
-  if (message.kind === "codex_message") {
-    return <div className="chat-msg chat-msg-codex">{message.text}</div>;
-  }
-  if (message.kind === "codex_command") {
-    return (
-      <div className="chat-msg chat-msg-cmd">
-        <span className="chat-msg-sigil">{message.cmdStatus === "failed" ? "✗" : "›"}</span>
-        <code>{message.cmd}</code>
-      </div>
-    );
-  }
-  if (message.kind === "codex_file_change") {
-    const kind = (message.fileKind || "").toLowerCase();
-    const sigil =
-      kind === "add" || kind === "added"
-        ? "+"
-        : kind === "delete" || kind === "deleted"
-          ? "−"
-          : "~";
-    return (
-      <div className="chat-msg chat-msg-file">
-        <span className="chat-msg-sigil">{sigil}</span>
-        <code>{message.filePath}</code>
-      </div>
-    );
-  }
-  if (message.kind === "system") {
-    const severity = message.severity || "info";
-    return <div className={`chat-msg chat-msg-system chat-msg-system-${severity}`}>{message.text}</div>;
-  }
-  return null;
-}
-
 type TreeNode = {
   name: string;
   path: string;
   isDir: boolean;
   children: TreeNode[];
+  sectionStart?: boolean;
 };
 
 function buildTree(files: string[], rootPrefix: string): TreeNode[] {
@@ -1771,9 +5453,11 @@ type TreeViewProps = {
   expanded: Set<string>;
   toggleFolder: (path: string) => void;
   selectedPath: string;
+  changedFileMap: Map<string, ChangedFile>;
   onSelect?: (path: string) => void;
   onRemove?: (path: string) => void;
   removeDisabled?: boolean;
+  removeDisabledReason?: string | null;
 };
 
 function TreeView(props: TreeViewProps) {
@@ -1792,25 +5476,33 @@ function TreeItem({
   expanded,
   toggleFolder,
   selectedPath,
+  changedFileMap,
   onSelect,
   onRemove,
   removeDisabled,
+  removeDisabledReason,
 }: TreeViewProps & { node: TreeNode }) {
-  const indent = level === 0 ? 10 : 0;
+  const indent = level === 0 ? 8 : 0;
+  const changedDescendantCount = node.isDir
+    ? Array.from(changedFileMap.keys()).filter((path) => path.startsWith(`${node.path}/`)).length
+    : 0;
 
   if (node.isDir) {
     const isOpen = expanded.has(node.path);
     return (
-      <li className="tree-item">
+      <li className={`tree-item${node.sectionStart ? " tree-section-start" : ""}`}>
         <button
           type="button"
-          className="tree-row tree-folder"
+          className={`tree-row tree-folder ${changedDescendantCount > 0 ? "has-changes" : ""}`}
           style={{ paddingLeft: indent }}
           onClick={() => toggleFolder(node.path)}
           title={node.path}
         >
           <span className="tree-chevron">{isOpen ? "▾" : "▸"}</span>
           <span className="tree-name">{node.name}</span>
+          {changedDescendantCount > 0 ? (
+            <span className="tree-change-dot" title={`${changedDescendantCount} file(s) to review`} />
+          ) : null}
         </button>
         {isOpen ? (
           <TreeView
@@ -1819,9 +5511,11 @@ function TreeItem({
             expanded={expanded}
             toggleFolder={toggleFolder}
             selectedPath={selectedPath}
+            changedFileMap={changedFileMap}
             onSelect={onSelect}
             onRemove={onRemove}
             removeDisabled={removeDisabled}
+            removeDisabledReason={removeDisabledReason}
           />
         ) : null}
       </li>
@@ -1829,16 +5523,26 @@ function TreeItem({
   }
 
   const isSelected = selectedPath === node.path;
-  const fileIndent = level === 0 ? 30 : 24;
+  const fileIndent = level === 0 ? 24 : 14;
   const fileDisplay = getFileDisplayParts(node.name);
-  const canRemove = Boolean(onRemove && node.path.startsWith("raw/"));
+  const canRemove = Boolean(onRemove && node.path.startsWith("sources/"));
+  const changedFile = changedFileMap.get(node.path);
+  const changeStatus = changedFile?.status || "";
 
   return (
-    <li className="tree-item">
+    <li className={`tree-item${node.sectionStart ? " tree-section-start" : ""}`}>
       <div
-        className={`tree-row tree-file-row ${isSelected ? "selected" : ""}`}
+        className={[
+          "tree-row",
+          "tree-file-row",
+          isSelected ? "selected" : "",
+          changedFile ? "changed" : "",
+          changeStatus ? `changed-${changeStatus}` : "",
+        ]
+          .filter(Boolean)
+          .join(" ")}
         style={{ paddingLeft: fileIndent }}
-        title={node.path}
+        title={changedFile ? `${node.path} (${changedFile.status})` : node.path}
       >
         {onSelect ? (
           <button
@@ -1860,13 +5564,19 @@ function TreeItem({
             ) : null}
           </span>
         )}
+        {changedFile ? (
+          <span
+            className={`tree-change-dot tree-change-dot-${changeStatus}`}
+            title={changedFile.status}
+          />
+        ) : null}
         {canRemove ? (
           <button
             type="button"
             className="tree-icon-btn ghost"
             disabled={removeDisabled}
             onClick={() => onRemove?.(node.path)}
-            title="Remove"
+            title={removeDisabled && removeDisabledReason ? removeDisabledReason : "Remove"}
           >
             ×
           </button>
@@ -1887,6 +5597,233 @@ function getFileDisplayParts(fileName: string): { label: string; extension: stri
   };
 }
 
+type WikiPageMetadata = {
+  sources: string[];
+  created?: string;
+  updated?: string;
+};
+
+type MarkdownCalloutTone =
+  | "info"
+  | "tip"
+  | "success"
+  | "question"
+  | "warning"
+  | "danger"
+  | "quote";
+
+type MarkdownCalloutConfig = {
+  label: string;
+  tone: MarkdownCalloutTone;
+  Icon: LucideIcon;
+};
+
+type MarkdownCalloutMarkerState = {
+  type: string | null;
+  title: string | null;
+};
+
+const MARKDOWN_CALLOUT_MARKER_REGEX = /^\s*\[!([A-Za-z][\w-]*)\][+-]?(?:[ \t]*([^\r\n]*)(\r?\n[ \t]*))?/;
+const MARKDOWN_DIRECTIVE_CALLOUT_REGEX =
+  /(^|\n):::(note|abstract|summary|tldr|info|todo|tip|hint|important|success|check|done|question|help|faq|warning|caution|attention|failure|fail|missing|danger|error|bug|example|quote|cite)([^\n]*)\n([\s\S]*?)\n:::[ \t]*(?=\n|$)/gi;
+
+const MARKDOWN_CALLOUT_CONFIGS: Record<string, MarkdownCalloutConfig> = {
+  note: { label: "Note", tone: "info", Icon: Info },
+  info: { label: "Info", tone: "info", Icon: Info },
+  abstract: { label: "Summary", tone: "info", Icon: Info },
+  summary: { label: "Summary", tone: "info", Icon: Info },
+  tldr: { label: "TL;DR", tone: "info", Icon: Info },
+  tip: { label: "Tip", tone: "tip", Icon: Lightbulb },
+  hint: { label: "Hint", tone: "tip", Icon: Lightbulb },
+  important: { label: "Important", tone: "tip", Icon: Lightbulb },
+  todo: { label: "Todo", tone: "success", Icon: CheckCircle2 },
+  success: { label: "Success", tone: "success", Icon: CheckCircle2 },
+  check: { label: "Check", tone: "success", Icon: CheckCircle2 },
+  done: { label: "Done", tone: "success", Icon: CheckCircle2 },
+  question: { label: "Question", tone: "question", Icon: HelpCircle },
+  help: { label: "Help", tone: "question", Icon: HelpCircle },
+  faq: { label: "Question", tone: "question", Icon: HelpCircle },
+  warning: { label: "Warning", tone: "warning", Icon: AlertTriangle },
+  caution: { label: "Caution", tone: "warning", Icon: AlertTriangle },
+  attention: { label: "Attention", tone: "warning", Icon: AlertTriangle },
+  danger: { label: "Danger", tone: "danger", Icon: XCircle },
+  error: { label: "Error", tone: "danger", Icon: XCircle },
+  failure: { label: "Failure", tone: "danger", Icon: XCircle },
+  fail: { label: "Failure", tone: "danger", Icon: XCircle },
+  missing: { label: "Missing", tone: "danger", Icon: XCircle },
+  bug: { label: "Bug", tone: "danger", Icon: XCircle },
+  example: { label: "Example", tone: "info", Icon: Info },
+  quote: { label: "Quote", tone: "quote", Icon: Quote },
+  cite: { label: "Quote", tone: "quote", Icon: Quote },
+};
+
+const MarkdownCalloutBlockquote: Components["blockquote"] = ({ children, className }) => {
+  const callout = extractMarkdownCallout(children);
+  if (!callout) {
+    return <blockquote className={className}>{children}</blockquote>;
+  }
+
+  const config = getMarkdownCalloutConfig(callout.type);
+  const title = callout.title || config.label;
+  const Icon = config.Icon;
+  const classes = ["markdown-callout", `markdown-callout-${config.tone}`, className]
+    .filter(Boolean)
+    .join(" ");
+
+  return (
+    <aside className={classes} data-callout={callout.type} aria-label={title}>
+      <div className="markdown-callout-title">
+        <Icon aria-hidden="true" size={16} strokeWidth={2.2} />
+        <span>{title}</span>
+      </div>
+      <div className="markdown-callout-body">{callout.children}</div>
+    </aside>
+  );
+};
+
+function extractMarkdownCallout(
+  children: ReactNode,
+): { type: string; title: string | null; children: ReactNode } | null {
+  const state: MarkdownCalloutMarkerState = { type: null, title: null };
+  const strippedChildren = stripMarkdownCalloutMarker(children, state);
+  if (!state.type) return null;
+
+  return {
+    type: state.type,
+    title: state.title,
+    children: strippedChildren,
+  };
+}
+
+function stripMarkdownCalloutMarker(
+  node: ReactNode,
+  state: MarkdownCalloutMarkerState,
+): ReactNode {
+  if (state.type) return node;
+
+  if (typeof node === "string") {
+    const marker = node.match(MARKDOWN_CALLOUT_MARKER_REGEX);
+    if (!marker) return node;
+
+    state.type = marker[1].toLowerCase();
+    const hasContentAfterMarkerLine = Boolean(marker[3]);
+    if (hasContentAfterMarkerLine) {
+      const title = marker[2].trim();
+      state.title = title || null;
+      return node.slice(marker[0].length);
+    }
+
+    return node.slice(marker[0].length).replace(/^[ \t]+/, "");
+  }
+
+  if (node === null || node === undefined || typeof node === "boolean" || typeof node === "number") {
+    return node;
+  }
+
+  if (isValidElement<{ children?: ReactNode }>(node)) {
+    const childNodes = node.props.children;
+    if (childNodes === undefined) return node;
+
+    const nextChildren = stripMarkdownCalloutMarker(childNodes, state);
+    return state.type ? cloneElement(node, undefined, nextChildren) : node;
+  }
+
+  return Children.map(node, (child) => stripMarkdownCalloutMarker(child, state));
+}
+
+function getMarkdownCalloutConfig(type: string): MarkdownCalloutConfig {
+  return (
+    MARKDOWN_CALLOUT_CONFIGS[type] ?? {
+      label: humanizeMarkdownCalloutType(type),
+      tone: "info",
+      Icon: Info,
+    }
+  );
+}
+
+function humanizeMarkdownCalloutType(type: string) {
+  return type
+    .replace(/[-_]+/g, " ")
+    .replace(/\b\w/g, (character) => character.toUpperCase());
+}
+
+function WorkspaceAwareMarkdown({
+  content,
+  currentPath,
+  availableDocuments,
+  onOpenDocument,
+}: {
+  content: string;
+  currentPath: string;
+  availableDocuments: string[];
+  onOpenDocument: (path: string, anchor?: string | null) => void;
+}) {
+  const renderedContent = normalizeMarkdownForDisplay(content, currentPath, availableDocuments);
+  const components: Components = {
+    blockquote: MarkdownCalloutBlockquote,
+    a({ href, children, ...props }) {
+      if (href?.startsWith("aiwiki-broken://")) {
+        const target = decodeURIComponent(href.slice("aiwiki-broken://".length));
+        return (
+          <span className="broken-wikilink" title={`No page named "${target}" yet`}>
+            {children}
+          </span>
+        );
+      }
+
+      if (href && isExternalUrl(href)) {
+        return (
+          <a
+            {...props}
+            href={href}
+            onClick={(event) => {
+              event.preventDefault();
+              openUrl(href).catch(() => {});
+            }}
+          >
+            {children}
+          </a>
+        );
+      }
+
+      const target = href
+        ? resolveWorkspaceDocumentReference(href, currentPath, availableDocuments)
+        : null;
+      if (target) {
+        return (
+          <a
+            {...props}
+            href={href}
+            onClick={(event) => {
+              event.preventDefault();
+              onOpenDocument(target.path, target.anchor);
+            }}
+          >
+            {children}
+          </a>
+        );
+      }
+
+      return (
+        <a {...props} href={href}>
+          {children}
+        </a>
+      );
+    },
+  };
+
+  return (
+    <ReactMarkdown
+      remarkPlugins={[remarkGfm, remarkMath]}
+      rehypePlugins={[rehypeKatex]}
+      components={components}
+      urlTransform={(url) => url}
+    >
+      {renderedContent}
+    </ReactMarkdown>
+  );
+}
+
 function MarkdownDocument({
   content,
   currentPath,
@@ -1902,15 +5839,20 @@ function MarkdownDocument({
   onOpenDocument: (path: string, anchor?: string | null) => void;
   onOpenImage: (image: ExpandedImage) => void;
 }) {
+  const parsedDocument = parseMarkdownFrontmatter(content);
+  const headerDocument = extractWikiPageHeaderMetadata(parsedDocument.body);
+  const metadata = mergeWikiPageMetadata(parsedDocument.metadata, headerDocument.metadata);
+  const titledDocument = extractFirstMarkdownTitle(headerDocument.body);
   const renderedContent = normalizeMarkdownForDisplay(
-    stripFrontmatter(content),
+    titledDocument.body,
     currentPath,
     availableDocuments,
   );
   const components: Components = {
+    blockquote: MarkdownCalloutBlockquote,
     a({ href, children, ...props }) {
-      if (href?.startsWith("studywiki-broken://")) {
-        const target = decodeURIComponent(href.slice("studywiki-broken://".length));
+      if (href?.startsWith("aiwiki-broken://")) {
+        const target = decodeURIComponent(href.slice("aiwiki-broken://".length));
         return (
           <span className="broken-wikilink" title={`No page named "${target}" yet`}>
             {children}
@@ -1999,7 +5941,17 @@ function MarkdownDocument({
   };
 
   return (
-    <article className="study-document">
+    <article className="wiki-document">
+      {titledDocument.title ? (
+        <h1 id={slugifyMarkdownHeading(titledDocument.title)}>{titledDocument.title}</h1>
+      ) : null}
+      {metadata ? (
+        <WikiPageMetadataLine
+          metadata={metadata}
+          availableDocuments={availableDocuments}
+          onOpenDocument={onOpenDocument}
+        />
+      ) : null}
       <ReactMarkdown
         remarkPlugins={[remarkGfm, [remarkMath, { singleDollarTextMath: true }]]}
         rehypePlugins={[rehypeSlug, rehypeKatex]}
@@ -2012,16 +5964,85 @@ function MarkdownDocument({
   );
 }
 
+function WikiPageMetadataLine({
+  metadata,
+  availableDocuments,
+  onOpenDocument,
+}: {
+  metadata: WikiPageMetadata;
+  availableDocuments: string[];
+  onOpenDocument: (path: string, anchor?: string | null) => void;
+}) {
+  const hasSources = metadata.sources.length > 0;
+  if (!hasSources && !metadata.created && !metadata.updated) return null;
+
+  return (
+    <div className="wiki-page-meta" aria-label="Page details">
+      {hasSources ? (
+        <div className="wiki-page-meta-sources">
+          <span className="wiki-page-meta-label">
+            {metadata.sources.length === 1 ? "Source" : "Sources"}
+          </span>
+          <div className="wiki-page-meta-source-list">
+            {metadata.sources.map((source, index) => {
+              const canOpen = availableDocuments.includes(source);
+              return canOpen ? (
+                <button
+                  key={`${source}-${index}`}
+                  type="button"
+                  className="wiki-page-meta-source"
+                  onClick={() => onOpenDocument(source)}
+                >
+                  {source}
+                </button>
+              ) : (
+                <span key={`${source}-${index}`} className="wiki-page-meta-source">
+                  {source}
+                </span>
+              );
+            })}
+          </div>
+        </div>
+      ) : null}
+      {metadata.created || metadata.updated ? (
+        <div className="wiki-page-meta-dates">
+          {metadata.created ? (
+            <span className="wiki-page-meta-date">
+              <span className="wiki-page-meta-label">Created</span>
+              <time dateTime={metadata.created}>{formatFrontmatterDate(metadata.created)}</time>
+            </span>
+          ) : null}
+          {metadata.updated ? (
+            <span className="wiki-page-meta-date">
+              <span className="wiki-page-meta-label">Updated</span>
+              <time dateTime={metadata.updated}>{formatFrontmatterDate(metadata.updated)}</time>
+            </span>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function chooseDocumentAfterCommand(command: CommandName, state: WorkspaceState) {
   if (command === "reset_sample_workspace" || command === "undo_last_operation") {
     return "index.md";
   }
 
-  if (command !== "build_wiki") {
+  if (
+    command !== "build_wiki" &&
+    command !== "wiki_healthcheck" &&
+    command !== "improve_wiki" &&
+    command !== "organize_sources" &&
+    command !== "update_wiki_rules"
+  ) {
     return null;
   }
 
   const changed = state.changedMarker?.changedFiles ?? [];
+  if (command === "update_wiki_rules") {
+    return changed.find((file) => file.path === "schema.md")?.path ?? "schema.md";
+  }
   const summary = changed.find(
     (file) => file.path.startsWith("wiki/summaries/") && file.path.endsWith(".md"),
   );
@@ -2031,17 +6052,280 @@ function chooseDocumentAfterCommand(command: CommandName, state: WorkspaceState)
   return summary?.path ?? generatedPage?.path ?? "index.md";
 }
 
-function stripFrontmatter(content: string) {
+function parseMarkdownFrontmatter(content: string): { body: string; metadata: WikiPageMetadata | null } {
   if (!content.startsWith("---\n")) {
-    return content;
+    return { body: content, metadata: null };
   }
 
   const closing = content.indexOf("\n---\n", 4);
   if (closing === -1) {
-    return content;
+    return { body: content, metadata: null };
   }
 
-  return content.slice(closing + 5).trimStart();
+  const frontmatter = content.slice(4, closing);
+  const body = content.slice(closing + 5).trimStart();
+  const metadata = parseWikiPageMetadata(frontmatter);
+  return { body, metadata };
+}
+
+function mergeWikiPageMetadata(
+  frontmatter: WikiPageMetadata | null,
+  header: WikiPageMetadata | null,
+): WikiPageMetadata | null {
+  if (!frontmatter) return header;
+  if (!header) return frontmatter;
+
+  const sources = frontmatter.sources.length > 0 ? frontmatter.sources : header.sources;
+  const metadata: WikiPageMetadata = {
+    sources: Array.from(new Set(sources)),
+    created: frontmatter.created ?? header.created,
+    updated: frontmatter.updated ?? header.updated,
+  };
+
+  if (!metadata.sources.length && !metadata.created && !metadata.updated) {
+    return null;
+  }
+
+  return metadata;
+}
+
+function extractWikiPageHeaderMetadata(content: string): { body: string; metadata: WikiPageMetadata | null } {
+  const lines = content.split(/\r?\n/);
+  let index = 0;
+
+  while (index < lines.length && lines[index].trim() === "") {
+    index += 1;
+  }
+
+  if (index < lines.length && /^#\s+/.test(lines[index])) {
+    index += 1;
+    while (index < lines.length && lines[index].trim() === "") {
+      index += 1;
+    }
+  }
+
+  const metadataStart = index;
+  if (metadataStart >= lines.length) {
+    return { body: content, metadata: null };
+  }
+
+  const paragraphLines: string[] = [];
+  while (index < lines.length && lines[index].trim() !== "") {
+    if (paragraphLines.length > 0 && /^#{1,6}\s+/.test(lines[index])) {
+      break;
+    }
+    paragraphLines.push(lines[index]);
+    index += 1;
+  }
+
+  const metadata = parseInlineWikiPageMetadata(paragraphLines.join(" "));
+  if (!metadata) {
+    return { body: content, metadata: null };
+  }
+
+  let contentStart = index;
+  while (contentStart < lines.length && lines[contentStart].trim() === "") {
+    contentStart += 1;
+  }
+
+  return {
+    body: [...lines.slice(0, metadataStart), ...lines.slice(contentStart)].join("\n"),
+    metadata,
+  };
+}
+
+function extractFirstMarkdownTitle(content: string): { title: string | null; body: string } {
+  const lines = content.split(/\r?\n/);
+  let index = 0;
+
+  while (index < lines.length && lines[index].trim() === "") {
+    index += 1;
+  }
+
+  const match = lines[index]?.match(/^#\s+(.+?)\s*#*\s*$/);
+  if (!match) {
+    return { title: null, body: content };
+  }
+
+  let bodyStart = index + 1;
+  while (bodyStart < lines.length && lines[bodyStart].trim() === "") {
+    bodyStart += 1;
+  }
+
+  return {
+    title: match[1].trim(),
+    body: lines.slice(bodyStart).join("\n"),
+  };
+}
+
+function slugifyMarkdownHeading(title: string) {
+  return title
+    .trim()
+    .toLowerCase()
+    .replace(/[`*_~[\]()]/g, "")
+    .replace(/[^a-z0-9가-힣]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+function parseInlineWikiPageMetadata(paragraph: string): WikiPageMetadata | null {
+  const text = paragraph.replace(/\s+/g, " ").trim();
+  if (!text) return null;
+
+  const markerMatches = Array.from(text.matchAll(/\b(Sources?|Created|Updated):/gi));
+  if (!markerMatches.length) return null;
+
+  const metadata: WikiPageMetadata = { sources: [] };
+  for (let index = 0; index < markerMatches.length; index += 1) {
+    const marker = markerMatches[index];
+    const key = marker[1].toLowerCase();
+    const start = (marker.index ?? 0) + marker[0].length;
+    const end =
+      index + 1 < markerMatches.length ? (markerMatches[index + 1].index ?? text.length) : text.length;
+    const value = text.slice(start, end).trim();
+
+    if (key === "source" || key === "sources") {
+      metadata.sources = parseInlineSourceValues(value);
+    } else if (key === "created") {
+      metadata.created = cleanInlineMetadataScalar(value) || undefined;
+    } else if (key === "updated") {
+      metadata.updated = cleanInlineMetadataScalar(value) || undefined;
+    }
+  }
+
+  const hasDates = Boolean(metadata.created || metadata.updated);
+  if (!metadata.sources.length && !hasDates) {
+    return null;
+  }
+  if (!hasDates && metadata.sources.length && !metadata.sources.some(looksLikeWorkspaceSource)) {
+    return null;
+  }
+
+  return metadata;
+}
+
+function parseInlineSourceValues(value: string) {
+  const text = value.trim();
+  if (!text) return [];
+
+  const codeValues = Array.from(text.matchAll(/`([^`]+)`/g))
+    .map((match) => cleanInlineMetadataScalar(match[1]))
+    .filter(Boolean);
+  if (codeValues.length > 0) {
+    return Array.from(new Set(codeValues));
+  }
+
+  const linkValues = Array.from(text.matchAll(/\[[^\]]+\]\(([^)]+)\)/g))
+    .map((match) => cleanInlineMetadataScalar(match[1]))
+    .filter(Boolean);
+  if (linkValues.length > 0) {
+    return Array.from(new Set(linkValues));
+  }
+
+  const listValue = text.replace(/^\[\s*/, "").replace(/\s*\]$/, "");
+  return Array.from(
+    new Set(
+      listValue
+        .split(/\s*,\s*/)
+        .map(cleanInlineMetadataScalar)
+        .filter(Boolean),
+    ),
+  );
+}
+
+function parseWikiPageMetadata(frontmatter: string): WikiPageMetadata | null {
+  const lines = frontmatter.split(/\r?\n/);
+  const metadata: WikiPageMetadata = { sources: [] };
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const match = lines[index].match(/^([A-Za-z0-9_-]+):\s*(.*)$/);
+    if (!match) continue;
+
+    const key = match[1];
+    const value = match[2].trim();
+
+    if (key === "sources") {
+      if (value.startsWith("[") && value.endsWith("]")) {
+        metadata.sources = value
+          .slice(1, -1)
+          .split(",")
+          .map(cleanFrontmatterScalar)
+          .filter(Boolean);
+        continue;
+      }
+
+      const sources = [];
+      let sourceIndex = index + 1;
+      while (sourceIndex < lines.length) {
+        const sourceMatch = lines[sourceIndex].match(/^\s*-\s+(.+)$/);
+        if (!sourceMatch) break;
+        const source = cleanFrontmatterScalar(sourceMatch[1]);
+        if (source) sources.push(source);
+        sourceIndex += 1;
+      }
+      metadata.sources = sources;
+      index = sourceIndex - 1;
+    } else if (key === "created") {
+      metadata.created = cleanFrontmatterScalar(value) || undefined;
+    } else if (key === "updated") {
+      metadata.updated = cleanFrontmatterScalar(value) || undefined;
+    }
+  }
+
+  if (!metadata.sources.length && !metadata.created && !metadata.updated) {
+    return null;
+  }
+
+  return metadata;
+}
+
+function cleanFrontmatterScalar(value: string) {
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  if (
+    (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+    (trimmed.startsWith("'") && trimmed.endsWith("'"))
+  ) {
+    return trimmed.slice(1, -1).trim();
+  }
+  return trimmed;
+}
+
+function cleanInlineMetadataScalar(value: string) {
+  let cleaned = cleanFrontmatterScalar(value)
+    .replace(/\s+/g, " ")
+    .replace(/^[-*]\s+/, "")
+    .trim();
+
+  const linkMatch = cleaned.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
+  if (linkMatch) {
+    cleaned = (linkMatch[2] || linkMatch[1]).trim();
+  }
+
+  if (cleaned.startsWith("`") && cleaned.endsWith("`")) {
+    cleaned = cleaned.slice(1, -1).trim();
+  }
+
+  return cleaned.replace(/[.;,]\s*$/, "").trim();
+}
+
+function looksLikeWorkspaceSource(value: string) {
+  return /^(sources|wiki)\//.test(value) || /^(index|schema|log)\.md$/i.test(value);
+}
+
+function formatFrontmatterDate(value: string) {
+  const match = value.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) return value;
+
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  if (!year || month < 1 || month > 12 || day < 1 || day > 31) return value;
+
+  return new Intl.DateTimeFormat(undefined, {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+  }).format(new Date(year, month - 1, day));
 }
 
 function normalizeMarkdownForDisplay(
@@ -2049,9 +6333,38 @@ function normalizeMarkdownForDisplay(
   currentPath: string,
   availableDocuments: string[],
 ) {
-  return transformMarkdownOutsideCodeFences(content, (segment) =>
-    convertWikiLinks(convertEscapedMathDelimiters(segment), currentPath, availableDocuments),
+  return transformMarkdownOutsideCode(content, (segment) =>
+    convertWikiLinks(
+      convertEscapedMathDelimiters(convertMarkdownDirectiveCallouts(segment)),
+      currentPath,
+      availableDocuments,
+    ),
   );
+}
+
+function convertMarkdownDirectiveCallouts(content: string) {
+  return content.replace(
+    MARKDOWN_DIRECTIVE_CALLOUT_REGEX,
+    (_match, prefix: string, type: string, rawTitle: string, body: string) => {
+      const title = normalizeDirectiveCalloutTitle(rawTitle);
+      const marker = `[!${type.toLowerCase()}]${title ? ` ${title}` : ""}`;
+      const trimmedBody = body.replace(/\s+$/g, "");
+      const quotedBody = trimmedBody
+        ? trimmedBody
+            .split(/\r?\n/)
+            .map((line) => (line ? `> ${line}` : ">"))
+            .join("\n")
+        : "";
+
+      return `${prefix}> ${marker}${quotedBody ? `\n${quotedBody}` : ""}`;
+    },
+  );
+}
+
+function normalizeDirectiveCalloutTitle(rawTitle: string) {
+  const title = rawTitle.trim();
+  const quotedTitle = title.match(/^["'](.+)["']$/);
+  return quotedTitle?.[1].trim() || title;
 }
 
 function convertEscapedMathDelimiters(content: string) {
@@ -2072,14 +6385,14 @@ function convertWikiLinks(
     const resolvedPath = resolveWikiLinkTarget(currentPath, target, availableDocuments);
 
     if (!resolvedPath) {
-      return `[${escapeMarkdownLinkLabel(label || target)}](studywiki-broken://${encodeURIComponent(target)})`;
+      return `[${escapeMarkdownLinkLabel(label || target)}](aiwiki-broken://${encodeURIComponent(target)})`;
     }
 
     return `[${escapeMarkdownLinkLabel(label || resolvedPath)}](${resolvedPath})`;
   });
 }
 
-function transformMarkdownOutsideCodeFences(
+function transformMarkdownOutsideCode(
   markdown: string,
   transform: (segment: string) => string,
 ) {
@@ -2089,9 +6402,39 @@ function transformMarkdownOutsideCodeFences(
       if (part.startsWith("```") || part.startsWith("~~~")) {
         return part;
       }
-      return transform(part);
+      return transformMarkdownOutsideInlineCode(part, transform);
     })
     .join("");
+}
+
+function transformMarkdownOutsideInlineCode(
+  markdown: string,
+  transform: (segment: string) => string,
+) {
+  let result = "";
+  let index = 0;
+
+  while (index < markdown.length) {
+    const openIndex = markdown.indexOf("`", index);
+    if (openIndex === -1) {
+      result += transform(markdown.slice(index));
+      break;
+    }
+
+    result += transform(markdown.slice(index, openIndex));
+    const delimiterMatch = markdown.slice(openIndex).match(/^`+/);
+    const delimiter = delimiterMatch?.[0] ?? "`";
+    const closeIndex = markdown.indexOf(delimiter, openIndex + delimiter.length);
+    if (closeIndex === -1) {
+      result += markdown.slice(openIndex);
+      break;
+    }
+
+    result += markdown.slice(openIndex, closeIndex + delimiter.length);
+    index = closeIndex + delimiter.length;
+  }
+
+  return result;
 }
 
 function extractWikiLinkTargets(
@@ -2119,13 +6462,13 @@ function resolveWikiLinkTarget(
   target: string,
   availableDocuments: string[],
 ) {
-  const [rawTarget, rawAnchor = ""] = target.split("#", 2);
-  const trimmedTarget = rawTarget.trim();
+  const [linkTargetPart, linkAnchorPart = ""] = target.split("#", 2);
+  const trimmedTarget = linkTargetPart.trim();
   if (!trimmedTarget) {
     return null;
   }
 
-  const anchor = rawAnchor.trim();
+  const anchor = linkAnchorPart.trim();
   const withAnchor = (path: string) => (anchor ? `${path}#${anchor}` : path);
   const explicitTarget = trimmedTarget.endsWith(".md") ? trimmedTarget : `${trimmedTarget}.md`;
   const directTarget = normalizeWorkspacePath(explicitTarget);
@@ -2215,8 +6558,8 @@ function resolveWorkspacePath(currentPath: string, target: string) {
 function normalizeWorkspacePath(path: string) {
   const parts: string[] = [];
 
-  for (const rawPart of path.replace(/\\/g, "/").split("/")) {
-    const part = rawPart.trim();
+  for (const pathPart of path.replace(/\\/g, "/").split("/")) {
+    const part = pathPart.trim();
     if (!part || part === ".") {
       continue;
     }

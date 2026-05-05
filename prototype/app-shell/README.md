@@ -1,6 +1,6 @@
 # App Shell Prototype
 
-This is the thin desktop integration spike for AI Study Wiki Builder.
+This is the thin desktop integration spike for Maple.
 
 It does not implement the full app UI. It proves that a Tauri/React shell can call
 the operation runner and display:
@@ -21,6 +21,23 @@ npm run build
 npm run tauri build
 npm run tauri dev
 ```
+
+## Setup UX Simulation
+
+Use these dev-only environment flags to test first-run setup states without
+uninstalling local tools:
+
+```bash
+MAPLE_SIMULATE_MISSING_NODE=1 npm run tauri dev
+MAPLE_SIMULATE_MISSING_NPM=1 npm run tauri dev
+MAPLE_SIMULATE_MISSING_CODEX=1 npm run tauri dev
+MAPLE_SIMULATE_CODEX_LOGGED_OUT=1 npm run tauri dev
+MAPLE_SIMULATE_MISSING_CLAUDE=1 npm run tauri dev
+MAPLE_SIMULATE_CLAUDE_LOGGED_OUT=1 npm run tauri dev
+```
+
+The flags affect the app's setup checks only. They do not remove or modify
+your installed Node.js, npm, Codex, or Claude Code.
 
 The app backend calls:
 
@@ -54,4 +71,4 @@ Deferred:
 - PDF preview
 - wikilink navigation
 - graph view
-- polished study reader
+- polished wiki reader
