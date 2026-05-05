@@ -46,3 +46,4 @@ workspace/
 - [MVP Plan](docs/mvp-plan.md)
 - [Karpathy LLM Wiki Background](docs/karpathy-llm-wiki-background.md)
 - [Technical Spike](docs/technical-spike.md)
+- [macOS Release Checklist](docs/release-macos.md)

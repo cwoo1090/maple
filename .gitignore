@@ -6,6 +6,12 @@ build/
 .vite/
 target/
 *.log
+*.cer
+*.certSigningRequest
+*.p12
+AuthKey_*.p8
+*.mobileprovision
+*.provisionprofile
 .omx/
 .omc/
 .aiwiki/

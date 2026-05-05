@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>NSDesktopFolderUsageDescription</key>
+  <string>Maple needs access to selected desktop files and folders so it can import sources and write the local wiki workspace.</string>
+  <key>NSDocumentsFolderUsageDescription</key>
+  <string>Maple needs access to selected document files and folders so it can import sources and write the local wiki workspace.</string>
+  <key>NSDownloadsFolderUsageDescription</key>
+  <string>Maple needs access to selected downloaded files so it can import them as wiki sources.</string>
+  <key>NSNetworkVolumesUsageDescription</key>
+  <string>Maple needs access to selected network volume files and folders when you choose a workspace or sources there.</string>
+  <key>NSRemovableVolumesUsageDescription</key>
+  <string>Maple needs access to selected removable volume files and folders when you choose a workspace or sources there.</string>
+</dict>
+</plist>

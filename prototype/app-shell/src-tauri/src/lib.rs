@@ -102,6 +102,7 @@ const METADATA_DIR: &str = ".aiwiki";
 const LEGACY_METADATA_DIR: &str = ".studywiki";
 const EXPLORE_CHAT_OPERATION: &str = "explore-chat";
 const OPERATION_START_GRACE_MS: u128 = 15_000;
+const RUNNER_ROOT_ENV: &str = "MAPLE_RUNNER_ROOT";
 
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -4237,12 +4238,28 @@ fn load_state_at(workspace: &Path) -> Result<WorkspaceState, String> {
 }
 
 fn runner_root() -> Result<PathBuf, String> {
+    if let Ok(path) = env::var(RUNNER_ROOT_ENV) {
+        let runner_root = PathBuf::from(path);
+        if is_runner_root(&runner_root) {
+            return Ok(runner_root);
+        }
+    }
+
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let prototype_dir = manifest_dir
         .parent()
         .and_then(Path::parent)
         .ok_or_else(|| "Could not resolve prototype directory".to_string())?;
-    Ok(prototype_dir.join("operation-runner"))
+    let runner_root = prototype_dir.join("operation-runner");
+    if is_runner_root(&runner_root) {
+        return Ok(runner_root);
+    }
+
+    Err("Could not find bundled or development operation runner".to_string())
+}
+
+fn is_runner_root(path: &Path) -> bool {
+    path.join("src").join("operation-runner.js").is_file()
 }
 
 fn read_text_if_exists(path: &Path) -> Option<String> {
@@ -4900,6 +4917,12 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
+            if let Ok(resource_dir) = app.path().resource_dir() {
+                let runner_root = resource_dir.join("operation-runner");
+                if is_runner_root(&runner_root) {
+                    env::set_var(RUNNER_ROOT_ENV, runner_root);
+                }
+            }
             app.manage(WorkspaceStore {
                 path: Mutex::new(None),
             });
