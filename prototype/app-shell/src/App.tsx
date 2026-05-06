@@ -382,6 +382,7 @@ const LEFT_PANEL_COLLAPSED_KEY = "maple.leftPanelCollapsed";
 const RIGHT_PANEL_COLLAPSED_KEY = "maple.rightPanelCollapsed";
 const SEEN_CHAT_THREADS_KEY = "maple.seenChatThreads";
 const SEEN_MAINTAIN_THREADS_KEY = "maple.seenMaintainThreads";
+const READING_TEXT_SIZE_KEY = "maple.readingTextSizePx";
 const LEGACY_LEFT_PANEL_WIDTH_KEY = "studywiki.leftPanelWidth";
 const LEGACY_RIGHT_PANEL_WIDTH_KEY = "studywiki.rightPanelWidth";
 const LEGACY_LEFT_PANEL_COLLAPSED_KEY = "studywiki.leftPanelCollapsed";
@@ -397,6 +398,10 @@ const MIN_RIGHT_PANEL_WIDTH = 260;
 const MAX_RIGHT_PANEL_WIDTH = 560;
 const MIN_CENTER_PANEL_WIDTH = 420;
 const RESIZE_HANDLE_WIDTH = 1;
+const DEFAULT_READING_TEXT_SIZE = 15;
+const MIN_READING_TEXT_SIZE = 12;
+const MAX_READING_TEXT_SIZE = 20;
+const READING_TEXT_SIZE_STEP = 1;
 
 const MAINTAIN_TASKS: MaintainTaskConfig[] = [
   {
@@ -736,6 +741,25 @@ function readStoredPanelCollapsed(key: string, legacyKey: string): boolean {
   return (window.localStorage.getItem(key) ?? window.localStorage.getItem(legacyKey)) === "true";
 }
 
+function readStoredReadingTextSize(): number {
+  const storedText = window.localStorage.getItem(READING_TEXT_SIZE_KEY);
+  if (storedText === null) return DEFAULT_READING_TEXT_SIZE;
+  const stored = Number(storedText);
+  if (!Number.isFinite(stored)) return DEFAULT_READING_TEXT_SIZE;
+  const rounded = Math.round(stored);
+  if (rounded < MIN_READING_TEXT_SIZE || rounded > MAX_READING_TEXT_SIZE) {
+    return DEFAULT_READING_TEXT_SIZE;
+  }
+  return rounded;
+}
+
+function isEditableKeyboardTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  if (target.isContentEditable) return true;
+  const tagName = target.tagName.toLowerCase();
+  return tagName === "input" || tagName === "textarea" || tagName === "select";
+}
+
 function mergeOperationProgress(
   previous: OperationProgress | null | undefined,
   next: OperationProgress,
@@ -970,6 +994,7 @@ function App() {
   const [rightPanelCollapsed, setRightPanelCollapsed] = useState(() =>
     readStoredPanelCollapsed(RIGHT_PANEL_COLLAPSED_KEY, LEGACY_RIGHT_PANEL_COLLAPSED_KEY),
   );
+  const [readingTextSize, setReadingTextSize] = useState(readStoredReadingTextSize);
   const [pptxRender, setPptxRender] = useState<{
     sourcePath: string;
     status: "pending" | "ready" | "error";
@@ -1737,6 +1762,38 @@ function App() {
       window.removeEventListener("keydown", handleKeyDown);
     };
   }, [chatHistoryOpen, connectionsOpen, maintainHistoryOpen]);
+
+  useEffect(() => {
+    window.localStorage.setItem(READING_TEXT_SIZE_KEY, String(readingTextSize));
+  }, [readingTextSize]);
+
+  useEffect(() => {
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.defaultPrevented) return;
+      if (!(event.metaKey || event.ctrlKey)) return;
+      if (event.altKey || isEditableKeyboardTarget(event.target)) return;
+
+      if (event.key === "+" || event.key === "=") {
+        event.preventDefault();
+        adjustReadingTextSize(READING_TEXT_SIZE_STEP);
+        return;
+      }
+
+      if (event.key === "-") {
+        event.preventDefault();
+        adjustReadingTextSize(-READING_TEXT_SIZE_STEP);
+        return;
+      }
+
+      if (event.key === "0") {
+        event.preventDefault();
+        resetReadingTextSize();
+      }
+    }
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, []);
 
   useEffect(() => {
     if (!workspace.workspacePath) {
@@ -3541,6 +3598,16 @@ function App() {
     return shouldShowThreadMarker(thread, activity, maintainThread?.id, seenMaintainThreadUpdates);
   }
 
+  function adjustReadingTextSize(delta: number) {
+    setReadingTextSize((currentSize) =>
+      clampNumber(currentSize + delta, MIN_READING_TEXT_SIZE, MAX_READING_TEXT_SIZE),
+    );
+  }
+
+  function resetReadingTextSize() {
+    setReadingTextSize(DEFAULT_READING_TEXT_SIZE);
+  }
+
   const centerHeaderPathParts = activeCenterTab?.kind === "report"
     ? ["Operation report"]
     : viewMode === "graph"
@@ -3549,7 +3616,10 @@ function App() {
   const centerHeaderTitle = centerHeaderPathParts.join(" / ");
 
   return (
-    <main className="app">
+    <main
+      className="app"
+      style={{ "--reading-font-size": `${readingTextSize}px` } as React.CSSProperties}
+    >
       <header
         className="app-topbar"
         style={{ gridTemplateColumns: topbarGridTemplateColumns } as React.CSSProperties}
@@ -5136,6 +5206,14 @@ function App() {
 
       {showSettings ? (
         <Settings
+          readingTextSize={readingTextSize}
+          minReadingTextSize={MIN_READING_TEXT_SIZE}
+          maxReadingTextSize={MAX_READING_TEXT_SIZE}
+          defaultReadingTextSize={DEFAULT_READING_TEXT_SIZE}
+          readingTextSizeStep={READING_TEXT_SIZE_STEP}
+          onReadingTextSizeChange={(size) =>
+            setReadingTextSize(clampNumber(size, MIN_READING_TEXT_SIZE, MAX_READING_TEXT_SIZE))
+          }
           onClose={() => {
             setShowSettings(false);
             void Promise.all([

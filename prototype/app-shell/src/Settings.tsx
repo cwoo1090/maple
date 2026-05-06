@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { Minus, Plus, RotateCcw } from "lucide-react";
 import {
   parseProviderStatus,
   ProviderDiagnostics,
@@ -23,10 +24,24 @@ function sleep(ms: number) {
 }
 
 interface Props {
+  readingTextSize: number;
+  minReadingTextSize: number;
+  maxReadingTextSize: number;
+  defaultReadingTextSize: number;
+  readingTextSizeStep: number;
+  onReadingTextSizeChange: (size: number) => void;
   onClose: () => void;
 }
 
-export function Settings({ onClose }: Props) {
+export function Settings({
+  readingTextSize,
+  minReadingTextSize,
+  maxReadingTextSize,
+  defaultReadingTextSize,
+  readingTextSizeStep,
+  onReadingTextSizeChange,
+  onClose,
+}: Props) {
   const [providers, setProviders] = useState<ProviderInfo[]>([]);
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [runtimeStatus, setRuntimeStatus] = useState<NodeRuntimeStatus | null>(null);
@@ -201,6 +216,59 @@ export function Settings({ onClose }: Props) {
             Close
           </button>
         </header>
+
+        <section className="settings-section settings-section-reading">
+          <h3>Reading</h3>
+          <div className="settings-reading-row">
+            <label className="settings-reading-label" htmlFor="reading-text-size">
+              <span>Text size</span>
+              <strong>{readingTextSize}px</strong>
+            </label>
+            <div className="settings-reading-controls">
+              <button
+                type="button"
+                disabled={readingTextSize <= minReadingTextSize}
+                onClick={() => onReadingTextSizeChange(readingTextSize - readingTextSizeStep)}
+                aria-label="Decrease reading text size"
+                title="Decrease reading text size"
+              >
+                <Minus size={14} strokeWidth={2.2} aria-hidden="true" />
+              </button>
+              <input
+                id="reading-text-size"
+                type="range"
+                min={minReadingTextSize}
+                max={maxReadingTextSize}
+                step={readingTextSizeStep}
+                value={readingTextSize}
+                onChange={(event) => onReadingTextSizeChange(Number(event.target.value))}
+                aria-label="Reading text size"
+              />
+              <button
+                type="button"
+                disabled={readingTextSize >= maxReadingTextSize}
+                onClick={() => onReadingTextSizeChange(readingTextSize + readingTextSizeStep)}
+                aria-label="Increase reading text size"
+                title="Increase reading text size"
+              >
+                <Plus size={14} strokeWidth={2.2} aria-hidden="true" />
+              </button>
+              <button
+                type="button"
+                disabled={readingTextSize === defaultReadingTextSize}
+                onClick={() => onReadingTextSizeChange(defaultReadingTextSize)}
+                aria-label="Reset reading text size"
+                title="Reset reading text size"
+              >
+                <RotateCcw size={13} strokeWidth={2.2} aria-hidden="true" />
+              </button>
+            </div>
+          </div>
+          <p className="settings-reading-shortcuts">
+            Shortcuts: <kbd>⌘/Ctrl</kbd> <kbd>+</kbd>, <kbd>⌘/Ctrl</kbd> <kbd>-</kbd>,{" "}
+            <kbd>⌘/Ctrl</kbd> <kbd>0</kbd>
+          </p>
+        </section>
 
         <section className="settings-section">
           <h3>AI Provider</h3>
