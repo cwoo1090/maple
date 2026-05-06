@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::{
     collections::{HashMap, HashSet},
     env, fs,
@@ -400,7 +402,7 @@ async fn list_providers() -> Result<Vec<ProviderInfo>, String> {
             name: "claude".into(),
             label: "Claude (via Claude Code CLI)".into(),
             install_command: "npm i -g @anthropic-ai/claude-code".into(),
-            login_command: "claude".into(),
+            login_command: "claude auth login --claudeai".into(),
             default_model: "claude-sonnet-4-6".into(),
             supported_models: vec![
                 ProviderModel {
@@ -470,7 +472,7 @@ async fn login_provider(
 ) -> Result<RunnerOutput, String> {
     let cmd = match name.as_str() {
         "codex" => "codex login",
-        "claude" => "claude",
+        "claude" => "claude auth login --claudeai",
         other => return Err(format!("Unknown provider: {other}")),
     };
     invalidate_provider_status(&cache, &name);
@@ -478,14 +480,24 @@ async fn login_provider(
 }
 
 fn open_terminal_with(command: &str) -> Result<RunnerOutput, String> {
-    let escaped = command.replace('"', "\\\"");
-    let script = format!(
-        "tell application \"Terminal\"\n    activate\n    do script \"{}\"\nend tell",
-        escaped
-    );
-    let output = Command::new("osascript")
-        .arg("-e")
-        .arg(script)
+    let script = terminal_command_script(command)?;
+    let script_path = terminal_command_script_path();
+    fs::write(&script_path, script)
+        .map_err(|error| format!("Failed to prepare Terminal command: {error}"))?;
+
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(&script_path)
+            .map_err(|error| format!("Failed to inspect Terminal command: {error}"))?
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&script_path, permissions)
+            .map_err(|error| format!("Failed to mark Terminal command executable: {error}"))?;
+    }
+
+    let output = Command::new("open")
+        .args(["-a", "Terminal"])
+        .arg(&script_path)
         .output()
         .map_err(|error| format!("Failed to launch Terminal: {error}"))?;
     Ok(RunnerOutput {
@@ -494,6 +506,42 @@ fn open_terminal_with(command: &str) -> Result<RunnerOutput, String> {
         stdout: String::from_utf8_lossy(&output.stdout).to_string(),
         stderr: String::from_utf8_lossy(&output.stderr).to_string(),
     })
+}
+
+fn terminal_command_script_path() -> PathBuf {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    env::temp_dir().join(format!(
+        "maple-terminal-{}-{millis}.command",
+        std::process::id()
+    ))
+}
+
+fn terminal_command_script(command: &str) -> Result<String, String> {
+    if command.contains('\n') || command.contains('\r') {
+        return Err("Terminal command cannot contain newlines.".to_string());
+    }
+
+    let path_env = shell_single_quote(&runtime_path_env());
+    let display_command = shell_single_quote(command);
+    Ok(format!(
+        r#"#!/bin/zsh -l
+rm -f "$0"
+export PATH={path_env}
+printf '\nMaple is running:\n  %s\n\n' {display_command}
+{command}
+status=$?
+printf '\nMaple command finished with exit code %s.\n' "$status"
+printf 'You can close this Terminal window after you review the output.\n'
+exec "${{SHELL:-/bin/zsh}}" -l
+"#,
+    ))
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn run_provider_check(name: &str) -> Result<RunnerOutput, String> {
@@ -520,7 +568,7 @@ fn simulated_provider_check(name: &str) -> Option<RunnerOutput> {
             "MAPLE_SIMULATE_MISSING_CLAUDE",
             "MAPLE_SIMULATE_CLAUDE_LOGGED_OUT",
             "npm i -g @anthropic-ai/claude-code",
-            "claude",
+            "claude auth login --claudeai",
         ),
         _ => return None,
     };
@@ -4053,23 +4101,15 @@ fn runtime_path_env() -> String {
         push_path_parts(&mut parts, &current_path);
     }
 
+    push_user_bin_dirs(&mut parts);
+
     if let Some(node) = find_nvm_node() {
         if let Some(parent) = node.parent() {
             push_path_part(&mut parts, parent.display().to_string());
         }
     }
 
-    for part in [
-        "/opt/homebrew/bin",
-        "/opt/homebrew/sbin",
-        "/usr/local/bin",
-        "/usr/bin",
-        "/bin",
-        "/usr/sbin",
-        "/sbin",
-    ] {
-        push_path_part(&mut parts, part.to_string());
-    }
+    push_common_bin_dirs(&mut parts);
 
     parts.join(":")
 }
@@ -4106,19 +4146,178 @@ fn runner_path_env(node: &Path) -> String {
         push_path_parts(&mut parts, &current_path);
     }
 
+    push_user_bin_dirs(&mut parts);
+
+    if let Some(nvm_node) = find_nvm_node() {
+        if let Some(parent) = nvm_node.parent() {
+            push_path_part(&mut parts, parent.display().to_string());
+        }
+    }
+
+    push_common_bin_dirs(&mut parts);
+
+    parts.join(":")
+}
+
+fn push_user_bin_dirs(parts: &mut Vec<String>) {
+    let Ok(home) = env::var("HOME") else {
+        return;
+    };
+    for part in [
+        format!("{home}/.local/bin"),
+        format!("{home}/bin"),
+        format!("{home}/.claude/bin"),
+        format!("{home}/.nix-profile/bin"),
+        format!("{home}/.npm-global/bin"),
+        format!("{home}/.npm-packages/bin"),
+        format!("{home}/.node/bin"),
+        format!("{home}/.volta/bin"),
+        format!("{home}/.asdf/shims"),
+        format!("{home}/.asdf/bin"),
+        format!("{home}/.local/share/mise/shims"),
+        format!("{home}/.mise/shims"),
+        format!("{home}/Library/pnpm"),
+        format!("{home}/Library/pnpm/bin"),
+        format!("{home}/.local/share/pnpm"),
+        format!("{home}/.local/share/pnpm/bin"),
+        format!("{home}/.yarn/bin"),
+        format!("{home}/.config/yarn/global/node_modules/.bin"),
+        format!("{home}/.bun/bin"),
+    ] {
+        push_path_part(parts, part);
+    }
+    push_env_prefix_bin(parts, "npm_config_prefix");
+    push_env_prefix_bin(parts, "NPM_CONFIG_PREFIX");
+    push_env_home_bin(parts, "VOLTA_HOME");
+    push_env_shims_dir(parts, "ASDF_DATA_DIR");
+    push_env_shims_dir(parts, "MISE_DATA_DIR");
+    push_pnpm_home_dirs(parts);
+    push_npmrc_prefix_dirs(parts, &home);
+    push_fnm_dirs(parts, &home);
+}
+
+fn push_common_bin_dirs(parts: &mut Vec<String>) {
     for part in [
         "/opt/homebrew/bin",
         "/opt/homebrew/sbin",
         "/usr/local/bin",
+        "/usr/local/sbin",
+        "/opt/local/bin",
+        "/opt/local/sbin",
         "/usr/bin",
         "/bin",
         "/usr/sbin",
         "/sbin",
+        "/nix/var/nix/profiles/default/bin",
+        "/run/current-system/sw/bin",
     ] {
-        push_path_part(&mut parts, part.to_string());
+        push_path_part(parts, part.to_string());
+    }
+}
+
+fn push_env_prefix_bin(parts: &mut Vec<String>, name: &str) {
+    if let Ok(prefix) = env::var(name) {
+        push_path_part(parts, Path::new(&prefix).join("bin").display().to_string());
+    }
+}
+
+fn push_env_home_bin(parts: &mut Vec<String>, name: &str) {
+    if let Ok(home) = env::var(name) {
+        push_path_part(parts, Path::new(&home).join("bin").display().to_string());
+    }
+}
+
+fn push_env_shims_dir(parts: &mut Vec<String>, name: &str) {
+    if let Ok(home) = env::var(name) {
+        push_path_part(parts, Path::new(&home).join("shims").display().to_string());
+        push_path_part(parts, Path::new(&home).join("bin").display().to_string());
+    }
+}
+
+fn push_pnpm_home_dirs(parts: &mut Vec<String>) {
+    if let Ok(home) = env::var("PNPM_HOME") {
+        push_path_part(parts, home.clone());
+        push_path_part(parts, Path::new(&home).join("bin").display().to_string());
+    }
+}
+
+fn push_npmrc_prefix_dirs(parts: &mut Vec<String>, home: &str) {
+    let path = Path::new(home).join(".npmrc");
+    let Ok(text) = fs::read_to_string(path) else {
+        return;
+    };
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let Some((key, value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "prefix" {
+            continue;
+        }
+        let prefix = value.trim().replace("${HOME}", home).replace("$HOME", home);
+        push_path_part(parts, Path::new(&prefix).join("bin").display().to_string());
+    }
+}
+
+fn push_fnm_dirs(parts: &mut Vec<String>, home: &str) {
+    if let Ok(multishell_path) = env::var("FNM_MULTISHELL_PATH") {
+        push_path_part(parts, multishell_path);
     }
 
-    parts.join(":")
+    let mut roots = Vec::new();
+    if let Ok(fnm_dir) = env::var("FNM_DIR") {
+        roots.push(PathBuf::from(fnm_dir));
+    }
+    if let Ok(xdg_data_home) = env::var("XDG_DATA_HOME") {
+        roots.push(Path::new(&xdg_data_home).join("fnm"));
+    }
+    roots.push(
+        Path::new(home)
+            .join("Library")
+            .join("Application Support")
+            .join("fnm"),
+    );
+    roots.push(Path::new(home).join(".local").join("share").join("fnm"));
+
+    for root in roots {
+        collect_nested_bin_dirs(&root.join("node-versions"), 4, parts);
+    }
+
+    let state_home = env::var("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| Path::new(home).join(".local").join("state"));
+    let multishells = state_home.join("fnm_multishells");
+    if let Ok(entries) = fs::read_dir(multishells) {
+        for entry in entries.flatten() {
+            push_path_part(parts, entry.path().join("bin").display().to_string());
+        }
+    }
+}
+
+fn collect_nested_bin_dirs(root: &Path, max_depth: usize, parts: &mut Vec<String>) {
+    fn visit(dir: &Path, depth: usize, max_depth: usize, parts: &mut Vec<String>) {
+        if depth > max_depth {
+            return;
+        }
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+            let path = entry.path();
+            if path.file_name().and_then(|name| name.to_str()) == Some("bin") {
+                push_path_part(parts, path.display().to_string());
+            }
+            visit(&path, depth + 1, max_depth, parts);
+        }
+    }
+
+    visit(root, 0, max_depth, parts);
 }
 
 fn push_path_parts(parts: &mut Vec<String>, path_value: &str) {
@@ -4128,11 +4327,28 @@ fn push_path_parts(parts: &mut Vec<String>, path_value: &str) {
 }
 
 fn push_path_part(parts: &mut Vec<String>, part: String) {
+    let Some(part) = expand_path_part(&part) else {
+        return;
+    };
     if part.is_empty() || parts.iter().any(|existing| existing == &part) {
         return;
     }
 
     parts.push(part);
+}
+
+fn expand_path_part(part: &str) -> Option<String> {
+    if part.is_empty() {
+        return None;
+    }
+    if part == "~" {
+        return env::var("HOME").ok();
+    }
+    if let Some(rest) = part.strip_prefix("~/") {
+        let home = env::var("HOME").ok()?;
+        return Some(format!("{home}/{rest}"));
+    }
+    Some(part.to_string())
 }
 
 fn find_executable_in_path(binary: &str, path_value: Option<&str>) -> Option<PathBuf> {
@@ -4609,7 +4825,8 @@ mod tests {
     use super::{
         chat_thread_summary, chat_threads_dir, extract_partial_answer_from_events,
         make_chat_thread, normalize_operation_events, read_requested_or_new_chat_thread,
-        refresh_streaming_messages, thread_activity_context, ChatThreadMessage,
+        refresh_streaming_messages, shell_single_quote, terminal_command_script,
+        thread_activity_context, ChatThreadMessage,
     };
     use std::{
         fs,
@@ -4761,6 +4978,21 @@ not-json
         let normalized = normalize_operation_events(events, Path::new("/tmp/work"));
         assert_eq!(normalized.len(), 1);
         assert_eq!(normalized[0].title, "Started AI turn");
+    }
+
+    #[test]
+    fn terminal_command_script_runs_exact_provider_command() {
+        let script = terminal_command_script("npm i -g @openai/codex").unwrap();
+        assert!(
+            script.contains("printf '\\nMaple is running:\\n  %s\\n\\n' 'npm i -g @openai/codex'")
+        );
+        assert!(script.contains("\nnpm i -g @openai/codex\n"));
+        assert!(script.contains("exec \"${SHELL:-/bin/zsh}\" -l"));
+    }
+
+    #[test]
+    fn shell_single_quote_escapes_embedded_quotes() {
+        assert_eq!(shell_single_quote("a'b"), "'a'\\''b'");
     }
 
     #[test]

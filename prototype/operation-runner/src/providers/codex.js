@@ -1,28 +1,39 @@
 const { spawnSync } = require("node:child_process");
+const { buildPathEnv, findBinary } = require("./path-utils");
 
 function cleanCommandText(text) {
   return (text || "").trim() || null;
 }
 
 function checkInstalled() {
-  const pathCommand =
-    process.platform === "win32"
-      ? spawnSync("where", ["codex"], { encoding: "utf8" })
-      : spawnSync("sh", ["-lc", "command -v codex"], { encoding: "utf8" });
+  const binPath = findBinary("codex");
+  if (!binPath) return { installed: false, path: null, version: null };
 
-  const installed = pathCommand.status === 0 && pathCommand.stdout.trim().length > 0;
-  if (!installed) return { installed: false, path: null, version: null };
-
-  const version = spawnSync("codex", ["--version"], { encoding: "utf8" });
+  const version = spawnSync(binPath, ["--version"], {
+    encoding: "utf8",
+    env: buildSpawnEnv(process.env),
+  });
   return {
     installed: true,
-    path: pathCommand.stdout.trim().split(/\r?\n/)[0],
+    path: binPath,
     version: cleanCommandText(version.stdout || version.stderr),
   };
 }
 
 function checkLoggedIn() {
-  const login = spawnSync("codex", ["login", "status"], { encoding: "utf8" });
+  const binPath = findBinary("codex");
+  if (!binPath) {
+    return {
+      loggedIn: false,
+      statusText: "Codex CLI was not found",
+      warnings: [],
+    };
+  }
+
+  const login = spawnSync(binPath, ["login", "status"], {
+    encoding: "utf8",
+    env: buildSpawnEnv(process.env),
+  });
   const statusText = cleanCommandText(login.stdout || login.stderr);
   return {
     loggedIn: login.status === 0 && /logged in/i.test(statusText || ""),
@@ -65,7 +76,7 @@ function askExecArgs(ctx) {
 }
 
 function buildSpawnEnv(baseEnv) {
-  return { ...baseEnv };
+  return { ...baseEnv, PATH: buildPathEnv(baseEnv.PATH || "", baseEnv) };
 }
 
 function feedPrompt(child, prompt) {

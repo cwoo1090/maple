@@ -3,6 +3,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   parseProviderStatus,
+  ProviderDiagnostics,
+  providerSetupMessage,
   type AppSettings,
   type NodeRuntimeStatus,
   type ProviderInfo,
@@ -15,6 +17,10 @@ type RunnerOutput = {
   stdout: string;
   stderr: string;
 };
+
+function sleep(ms: number) {
+  return new Promise<void>((resolve) => window.setTimeout(resolve, ms));
+}
 
 interface Props {
   onClose: () => void;
@@ -49,12 +55,25 @@ export function Settings({ onClose }: Props) {
       const result = await invoke<RunnerOutput>("check_provider", { name });
       const parsed = parseProviderStatus(result.stdout);
       setStatuses((prev) => ({ ...prev, [name]: parsed }));
+      return parsed;
     } catch (err) {
       setError(`Failed to check ${name}: ${String(err)}`);
+      return null;
     } finally {
       setRefreshing((prev) => ({ ...prev, [name]: false }));
     }
   }, []);
+
+  const pollStatus = useCallback(
+    async (name: string, isDone: (status: ProviderStatus | null) => boolean) => {
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        await sleep(attempt === 0 ? 2500 : 3000);
+        const status = await refreshStatus(name);
+        if (isDone(status)) return;
+      }
+    },
+    [refreshStatus],
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -129,7 +148,7 @@ export function Settings({ onClose }: Props) {
   async function handleInstall(name: string) {
     try {
       await invoke("install_provider", { name });
-      window.setTimeout(() => refreshStatus(name), 4000);
+      void pollStatus(name, (status) => Boolean(status?.installed));
     } catch (err) {
       setError(`Failed to launch installer: ${String(err)}`);
     }
@@ -138,7 +157,7 @@ export function Settings({ onClose }: Props) {
   async function handleLogin(name: string) {
     try {
       await invoke("login_provider", { name });
-      window.setTimeout(() => refreshStatus(name), 4000);
+      void pollStatus(name, (status) => Boolean(status?.installed && status.loggedIn));
     } catch (err) {
       setError(`Failed to launch sign-in: ${String(err)}`);
     }
@@ -224,21 +243,43 @@ export function Settings({ onClose }: Props) {
             const providerInstallBlocked = Boolean(
               status && !status.installed && (!runtimeStatus?.nodeInstalled || !runtimeStatus?.npmInstalled),
             );
+            const needsDiagnostics = Boolean(
+              status && (!status.installed || !status.loggedIn || status.warnings.length > 0),
+            );
+            const setupMessage = providerSetupMessage(
+              provider,
+              runtimeStatus,
+              status ?? null,
+              isRefreshing,
+              "settings",
+            );
+            const ready = Boolean(status?.installed && status.loggedIn);
 
             return (
               <div
                 key={provider.name}
-                className={`provider-row${active ? " provider-row-active" : ""}`}
+                className={[
+                  "provider-row",
+                  active ? "provider-row-active" : "",
+                  `provider-row-${setupMessage.tone}`,
+                ]
+                  .filter(Boolean)
+                  .join(" ")}
               >
-                <label className="provider-row-header">
-                  <input
-                    type="radio"
-                    name="provider"
-                    checked={active}
-                    onChange={() => handleSelectProvider(provider.name)}
-                  />
-                  <span className="provider-row-label">{provider.label}</span>
-                </label>
+                <div className="provider-row-top">
+                  <label className="provider-row-header">
+                    <input
+                      type="radio"
+                      name="provider"
+                      checked={active}
+                      onChange={() => handleSelectProvider(provider.name)}
+                    />
+                    <span className="provider-row-label">{provider.label}</span>
+                  </label>
+                  <span className={`provider-row-badge provider-row-badge-${setupMessage.tone}`}>
+                    {setupMessage.badgeLabel}
+                  </span>
+                </div>
 
                 <div className="provider-row-controls">
                   <label className="provider-row-model">
@@ -264,44 +305,79 @@ export function Settings({ onClose }: Props) {
                     </select>
                   </label>
 
-                  <div className="provider-row-status">
-                    {isRefreshing
-                      ? "Checking…"
-                      : status === null || status === undefined
-                        ? "—"
-                        : `${status.installed ? "✓ Installed" : "✗ Not installed"} · ${
-                            status.loggedIn ? "✓ Signed in" : "✗ Not signed in"
-                          }`}
-                  </div>
-
-                  <div className="provider-row-actions">
-                    <button type="button" onClick={() => refreshStatus(provider.name)}>
-                      Recheck
-                    </button>
-                    {status && !status.installed ? (
+                  {ready ? (
+                    <div className="provider-row-actions provider-row-actions-ready">
                       <button
                         type="button"
-                        onClick={() => handleInstall(provider.name)}
-                        disabled={providerInstallBlocked}
-                        title={providerInstallBlocked ? "Install Node.js with npm first" : undefined}
+                        onClick={() => void refreshStatus(provider.name)}
+                        disabled={isRefreshing}
                       >
-                        Install in Terminal
+                        {isRefreshing ? "Checking..." : "Recheck"}
                       </button>
-                    ) : null}
-                    {status && status.installed && !status.loggedIn ? (
-                      <button type="button" onClick={() => handleLogin(provider.name)}>
-                        Sign in in Terminal
-                      </button>
-                    ) : null}
-                  </div>
+                    </div>
+                  ) : null}
                 </div>
 
-                {status && status.warnings.length > 0 ? (
-                  <ul className="provider-row-warnings">
-                    {status.warnings.map((warning, index) => (
-                      <li key={index}>⚠ {warning}</li>
-                    ))}
-                  </ul>
+                {!ready ? (
+                  <div className="provider-row-issue">
+                    <div className="provider-row-issue-copy">
+                      <div className="provider-row-issue-title">{setupMessage.title}</div>
+                      <p>{setupMessage.body}</p>
+                      {setupMessage.command ? (
+                        <code className="provider-row-command">{setupMessage.command}</code>
+                      ) : null}
+                    </div>
+                    <div className="provider-row-actions">
+                      {setupMessage.actionKind === "node" ? (
+                        <button
+                          type="button"
+                          className="provider-row-primary"
+                          onClick={handleOpenNodeDownload}
+                        >
+                          Get Node.js
+                        </button>
+                      ) : null}
+                      {setupMessage.actionKind === "install" ? (
+                        <button
+                          type="button"
+                          className="provider-row-primary"
+                          onClick={() => handleInstall(provider.name)}
+                          disabled={providerInstallBlocked || isRefreshing}
+                          title={
+                            providerInstallBlocked ? "Install Node.js with npm first" : undefined
+                          }
+                        >
+                          Install in Terminal
+                        </button>
+                      ) : null}
+                      {setupMessage.actionKind === "login" ? (
+                        <button
+                          type="button"
+                          className="provider-row-primary"
+                          onClick={() => handleLogin(provider.name)}
+                          disabled={isRefreshing}
+                        >
+                          Sign in in Terminal
+                        </button>
+                      ) : null}
+                      <button
+                        type="button"
+                        onClick={() => void refreshStatus(provider.name)}
+                        disabled={isRefreshing}
+                      >
+                        {isRefreshing ? "Checking..." : "Recheck"}
+                      </button>
+                    </div>
+                  </div>
+                ) : null}
+
+                {needsDiagnostics ? (
+                  <ProviderDiagnostics
+                    provider={provider}
+                    runtime={runtimeStatus}
+                    status={status ?? null}
+                    defaultOpen={false}
+                  />
                 ) : null}
               </div>
             );

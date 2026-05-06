@@ -1,5 +1,8 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
 
 const codex = require("../../src/providers/codex");
 const claude = require("../../src/providers/claude");
@@ -25,7 +28,7 @@ const REQUIRED_METHODS = [
 ];
 
 for (const provider of [codex, claude]) {
-	  test(`${provider.name} declares required fields`, () => {
+  test(`${provider.name} declares required fields`, () => {
     for (const field of REQUIRED_FIELDS) {
       assert.ok(
         provider[field] !== undefined,
@@ -34,9 +37,9 @@ for (const provider of [codex, claude]) {
     }
     assert.ok(Array.isArray(provider.supportedModels));
     assert.ok(provider.supportedModels.length > 0);
-	    assert.equal(typeof provider.defaultTimeoutMs, "number");
-	    assert.equal(typeof provider.supportsImageAttachments, "boolean");
-	  });
+    assert.equal(typeof provider.defaultTimeoutMs, "number");
+    assert.equal(typeof provider.supportsImageAttachments, "boolean");
+  });
 
   test(`${provider.name} declares required methods`, () => {
     for (const method of REQUIRED_METHODS) {
@@ -81,6 +84,42 @@ test("claude ask enables web tools only when requested", () => {
 
   const tools = args[args.indexOf("--tools") + 1];
   assert.equal(tools, "Read,Grep,Glob,WebSearch,WebFetch");
+});
+
+test("claude spawn env prefers subscription auth and user-local binaries", () => {
+  const env = claude.buildSpawnEnv({
+    HOME: "/tmp/maple-home",
+    PATH: "/usr/bin",
+    ANTHROPIC_API_KEY: "test-key",
+  });
+
+  assert.equal(env.ANTHROPIC_API_KEY, undefined);
+  assert.ok(env.PATH.split(":").includes("/tmp/maple-home/.local/bin"));
+  assert.ok(env.PATH.split(":").includes("/tmp/maple-home/.claude/bin"));
+});
+
+test("codex spawn env includes user-local binaries", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "maple-path-home-"));
+  fs.writeFileSync(path.join(home, ".npmrc"), "prefix=~/.npm-custom\n");
+  const env = codex.buildSpawnEnv({
+    HOME: home,
+    PATH: "/usr/bin",
+    VOLTA_HOME: `${home}/volta`,
+    ASDF_DATA_DIR: `${home}/asdf-data`,
+    MISE_DATA_DIR: `${home}/mise-data`,
+    PNPM_HOME: `${home}/pnpm-home`,
+    NPM_CONFIG_PREFIX: `${home}/npm-prefix`,
+  });
+  const parts = env.PATH.split(":");
+
+  assert.ok(parts.includes(`${home}/.local/bin`));
+  assert.ok(parts.includes(`${home}/.npm-global/bin`));
+  assert.ok(parts.includes(`${home}/.npm-custom/bin`));
+  assert.ok(parts.includes(`${home}/volta/bin`));
+  assert.ok(parts.includes(`${home}/asdf-data/shims`));
+  assert.ok(parts.includes(`${home}/mise-data/shims`));
+  assert.ok(parts.includes(`${home}/pnpm-home`));
+  assert.ok(parts.includes(`${home}/pnpm-home/bin`));
 });
 
 test("codex ask forwards image attachments", () => {
