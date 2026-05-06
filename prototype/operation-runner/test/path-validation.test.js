@@ -5,6 +5,8 @@ const path = require("node:path");
 const test = require("node:test");
 
 const {
+  IMPROVE_WIKI_ALLOWED_PATHS,
+  IMPROVE_WIKI_FORBIDDEN_PATHS,
   ORGANIZE_SOURCES_ALLOWED_PATHS,
   SOURCE_MANIFEST_PATH,
   WIKI_HEALTHCHECK_ALLOWED_PATHS,
@@ -35,7 +37,9 @@ const {
   parseExplorePageReferences,
   parseSlideSelectionJson,
   renderPreparedSourcesForPrompt,
+  renderSourceStatusForPrompt,
   resolveOperationId,
+  sourcePathsForBuild,
   validateAndRestoreChanges,
   workspaceAgentInstructions,
   writeSourceManifest,
@@ -125,6 +129,13 @@ test("uses per-operation allowlists", () => {
   assert.equal(isAllowedPath("schema.md", WIKI_HEALTHCHECK_ALLOWED_PATHS), false);
   assert.equal(isAllowedPath("sources/source.md", WIKI_HEALTHCHECK_ALLOWED_PATHS), false);
 
+  assert.equal(isAllowedPath("wiki/concepts/a.md", IMPROVE_WIKI_ALLOWED_PATHS), true);
+  assert.equal(isAllowedPath("schema.md", IMPROVE_WIKI_ALLOWED_PATHS), true);
+  assert.equal(isAllowedPath("AGENTS.md", IMPROVE_WIKI_ALLOWED_PATHS), true);
+  assert.equal(isAllowedPath("CLAUDE.md", IMPROVE_WIKI_ALLOWED_PATHS), true);
+  assert.equal(isAllowedPath("tools/wiki_lint.py", IMPROVE_WIKI_ALLOWED_PATHS), true);
+  assert.equal(isAllowedPath("sources/source.md", IMPROVE_WIKI_FORBIDDEN_PATHS), true);
+
   assert.equal(isAllowedPath("sources/source.md", ORGANIZE_SOURCES_ALLOWED_PATHS), true);
   assert.equal(isAllowedPath("wiki/summaries/a.md", ORGANIZE_SOURCES_ALLOWED_PATHS), true);
   assert.equal(isAllowedPath("schema.md", ORGANIZE_SOURCES_ALLOWED_PATHS), false);
@@ -132,6 +143,41 @@ test("uses per-operation allowlists", () => {
   assert.equal(isAllowedPath("schema.md", UPDATE_RULES_ALLOWED_PATHS), true);
   assert.equal(isAllowedPath("AGENTS.md", UPDATE_RULES_ALLOWED_PATHS), true);
   assert.equal(isAllowedPath("wiki/concepts/a.md", UPDATE_RULES_ALLOWED_PATHS), false);
+});
+
+test("Improve Wiki restores source edits while allowing rule files", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "maple-improve-rules-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+
+  await fs.mkdir(path.join(workspace, "sources"), { recursive: true });
+  await fs.mkdir(path.join(workspace, "wiki", "concepts"), { recursive: true });
+  await fs.writeFile(path.join(workspace, "sources", "source.md"), "original source\n");
+  await fs.writeFile(path.join(workspace, "schema.md"), "# Schema\n");
+  await fs.writeFile(path.join(workspace, "AGENTS.md"), "# Agents\n");
+
+  const snapshot = await createSnapshot(workspace, "op-improve-rules");
+  await fs.writeFile(path.join(workspace, "sources", "source.md"), "edited source\n");
+  await fs.writeFile(path.join(workspace, "schema.md"), "# Schema\n\nClickable source links.\n");
+  await fs.writeFile(path.join(workspace, "AGENTS.md"), "# Agents\n\nFollow schema.\n");
+  await fs.writeFile(path.join(workspace, "CLAUDE.md"), "# Claude\n\nFollow schema.\n");
+
+  const changes = await diffSnapshot(workspace, snapshot);
+  const validated = await validateAndRestoreChanges(
+    workspace,
+    snapshot,
+    changes,
+    IMPROVE_WIKI_ALLOWED_PATHS,
+    { forbiddenPathRules: IMPROVE_WIKI_FORBIDDEN_PATHS },
+  );
+
+  const byPath = new Map(validated.map((change) => [change.path, change]));
+  assert.equal(byPath.get("sources/source.md")?.allowed, false);
+  assert.equal(byPath.get("sources/source.md")?.restored, true);
+  assert.equal(byPath.get("schema.md")?.allowed, true);
+  assert.equal(byPath.get("AGENTS.md")?.allowed, true);
+  assert.equal(byPath.get("CLAUDE.md")?.allowed, true);
+  assert.equal(await fs.readFile(path.join(workspace, "sources", "source.md"), "utf8"), "original source\n");
+  assert.match(await fs.readFile(path.join(workspace, "CLAUDE.md"), "utf8"), /Follow schema/);
 });
 
 test("identifies runner-owned metadata paths", () => {
@@ -142,7 +188,7 @@ test("identifies runner-owned metadata paths", () => {
   assert.equal(isRunnerMetadataPath(".aiwiki/extracted/sample.json"), false);
 });
 
-test("auto-accepts bookkeeping, assets, and deleted paths outside review markers", () => {
+test("reviews root files while excluding sources, metadata, assets, and deleted paths", () => {
   const changes = [
     {
       path: "wiki/concepts/old-topic.md",
@@ -169,7 +215,31 @@ test("auto-accepts bookkeeping, assets, and deleted paths outside review markers
       restored: false,
     },
     {
+      path: "log.md",
+      status: "modified",
+      allowed: true,
+      restored: false,
+    },
+    {
       path: "schema.md",
+      status: "modified",
+      allowed: true,
+      restored: false,
+    },
+    {
+      path: "AGENTS.md",
+      status: "modified",
+      allowed: true,
+      restored: false,
+    },
+    {
+      path: "CLAUDE.md",
+      status: "added",
+      allowed: true,
+      restored: false,
+    },
+    {
+      path: "README.md",
       status: "modified",
       allowed: true,
       restored: false,
@@ -177,8 +247,8 @@ test("auto-accepts bookkeeping, assets, and deleted paths outside review markers
     {
       path: "sources/source.md",
       status: "modified",
-      allowed: false,
-      restored: true,
+      allowed: true,
+      restored: false,
     },
     {
       path: ".aiwiki/operations/op/report.json",
@@ -191,16 +261,33 @@ test("auto-accepts bookkeeping, assets, and deleted paths outside review markers
   const userVisible = getUserVisibleChangedFiles(changes);
   assert.deepEqual(
     userVisible.map((change) => change.path),
-    ["wiki/concepts/old-topic.md", "wiki/concepts/new-folder/old-topic.md"],
+    [
+      "wiki/concepts/old-topic.md",
+      "wiki/concepts/new-folder/old-topic.md",
+      "index.md",
+      "log.md",
+      "schema.md",
+      "AGENTS.md",
+      "CLAUDE.md",
+      "README.md",
+    ],
   );
 
   assert.deepEqual(
     getReviewableChangedFiles(userVisible).map((change) => change.path),
-    ["wiki/concepts/new-folder/old-topic.md"],
+    [
+      "wiki/concepts/new-folder/old-topic.md",
+      "index.md",
+      "log.md",
+      "schema.md",
+      "AGENTS.md",
+      "CLAUDE.md",
+      "README.md",
+    ],
   );
 });
 
-test("does not block source baseline for auto-accepted generated changes", async (t) => {
+test("does not block source baseline for non-reviewable changed markers", async (t) => {
   const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "maple-pending-review-"));
   t.after(() => fs.rm(workspace, { recursive: true, force: true }));
 
@@ -214,7 +301,7 @@ test("does not block source baseline for auto-accepted generated changes", async
         operationType: "build-wiki",
         status: "completed",
         changedFiles: [
-          { path: "index.md", status: "modified", allowed: true, restored: false },
+          { path: "sources/source.md", status: "modified", allowed: true, restored: false },
           { path: "wiki/assets/diagram.png", status: "added", allowed: true, restored: false },
         ],
       },
@@ -396,6 +483,76 @@ test("tracks source status from source manifest", async (t) => {
   await fs.rm(path.join(workspace, "sources", "a.md"));
   status = await getSourceStatus(workspace);
   assert.equal(status.files.find((file) => file.path === "sources/a.md")?.state, "removed");
+});
+
+test("treats source renames with unchanged content as already ingested", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "maple-source-rename-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  await fs.mkdir(path.join(workspace, "sources"), { recursive: true });
+  await fs.writeFile(path.join(workspace, "sources", "a.md"), "alpha\n");
+  await writeSourceManifest(workspace, "test-op");
+
+  await fs.rename(path.join(workspace, "sources", "a.md"), path.join(workspace, "sources", "renamed.md"));
+
+  const status = await getSourceStatus(workspace);
+  assert.equal(status.pendingCount, 0);
+  assert.equal(status.files.find((file) => file.path === "sources/renamed.md")?.state, "unchanged");
+  assert.equal(status.files.find((file) => file.path === "sources/a.md"), undefined);
+  assert.deepEqual(sourcePathsForBuild(status), []);
+  assert.match(renderSourceStatusForPrompt(status), /No pending source changes/);
+});
+
+test("treats source moves into folders with unchanged content as already ingested", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "maple-source-folder-move-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  await fs.mkdir(path.join(workspace, "sources"), { recursive: true });
+  await fs.writeFile(path.join(workspace, "sources", "a.md"), "alpha\n");
+  await writeSourceManifest(workspace, "test-op");
+
+  await fs.mkdir(path.join(workspace, "sources", "week-1"), { recursive: true });
+  await fs.rename(path.join(workspace, "sources", "a.md"), path.join(workspace, "sources", "week-1", "a.md"));
+
+  const status = await getSourceStatus(workspace);
+  assert.equal(status.pendingCount, 0);
+  assert.equal(status.files.find((file) => file.path === "sources/week-1/a.md")?.state, "unchanged");
+  assert.equal(status.files.find((file) => file.path === "sources/a.md"), undefined);
+});
+
+test("tracks source move plus content edit as pending source content changes", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "maple-source-move-edit-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  await fs.mkdir(path.join(workspace, "sources"), { recursive: true });
+  await fs.writeFile(path.join(workspace, "sources", "a.md"), "alpha\n");
+  await writeSourceManifest(workspace, "test-op");
+
+  await fs.mkdir(path.join(workspace, "sources", "week-1"), { recursive: true });
+  await fs.rename(path.join(workspace, "sources", "a.md"), path.join(workspace, "sources", "week-1", "a.md"));
+  await fs.writeFile(path.join(workspace, "sources", "week-1", "a.md"), "changed\n");
+
+  const status = await getSourceStatus(workspace);
+  assert.equal(status.pendingCount, 2);
+  assert.equal(status.files.find((file) => file.path === "sources/week-1/a.md")?.state, "new");
+  assert.equal(status.files.find((file) => file.path === "sources/a.md")?.state, "removed");
+  assert.deepEqual(sourcePathsForBuild(status), ["sources/week-1/a.md"]);
+});
+
+test("matches duplicate source-content moves by count", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "maple-source-duplicate-move-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  await fs.mkdir(path.join(workspace, "sources"), { recursive: true });
+  await fs.writeFile(path.join(workspace, "sources", "a.md"), "same\n");
+  await fs.writeFile(path.join(workspace, "sources", "b.md"), "same\n");
+  await writeSourceManifest(workspace, "test-op");
+
+  await fs.mkdir(path.join(workspace, "sources", "organized"), { recursive: true });
+  await fs.rename(path.join(workspace, "sources", "a.md"), path.join(workspace, "sources", "organized", "a.md"));
+  await fs.rename(path.join(workspace, "sources", "b.md"), path.join(workspace, "sources", "organized", "b.md"));
+
+  const status = await getSourceStatus(workspace);
+  assert.equal(status.pendingCount, 0);
+  assert.equal(status.files.find((file) => file.path === "sources/organized/a.md")?.state, "unchanged");
+  assert.equal(status.files.find((file) => file.path === "sources/organized/b.md")?.state, "unchanged");
+  assert.equal(status.files.some((file) => file.state === "removed"), false);
 });
 
 test("migrates legacy raw to sources before default folder initialization", async (t) => {

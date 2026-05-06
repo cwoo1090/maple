@@ -19,7 +19,7 @@
         <span>Maple</span>
       </a>
       <nav class="site-nav" aria-label="Primary navigation">
-        <a href="#download">Download</a>
+        <a href="download-macos.html">Download</a>
         <a href="#workflow">Workflow</a>
         <a href="#privacy">Privacy</a>
       </nav>
@@ -38,16 +38,14 @@
             <div class="hero-actions">
               <a
                 class="button primary"
-                href="https://github.com/cwoo1090/maple/releases/download/v0.1.1/Maple_0.1.1_aarch64.dmg"
-                download
+                href="download-macos.html"
               >
                 Download for macOS
               </a>
               <a class="button secondary" href="#workflow">See how it works</a>
             </div>
             <p class="release-note">
-              Version 0.1.1 beta for Apple silicon Macs. Requires macOS 12 or
-              newer.
+              For Apple silicon Macs. Requires macOS 12 or newer.
             </p>
           </div>
           <figure class="hero-product-shot">
@@ -61,47 +59,20 @@
         </div>
       </section>
 
-      <section class="download-band" id="download" aria-labelledby="download-title">
-        <div class="download-layout">
-          <div>
-            <p class="section-kicker">Direct download</p>
-            <h2 id="download-title">Get Maple for macOS</h2>
-            <p>
-              This first MVP is a direct-download desktop app. It uses local
-              files and your existing ChatGPT/Codex setup instead of accounts,
-              sync, or built-in API billing.
-            </p>
-          </div>
-          <div class="download-box">
-            <div class="download-meta">
-              <span>Maple 0.1.1 beta</span>
-              <span>10 MB</span>
-              <span>Apple silicon</span>
-            </div>
-            <a
-              class="button primary full"
-              href="https://github.com/cwoo1090/maple/releases/download/v0.1.1/Maple_0.1.1_aarch64.dmg"
-              download
-            >
-              Download DMG
-            </a>
-            <div class="checksum-row">
-              <code id="checksum-value"
-                >5f5c463df1d0a433c18f04f67e840d72ced3e288b555a9a80ad2311ecf1917aa</code
-              >
-              <button type="button" id="copy-checksum">Copy</button>
-            </div>
-            <p class="download-hint" id="copy-status" aria-live="polite">
-              SHA-256 checksum for the current local build.
-            </p>
-          </div>
-        </div>
-      </section>
-
       <section class="workflow-section" id="workflow" aria-labelledby="workflow-title">
         <div class="section-heading">
           <p class="section-kicker">Workflow</p>
           <h2 id="workflow-title">From scattered sources to a maintained wiki</h2>
+          <p class="section-intro">
+            Inspired by
+            <a
+              href="https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f"
+              target="_blank"
+              rel="noreferrer"
+            >Andrej Karpathy's LLM Wiki</a>:
+            keep raw sources separate while an AI-maintained wiki becomes the
+            working layer for learning and research.
+          </p>
         </div>
         <div class="workflow-grid">
           <article>
@@ -121,13 +92,13 @@
           </article>
           <article>
             <span>4</span>
-            <h3>Review changes</h3>
-            <p>See generated files before accepting updates to your wiki.</p>
+            <h3>Explore</h3>
+            <p>Read pages, follow links, ask questions, and improve the wiki over time.</p>
           </article>
           <article>
             <span>5</span>
-            <h3>Explore</h3>
-            <p>Read pages, follow links, ask questions, and improve the wiki over time.</p>
+            <h3>Maintain</h3>
+            <p>Improve pages, run healthchecks, clean up links, and keep the wiki useful as it grows.</p>
           </article>
         </div>
       </section>

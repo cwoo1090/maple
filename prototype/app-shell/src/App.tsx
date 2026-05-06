@@ -170,6 +170,7 @@ type ChatThread = {
   initialContextPath?: string | null;
   operationType?: string | null;
   operationId?: string | null;
+  draftOperationType?: string | null;
   changedFiles?: ChangedFile[];
   messages: ExploreChatMessage[];
 };
@@ -281,7 +282,6 @@ type MaintainTaskConfig = {
   command: MaintainCommand;
   busyLabel: string;
   actionLabel: string;
-  explanation: string;
   placeholder: string;
   requiresInstruction: boolean;
   runningSteps: string[];
@@ -348,6 +348,7 @@ const BUILD_WIKI_STEPS = [
 ];
 const BUILD_WIKI_STEP_INTERVAL_MS = 4600;
 const MAINTAIN_STEP_INTERVAL_MS = 4600;
+const TRANSIENT_UNDONE_STATUS_MS = 10_000;
 const DEFAULT_WIKI_UPDATE_USER_MESSAGE = "Update this wiki using the selected chat.";
 const DEFAULT_WIKI_UPDATE_ASSISTANT_INTRO =
   "I'll update this wiki using the selected chat and current wiki context.";
@@ -412,8 +413,6 @@ const MAINTAIN_TASKS: MaintainTaskConfig[] = [
     command: "wiki_healthcheck",
     busyLabel: "Running healthcheck",
     actionLabel: "Run healthcheck",
-    explanation:
-      "I will check the wiki against the healthcheck rules and fix conservative issues like obvious broken links, stale index entries, weak pages, and missing citations.",
     placeholder: "Optional focus, for example: Check citation quality in the summaries.",
     requiresInstruction: false,
     runningSteps: [
@@ -431,10 +430,9 @@ const MAINTAIN_TASKS: MaintainTaskConfig[] = [
     guidanceLabel: "Needs instruction",
     command: "improve_wiki",
     busyLabel: "Improving wiki",
-    actionLabel: "Improve wiki",
-    explanation:
-      "Tell me how the wiki should develop. I can create guides, improve structure, connect pages, and reshape content around that direction.",
-    placeholder: "Example: Create a beginner-friendly learning guide from the whole wiki.",
+    actionLabel: "Run wiki improvement",
+    placeholder:
+      "Example: Make every image source citation clickable and remember that rule for future pages.",
     requiresInstruction: true,
     runningSteps: [
       "Reading workspace rules",
@@ -451,9 +449,7 @@ const MAINTAIN_TASKS: MaintainTaskConfig[] = [
     guidanceLabel: "Needs instruction",
     command: "organize_sources",
     busyLabel: "Organizing sources",
-    actionLabel: "Organize sources",
-    explanation:
-      "Tell me how sources should be grouped or renamed. I will move files without changing their contents and update wiki citations that point to them.",
+    actionLabel: "Run source organization",
     placeholder: "Example: Group slides, notes, and transcripts by lecture week.",
     requiresInstruction: true,
     runningSteps: [
@@ -471,9 +467,7 @@ const MAINTAIN_TASKS: MaintainTaskConfig[] = [
     guidanceLabel: "Needs instruction",
     command: "update_wiki_rules",
     busyLabel: "Updating rules",
-    actionLabel: "Update rules",
-    explanation:
-      "Rules are saved instructions this workspace asks the AI to follow. Tell me a rule to remember for future build, explore, and maintenance tasks.",
+    actionLabel: "Run rule update",
     placeholder: "Example: Add practice questions to every guide.",
     requiresInstruction: true,
     runningSteps: [
@@ -783,6 +777,37 @@ function maintainTaskIdFromOperationType(operationType?: string | null): Maintai
   return operationType ? MAINTAIN_TASK_ID_BY_OPERATION[operationType] ?? null : null;
 }
 
+function maintainTaskIdFromThread(thread?: ChatThread | null): MaintainTaskId | null {
+  return (
+    maintainTaskIdFromOperationType(thread?.operationType) ??
+    maintainTaskIdFromOperationType(thread?.draftOperationType)
+  );
+}
+
+function maintainStageFromThread(
+  thread: ChatThread,
+  activityStatus?: ThreadActivityStatus,
+): MaintainStage {
+  const taskId = maintainTaskIdFromThread(thread);
+  if (thread.operationType && activityStatus === "running") return "running";
+  if (thread.operationType && taskId) return "done";
+  if (taskId) return "compose";
+  return "choose";
+}
+
+function maintainTaskContextHint(task: MaintainTaskConfig): string {
+  switch (task.id) {
+    case "healthcheck":
+      return "Optional focus. Can run with no final instruction.";
+    case "improveWiki":
+      return "Creates reviewable wiki changes.";
+    case "organizeSources":
+      return "May move or rename sources; source contents stay unchanged.";
+    case "updateRules":
+      return "Updates durable rules for future wiki work.";
+  }
+}
+
 function operationTypeLabel(operationType?: string | null): string {
   const taskId = maintainTaskIdFromOperationType(operationType);
   if (taskId) return MAINTAIN_TASK_BY_ID[taskId].label;
@@ -880,7 +905,7 @@ function isPendingReviewChange(file: ChangedFile): boolean {
 
 function isManualReviewPath(path: string, status?: string): boolean {
   if (status === "deleted") return false;
-  if (path === "index.md" || path === "log.md" || path === "schema.md") return false;
+  if (path === "sources" || path.startsWith("sources/")) return false;
   if (path.startsWith("wiki/assets/")) return false;
   if (path === ".aiwiki" || path.startsWith(".aiwiki/")) return false;
   if (path === ".studywiki" || path.startsWith(".studywiki/")) return false;
@@ -890,6 +915,7 @@ function isManualReviewPath(path: string, status?: string): boolean {
 function App() {
   const appBodyRef = useRef<HTMLDivElement | null>(null);
   const exploreChatMessagesRef = useRef<HTMLDivElement | null>(null);
+  const maintainChatMessagesRef = useRef<HTMLDivElement | null>(null);
   const topbarWorkspaceMenuRef = useRef<HTMLDetailsElement | null>(null);
   const topbarMenuRef = useRef<HTMLDetailsElement | null>(null);
   const chatHistoryButtonRef = useRef<HTMLButtonElement | null>(null);
@@ -938,6 +964,7 @@ function App() {
   const [wikiUpdateStatusStep, setWikiUpdateStatusStep] = useState(0);
   const [workspaceOperationProgress, setWorkspaceOperationProgress] =
     useState<OperationProgress | null>(null);
+  const [statusBadgeClockMs, setStatusBadgeClockMs] = useState(() => Date.now());
   const [backgroundBuildActive, setBackgroundBuildActive] = useState(false);
   const [backgroundBuildStartedAt, setBackgroundBuildStartedAt] = useState<number | null>(null);
   const handledBuildOperationIdRef = useRef<string | null>(null);
@@ -1003,6 +1030,13 @@ function App() {
   } | null>(null);
   const exploreChatMessages = chatThread?.messages ?? [];
   const latestExploreChatMessage = exploreChatMessages[exploreChatMessages.length - 1];
+  const maintainThreadMessages = maintainThread?.messages ?? [];
+  const latestMaintainThreadMessage = maintainThreadMessages[maintainThreadMessages.length - 1];
+  const isAskingMaintainDiscussion = maintainThreadMessages.some(
+    (message) => message.status === "streaming",
+  );
+  const isStartingMaintainDiscussion = busy === "Starting Maintain discussion";
+  const maintainDiscussionBusy = isStartingMaintainDiscussion || isAskingMaintainDiscussion;
   const runningChatSummaryCount = useMemo(
     () =>
       chatThreads.filter(
@@ -1057,14 +1091,20 @@ function App() {
   const isAskingWiki = exploreChatMessages.some((message) => message.status === "streaming");
   const isStartingExplore = busy === "Starting chat";
   const exploreBusy = isStartingExplore || isAskingWiki;
-  const currentMaintainTaskId =
-    selectedMaintainTaskId ?? maintainTaskIdFromOperationType(maintainThread?.operationType);
+  const activeMaintainDiscussionRunId = maintainThreadMessages
+    .slice()
+    .reverse()
+    .find((message) => message.role === "assistant" && message.status === "streaming" && message.runId)
+    ?.runId;
+  const currentMaintainTaskId = maintainTaskIdFromThread(maintainThread) ?? selectedMaintainTaskId;
   const selectedMaintainTask = currentMaintainTaskId
     ? MAINTAIN_TASK_BY_ID[currentMaintainTaskId]
     : null;
   const currentMaintainSummary = maintainThreads.find((thread) => thread.id === maintainThread?.id);
-  const currentMaintainSummaryRunning =
-    normalizeThreadActivityStatus(currentMaintainSummary?.activityStatus) === "running";
+  const currentMaintainSummaryRunning = Boolean(
+    maintainThread?.operationType &&
+      normalizeThreadActivityStatus(currentMaintainSummary?.activityStatus) === "running",
+  );
   const workspaceMaintainOperationRunning = Boolean(
     selectedMaintainTask &&
       workspaceOperationProgress?.running &&
@@ -1082,9 +1122,14 @@ function App() {
   const workspaceWriteBusy =
     isBuilding || isMaintainOperationRunning || isWikiUpdateRunning;
   const blockingUiBusy = Boolean(
-    busy && !isStartingBuild && !isStartingExplore && !isMaintainOperationRunning,
+    busy &&
+      !isStartingBuild &&
+      !isStartingExplore &&
+      !isStartingMaintainDiscussion &&
+      !isMaintainOperationRunning,
   );
-  const writeActionBlocked = workspaceWriteBusy || exploreBusy || blockingUiBusy;
+  const writeActionBlocked =
+    workspaceWriteBusy || exploreBusy || maintainDiscussionBusy || blockingUiBusy;
   const anyOperationBusy = writeActionBlocked;
   const activeWorkspaceWriteLabel = isBuilding
     ? "Build wiki"
@@ -1093,7 +1138,9 @@ function App() {
       : isMaintainOperationRunning && selectedMaintainTask
         ? selectedMaintainTask.label
         : null;
-  const activeOperationLabel = activeWorkspaceWriteLabel ?? (exploreBusy ? "Explore Chat" : busy);
+  const activeOperationLabel =
+    activeWorkspaceWriteLabel ??
+    (exploreBusy ? "Explore Chat" : maintainDiscussionBusy ? "Maintain discussion" : busy);
   const changedFiles =
     workspace.changedMarker?.changedFiles ?? workspace.changedMarker?.allChangedFiles ?? [];
   const reviewableChangedFiles = changedFiles.filter(isPendingReviewChange);
@@ -1132,6 +1179,9 @@ function App() {
       if (blockingUiBusy && activeOperationLabel) {
         return `${activeOperationLabel} is running. Wait for it to finish before asking chat.`;
       }
+      if (maintainDiscussionBusy) {
+        return "Maintain discussion is answering. Wait for it to finish before asking chat.";
+      }
       return null;
     }
 
@@ -1152,6 +1202,10 @@ function App() {
 
     if (exploreBusy) {
       return `Explore Chat is answering. Wait for it to finish before ${actionPhrase(action)}.`;
+    }
+
+    if (maintainDiscussionBusy) {
+      return `Maintain discussion is answering. Wait for it to finish before ${actionPhrase(action)}.`;
     }
 
     if (blockingUiBusy && activeOperationLabel) {
@@ -1182,7 +1236,6 @@ function App() {
   const maintainCanRun = Boolean(
     workspace.workspacePath &&
       maintainThread &&
-      !maintainThread.operationType &&
       selectedMaintainTask &&
       !maintainBlockedReason &&
       (!selectedMaintainTask.requiresInstruction || maintainInstruction.trim()),
@@ -1193,7 +1246,6 @@ function App() {
       workspace.changedMarker?.operationId &&
       maintainThread.operationId === workspace.changedMarker.operationId,
   );
-  const maintainThreadMessages = maintainThread?.messages ?? [];
   const visibleMaintainThreadMessages = useMemo(
     () =>
       maintainThread?.operationType
@@ -1206,8 +1258,28 @@ function App() {
         : maintainThreadMessages,
     [maintainThread?.operationType, maintainThreadMessages],
   );
+  const hasMaintainConversation = visibleMaintainThreadMessages.length > 0;
+  const showMaintainTaskChoices = Boolean(
+    !maintainThread?.operationType && maintainStage === "choose" && !hasMaintainConversation,
+  );
+  const showMaintainUnscopedDiscussionActions = Boolean(
+    !maintainThread?.operationType &&
+      maintainStage === "choose" &&
+      hasMaintainConversation &&
+      !selectedMaintainTask,
+  );
+  const showMaintainComposer = Boolean(
+    selectedMaintainTask && (maintainStage === "compose" || maintainStage === "done"),
+  );
+  const showMaintainCompletionBar = Boolean(
+    maintainThread?.operationType && maintainStage === "done",
+  );
+  const showMaintainOperationFeed = Boolean(maintainStage === "running" && selectedMaintainTask);
+  const maintainComposerBlockedReason = exploreBlockedReason;
   const maintainContextLabel = maintainThread?.operationType
     ? operationTypeLabel(maintainThread.operationType)
+    : selectedMaintainTask
+    ? selectedMaintainTask.label
     : "New task";
   const sourceStatus = workspace.sourceStatus;
   const pendingSourceFiles = useMemo(
@@ -1347,13 +1419,20 @@ function App() {
     "Maintaining wiki";
   const wikiUpdateActiveStep = Math.min(wikiUpdateStatusStep, WIKI_UPDATE_STEPS.length - 1);
   const wikiUpdateRunningLabel = WIKI_UPDATE_STEPS[wikiUpdateActiveStep] ?? "Updating wiki";
+  const showUndoneStatus = useMemo(() => {
+    const undoneAt = workspace.changedMarker?.undoneAt;
+    if (!undoneAt) return false;
+    const undoneAtMs = Date.parse(undoneAt);
+    if (!Number.isFinite(undoneAtMs)) return false;
+    return statusBadgeClockMs - undoneAtMs < TRANSIENT_UNDONE_STATUS_MS;
+  }, [statusBadgeClockMs, workspace.changedMarker?.undoneAt]);
   const statusLabel = useMemo(() => {
     if (isBuilding) return "Building wiki";
     if (isMaintainOperationRunning && selectedMaintainTask) return selectedMaintainTask.busyLabel;
     if (isWikiUpdateRunning) return "Updating wiki";
     if (exploreBusy) return isStartingExplore ? "Starting chat" : "Explore Chat";
     if (busy) return busy;
-    if (workspace.changedMarker?.undoneAt) return "Undone";
+    if (showUndoneStatus) return "Undone";
     if (reviewableChangedFiles.length > 0) {
       if (unreviewedChangedFiles.length === 0) return "Generated changes reviewed";
       return `${unreviewedChangedFiles.length} generated change${unreviewedChangedFiles.length === 1 ? "" : "s"} to review`;
@@ -1368,9 +1447,9 @@ function App() {
     isStartingExplore,
     reviewableChangedFiles.length,
     selectedMaintainTask,
+    showUndoneStatus,
     unreviewedChangedFiles.length,
     isWikiUpdateRunning,
-    workspace.changedMarker?.undoneAt,
     workspace.indexMd,
   ]);
 
@@ -1681,6 +1760,23 @@ function App() {
   ]);
 
   useEffect(() => {
+    const undoneAt = workspace.changedMarker?.undoneAt;
+    if (!undoneAt) return;
+    const undoneAtMs = Date.parse(undoneAt);
+    if (!Number.isFinite(undoneAtMs)) return;
+
+    const now = Date.now();
+    setStatusBadgeClockMs(now);
+    const remainingMs = TRANSIENT_UNDONE_STATUS_MS - (now - undoneAtMs);
+    if (remainingMs <= 0) return;
+
+    const timeoutId = window.setTimeout(() => {
+      setStatusBadgeClockMs(Date.now());
+    }, remainingMs + 50);
+    return () => window.clearTimeout(timeoutId);
+  }, [workspace.changedMarker?.undoneAt]);
+
+  useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
@@ -1847,11 +1943,11 @@ function App() {
         writeSeenThreadMap(SEEN_MAINTAIN_THREADS_KEY, workspace.workspacePath, seenMaintain);
         setSeenChatThreadUpdates(seenChats);
         setSeenMaintainThreadUpdates(seenMaintain);
-        const taskId = maintainTaskIdFromOperationType(maintainThread.operationType);
+        const taskId = maintainTaskIdFromThread(maintainThread);
         const maintainSummary = maintainSummaries.find((summary) => summary.id === maintainThread.id);
         const maintainStatus = normalizeThreadActivityStatus(maintainSummary?.activityStatus);
         setSelectedMaintainTaskId(taskId);
-        setMaintainStage(maintainStatus === "running" ? "running" : taskId ? "done" : "choose");
+        setMaintainStage(maintainStageFromThread(maintainThread, maintainStatus));
       } catch (err) {
         if (!cancelled) setError(`Failed to load chat history: ${String(err)}`);
       }
@@ -1887,6 +1983,23 @@ function App() {
   }, [chatThread?.id, isAskingWiki]);
 
   useEffect(() => {
+    if (!maintainThread?.id || !isAskingMaintainDiscussion) return;
+    const intervalId = window.setInterval(async () => {
+      try {
+        const thread = await invoke<ChatThread>("read_current_maintain_thread");
+        setMaintainThread(thread);
+        if (!thread.messages.some((message) => message.status === "streaming")) {
+          markMaintainThreadSeen(thread);
+          await refreshMaintainHistorySummaries();
+        }
+      } catch (err) {
+        setError(`Failed to read maintain discussion progress: ${String(err)}`);
+      }
+    }, 700);
+    return () => window.clearInterval(intervalId);
+  }, [maintainThread?.id, isAskingMaintainDiscussion]);
+
+  useEffect(() => {
     if (
       !workspace.workspacePath ||
       !chatHistoryOpen ||
@@ -1914,7 +2027,7 @@ function App() {
     if (
       !workspace.workspacePath ||
       !maintainHistoryOpen ||
-      (runningMaintainSummaryCount === 0 && !isMaintainOperationRunning)
+      (runningMaintainSummaryCount === 0 && !isMaintainOperationRunning && !maintainDiscussionBusy)
     ) {
       return;
     }
@@ -1937,6 +2050,7 @@ function App() {
     maintainHistoryOpen,
     runningMaintainSummaryCount,
     isMaintainOperationRunning,
+    maintainDiscussionBusy,
   ]);
 
   useEffect(() => {
@@ -1979,6 +2093,42 @@ function App() {
     maintainStage,
     selectedMaintainTask,
     workspaceMaintainOperationRunning,
+  ]);
+
+  useEffect(() => {
+    if (
+      !workspace.workspacePath ||
+      !maintainThread?.id ||
+      maintainStage !== "running" ||
+      !isMaintainOperationRunning
+    ) {
+      return;
+    }
+
+    let cancelled = false;
+    const runningThreadId = maintainThread.id;
+    const readThread = async () => {
+      try {
+        const thread = await invoke<ChatThread>("read_current_maintain_thread");
+        if (cancelled || thread.id !== runningThreadId) return;
+        setMaintainThread(thread);
+        markMaintainThreadSeen(thread);
+      } catch (err) {
+        if (!cancelled) setError(`Failed to read maintain operation chat: ${String(err)}`);
+      }
+    };
+
+    void readThread();
+    const intervalId = window.setInterval(readThread, 900);
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+    };
+  }, [
+    workspace.workspacePath,
+    maintainThread?.id,
+    maintainStage,
+    isMaintainOperationRunning,
   ]);
 
   useEffect(() => {
@@ -2086,6 +2236,32 @@ function App() {
   }, [activeExploreRunId, workspace.workspacePath]);
 
   useEffect(() => {
+    if (!workspace.workspacePath || !activeMaintainDiscussionRunId) return;
+    let cancelled = false;
+    const readProgress = async () => {
+      try {
+        const progress = await invoke<OperationProgress>("read_chat_run_progress", {
+          runId: activeMaintainDiscussionRunId,
+        });
+        if (cancelled) return;
+        setChatRunProgressById((previous) => ({
+          ...previous,
+          [activeMaintainDiscussionRunId]: mergeOperationProgress(
+            previous[activeMaintainDiscussionRunId],
+            progress,
+          ),
+        }));
+      } catch (_err) {}
+    };
+    void readProgress();
+    const intervalId = window.setInterval(readProgress, 900);
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+    };
+  }, [activeMaintainDiscussionRunId, workspace.workspacePath]);
+
+  useEffect(() => {
     if (!workspace.workspacePath || exploreChatMessages.length === 0) return;
     const runIds = exploreChatMessages
       .map((message) => message.runId)
@@ -2107,7 +2283,7 @@ function App() {
   }, [chatRunProgressById, exploreChatMessages, workspace.workspacePath]);
 
   useEffect(() => {
-    if (!isAskingWiki) {
+    if (!isAskingWiki && !isAskingMaintainDiscussion) {
       setChatStatusStep(0);
       return;
     }
@@ -2116,7 +2292,7 @@ function App() {
       setChatStatusStep((step) => step + 1);
     }, 2600);
     return () => window.clearInterval(intervalId);
-  }, [isAskingWiki]);
+  }, [isAskingWiki, isAskingMaintainDiscussion]);
 
   useEffect(() => {
     if (!isBuilding) {
@@ -2177,6 +2353,32 @@ function App() {
     wikiUpdateStatusStep,
     workspaceOperationProgress?.events.length,
     activeExploreRunId ? chatRunProgressById[activeExploreRunId]?.events.length : 0,
+  ]);
+
+  useEffect(() => {
+    if (maintainThreadMessages.length === 0) return;
+    const frameId = requestAnimationFrame(() => {
+      const messagesEl = maintainChatMessagesRef.current;
+      if (!messagesEl) return;
+      messagesEl.scrollTo({
+        top: messagesEl.scrollHeight,
+        behavior: isAskingMaintainDiscussion || isMaintainOperationRunning ? "smooth" : "auto",
+      });
+    });
+    return () => cancelAnimationFrame(frameId);
+  }, [
+    maintainThread?.id,
+    isAskingMaintainDiscussion,
+    isMaintainOperationRunning,
+    latestMaintainThreadMessage?.id,
+    latestMaintainThreadMessage?.status,
+    latestMaintainThreadMessage?.text,
+    maintainStage,
+    maintainThreadMessages.length,
+    workspaceOperationProgress?.events.length,
+    activeMaintainDiscussionRunId
+      ? chatRunProgressById[activeMaintainDiscussionRunId]?.events.length
+      : 0,
   ]);
 
   useEffect(() => {
@@ -2625,7 +2827,7 @@ function App() {
   }
 
   function selectMaintainTask(taskId: MaintainTaskId) {
-    if (maintainBlockedReason || maintainThread?.operationType) return;
+    if (maintainBlockedReason) return;
     setSelectedMaintainTaskId(taskId);
     setMaintainInstruction("");
     setMaintainLastResult(null);
@@ -2663,13 +2865,13 @@ function App() {
       const thread = await invoke<ChatThread>("set_current_maintain_thread", { threadId });
       setMaintainThread(thread);
       markMaintainThreadSeen(thread);
-      const taskId = maintainTaskIdFromOperationType(thread.operationType);
+      const taskId = maintainTaskIdFromThread(thread);
       const summary = maintainThreads.find((item) => item.id === thread.id);
       const status = normalizeThreadActivityStatus(summary?.activityStatus);
       setSelectedMaintainTaskId(taskId);
       setMaintainInstruction("");
       setMaintainLastResult(null);
-      setMaintainStage(status === "running" ? "running" : taskId ? "done" : "choose");
+      setMaintainStage(maintainStageFromThread(thread, status));
       setMaintainHistoryOpen(false);
     } catch (err) {
       setError(`Failed to open maintain chat: ${String(err)}`);
@@ -2684,11 +2886,11 @@ function App() {
       });
       setMaintainThread(thread);
       markMaintainThreadSeen(thread);
-      const taskId = maintainTaskIdFromOperationType(thread.operationType);
+      const taskId = maintainTaskIdFromThread(thread);
       setSelectedMaintainTaskId(taskId);
       setMaintainInstruction("");
       setMaintainLastResult(null);
-      setMaintainStage(taskId ? "done" : "choose");
+      setMaintainStage(maintainStageFromThread(thread));
       await refreshMaintainHistorySummaries();
     } catch (err) {
       setError(`Failed to delete maintain chat: ${String(err)}`);
@@ -2702,6 +2904,14 @@ function App() {
     setMaintainStage("choose");
   }
 
+  async function changeMaintainTask() {
+    if (maintainThread?.operationType || maintainThread?.messages.length) {
+      await createNewMaintainThread();
+      return;
+    }
+    resetMaintainFlow();
+  }
+
   async function runMaintainCommand() {
     if (!selectedMaintainTask || !maintainThread) return;
     if (maintainBlockedReason) {
@@ -2713,10 +2923,6 @@ function App() {
         `${activeProvider ? displayProviderName(activeProvider) : "AI"} setup is needed before running maintenance.`,
       );
       void providerSetup.refresh();
-      return;
-    }
-    if (maintainThread.operationType) {
-      setError("Start another maintain chat for a new task.");
       return;
     }
     const trimmedInstruction = maintainInstruction.trim();
@@ -2832,17 +3038,17 @@ function App() {
     return thread;
   }
 
-  async function askExploreChat() {
-    if (exploreBlockedReason || !workspace.workspacePath) return;
+  async function askExploreChat(questionOverride?: string): Promise<boolean> {
+    if (exploreBlockedReason || !workspace.workspacePath) return false;
     if (!activeProviderReady) {
       setError(
         `${activeProvider ? displayProviderName(activeProvider) : "AI"} setup is needed before asking chat.`,
       );
       void providerSetup.refresh();
-      return;
+      return false;
     }
-    const question = exploreQuestion.trim();
-    if (!question) return;
+    const question = (questionOverride ?? exploreQuestion).trim();
+    if (!question) return false;
     setBusy("Starting chat");
     setError(null);
 
@@ -2857,10 +3063,11 @@ function App() {
       setChatThread(thread);
       markChatThreadSeen(thread);
       await refreshChatHistorySummaries();
+      return true;
     } catch (err) {
       if (!chatThread?.id || !isMissingChatThreadError(err)) {
         setError(String(err));
-        return;
+        return false;
       }
 
       try {
@@ -2881,9 +3088,54 @@ function App() {
         setChatHistoryOpen(false);
         await refreshChatHistorySummaries();
         setError(null);
+        return true;
       } catch (retryErr) {
         setError(String(retryErr));
+        return false;
       }
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function askMaintainDraftInMaintain() {
+    if (!maintainThread) return;
+    if (!selectedMaintainTask) {
+      setError("Choose a Maintain task first.");
+      return;
+    }
+    const question = maintainInstruction.trim();
+    if (!question) {
+      setError("Ask a question first.");
+      return;
+    }
+    if (!activeProviderReady) {
+      setError(
+        `${activeProvider ? displayProviderName(activeProvider) : "AI"} setup is needed before asking Maintain.`,
+      );
+      void providerSetup.refresh();
+      return;
+    }
+    if (maintainDiscussionBusy) {
+      setError("Maintain discussion is already answering.");
+      return;
+    }
+    setBusy("Starting Maintain discussion");
+    setError(null);
+    try {
+      const thread = await invoke<ChatThread>("start_maintain_discussion", {
+        threadId: maintainThread.id,
+        command: selectedMaintainTask.command,
+        question,
+        selectedPath,
+      });
+      setMaintainThread(thread);
+      markMaintainThreadSeen(thread);
+      setMaintainInstruction("");
+      setMaintainStage(maintainStageFromThread(thread));
+      await refreshMaintainHistorySummaries();
+    } catch (err) {
+      setError(String(err));
     } finally {
       setBusy(null);
     }
@@ -4002,7 +4254,7 @@ function App() {
                           ? "Wiki page"
                           : selectedPath.startsWith("sources/")
                             ? "Source"
-                            : "Workspace file"}
+                          : "Workspace file"}
                 </span>
               ) : null}
               <div className="view-toggle">
@@ -4363,14 +4615,14 @@ function App() {
                         {message.role === "assistant" && message.runId ? (
                           <OperationFeedPanel
                             progress={chatRunProgressById[message.runId] ?? null}
-                            title="Runner events"
+                            title="Progress"
                             fallbackSteps={chatRunningSteps}
                             fallbackActiveIndex={Math.min(
                               chatStatusStep,
                               chatRunningSteps.length - 1,
                             )}
                             fallbackRunning={message.status === "streaming"}
-                            open={openFeedIds.has(message.runId)}
+                            open={message.status === "failed" || openFeedIds.has(message.runId)}
                             onToggle={() =>
                               setOpenFeedIds((previous) => {
                                 const next = new Set(previous);
@@ -4617,19 +4869,51 @@ function App() {
                   </div>
                 ) : null}
               </header>
-              <div className="maintain-chat-messages">
+              <div className="maintain-chat-messages" ref={maintainChatMessagesRef}>
                 {visibleMaintainThreadMessages.map((message) => (
                   <div
                     key={message.id}
                     className={`maintain-message maintain-message-${message.role}`}
                   >
                     {message.role === "assistant" ? (
-                      <WorkspaceAwareMarkdown
-                        content={message.text}
-                        currentPath={selectedPath}
-                        availableDocuments={availableDocuments}
-                        onOpenDocument={openWorkspaceDocument}
-                      />
+                      <>
+                        {message.runId ? (
+                          <OperationFeedPanel
+                            progress={chatRunProgressById[message.runId] ?? null}
+                            title="Progress"
+                            fallbackSteps={chatRunningSteps}
+                            fallbackActiveIndex={Math.min(
+                              chatStatusStep,
+                              chatRunningSteps.length - 1,
+                            )}
+                            fallbackRunning={message.status === "streaming"}
+                            open={
+                              message.status === "failed" || openFeedIds.has(message.runId)
+                            }
+                            onToggle={() =>
+                              setOpenFeedIds((previous) => {
+                                const next = new Set(previous);
+                                if (next.has(message.runId!)) next.delete(message.runId!);
+                                else next.add(message.runId!);
+                                return next;
+                              })
+                            }
+                            onOpenPath={(path) =>
+                              openDocumentReference(path, message.contextPath ?? selectedPath)
+                            }
+                            canOpenPath={(path) =>
+                              canOpenDocumentReference(path, message.contextPath ?? selectedPath)
+                            }
+                            compact
+                          />
+                        ) : null}
+                        <WorkspaceAwareMarkdown
+                          content={message.text}
+                          currentPath={message.contextPath ?? selectedPath}
+                          availableDocuments={availableDocuments}
+                          onOpenDocument={openWorkspaceDocument}
+                        />
+                      </>
                     ) : message.role === "user" ? (
                       <MaintainUserMessage text={message.text} />
                     ) : (
@@ -4638,15 +4922,15 @@ function App() {
                   </div>
                 ))}
 
-                {!maintainThread?.operationType && maintainStage === "choose" ? (
-                  <div className="maintain-message maintain-message-assistant">
-                    <p className="maintain-message-title">What do you want to do?</p>
+                {showMaintainTaskChoices ? (
+                  <div className="maintain-empty-prompt">
+                    <p className="maintain-empty-title">What do you want to do?</p>
                     {maintainBlockedReason ? (
                       <p className="maintain-message-note">{maintainBlockedReason}</p>
                     ) : null}
                   </div>
                 ) : null}
-                {!maintainThread?.operationType && maintainStage === "choose" ? (
+                {showMaintainTaskChoices ? (
                   <div className="maintain-task-list" aria-label="Maintain actions">
                     {MAINTAIN_TASKS.map((task) => (
                       <button
@@ -4667,127 +4951,60 @@ function App() {
                   </div>
                 ) : null}
 
-                {!maintainThread?.operationType && selectedMaintainTask ? (
-                  <>
-                    {maintainStage === "compose" ? (
-                      <button
-                        type="button"
-                        className="maintain-back-inline"
-                        onClick={resetMaintainFlow}
-                        disabled={Boolean(maintainBlockedReason)}
-                        title={maintainBlockedReason ?? "Back to choices"}
-                      >
-                        ← Back to choices
-                      </button>
-                    ) : null}
-
-                    <div className="maintain-message maintain-message-user">
-                      <MaintainUserMessage text={selectedMaintainTask.label} />
-                    </div>
-
-                    <div className="maintain-message maintain-message-assistant">
-                      {maintainStage === "compose" ? (
-                        <>
-                          <p>{selectedMaintainTask.explanation}</p>
-                          {selectedMaintainTask.id === "updateRules" ? (
-                            <section
-                              className="maintain-rule-files"
-                              aria-label="Current rule files"
-                            >
-                              <p className="maintain-rule-files-title">Current rule files</p>
-                              {RULE_FILE_GUIDES.map((ruleFile) => {
-                                const canOpenRuleFile = availableDocuments.includes(
-                                  ruleFile.path,
-                                );
-                                return (
-                                  <div className="maintain-rule-file" key={ruleFile.path}>
-                                    <div className="maintain-rule-file-copy">
-                                      <span className="maintain-rule-file-name">
-                                        {ruleFile.title}
-                                      </span>
-                                      <span className="maintain-rule-file-description">
-                                        {ruleFile.description}
-                                      </span>
-                                    </div>
-                                    <button
-                                      type="button"
-                                      className="maintain-rule-file-action"
-                                      disabled={!canOpenRuleFile}
-                                      onClick={() => openWorkspaceFile(ruleFile.path)}
-                                    >
-                                      {canOpenRuleFile ? "Open" : "Missing"}
-                                    </button>
-                                  </div>
-                                );
-                              })}
-                            </section>
-                          ) : null}
-                          <p className="maintain-message-note">
-                            {maintainBlockedReason
-                              ? maintainBlockedReason
-                              : selectedMaintainTask.requiresInstruction
-                              ? "Add an instruction before I run this."
-                              : "You can add a focus, or run it with no extra instruction."}
-                          </p>
-                        </>
-                      ) : null}
-
-                      {maintainStage === "running" ? (
-                        <>
-                          <OperationFeedPanel
-                            progress={workspaceOperationProgress}
-                            title={selectedMaintainTask.label}
-                            runningLabel={maintainRunningLabel}
-                            meta={[selectedMaintainTask.busyLabel]}
-                            fallbackSteps={selectedMaintainTask.runningSteps}
-                            fallbackActiveIndex={maintainActiveStep}
-                            open={maintainFeedOpen}
-                            onToggle={() => setMaintainFeedOpen((open) => !open)}
-                            onOpenPath={openDocumentReference}
-                            canOpenPath={canOpenDocumentReference}
-                          />
-                        </>
-                      ) : null}
-                    </div>
-                  </>
-                ) : null}
-
-                {maintainThread?.operationType && maintainStage === "done" ? (
+                {showMaintainOperationFeed && selectedMaintainTask ? (
                   <div className="maintain-message maintain-message-assistant">
-                    <p className="maintain-message-title">
-                      {maintainLastResult?.success === false
-                        ? "The operation needs review."
-                        : "Finished."}
-                    </p>
-                    <p>
-                      {maintainChangedFiles.length === 0
-                        ? "No reviewable generated changes were reported."
-                        : `${maintainChangedFiles.length} generated change${
-                            maintainChangedFiles.length === 1 ? "" : "s"
-                          } ready to review. Review or undo them from the left panel.`}
-                    </p>
-                    <div className="maintain-result-actions">
-                      <button
-                        type="button"
-                        onClick={() => void createNewMaintainThread()}
-                        disabled={anyOperationBusy}
-                        title={maintainBlockedReason ?? "Start another"}
-                      >
-                        Start another
-                      </button>
-                      {workspace.reportMd && maintainOperationIsCurrent ? (
-                        <button type="button" onClick={openReportTab}>
-                          Show report
-                        </button>
-                      ) : null}
-                    </div>
+                    <OperationFeedPanel
+                      progress={workspaceOperationProgress}
+                      title={selectedMaintainTask.label}
+                      runningLabel={maintainRunningLabel}
+                      meta={[selectedMaintainTask.busyLabel]}
+                      fallbackSteps={selectedMaintainTask.runningSteps}
+                      fallbackActiveIndex={maintainActiveStep}
+                      open={maintainFeedOpen}
+                      onToggle={() => setMaintainFeedOpen((open) => !open)}
+                      onOpenPath={openDocumentReference}
+                      canOpenPath={canOpenDocumentReference}
+                    />
                   </div>
                 ) : null}
+
+                {showMaintainUnscopedDiscussionActions ? (
+                  <div className="maintain-thread-action-panel">
+                    <span>
+                      This saved discussion was created before Maintain chats were task-scoped.
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => void createNewMaintainThread()}
+                      disabled={anyOperationBusy}
+                    >
+                      Start task
+                    </button>
+                  </div>
+                ) : null}
+
               </div>
 
-              {maintainStage === "compose" &&
-              selectedMaintainTask &&
-              !maintainThread?.operationType ? (
+              {showMaintainCompletionBar ? (
+                <div className="maintain-result-bar" role="status">
+                  <span>
+                    {maintainLastResult?.success === false
+                      ? "Operation needs review."
+                      : maintainChangedFiles.length === 0
+                        ? "No reviewable generated changes reported."
+                        : `${maintainChangedFiles.length} generated change${
+                            maintainChangedFiles.length === 1 ? "" : "s"
+                          } ready to review.`}
+                  </span>
+                  {workspace.reportMd && maintainOperationIsCurrent ? (
+                    <button type="button" onClick={openReportTab}>
+                      Show report
+                    </button>
+                  ) : null}
+                </div>
+              ) : null}
+
+              {showMaintainComposer && selectedMaintainTask ? (
                 <form
                   className="maintain-composer"
                   onSubmit={(event) => {
@@ -4803,12 +5020,63 @@ function App() {
                       className="maintain-provider-setup"
                     />
                   ) : null}
+                  <section className="maintain-task-context" aria-label="Selected Maintain task">
+                    <div className="maintain-task-context-copy">
+                      <span className="maintain-task-context-title">
+                        {selectedMaintainTask.label}
+                      </span>
+                      <span className="maintain-task-context-hint">
+                        {maintainTaskContextHint(selectedMaintainTask)}
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      className="maintain-task-context-change"
+                      onClick={() => void changeMaintainTask()}
+                      disabled={anyOperationBusy}
+                      title={
+                        maintainThread?.messages.length
+                          ? "Start another Maintain task"
+                          : "Change task"
+                      }
+                    >
+                      Change
+                    </button>
+                  </section>
+                  {selectedMaintainTask.id === "updateRules" ? (
+                    <details className="maintain-rule-details">
+                      <summary>Rule files</summary>
+                      <section className="maintain-rule-files" aria-label="Current rule files">
+                        {RULE_FILE_GUIDES.map((ruleFile) => {
+                          const canOpenRuleFile = availableDocuments.includes(ruleFile.path);
+                          return (
+                            <div className="maintain-rule-file" key={ruleFile.path}>
+                              <div className="maintain-rule-file-copy">
+                                <span className="maintain-rule-file-name">{ruleFile.title}</span>
+                                <span className="maintain-rule-file-description">
+                                  {ruleFile.description}
+                                </span>
+                              </div>
+                              <button
+                                type="button"
+                                className="maintain-rule-file-action"
+                                disabled={!canOpenRuleFile}
+                                onClick={() => openWorkspaceFile(ruleFile.path)}
+                              >
+                                {canOpenRuleFile ? "Open" : "Missing"}
+                              </button>
+                            </div>
+                          );
+                        })}
+                      </section>
+                    </details>
+                  ) : null}
                   <textarea
                     className="maintain-input"
                     value={maintainInstruction}
                     rows={3}
-                    disabled={Boolean(maintainBlockedReason) || !activeProviderReady}
-                    title={maintainBlockedReason ?? undefined}
+                    disabled={Boolean(maintainComposerBlockedReason) || !activeProviderReady}
+                    title={maintainComposerBlockedReason ?? undefined}
                     placeholder={selectedMaintainTask.placeholder}
                     onChange={(event) => setMaintainInstruction(event.target.value)}
                   />
@@ -4843,15 +5111,37 @@ function App() {
                         <span className="explore-chat-model-fallback">{activeModel.label}</span>
                       ) : null}
                     </div>
-                    <button
-                      type="submit"
-                      className="maintain-primary"
-                      disabled={!maintainCanRun || !activeProviderReady}
-                      aria-label={selectedMaintainTask.actionLabel}
-                      title={maintainBlockedReason ?? selectedMaintainTask.actionLabel}
-                    >
-                      ↑
-                    </button>
+                    <div className="maintain-composer-actions">
+                      <button
+                        type="button"
+                        className="maintain-ask-only"
+                        disabled={
+                          Boolean(exploreBlockedReason) ||
+                          maintainDiscussionBusy ||
+                          !activeProviderReady ||
+                          !workspace.workspacePath ||
+                          !maintainInstruction.trim()
+                        }
+                        title={
+                          maintainDiscussionBusy
+                            ? "Maintain discussion is already answering"
+                            : exploreBlockedReason ?? "Ask in read-only Maintain discussion"
+                        }
+                        onClick={() => void askMaintainDraftInMaintain()}
+                      >
+                        <HelpCircle size={14} strokeWidth={2.2} aria-hidden="true" />
+                        Ask only
+                      </button>
+                      <button
+                        type="submit"
+                        className="maintain-primary"
+                        disabled={!maintainCanRun || !activeProviderReady}
+                        aria-label={selectedMaintainTask.actionLabel}
+                        title={maintainBlockedReason ?? selectedMaintainTask.actionLabel}
+                      >
+                        ↑
+                      </button>
+                    </div>
                   </div>
                 </form>
               ) : null}

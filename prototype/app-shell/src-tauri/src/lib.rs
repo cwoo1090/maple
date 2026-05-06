@@ -126,6 +126,8 @@ struct ChatThread {
     operation_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     operation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    draft_operation_type: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     changed_files: Vec<ThreadChangedFile>,
     messages: Vec<ChatThreadMessage>,
@@ -253,6 +255,12 @@ struct OperationProgress {
     events: Vec<NormalizedOperationEvent>,
     stderr_tail: Option<String>,
     error: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+enum ThreadFileKind {
+    Chat,
+    Maintain,
 }
 
 fn default_settings() -> AppSettings {
@@ -1020,6 +1028,28 @@ fn write_maintain_thread_file(workspace: &Path, thread: &ChatThread) -> Result<(
         .map_err(|error| format!("Failed to write maintain thread {}: {error}", thread.id))
 }
 
+fn read_thread_file_by_kind(
+    workspace: &Path,
+    thread_id: &str,
+    kind: ThreadFileKind,
+) -> Result<ChatThread, String> {
+    match kind {
+        ThreadFileKind::Chat => read_thread_file(workspace, thread_id),
+        ThreadFileKind::Maintain => read_maintain_thread_file(workspace, thread_id),
+    }
+}
+
+fn write_thread_file_by_kind(
+    workspace: &Path,
+    thread: &ChatThread,
+    kind: ThreadFileKind,
+) -> Result<(), String> {
+    match kind {
+        ThreadFileKind::Chat => write_thread_file(workspace, thread),
+        ThreadFileKind::Maintain => write_maintain_thread_file(workspace, thread),
+    }
+}
+
 fn make_chat_thread(initial_context_path: Option<String>) -> ChatThread {
     let now = now_string();
     let title = initial_context_path
@@ -1036,6 +1066,7 @@ fn make_chat_thread(initial_context_path: Option<String>) -> ChatThread {
         initial_context_path,
         operation_type: None,
         operation_id: None,
+        draft_operation_type: None,
         changed_files: Vec::new(),
         messages: Vec::new(),
     }
@@ -1052,6 +1083,7 @@ fn make_maintain_thread() -> ChatThread {
         initial_context_path: None,
         operation_type: None,
         operation_id: None,
+        draft_operation_type: None,
         changed_files: Vec::new(),
         messages: Vec::new(),
     }
@@ -1628,7 +1660,7 @@ fn extract_json_from_runner_stdout<T: for<'de> Deserialize<'de>>(
 }
 
 fn build_history_json(thread: &ChatThread) -> Result<String, String> {
-    let mut items: Vec<ExploreChatHistoryItem> = thread
+    let messages = thread
         .messages
         .iter()
         .filter(|message| {
@@ -1636,13 +1668,51 @@ fn build_history_json(thread: &ChatThread) -> Result<String, String> {
                 && message.status.as_deref() != Some("streaming")
                 && !message.text.trim().is_empty()
         })
-        .rev()
-        .take(6)
-        .cloned()
-        .collect::<Vec<_>>()
+        .collect::<Vec<_>>();
+    let start = messages.len().saturating_sub(6);
+    let items: Vec<ExploreChatHistoryItem> = messages
         .into_iter()
-        .rev()
+        .skip(start)
         .map(|message| {
+            let text = if message.text.chars().count() > 2000 {
+                format!(
+                    "{}\n\n[truncated]",
+                    message.text.chars().take(2000).collect::<String>()
+                )
+            } else {
+                message.text.clone()
+            };
+            ExploreChatHistoryItem {
+                role: message.role.clone(),
+                text,
+                context_path: message.context_path.clone(),
+                web_search_enabled: message.web_search_enabled.unwrap_or(false),
+            }
+        })
+        .collect();
+    serde_json::to_string(&items).map_err(|error| format!("Failed to serialize history: {error}"))
+}
+
+fn render_prior_maintain_discussion(thread: &ChatThread) -> String {
+    let messages = thread
+        .messages
+        .iter()
+        .filter(|message| {
+            (message.role == "user" || message.role == "assistant")
+                && message.status.as_deref() == Some("completed")
+                && !message.text.trim().is_empty()
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    messages
+        .into_iter()
+        .map(|message| {
+            let label = if message.role == "user" {
+                "User"
+            } else {
+                "Assistant"
+            };
             let text = if message.text.chars().count() > 2000 {
                 format!(
                     "{}\n\n[truncated]",
@@ -1651,18 +1721,126 @@ fn build_history_json(thread: &ChatThread) -> Result<String, String> {
             } else {
                 message.text
             };
-            ExploreChatHistoryItem {
-                role: message.role,
-                text,
-                context_path: message.context_path,
-                web_search_enabled: message.web_search_enabled.unwrap_or(false),
-            }
+            format!("{label}: {}", text.trim())
         })
-        .collect();
-    if items.len() > 6 {
-        items = items.split_off(items.len() - 6);
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn compose_maintain_operation_instruction(
+    thread: &ChatThread,
+    label: &str,
+    trimmed_instruction: &str,
+) -> String {
+    let discussion = render_prior_maintain_discussion(thread);
+    if discussion.is_empty() {
+        return trimmed_instruction.to_string();
     }
-    serde_json::to_string(&items).map_err(|error| format!("Failed to serialize history: {error}"))
+
+    let final_instruction = if trimmed_instruction.is_empty() {
+        format!("Run the {label} operation using its default behavior.")
+    } else {
+        trimmed_instruction.to_string()
+    };
+
+    format!(
+        "Prior read-only discussion from this Maintain thread:\n{discussion}\n\nFinal Maintain instruction:\n{final_instruction}"
+    )
+}
+
+fn maintain_operation_user_text(label: &str, trimmed_instruction: &str) -> String {
+    if trimmed_instruction.is_empty() {
+        label.to_string()
+    } else {
+        trimmed_instruction.to_string()
+    }
+}
+
+fn operation_last_message_path(workspace: &Path, operation_id: &str) -> Option<PathBuf> {
+    first_existing_path(&[
+        workspace
+            .join(METADATA_DIR)
+            .join("operations")
+            .join(operation_id)
+            .join("last-message.md"),
+        workspace
+            .join(LEGACY_METADATA_DIR)
+            .join("operations")
+            .join(operation_id)
+            .join("last-message.md"),
+    ])
+}
+
+fn read_operation_last_message(workspace: &Path, operation_id: &str) -> Option<String> {
+    let path = operation_last_message_path(workspace, operation_id)?;
+    let text = fs::read_to_string(path).ok()?.trim().to_string();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+fn maintain_operation_assistant_text(
+    workspace: &Path,
+    operation_id: &str,
+    fallback_summary: String,
+) -> String {
+    read_operation_last_message(workspace, operation_id).unwrap_or(fallback_summary)
+}
+
+fn is_generic_maintain_completion_text(text: &str) -> bool {
+    let text = text.trim();
+    text.contains(" finished.")
+        && (text.contains("generated change(s) ready to review")
+            || text.contains("No reviewable file changes were reported")
+            || text.contains("Check the operation feed and report before keeping changes"))
+}
+
+fn refresh_maintain_operation_messages(
+    workspace: &Path,
+    thread: &mut ChatThread,
+) -> Result<bool, String> {
+    let mut changed = false;
+
+    if let Some(operation_type) = thread.operation_type.as_deref() {
+        if let Ok((_runner_command, label, _require_instruction)) =
+            maintain_command_config(operation_type)
+        {
+            let legacy_prefix = format!("{label}\n\n");
+            if let Some(message) = thread.messages.iter_mut().rev().find(|message| {
+                message.role == "user"
+                    && message.status.as_deref() == Some("completed")
+                    && message.text.starts_with(&legacy_prefix)
+            }) {
+                if let Some(text) = message.text.strip_prefix(&legacy_prefix) {
+                    message.text = text.to_string();
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    if let Some(operation_id) = thread.operation_id.as_deref() {
+        if let Some(last_message) = read_operation_last_message(workspace, operation_id) {
+            if let Some(message) = thread.messages.iter_mut().rev().find(|message| {
+                message.role == "assistant"
+                    && message.status.as_deref() != Some("streaming")
+                    && message.run_id.is_none()
+                    && is_generic_maintain_completion_text(&message.text)
+            }) {
+                if message.text.trim() != last_message {
+                    message.text = last_message;
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    if changed {
+        write_maintain_thread_file(workspace, thread)?;
+    }
+    Ok(changed)
 }
 
 fn extract_partial_answer_from_events(events: &str) -> Option<String> {
@@ -2102,7 +2280,11 @@ fn progress_from_event_paths(
     })
 }
 
-fn refresh_streaming_messages(workspace: &Path, thread: &mut ChatThread) -> Result<bool, String> {
+fn refresh_streaming_messages(
+    workspace: &Path,
+    thread: &mut ChatThread,
+    kind: ThreadFileKind,
+) -> Result<bool, String> {
     let mut changed = false;
     let mut should_save = false;
 
@@ -2168,19 +2350,20 @@ fn refresh_streaming_messages(workspace: &Path, thread: &mut ChatThread) -> Resu
 
     if should_save {
         thread.updated_at = now_string();
-        write_thread_file(workspace, thread)?;
+        write_thread_file_by_kind(workspace, thread, kind)?;
     }
 
     Ok(changed || should_save)
 }
 
-fn finish_explore_chat_run(
+fn finish_chat_run(
     workspace: &Path,
     thread_id: &str,
     assistant_message_id: &str,
     result: Result<RunnerOutput, String>,
+    kind: ThreadFileKind,
 ) -> Result<(), String> {
-    let mut thread = read_thread_file(workspace, thread_id)?;
+    let mut thread = read_thread_file_by_kind(workspace, thread_id, kind)?;
     let now = now_string();
     let message = thread
         .messages
@@ -2229,7 +2412,37 @@ fn finish_explore_chat_run(
     }
 
     thread.updated_at = now;
-    write_thread_file(workspace, &thread)
+    write_thread_file_by_kind(workspace, &thread, kind)
+}
+
+fn finish_explore_chat_run(
+    workspace: &Path,
+    thread_id: &str,
+    assistant_message_id: &str,
+    result: Result<RunnerOutput, String>,
+) -> Result<(), String> {
+    finish_chat_run(
+        workspace,
+        thread_id,
+        assistant_message_id,
+        result,
+        ThreadFileKind::Chat,
+    )
+}
+
+fn finish_maintain_discussion_run(
+    workspace: &Path,
+    thread_id: &str,
+    assistant_message_id: &str,
+    result: Result<RunnerOutput, String>,
+) -> Result<(), String> {
+    finish_chat_run(
+        workspace,
+        thread_id,
+        assistant_message_id,
+        result,
+        ThreadFileKind::Maintain,
+    )
 }
 
 #[tauri::command]
@@ -2297,7 +2510,11 @@ async fn list_chat_threads(
             if let Some(thread_id) = path.file_stem().and_then(|value| value.to_str()) {
                 if seen.insert(thread_id.to_string()) {
                     if let Ok(mut thread) = read_thread_file(&workspace, thread_id) {
-                        let _ = refresh_streaming_messages(&workspace, &mut thread);
+                        let _ = refresh_streaming_messages(
+                            &workspace,
+                            &mut thread,
+                            ThreadFileKind::Chat,
+                        );
                         summaries.push(chat_thread_summary(&workspace, &thread, &activity_context));
                     }
                 }
@@ -2312,7 +2529,7 @@ async fn list_chat_threads(
 async fn read_current_chat_thread(state: State<'_, WorkspaceStore>) -> Result<ChatThread, String> {
     let workspace = current_workspace(&state)?;
     let mut thread = ensure_current_thread(&workspace)?;
-    let _ = refresh_streaming_messages(&workspace, &mut thread)?;
+    let _ = refresh_streaming_messages(&workspace, &mut thread, ThreadFileKind::Chat)?;
     Ok(thread)
 }
 
@@ -2323,7 +2540,7 @@ async fn read_chat_thread(
 ) -> Result<ChatThread, String> {
     let workspace = current_workspace(&state)?;
     let mut thread = read_thread_file(&workspace, &thread_id)?;
-    let _ = refresh_streaming_messages(&workspace, &mut thread)?;
+    let _ = refresh_streaming_messages(&workspace, &mut thread, ThreadFileKind::Chat)?;
     Ok(thread)
 }
 
@@ -2362,7 +2579,7 @@ async fn set_current_chat_thread(
             current_thread_id: Some(thread.id.clone()),
         },
     )?;
-    let _ = refresh_streaming_messages(&workspace, &mut thread)?;
+    let _ = refresh_streaming_messages(&workspace, &mut thread, ThreadFileKind::Chat)?;
     Ok(thread)
 }
 
@@ -2418,7 +2635,13 @@ async fn list_maintain_threads(
             }
             if let Some(thread_id) = path.file_stem().and_then(|value| value.to_str()) {
                 if seen.insert(thread_id.to_string()) {
-                    if let Ok(thread) = read_maintain_thread_file(&workspace, thread_id) {
+                    if let Ok(mut thread) = read_maintain_thread_file(&workspace, thread_id) {
+                        let _ = refresh_streaming_messages(
+                            &workspace,
+                            &mut thread,
+                            ThreadFileKind::Maintain,
+                        );
+                        let _ = refresh_maintain_operation_messages(&workspace, &mut thread);
                         summaries.push(chat_thread_summary(&workspace, &thread, &activity_context));
                     }
                 }
@@ -2434,7 +2657,10 @@ async fn read_current_maintain_thread(
     state: State<'_, WorkspaceStore>,
 ) -> Result<ChatThread, String> {
     let workspace = current_workspace(&state)?;
-    ensure_current_maintain_thread(&workspace)
+    let mut thread = ensure_current_maintain_thread(&workspace)?;
+    let _ = refresh_streaming_messages(&workspace, &mut thread, ThreadFileKind::Maintain)?;
+    let _ = refresh_maintain_operation_messages(&workspace, &mut thread)?;
+    Ok(thread)
 }
 
 #[tauri::command]
@@ -2457,13 +2683,15 @@ async fn set_current_maintain_thread(
     state: State<'_, WorkspaceStore>,
 ) -> Result<ChatThread, String> {
     let workspace = current_workspace(&state)?;
-    let thread = read_maintain_thread_file(&workspace, &thread_id)?;
+    let mut thread = read_maintain_thread_file(&workspace, &thread_id)?;
     write_maintain_index(
         &workspace,
         &ChatThreadIndex {
             current_thread_id: Some(thread.id.clone()),
         },
     )?;
+    let _ = refresh_streaming_messages(&workspace, &mut thread, ThreadFileKind::Maintain)?;
+    let _ = refresh_maintain_operation_messages(&workspace, &mut thread)?;
     Ok(thread)
 }
 
@@ -3182,6 +3410,29 @@ fn maintain_command_config(command: &str) -> Result<(&'static str, &'static str,
     }
 }
 
+fn ensure_maintain_thread_task_matches(
+    thread: &ChatThread,
+    runner_command: &str,
+) -> Result<(), String> {
+    if let Some(operation_type) = thread.operation_type.as_deref() {
+        if operation_type != runner_command {
+            return Err(
+                "Start another maintain chat to use a different Maintain task.".to_string(),
+            );
+        }
+    }
+
+    if let Some(draft_operation_type) = thread.draft_operation_type.as_deref() {
+        if draft_operation_type != runner_command {
+            return Err(
+                "Start another maintain chat to use a different Maintain task.".to_string(),
+            );
+        }
+    }
+
+    Ok(())
+}
+
 fn changed_marker_operation_id(marker: Option<&Value>) -> Option<String> {
     marker
         .and_then(|marker| marker.get("operationId"))
@@ -3251,20 +3502,18 @@ async fn run_maintain_thread_operation(
     }
 
     let mut thread = read_maintain_thread_file(&workspace, &thread_id)?;
-    if thread.operation_type.is_some() {
-        return Err("This maintenance chat already belongs to an operation. Start another chat for a new task.".to_string());
-    }
+    ensure_maintain_thread_task_matches(&thread, runner_command)?;
+    let operation_instruction =
+        compose_maintain_operation_instruction(&thread, label, &trimmed_instruction);
 
     let now = now_string();
     let operation_id = make_local_id("op");
-    let user_text = if trimmed_instruction.is_empty() {
-        label.to_string()
-    } else {
-        format!("{label}\n\n{trimmed_instruction}")
-    };
+    let user_text = maintain_operation_user_text(label, &trimmed_instruction);
     thread.title = label.to_string();
     thread.operation_type = Some(runner_command.to_string());
     thread.operation_id = Some(operation_id.clone());
+    thread.draft_operation_type = None;
+    thread.changed_files = Vec::new();
     thread.messages.push(ChatThreadMessage {
         id: make_local_id("msg"),
         role: "user".to_string(),
@@ -3291,7 +3540,7 @@ async fn run_maintain_thread_operation(
         &app,
         &state,
         runner_command,
-        Some(trimmed_instruction),
+        Some(operation_instruction),
         require_instruction,
         Some(operation_id.as_str()),
     );
@@ -3346,14 +3595,16 @@ async fn run_maintain_thread_operation(
                         .unwrap_or_else(|| "unknown".to_string())
                 )
             };
+            let assistant_text =
+                maintain_operation_assistant_text(&workspace, &operation_id, summary);
 
             thread.operation_type = Some(runner_command.to_string());
-            thread.operation_id = Some(operation_id);
+            thread.operation_id = Some(operation_id.clone());
             thread.changed_files = changed_files;
             thread.messages.push(ChatThreadMessage {
                 id: make_local_id("msg"),
                 role: "assistant".to_string(),
-                text: summary,
+                text: assistant_text,
                 context_path: None,
                 provider: Some(provider),
                 model: Some(model),
@@ -3561,6 +3812,124 @@ async fn start_explore_chat(
     thread::spawn(move || {
         let result = run_runner_with_args(&runner_args);
         let _ = finish_explore_chat_run(
+            &runner_workspace,
+            &runner_thread_id,
+            &runner_assistant_message_id,
+            result,
+        );
+    });
+
+    Ok(thread)
+}
+
+#[tauri::command]
+async fn start_maintain_discussion(
+    app: AppHandle,
+    thread_id: String,
+    command: String,
+    question: String,
+    selected_path: String,
+    state: State<'_, WorkspaceStore>,
+    provider_cache: State<'_, ProviderStatusCache>,
+) -> Result<ChatThread, String> {
+    let workspace = current_workspace(&state)?;
+    let question = question.trim().to_string();
+    if question.is_empty() {
+        return Err("Ask a question first.".to_string());
+    }
+    let (runner_command, _label, _require_instruction) = maintain_command_config(&command)?;
+
+    let settings = read_settings(&app);
+    let provider = settings.provider.clone();
+    ensure_provider_ready(&provider_cache, &provider)?;
+    let model =
+        settings
+            .models
+            .get(&provider)
+            .cloned()
+            .unwrap_or_else(|| match provider.as_str() {
+                "claude" => "claude-sonnet-4-6".to_string(),
+                _ => "gpt-5.5".to_string(),
+            });
+
+    let mut thread = read_maintain_thread_file(&workspace, &thread_id)?;
+    ensure_maintain_thread_task_matches(&thread, runner_command)?;
+
+    let history_json = build_history_json(&thread)?;
+    let now = now_string();
+    let assistant_message_id = make_local_id("msg");
+    let run_id = make_local_id("run");
+
+    if thread.messages.is_empty() {
+        thread.title = if question.chars().count() > 40 {
+            format!("{}...", question.chars().take(40).collect::<String>())
+        } else {
+            question.clone()
+        };
+    }
+
+    thread.messages.push(ChatThreadMessage {
+        id: make_local_id("msg"),
+        role: "user".to_string(),
+        text: question.clone(),
+        context_path: Some(selected_path.clone()),
+        provider: Some(provider.clone()),
+        model: Some(model.clone()),
+        web_search_enabled: Some(false),
+        run_id: None,
+        status: Some("completed".to_string()),
+        created_at: now.clone(),
+        completed_at: Some(now.clone()),
+    });
+    thread.messages.push(ChatThreadMessage {
+        id: assistant_message_id.clone(),
+        role: "assistant".to_string(),
+        text: String::new(),
+        context_path: Some(selected_path.clone()),
+        provider: Some(provider.clone()),
+        model: Some(model.clone()),
+        web_search_enabled: Some(false),
+        run_id: Some(run_id.clone()),
+        status: Some("streaming".to_string()),
+        created_at: now.clone(),
+        completed_at: None,
+    });
+    if thread.operation_type.is_none() {
+        thread.draft_operation_type = Some(runner_command.to_string());
+    }
+    thread.updated_at = now;
+    write_maintain_thread_file(&workspace, &thread)?;
+    write_maintain_index(
+        &workspace,
+        &ChatThreadIndex {
+            current_thread_id: Some(thread.id.clone()),
+        },
+    )?;
+
+    let runner_workspace = workspace.clone();
+    let runner_thread_id = thread.id.clone();
+    let runner_assistant_message_id = assistant_message_id;
+    let runner_args = vec![
+        EXPLORE_CHAT_OPERATION.to_string(),
+        workspace.to_string_lossy().to_string(),
+        "--provider".to_string(),
+        provider,
+        "--model".to_string(),
+        model,
+        "--question".to_string(),
+        question,
+        "--selected-path".to_string(),
+        selected_path,
+        "--history-json".to_string(),
+        history_json,
+        "--chat-id".to_string(),
+        run_id,
+        "--skip-provider-check".to_string(),
+    ];
+
+    thread::spawn(move || {
+        let result = run_runner_with_args(&runner_args);
+        let _ = finish_maintain_discussion_run(
             &runner_workspace,
             &runner_thread_id,
             &runner_assistant_message_id,
@@ -4682,9 +5051,8 @@ fn is_reviewable_generated_change(change: &Value) -> bool {
         return false;
     }
 
-    path != "index.md"
-        && path != "log.md"
-        && path != "schema.md"
+    path != "sources"
+        && !path.starts_with("sources/")
         && path != ".aiwiki"
         && path != ".studywiki"
         && !path.starts_with("wiki/assets/")
@@ -4823,10 +5191,12 @@ fn should_hide_workspace_file(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        chat_thread_summary, chat_threads_dir, extract_partial_answer_from_events,
-        make_chat_thread, normalize_operation_events, read_requested_or_new_chat_thread,
-        refresh_streaming_messages, shell_single_quote, terminal_command_script,
-        thread_activity_context, ChatThreadMessage,
+        chat_thread_summary, chat_threads_dir, compose_maintain_operation_instruction,
+        ensure_maintain_thread_task_matches, extract_partial_answer_from_events,
+        maintain_operation_assistant_text, maintain_operation_user_text, make_chat_thread,
+        make_maintain_thread, normalize_operation_events, read_requested_or_new_chat_thread,
+        refresh_maintain_operation_messages, refresh_streaming_messages, shell_single_quote,
+        terminal_command_script, thread_activity_context, ChatThreadMessage, ThreadFileKind,
     };
     use std::{
         fs,
@@ -4880,6 +5250,15 @@ mod tests {
         .unwrap();
     }
 
+    fn write_operation_last_message(workspace: &Path, operation_id: &str, text: &str) {
+        let operation_dir = workspace
+            .join(".aiwiki")
+            .join("operations")
+            .join(operation_id);
+        fs::create_dir_all(&operation_dir).unwrap();
+        fs::write(operation_dir.join("last-message.md"), text).unwrap();
+    }
+
     fn completed_message(text: &str) -> ChatThreadMessage {
         ChatThreadMessage {
             id: "msg-test".to_string(),
@@ -4889,6 +5268,22 @@ mod tests {
             provider: None,
             model: None,
             web_search_enabled: None,
+            run_id: None,
+            status: Some("completed".to_string()),
+            created_at: "1000".to_string(),
+            completed_at: Some("1000".to_string()),
+        }
+    }
+
+    fn discussion_message(role: &str, text: &str) -> ChatThreadMessage {
+        ChatThreadMessage {
+            id: format!("msg-{role}"),
+            role: role.to_string(),
+            text: text.to_string(),
+            context_path: Some("index.md".to_string()),
+            provider: Some("codex".to_string()),
+            model: Some("gpt-5.5".to_string()),
+            web_search_enabled: Some(false),
             run_id: None,
             status: Some("completed".to_string()),
             created_at: "1000".to_string(),
@@ -4988,6 +5383,99 @@ not-json
         );
         assert!(script.contains("\nnpm i -g @openai/codex\n"));
         assert!(script.contains("exec \"${SHELL:-/bin/zsh}\" -l"));
+    }
+
+    #[test]
+    fn maintain_operation_instruction_includes_prior_discussion() {
+        let mut thread = make_maintain_thread();
+        for index in 1..=8 {
+            thread
+                .messages
+                .push(discussion_message("user", &format!("Question {index}?")));
+            thread
+                .messages
+                .push(discussion_message("assistant", &format!("Answer {index}.")));
+        }
+
+        let instruction = compose_maintain_operation_instruction(
+            &thread,
+            "Improve wiki",
+            "Apply that pattern to existing image source labels.",
+        );
+
+        assert!(instruction.contains("Prior read-only discussion from this Maintain thread:"));
+        assert!(instruction.contains("User: Question 1?"));
+        assert!(instruction.contains("Assistant: Answer 8."));
+        assert!(instruction.contains(
+            "Final Maintain instruction:\nApply that pattern to existing image source labels."
+        ));
+    }
+
+    #[test]
+    fn maintain_operation_user_text_uses_typed_instruction_only() {
+        assert_eq!(
+            maintain_operation_user_text("Improve wiki", "좋아 그렇게 하자."),
+            "좋아 그렇게 하자."
+        );
+        assert_eq!(
+            maintain_operation_user_text("Wiki healthcheck", ""),
+            "Wiki healthcheck"
+        );
+    }
+
+    #[test]
+    fn maintain_thread_task_match_allows_same_operation_followup_and_rerun() {
+        let mut thread = make_maintain_thread();
+
+        assert!(ensure_maintain_thread_task_matches(&thread, "improve-wiki").is_ok());
+
+        thread.draft_operation_type = Some("improve-wiki".to_string());
+        assert!(ensure_maintain_thread_task_matches(&thread, "improve-wiki").is_ok());
+        assert!(ensure_maintain_thread_task_matches(&thread, "update-rules").is_err());
+
+        thread.draft_operation_type = None;
+        thread.operation_type = Some("improve-wiki".to_string());
+        assert!(ensure_maintain_thread_task_matches(&thread, "improve-wiki").is_ok());
+        assert!(ensure_maintain_thread_task_matches(&thread, "organize-sources").is_err());
+    }
+
+    #[test]
+    fn maintain_operation_assistant_text_prefers_last_message() {
+        let workspace = unique_test_workspace("maple-maintain-last-message");
+        write_operation_last_message(
+            &workspace,
+            "op-last",
+            "Changed:\n- Converted figure source links.\n",
+        );
+
+        let text = maintain_operation_assistant_text(
+            &workspace,
+            "op-last",
+            "Improve wiki finished. 1 generated change(s) ready to review.".to_string(),
+        );
+
+        assert!(text.contains("Converted figure source links"));
+    }
+
+    #[test]
+    fn refresh_maintain_operation_messages_replaces_generic_summary() {
+        let workspace = unique_test_workspace("maple-maintain-completion-repair");
+        write_operation_last_message(&workspace, "op-last", "AI final explanation.");
+        let mut thread = make_maintain_thread();
+        thread.operation_type = Some("improve-wiki".to_string());
+        thread.operation_id = Some("op-last".to_string());
+        thread.messages.push(discussion_message(
+            "user",
+            "Improve wiki\n\nTyped operation instruction.",
+        ));
+        thread.messages.push(discussion_message(
+            "assistant",
+            "Improve wiki finished. 1 generated change(s) ready to review.",
+        ));
+
+        assert!(refresh_maintain_operation_messages(&workspace, &mut thread).unwrap());
+        assert_eq!(thread.messages[0].text, "Typed operation instruction.");
+        assert_eq!(thread.messages[1].text, "AI final explanation.");
     }
 
     #[test]
@@ -5113,7 +5601,7 @@ not-json
             completed_at: None,
         });
 
-        assert!(refresh_streaming_messages(&workspace, &mut thread).unwrap());
+        assert!(refresh_streaming_messages(&workspace, &mut thread, ThreadFileKind::Chat).unwrap());
         assert_eq!(thread.messages[0].status.as_deref(), Some("completed"));
         assert_eq!(thread.messages[0].text, "Done answer");
 
@@ -5202,6 +5690,7 @@ pub fn run() {
             update_wiki_rules,
             ask_wiki,
             start_explore_chat,
+            start_maintain_discussion,
             apply_chat_to_wiki,
             run_maintain_thread_operation,
             undo_last_operation,

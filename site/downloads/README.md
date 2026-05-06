@@ -2,10 +2,11 @@
 
 Place release builds in this folder when publishing the static site.
 
-The current site points to the GitHub Release asset:
+The public site uses `download-macos.html` to redirect to the latest GitHub
+Release asset matching:
 
 ```text
-https://github.com/cwoo1090/maple/releases/download/v0.1.1/Maple_0.1.1_aarch64.dmg
+Maple_<version>_aarch64.dmg
 ```
 
 DMG, ZIP, and app bundle artifacts are intentionally ignored by git so release

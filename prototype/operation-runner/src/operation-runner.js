@@ -76,11 +76,9 @@ const WIKI_HEALTHCHECK_ALLOWED_PATHS = [
   ".aiwiki/**",
 ];
 const IMPROVE_WIKI_ALLOWED_PATHS = [
-  "wiki/**",
-  "index.md",
-  "log.md",
-  ".aiwiki/**",
+  "**",
 ];
+const IMPROVE_WIKI_FORBIDDEN_PATHS = ["sources/**"];
 const ORGANIZE_SOURCES_ALLOWED_PATHS = [
   "sources/**",
   "wiki/**",
@@ -1506,6 +1504,7 @@ async function runMaintenanceOperation(workspace, options = {}) {
     label: config.label,
     instruction,
     allowedPathRules: config.allowedPathRules,
+    forbiddenPathRules: config.forbiddenPathRules || [],
     sourceStatus,
   });
   const promptPath = path.join(operationDir, "prompt.md");
@@ -1552,7 +1551,10 @@ async function runMaintenanceOperation(workspace, options = {}) {
     snapshot,
     changedFiles,
     config.allowedPathRules,
-    { sourceMoveOnly: config.sourceMoveOnly },
+    {
+      sourceMoveOnly: config.sourceMoveOnly,
+      forbiddenPathRules: config.forbiddenPathRules || [],
+    },
   );
   const userVisibleChangedFiles = getUserVisibleChangedFiles(validatedChanges);
   const reviewableChangedFiles = getReviewableChangedFiles(userVisibleChangedFiles);
@@ -1571,7 +1573,7 @@ async function runMaintenanceOperation(workspace, options = {}) {
     status = "provider_failed";
   } else if (forbiddenCount > 0) {
     status = "completed_with_forbidden_edits_restored";
-  } else if (userVisibleChangedFiles.length === 0) {
+  } else if (allowedCount === 0) {
     status = "completed_without_changes";
   } else {
     status = "completed";
@@ -1587,6 +1589,7 @@ async function runMaintenanceOperation(workspace, options = {}) {
     startedAt,
     completedAt,
     allowedPathRules: config.allowedPathRules,
+    forbiddenPathRules: config.forbiddenPathRules || [],
     request: {
       instruction,
     },
@@ -1642,6 +1645,7 @@ function maintenanceOperationConfig(operationType) {
       type: "improve-wiki",
       label: "Improve wiki",
       allowedPathRules: IMPROVE_WIKI_ALLOWED_PATHS,
+      forbiddenPathRules: IMPROVE_WIKI_FORBIDDEN_PATHS,
       requiresInstruction: true,
       includeSourceStatus: false,
       sourceMoveOnly: false,
@@ -2317,7 +2321,19 @@ async function buildMaintenancePrompt(workspace, options) {
   const sourceStatusBlock = options.sourceStatus
     ? `\nCurrent source status:\n${renderSourceStatusForPrompt(options.sourceStatus)}\n`
     : "";
-  const allowedPaths = options.allowedPathRules.map((rule) => `- ${rule}`).join("\n");
+  const allowedPaths = options.allowedPathRules
+    .map((rule) => (rule === "**" ? "- all workspace paths" : `- ${rule}`))
+    .join("\n");
+  const forbiddenPathRules = Array.isArray(options.forbiddenPathRules)
+    ? options.forbiddenPathRules
+    : [];
+  const forbiddenPaths = forbiddenPathRules.map((rule) => `- ${rule}`).join("\n");
+  const forbiddenPathBlock = forbiddenPaths
+    ? `
+Forbidden write paths:
+${forbiddenPaths}
+`
+    : "";
 
   let operationGoal;
   let workflow;
@@ -2336,6 +2352,8 @@ async function buildMaintenancePrompt(workspace, options) {
       "Use workspace instructions already loaded by the CLI; do not re-read AGENTS.md or CLAUDE.md unless they are missing or ambiguous.",
       "Read schema.md for content conventions and index.md/log.md only as needed for navigation and bookkeeping.",
       "Inspect relevant wiki pages before creating guides, improving structure, connecting pages, moving, renaming, splitting, merging, or rewriting them.",
+      "When the user asks for durable conventions or agent behavior changes, update schema.md, AGENTS.md, and CLAUDE.md as needed.",
+      "Keep AGENTS.md and CLAUDE.md short and semantically consistent; they should point agents to schema.md instead of duplicating every content rule.",
       "Update links and index.md so navigation remains coherent.",
       "Append a short dated entry to log.md.",
     ];
@@ -2375,6 +2393,7 @@ ${sourceStatusBlock}
 Permission boundary:
 Allowed write paths:
 ${allowedPaths}
+${forbiddenPathBlock}
 
 Do not edit .aiwiki/source-manifest.json; the runner owns source ingestion state.
 
@@ -4153,26 +4172,47 @@ async function getSourceStatus(workspace) {
   const previousFiles = Array.isArray(previous?.files) ? previous.files : [];
   const previousByPath = new Map(previousFiles.map((file) => [file.path, file]));
   const currentByPath = new Map(current.map((file) => [file.path, file]));
+  const previousByContent = new Map();
   const files = [];
+  const unmatchedCurrent = [];
 
   for (const file of current) {
     const before = previousByPath.get(file.path);
-    let state = "unchanged";
     if (!before) {
-      state = "new";
-    } else if (
-      before.sha256 !== file.sha256 ||
-      before.size !== file.size ||
-      before.kind !== file.kind
-    ) {
-      state = "modified";
+      unmatchedCurrent.push(file);
+      continue;
     }
-    files.push({ ...file, state });
+
+    if (sourceContentMatches(before, file)) {
+      files.push({ ...file, state: "unchanged" });
+    } else {
+      files.push({ ...file, state: "modified" });
+      addSourceContentMatch(previousByContent, before, { file: before, removedCandidate: false });
+    }
   }
 
   for (const file of previousFiles) {
     if (!currentByPath.has(file.path)) {
-      files.push({ ...file, state: "removed" });
+      addSourceContentMatch(previousByContent, file, { file, removedCandidate: true });
+    }
+  }
+
+  for (const file of unmatchedCurrent) {
+    const signature = sourceContentSignature(file);
+    const matches = previousByContent.get(signature);
+    const match = matches?.shift();
+    if (match) {
+      files.push({ ...file, state: "unchanged" });
+    } else {
+      files.push({ ...file, state: "new" });
+    }
+  }
+
+  for (const matches of previousByContent.values()) {
+    for (const match of matches) {
+      if (match.removedCandidate) {
+        files.push({ ...match.file, state: "removed" });
+      }
     }
   }
 
@@ -4186,6 +4226,24 @@ async function getSourceStatus(workspace) {
     pendingCount,
     files,
   };
+}
+
+function sourceContentMatches(a, b) {
+  return a?.sha256 === b?.sha256 && a?.size === b?.size && a?.kind === b?.kind;
+}
+
+function sourceContentSignature(file) {
+  return `${file?.kind ?? ""}\0${file?.size ?? ""}\0${file?.sha256 ?? ""}`;
+}
+
+function addSourceContentMatch(index, file, value) {
+  const signature = sourceContentSignature(file);
+  const matches = index.get(signature);
+  if (matches) {
+    matches.push(value);
+  } else {
+    index.set(signature, [value]);
+  }
 }
 
 function sourcePathsForBuild(sourceStatus, options = {}) {
@@ -4299,6 +4357,9 @@ async function validateAndRestoreChanges(
 
   for (const change of changes) {
     let allowed = isAllowedPath(change.path, allowedRules) && !isProviderControlledPath(change.path);
+    if (allowed && isAllowedPath(change.path, options.forbiddenPathRules || [])) {
+      allowed = false;
+    }
     if (allowed && options.sourceMoveOnly && change.path.startsWith("sources/")) {
       allowed = sourceMoveOnlyValid && change.status !== "modified";
     }
@@ -4344,6 +4405,9 @@ function isAllowedPath(relPath, allowedRules = BUILD_WIKI_ALLOWED_PATHS) {
   if (!normalized) return false;
 
   return allowedRules.some((rule) => {
+    if (rule === "**") {
+      return true;
+    }
     if (rule.endsWith("/**")) {
       const prefix = rule.slice(0, -3);
       return normalized === prefix || normalized.startsWith(`${prefix}/`);
@@ -4383,9 +4447,7 @@ function summarizeChangedFiles(allChangedFiles, reviewableChangedFiles) {
 function isReviewableChangedPath(relPath) {
   const normalized = normalizeRelativePath(relPath);
   if (!normalized) return false;
-  if (normalized === "index.md" || normalized === "log.md" || normalized === "schema.md") {
-    return false;
-  }
+  if (normalized === SOURCE_DIR || normalized.startsWith(`${SOURCE_DIR}/`)) return false;
   if (normalized.startsWith("wiki/assets/")) return false;
   if (normalized === METADATA_DIR || normalized.startsWith(`${METADATA_DIR}/`)) return false;
   if (normalized === LEGACY_METADATA_DIR || normalized.startsWith(`${LEGACY_METADATA_DIR}/`)) {
@@ -5185,6 +5247,15 @@ function renderReportMarkdown(report) {
   for (const rule of report.allowedPathRules) {
     lines.push(`- \`${rule}\``);
   }
+
+  if (Array.isArray(report.forbiddenPathRules) && report.forbiddenPathRules.length > 0) {
+    lines.push("");
+    lines.push("## Forbidden Path Rules");
+    lines.push("");
+    for (const rule of report.forbiddenPathRules) {
+      lines.push(`- \`${rule}\``);
+    }
+  }
   lines.push("");
 
   return `${lines.join("\n")}\n`;
@@ -5306,6 +5377,7 @@ module.exports = {
   BUILD_WIKI_ALLOWED_PATHS,
   WIKI_HEALTHCHECK_ALLOWED_PATHS,
   IMPROVE_WIKI_ALLOWED_PATHS,
+  IMPROVE_WIKI_FORBIDDEN_PATHS,
   ORGANIZE_SOURCES_ALLOWED_PATHS,
   UPDATE_RULES_ALLOWED_PATHS,
   SOURCE_MANIFEST_PATH,
@@ -5332,6 +5404,8 @@ module.exports = {
   wikiSchemaTemplate,
   workspaceAgentInstructions,
 	  buildWikiPrompt,
+	  renderSourceStatusForPrompt,
+	  sourcePathsForBuild,
 	  renderPreparedSourcesForPrompt,
 	  buildExploreChatPrompt,
   collectWikiPageImageAttachments,

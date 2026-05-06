@@ -4,15 +4,26 @@ Static download page for Maple.
 
 Open `index.html` directly in a browser, or deploy the folder to any static host.
 
-## Local Release File
-
-The page links to the GitHub Release asset:
+Production URL:
 
 ```text
-https://github.com/cwoo1090/maple/releases/download/v0.1.1/Maple_0.1.1_aarch64.dmg
+https://maple-taupe.vercel.app
 ```
 
-The DMG is not committed to git. To refresh the page after a new macOS release build:
+## Latest Release Download
+
+The main download CTA links to `download-macos.html`. That page reads the latest
+GitHub Release and redirects to the first Apple silicon DMG asset matching:
+
+```text
+Maple_<version>_aarch64.dmg
+```
+
+This keeps the public CTA stable while still downloading the newest versioned
+DMG file directly.
+
+The DMG is not committed to git. To refresh checksum notes after a new macOS
+release build:
 
 ```bash
 LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8 \
@@ -20,4 +31,5 @@ LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8 \
   > downloads/checksums.txt
 ```
 
-Then update the release URL, visible file size, version, and checksum in `index.html`.
+The site download link does not need to change when a new release is published
+with the same DMG naming pattern.

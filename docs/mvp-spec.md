@@ -212,12 +212,17 @@ Actions:
 - `Organize sources`: user-directed source file/folder moves and renames
 - `Update rules`: update durable workspace rules
 
-Allowed write targets for `Wiki healthcheck` and `Improve wiki`:
+Allowed write targets for `Wiki healthcheck`:
 
 - `wiki/**`
 - `index.md`
 - `log.md`
 - `.aiwiki/**`
+
+Allowed write targets for `Improve wiki`:
+
+- any workspace path except `sources/**`
+- source contents remain immutable and any attempted source edit is restored
 
 Allowed write targets for `Organize sources`:
 
@@ -352,7 +357,7 @@ Every workspace should contain `AGENTS.md` and `schema.md`.
 - defines citation/linking/style rules
 - can evolve as the user teaches the wiki
 
-Explore and Build wiki may edit `schema.md` only with clear durable-rule intent. Update rules is the primary user-facing way to update `schema.md`; the app may sync `AGENTS.md` and `CLAUDE.md` afterward.
+Explore and Build wiki may edit `schema.md` only with clear durable-rule intent. Improve wiki and Update rules may update `schema.md`, `AGENTS.md`, and `CLAUDE.md` when the user asks for durable conventions or agent behavior changes.
 
 ## Source Management
 

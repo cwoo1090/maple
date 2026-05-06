@@ -1,0 +1,5 @@
+downloads/*.dmg
+downloads/*.zip
+downloads/*.app
+.vercel
+.DS_Store
