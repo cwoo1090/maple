@@ -66,6 +66,7 @@ Use `--instruction "..."` to add one-off operation guidance, or `--dry-run` with
 The Build Wiki operation may write:
 
 ```text
+sources/**
 wiki/**
 index.md
 log.md
@@ -73,4 +74,4 @@ schema.md
 .aiwiki/**
 ```
 
-It must not modify `sources/**`. If Codex changes a forbidden path, the runner restores that path from the pre-operation snapshot and records it as blocked in the operation report.
+It may move or rename files under `sources/**`, but it must not edit source file contents. If Codex changes source file bytes or any forbidden path, the runner restores that path from the pre-operation snapshot and records it as blocked in the operation report.

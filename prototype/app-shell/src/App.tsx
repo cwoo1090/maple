@@ -35,6 +35,7 @@ import {
   Info,
   Lightbulb,
   Quote,
+  X,
   XCircle,
   type LucideIcon,
   Globe,
@@ -67,8 +68,10 @@ type WorkspaceState = {
     operationType?: string;
     status?: string;
     completedAt?: string;
+    reviewedAt?: string;
     undoneAt?: string;
     changedFiles?: ChangedFile[];
+    reviewedChangedFiles?: ChangedFile[];
     allChangedFiles?: ChangedFile[];
     note?: string;
   } | null;
@@ -76,6 +79,7 @@ type WorkspaceState = {
   logMd: string | null;
   schemaMd: string | null;
   reportMd: string | null;
+  lastOperationMessage: string | null;
   rootFiles: string[];
   sourceFiles: string[];
   wikiFiles: string[];
@@ -273,6 +277,10 @@ type MaintainCommand =
 
 type MaintainTaskId = "healthcheck" | "improveWiki" | "organizeSources" | "updateRules";
 type MaintainStage = "choose" | "compose" | "running" | "done";
+type MaintainWriteRun = {
+  threadId: string;
+  taskId: MaintainTaskId;
+} | null;
 
 type MaintainTaskConfig = {
   id: MaintainTaskId;
@@ -377,6 +385,12 @@ function parseRunnerJson<T>(runner: RunnerOutput | null): T | null {
 const IMAGE_EXT_REGEX = /\.(apng|avif|gif|jpe?g|png|svg|webp)$/i;
 const PDF_EXT_REGEX = /\.pdf$/i;
 const PPTX_EXT_REGEX = /\.pptx?$/i;
+const CHAT_PROGRESS_ERROR_PREFIX = "Failed to read chat progress:";
+const MAINTAIN_DISCUSSION_PROGRESS_ERROR_PREFIX = "Failed to read maintain discussion progress:";
+const OPERATION_PROGRESS_ERROR_PREFIX = "Failed to read operation progress:";
+const BACKGROUND_BUILD_PROGRESS_ERROR_PREFIX = "Failed to read background build progress:";
+const PENDING_GENERATED_CHANGES_ERROR =
+  "Finish reviewing or undo generated changes before starting another workspace-changing action.";
 const LEFT_PANEL_WIDTH_KEY = "maple.leftPanelWidth";
 const RIGHT_PANEL_WIDTH_KEY = "maple.rightPanelWidth";
 const LEFT_PANEL_COLLAPSED_KEY = "maple.leftPanelCollapsed";
@@ -511,16 +525,14 @@ function resolveWorkspaceDocumentReference(
   reference: string,
   currentPath: string,
   availableDocuments: string[],
+  workspacePath = "",
 ): WorkspaceDocumentTarget | null {
-  const trimmed = reference.trim().replace(/^`([^`]+)`$/, "$1").trim();
-  if (!trimmed || isExternalUrl(trimmed) || trimmed.startsWith("#")) {
+  const parsedReference = parseWorkspaceDocumentReference(reference, workspacePath);
+  if (!parsedReference) {
     return null;
   }
 
-  const hashIndex = trimmed.indexOf("#");
-  const pathPart = hashIndex === -1 ? trimmed : trimmed.slice(0, hashIndex);
-  const anchor = hashIndex === -1 ? null : trimmed.slice(hashIndex + 1) || null;
-  const decodedPath = safeDecode(pathPart.split("?")[0]);
+  const { pathPart: decodedPath, anchor } = parsedReference;
   const directPath = normalizeWorkspacePath(decodedPath);
   if (directPath && availableDocuments.includes(directPath)) {
     return { path: directPath, anchor };
@@ -547,7 +559,7 @@ function resolveWorkspaceDocumentReference(
     return null;
   }
 
-  const wikiResolved = resolveWikiLinkTarget(currentPath, trimmed, availableDocuments);
+  const wikiResolved = resolveWikiLinkTarget(currentPath, decodedPath, availableDocuments);
   if (!wikiResolved) {
     return null;
   }
@@ -557,6 +569,69 @@ function resolveWorkspaceDocumentReference(
     path: resolvedHashIndex === -1 ? wikiResolved : wikiResolved.slice(0, resolvedHashIndex),
     anchor: resolvedHashIndex === -1 ? null : wikiResolved.slice(resolvedHashIndex + 1) || null,
   };
+}
+
+function parseWorkspaceDocumentReference(reference: string, workspacePath: string) {
+  const trimmed = reference.trim().replace(/^`([^`]+)`$/, "$1").trim();
+  if (!trimmed || trimmed.startsWith("#")) {
+    return null;
+  }
+
+  let pathPart = trimmed;
+  let anchor: string | null = null;
+
+  if (/^file:\/\//i.test(trimmed)) {
+    try {
+      const url = new URL(trimmed);
+      pathPart = safeDecode(url.pathname);
+      anchor = url.hash ? safeDecode(url.hash.slice(1)) || null : null;
+    } catch {
+      return null;
+    }
+  } else {
+    if (isExternalUrl(trimmed)) {
+      return null;
+    }
+    const hashIndex = trimmed.indexOf("#");
+    if (hashIndex !== -1) {
+      pathPart = trimmed.slice(0, hashIndex);
+      anchor = trimmed.slice(hashIndex + 1) || null;
+    }
+  }
+
+  pathPart = safeDecode(pathPart.split("?")[0]).trim();
+  pathPart = stripLocalLineReference(pathPart);
+
+  const workspaceRelativePath = stripWorkspaceRootFromReference(pathPart, workspacePath);
+  if (!workspaceRelativePath) {
+    return null;
+  }
+
+  return { pathPart: workspaceRelativePath, anchor };
+}
+
+function stripWorkspaceRootFromReference(pathPart: string, workspacePath: string) {
+  const normalizedPath = pathPart.replace(/\\/g, "/");
+  const normalizedWorkspace = safeDecode(workspacePath).replace(/\\/g, "/").replace(/\/+$/g, "");
+
+  if (normalizedWorkspace) {
+    if (normalizedPath === normalizedWorkspace) {
+      return "";
+    }
+    if (normalizedPath.startsWith(`${normalizedWorkspace}/`)) {
+      return normalizedPath.slice(normalizedWorkspace.length + 1);
+    }
+  }
+
+  if (/^\/(?:Users|Volumes|private|tmp|var|Applications|System|Library|opt|usr|bin|sbin|etc)\//.test(normalizedPath)) {
+    return null;
+  }
+
+  return normalizedPath;
+}
+
+function stripLocalLineReference(pathPart: string) {
+  return pathPart.replace(/:\d+(?::\d+)?$/u, "");
 }
 
 function parseTimestampMs(value: string | null | undefined): number | null {
@@ -894,6 +969,7 @@ const emptyState: WorkspaceState = {
   logMd: null,
   schemaMd: null,
   reportMd: null,
+  lastOperationMessage: null,
   rootFiles: [],
   sourceFiles: [],
   wikiFiles: [],
@@ -927,6 +1003,11 @@ function App() {
   const [runner, setRunner] = useState<RunnerOutput | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  function clearErrorMatching(prefixes: string[]) {
+    setError((current) =>
+      current && prefixes.some((prefix) => current.startsWith(prefix)) ? null : current,
+    );
+  }
   const [selectedPath, setSelectedPath] = useState("index.md");
   const [selectedDocument, setSelectedDocument] = useState<SelectedDocument>({
     path: "index.md",
@@ -943,6 +1024,8 @@ function App() {
   const [chatHistoryOpen, setChatHistoryOpen] = useState(false);
   const [seenChatThreadUpdates, setSeenChatThreadUpdates] = useState<SeenThreadMap>({});
   const [maintainThread, setMaintainThread] = useState<ChatThread | null>(null);
+  const currentMaintainThreadIdRef = useRef<string | null>(null);
+  currentMaintainThreadIdRef.current = maintainThread?.id ?? null;
   const [maintainThreads, setMaintainThreads] = useState<ChatThreadSummary[]>([]);
   const [maintainHistoryOpen, setMaintainHistoryOpen] = useState(false);
   const [seenMaintainThreadUpdates, setSeenMaintainThreadUpdates] = useState<SeenThreadMap>({});
@@ -952,6 +1035,7 @@ function App() {
   const [maintainStage, setMaintainStage] = useState<MaintainStage>("choose");
   const [selectedMaintainTaskId, setSelectedMaintainTaskId] = useState<MaintainTaskId | null>(null);
   const [maintainInstruction, setMaintainInstruction] = useState("");
+  const [maintainAskOnly, setMaintainAskOnly] = useState(false);
   const [buildStatusStep, setBuildStatusStep] = useState(0);
   const [maintainStatusStep, setMaintainStatusStep] = useState(0);
   const [maintainLastResult, setMaintainLastResult] = useState<{
@@ -959,6 +1043,7 @@ function App() {
     success: boolean;
     code: number | null;
   } | null>(null);
+  const [maintainWriteRun, setMaintainWriteRun] = useState<MaintainWriteRun>(null);
   const [wikiUpdateBusy, setWikiUpdateBusy] = useState(false);
   const [wikiUpdateRun, setWikiUpdateRun] = useState<WikiUpdateRun>(null);
   const [wikiUpdateStatusStep, setWikiUpdateStatusStep] = useState(0);
@@ -967,6 +1052,9 @@ function App() {
   const [statusBadgeClockMs, setStatusBadgeClockMs] = useState(() => Date.now());
   const [backgroundBuildActive, setBackgroundBuildActive] = useState(false);
   const [backgroundBuildStartedAt, setBackgroundBuildStartedAt] = useState<number | null>(null);
+  const [dismissedBuildSummaryOperationId, setDismissedBuildSummaryOperationId] = useState<
+    string | null
+  >(null);
   const handledBuildOperationIdRef = useRef<string | null>(null);
   const autoFinishedReviewOperationIdRef = useRef<string | null>(null);
   const [chatRunProgressById, setChatRunProgressById] = useState<Record<string, OperationProgress>>(
@@ -1101,23 +1189,55 @@ function App() {
     ? MAINTAIN_TASK_BY_ID[currentMaintainTaskId]
     : null;
   const currentMaintainSummary = maintainThreads.find((thread) => thread.id === maintainThread?.id);
+  const currentMaintainActivityStatus = normalizeThreadActivityStatus(
+    currentMaintainSummary?.activityStatus,
+  );
+  const runningMaintainSummary = useMemo(
+    () =>
+      maintainThreads.find(
+        (thread) =>
+          normalizeThreadActivityStatus(thread.activityStatus) === "running" &&
+          Boolean(maintainTaskIdFromOperationType(thread.operationType)),
+      ) ?? null,
+    [maintainThreads],
+  );
+  const workspaceMaintainOperationTaskId = workspaceOperationProgress?.running
+    ? maintainTaskIdFromOperationType(workspaceOperationProgress.operationType)
+    : null;
+  const workspaceMaintainOperationTask = workspaceMaintainOperationTaskId
+    ? MAINTAIN_TASK_BY_ID[workspaceMaintainOperationTaskId]
+    : null;
+  const runningMaintainSummaryTaskId = maintainTaskIdFromOperationType(
+    runningMaintainSummary?.operationType,
+  );
+  const runningMaintainSummaryTask = runningMaintainSummaryTaskId
+    ? MAINTAIN_TASK_BY_ID[runningMaintainSummaryTaskId]
+    : null;
+  const startingMaintainOperationTask =
+    maintainWriteRun ? MAINTAIN_TASK_BY_ID[maintainWriteRun.taskId] : null;
+  const activeMaintainOperationTask =
+    startingMaintainOperationTask ?? workspaceMaintainOperationTask ?? runningMaintainSummaryTask;
+  const activeMaintainOperationThreadId =
+    maintainWriteRun?.threadId ??
+    runningMaintainSummary?.id ??
+    (workspaceMaintainOperationTask &&
+    maintainThread?.operationId &&
+    workspaceOperationProgress?.operationId === maintainThread.operationId
+      ? maintainThread.id
+      : null);
   const currentMaintainSummaryRunning = Boolean(
-    maintainThread?.operationType &&
-      normalizeThreadActivityStatus(currentMaintainSummary?.activityStatus) === "running",
+    maintainThread?.operationType && currentMaintainActivityStatus === "running",
   );
   const workspaceMaintainOperationRunning = Boolean(
-    selectedMaintainTask &&
-      workspaceOperationProgress?.running &&
+    workspaceOperationProgress?.running &&
+      workspaceMaintainOperationTask &&
       maintainThread?.operationType &&
       workspaceOperationProgress.operationType === maintainThread.operationType &&
       (!maintainThread.operationId ||
         workspaceOperationProgress.operationId === maintainThread.operationId),
   );
   const isMaintainOperationRunning = Boolean(
-    selectedMaintainTask &&
-      (busy === selectedMaintainTask.busyLabel ||
-        currentMaintainSummaryRunning ||
-        workspaceMaintainOperationRunning),
+    activeMaintainOperationTask || currentMaintainSummaryRunning || workspaceMaintainOperationRunning,
   );
   const workspaceWriteBusy =
     isBuilding || isMaintainOperationRunning || isWikiUpdateRunning;
@@ -1135,8 +1255,8 @@ function App() {
     ? "Build wiki"
     : isWikiUpdateRunning
       ? "Update wiki from chat"
-      : isMaintainOperationRunning && selectedMaintainTask
-        ? selectedMaintainTask.label
+      : isMaintainOperationRunning && activeMaintainOperationTask
+        ? activeMaintainOperationTask.label
         : null;
   const activeOperationLabel =
     activeWorkspaceWriteLabel ??
@@ -1146,6 +1266,22 @@ function App() {
   const reviewableChangedFiles = changedFiles.filter(isPendingReviewChange);
   const hasPendingGeneratedChanges =
     reviewableChangedFiles.length > 0 && !workspace.changedMarker?.undoneAt;
+  const buildCompletionSummaryOperationId =
+    workspace.changedMarker?.operationType === "build-wiki"
+      ? workspace.changedMarker.operationId ?? null
+      : null;
+  const buildCompletionSummaryStatus = workspace.changedMarker?.status ?? "";
+  const buildCompletionSummaryText = workspace.lastOperationMessage?.trim() ?? "";
+  const showBuildCompletionSummary = Boolean(
+    !isBuilding &&
+      !workspaceBuildProgressFailed &&
+      buildCompletionSummaryOperationId &&
+      hasPendingGeneratedChanges &&
+      buildCompletionSummaryText &&
+      dismissedBuildSummaryOperationId !== buildCompletionSummaryOperationId &&
+      (buildCompletionSummaryStatus === "completed" ||
+        buildCompletionSummaryStatus === "completed_with_forbidden_edits_restored"),
+  );
 
   function actionPhrase(action: BlockedAction): string {
     switch (action) {
@@ -1213,7 +1349,7 @@ function App() {
     }
 
     if (hasPendingGeneratedChanges && action !== "review" && action !== "undo") {
-      return "Finish reviewing or undo generated changes before starting another workspace-changing action.";
+      return PENDING_GENERATED_CHANGES_ERROR;
     }
 
     return null;
@@ -1240,7 +1376,18 @@ function App() {
       !maintainBlockedReason &&
       (!selectedMaintainTask.requiresInstruction || maintainInstruction.trim()),
   );
-
+  const maintainDeleteBlockedReason =
+    maintainThread &&
+    (isAskingMaintainDiscussion ||
+      currentMaintainActivityStatus === "running" ||
+      activeMaintainOperationThreadId === maintainThread.id)
+      ? "Wait for this Maintain chat to finish before deleting it."
+      : null;
+  const maintainDeleteDisabled = !maintainThread || Boolean(maintainDeleteBlockedReason);
+  const maintainTaskChoiceNotice =
+    maintainBlockedReason && activeWorkspaceWriteLabel
+      ? `${activeWorkspaceWriteLabel} is running. You can still choose a task and use Ask only.`
+      : maintainBlockedReason;
   const maintainOperationIsCurrent = Boolean(
     maintainThread?.operationId &&
       workspace.changedMarker?.operationId &&
@@ -1318,6 +1465,34 @@ function App() {
       ),
     [openedChangedFiles, reviewableChangedFiles, selectedPath],
   );
+  const completedReviewedChangedCount =
+    workspace.changedMarker?.reviewedAt && workspace.changedMarker.reviewedChangedFiles
+      ? workspace.changedMarker.reviewedChangedFiles.filter(isPendingReviewChange).length
+      : 0;
+  const maintainResultMessage = (() => {
+    if (maintainLastResult?.success === false) return "Operation needs review.";
+    if (maintainOperationIsCurrent && completedReviewedChangedCount > 0) {
+      return `All ${completedReviewedChangedCount} generated change${
+        completedReviewedChangedCount === 1 ? "" : "s"
+      } reviewed.`;
+    }
+    if (maintainChangedFiles.length === 0) return "No generated changes.";
+    if (maintainOperationIsCurrent) {
+      if (unreviewedChangedFiles.length === 0) {
+        return `All ${maintainChangedFiles.length} generated change${
+          maintainChangedFiles.length === 1 ? "" : "s"
+        } reviewed.`;
+      }
+      if (reviewedChangedCount > 0) {
+        return `${unreviewedChangedFiles.length} generated change${
+          unreviewedChangedFiles.length === 1 ? "" : "s"
+        } left to review. ${reviewedChangedCount} reviewed.`;
+      }
+    }
+    return `${maintainChangedFiles.length} generated change${
+      maintainChangedFiles.length === 1 ? "" : "s"
+    } ready to review.`;
+  })();
   const finishReviewBlockedReason = reviewBlockedReason;
   const availableDocuments = useMemo(
     () => Array.from(new Set([...rootFiles, ...workspace.wikiFiles, ...workspace.sourceFiles])),
@@ -1363,6 +1538,26 @@ function App() {
   );
   const providerSetup = useProviderSetup(activeProvider?.name ?? null, Boolean(activeProvider));
   const activeProviderReady = providerSetup.ready;
+  const maintainCanAskOnly = Boolean(
+    workspace.workspacePath &&
+      maintainThread &&
+      selectedMaintainTask &&
+      !exploreBlockedReason &&
+      !maintainDiscussionBusy &&
+      activeProviderReady &&
+      maintainInstruction.trim(),
+  );
+  const maintainSubmitLabel = maintainAskOnly
+    ? "Ask in read-only Maintain discussion"
+    : selectedMaintainTask?.actionLabel ?? "Submit";
+  const maintainSubmitTitle = maintainAskOnly
+    ? maintainDiscussionBusy
+      ? "Maintain discussion is already answering"
+      : exploreBlockedReason ?? "Ask without creating wiki changes"
+    : maintainBlockedReason ?? selectedMaintainTask?.actionLabel;
+  const maintainSubmitDisabled = maintainAskOnly
+    ? !maintainCanAskOnly
+    : !maintainCanRun || !activeProviderReady;
   const activeModelId = activeProvider
     ? appSettings?.models[activeProvider.name] || activeProvider.defaultModel
     : "";
@@ -1404,6 +1599,20 @@ function App() {
   }, [activeProvider]);
   const chatRunningLabel =
     chatRunningSteps[chatStatusStep % chatRunningSteps.length] ?? "Thinking";
+  const maintainDiscussionRunningSteps = useMemo(() => {
+    const providerName = activeProvider ? displayProviderName(activeProvider) : "AI";
+    return [
+      "Preparing Maintain context",
+      "Checking current task",
+      "Reading selected page",
+      `Asking ${providerName}`,
+      "Writing answer",
+    ];
+  }, [activeProvider]);
+  const maintainDiscussionRunningLabel = isStartingMaintainDiscussion
+    ? "Starting Maintain discussion"
+    : maintainDiscussionRunningSteps[chatStatusStep % maintainDiscussionRunningSteps.length] ??
+      "Asking Maintain";
   const buildRunningLabel =
     BUILD_WIKI_STEPS[buildStatusStep % BUILD_WIKI_STEPS.length] ?? "Building wiki";
   const buildFallbackActiveStep = Math.min(buildStatusStep, BUILD_WIKI_STEPS.length - 1);
@@ -1428,9 +1637,14 @@ function App() {
   }, [statusBadgeClockMs, workspace.changedMarker?.undoneAt]);
   const statusLabel = useMemo(() => {
     if (isBuilding) return "Building wiki";
-    if (isMaintainOperationRunning && selectedMaintainTask) return selectedMaintainTask.busyLabel;
+    if (isMaintainOperationRunning && activeMaintainOperationTask) {
+      return activeMaintainOperationTask.busyLabel;
+    }
     if (isWikiUpdateRunning) return "Updating wiki";
     if (exploreBusy) return isStartingExplore ? "Starting chat" : "Explore Chat";
+    if (maintainDiscussionBusy) {
+      return isStartingMaintainDiscussion ? "Starting Maintain discussion" : "Maintain discussion";
+    }
     if (busy) return busy;
     if (showUndoneStatus) return "Undone";
     if (reviewableChangedFiles.length > 0) {
@@ -1445,8 +1659,10 @@ function App() {
     isBuilding,
     isMaintainOperationRunning,
     isStartingExplore,
+    isStartingMaintainDiscussion,
+    maintainDiscussionBusy,
     reviewableChangedFiles.length,
-    selectedMaintainTask,
+    activeMaintainOperationTask,
     showUndoneStatus,
     unreviewedChangedFiles.length,
     isWikiUpdateRunning,
@@ -1594,13 +1810,24 @@ function App() {
 
   function canOpenDocumentReference(reference: string | null | undefined, currentPath = selectedPath) {
     return Boolean(
-      reference && resolveWorkspaceDocumentReference(reference, currentPath, availableDocuments),
+      reference &&
+        resolveWorkspaceDocumentReference(
+          reference,
+          currentPath,
+          availableDocuments,
+          workspace.workspacePath,
+        ),
     );
   }
 
   function openDocumentReference(reference: string | null | undefined, currentPath = selectedPath) {
     if (!reference) return false;
-    const target = resolveWorkspaceDocumentReference(reference, currentPath, availableDocuments);
+    const target = resolveWorkspaceDocumentReference(
+      reference,
+      currentPath,
+      availableDocuments,
+      workspace.workspacePath,
+    );
     if (!target) return false;
     openWorkspaceFile(target.path);
     setPendingAnchor(target.anchor);
@@ -1965,6 +2192,7 @@ function App() {
           threadId: chatThread.id,
         });
         setChatThread(thread);
+        clearErrorMatching([CHAT_PROGRESS_ERROR_PREFIX]);
         if (!thread.messages.some((message) => message.status === "streaming")) {
           markChatThreadSeen(thread);
           await refreshChatHistorySummaries();
@@ -1975,7 +2203,7 @@ function App() {
             setError(`Failed to recover chat history: ${String(recoverErr)}`);
           });
         } else {
-          setError(`Failed to read chat progress: ${String(err)}`);
+          setError(`${CHAT_PROGRESS_ERROR_PREFIX} ${String(err)}`);
         }
       }
     }, 700);
@@ -1988,12 +2216,13 @@ function App() {
       try {
         const thread = await invoke<ChatThread>("read_current_maintain_thread");
         setMaintainThread(thread);
+        clearErrorMatching([MAINTAIN_DISCUSSION_PROGRESS_ERROR_PREFIX]);
         if (!thread.messages.some((message) => message.status === "streaming")) {
           markMaintainThreadSeen(thread);
           await refreshMaintainHistorySummaries();
         }
       } catch (err) {
-        setError(`Failed to read maintain discussion progress: ${String(err)}`);
+        setError(`${MAINTAIN_DISCUSSION_PROGRESS_ERROR_PREFIX} ${String(err)}`);
       }
     }, 700);
     return () => window.clearInterval(intervalId);
@@ -2064,8 +2293,9 @@ function App() {
         const progress = await invoke<OperationProgress>("read_workspace_operation_progress");
         if (cancelled) return;
         setWorkspaceOperationProgress((previous) => mergeOperationProgress(previous, progress));
+        clearErrorMatching([OPERATION_PROGRESS_ERROR_PREFIX]);
       } catch (err) {
-        if (!cancelled) setError(`Failed to read operation progress: ${String(err)}`);
+        if (!cancelled) setError(`${OPERATION_PROGRESS_ERROR_PREFIX} ${String(err)}`);
       }
     };
     void readProgress();
@@ -2179,19 +2409,33 @@ function App() {
         const progress = await invoke<OperationProgress>("read_workspace_operation_progress");
         if (cancelled) return;
         setWorkspaceOperationProgress((previous) => mergeOperationProgress(previous, progress));
+        clearErrorMatching([BACKGROUND_BUILD_PROGRESS_ERROR_PREFIX]);
         if (progress.operationId || progress.running) return;
-        setBackgroundBuildActive(false);
-        setBackgroundBuildStartedAt(null);
         const state = await invoke<WorkspaceState>("load_workspace_state");
         if (!cancelled) {
           setWorkspace(state);
-          setError("Build wiki stopped before progress was reported. Check the operation setup and try again.");
+          const completedAtMs = parseTimestampMs(state.changedMarker?.completedAt);
+          const completedBuildWasObserved = Boolean(
+            state.changedMarker?.operationType === "build-wiki" &&
+              completedAtMs !== null &&
+              completedAtMs >= backgroundBuildStartedAt - 1000,
+          );
+          if (completedBuildWasObserved) {
+            const nextPath = chooseDocumentAfterCommand("build_wiki", state);
+            if (nextPath) {
+              openWorkspaceFile(nextPath);
+            }
+          } else {
+            setError("Build wiki stopped before progress was reported. Check the operation setup and try again.");
+          }
+          setBackgroundBuildActive(false);
+          setBackgroundBuildStartedAt(null);
         }
       } catch (err) {
         if (cancelled) return;
         setBackgroundBuildActive(false);
         setBackgroundBuildStartedAt(null);
-        setError(`Failed to read background build progress: ${String(err)}`);
+        setError(`${BACKGROUND_BUILD_PROGRESS_ERROR_PREFIX} ${String(err)}`);
       }
     }, 10_000);
 
@@ -2356,18 +2600,20 @@ function App() {
   ]);
 
   useEffect(() => {
-    if (maintainThreadMessages.length === 0) return;
+    if (maintainThreadMessages.length === 0 && !maintainDiscussionBusy) return;
     const frameId = requestAnimationFrame(() => {
       const messagesEl = maintainChatMessagesRef.current;
       if (!messagesEl) return;
       messagesEl.scrollTo({
         top: messagesEl.scrollHeight,
-        behavior: isAskingMaintainDiscussion || isMaintainOperationRunning ? "smooth" : "auto",
+        behavior: maintainDiscussionBusy || isMaintainOperationRunning ? "smooth" : "auto",
       });
     });
     return () => cancelAnimationFrame(frameId);
   }, [
     maintainThread?.id,
+    maintainDiscussionBusy,
+    maintainDiscussionRunningLabel,
     isAskingMaintainDiscussion,
     isMaintainOperationRunning,
     latestMaintainThreadMessage?.id,
@@ -2623,7 +2869,16 @@ function App() {
     try {
       const progress = await invoke<OperationProgress>("read_workspace_operation_progress");
       setWorkspaceOperationProgress((previous) => mergeOperationProgress(previous, progress));
+      clearErrorMatching([OPERATION_PROGRESS_ERROR_PREFIX, BACKGROUND_BUILD_PROGRESS_ERROR_PREFIX]);
     } catch (_err) {}
+  }
+
+  async function refreshWorkspaceStateAfterPendingGeneratedChangesError(error: unknown) {
+    if (!String(error).includes(PENDING_GENERATED_CHANGES_ERROR)) return;
+    try {
+      const state = await invoke<WorkspaceState>("load_workspace_state");
+      setWorkspace(state);
+    } catch (_refreshErr) {}
   }
 
   async function refreshChatThreadSummaries() {
@@ -2774,6 +3029,7 @@ function App() {
     setError(null);
     setWorkspaceOperationProgress(null);
     handledBuildOperationIdRef.current = null;
+    setDismissedBuildSummaryOperationId(null);
     setBuildFeedOpen(true);
     setBuildDraft(null);
 
@@ -2797,6 +3053,7 @@ function App() {
       }
     } catch (err) {
       setError(String(err));
+      await refreshWorkspaceStateAfterPendingGeneratedChangesError(err);
       setBackgroundBuildActive(false);
       setBackgroundBuildStartedAt(null);
     } finally {
@@ -2827,18 +3084,19 @@ function App() {
   }
 
   function selectMaintainTask(taskId: MaintainTaskId) {
-    if (maintainBlockedReason) return;
     setSelectedMaintainTaskId(taskId);
     setMaintainInstruction("");
+    setMaintainAskOnly(false);
     setMaintainLastResult(null);
     setMaintainStage("compose");
   }
 
   async function createNewMaintainThread() {
-    if (anyOperationBusy || !workspace.workspacePath) return;
+    if (!workspace.workspacePath) return;
     if (maintainThread && maintainThread.messages.length === 0 && !maintainThread.operationType) {
       setSelectedMaintainTaskId(null);
       setMaintainInstruction("");
+      setMaintainAskOnly(false);
       setMaintainLastResult(null);
       setMaintainStage("choose");
       setMaintainHistoryOpen(false);
@@ -2850,6 +3108,7 @@ function App() {
       markMaintainThreadSeen(thread);
       setSelectedMaintainTaskId(null);
       setMaintainInstruction("");
+      setMaintainAskOnly(false);
       setMaintainLastResult(null);
       setMaintainStage("choose");
       setMaintainHistoryOpen(false);
@@ -2860,7 +3119,6 @@ function App() {
   }
 
   async function openMaintainThread(threadId: string) {
-    if (anyOperationBusy) return;
     try {
       const thread = await invoke<ChatThread>("set_current_maintain_thread", { threadId });
       setMaintainThread(thread);
@@ -2870,6 +3128,7 @@ function App() {
       const status = normalizeThreadActivityStatus(summary?.activityStatus);
       setSelectedMaintainTaskId(taskId);
       setMaintainInstruction("");
+      setMaintainAskOnly(false);
       setMaintainLastResult(null);
       setMaintainStage(maintainStageFromThread(thread, status));
       setMaintainHistoryOpen(false);
@@ -2879,7 +3138,7 @@ function App() {
   }
 
   async function deleteCurrentMaintainThread() {
-    if (!maintainThread || anyOperationBusy) return;
+    if (!maintainThread || maintainDeleteDisabled) return;
     try {
       const thread = await invoke<ChatThread>("delete_maintain_thread", {
         threadId: maintainThread.id,
@@ -2889,6 +3148,7 @@ function App() {
       const taskId = maintainTaskIdFromThread(thread);
       setSelectedMaintainTaskId(taskId);
       setMaintainInstruction("");
+      setMaintainAskOnly(false);
       setMaintainLastResult(null);
       setMaintainStage(maintainStageFromThread(thread));
       await refreshMaintainHistorySummaries();
@@ -2900,6 +3160,7 @@ function App() {
   function resetMaintainFlow() {
     setSelectedMaintainTaskId(null);
     setMaintainInstruction("");
+    setMaintainAskOnly(false);
     setMaintainLastResult(null);
     setMaintainStage("choose");
   }
@@ -2930,33 +3191,42 @@ function App() {
       setError("Add an instruction first.");
       return;
     }
+    const launchedThreadId = maintainThread.id;
+    const launchedTask = selectedMaintainTask;
     setBusy(selectedMaintainTask.busyLabel);
     setError(null);
     setWorkspaceOperationProgress(null);
     setMaintainFeedOpen(true);
     setMaintainLastResult(null);
     setMaintainStage("running");
+    setMaintainWriteRun({
+      threadId: launchedThreadId,
+      taskId: launchedTask.id,
+    });
 
     try {
       const result = await invoke<MaintainOperationResult>("run_maintain_thread_operation", {
-        threadId: maintainThread.id,
-        command: selectedMaintainTask.command,
+        threadId: launchedThreadId,
+        command: launchedTask.command,
         instruction: trimmedInstruction || null,
       });
+      const stillViewingLaunchedThread = currentMaintainThreadIdRef.current === launchedThreadId;
       setRunner(result.runner);
       setWorkspace(result.state);
-      setMaintainThread(result.thread);
-      markMaintainThreadSeen(result.thread);
-      setMaintainInstruction("");
-      setMaintainLastResult({
-        taskId: selectedMaintainTask.id,
-        success: Boolean(result.runner?.success),
-        code: result.runner?.code ?? null,
-      });
-      setMaintainStage("done");
+      if (stillViewingLaunchedThread) {
+        setMaintainThread(result.thread);
+        markMaintainThreadSeen(result.thread);
+        setMaintainInstruction("");
+        setMaintainLastResult({
+          taskId: launchedTask.id,
+          success: Boolean(result.runner?.success),
+          code: result.runner?.code ?? null,
+        });
+        setMaintainStage("done");
+      }
       await refreshMaintainHistorySummaries();
-      const nextPath = chooseDocumentAfterCommand(selectedMaintainTask.command, result.state);
-      if (nextPath) {
+      const nextPath = chooseDocumentAfterCommand(launchedTask.command, result.state);
+      if (stillViewingLaunchedThread && nextPath) {
         openWorkspaceFile(nextPath);
       }
       if (result.error) {
@@ -2966,21 +3236,34 @@ function App() {
       }
     } catch (err) {
       setError(String(err));
-      setMaintainLastResult({
-        taskId: selectedMaintainTask.id,
-        success: false,
-        code: null,
-      });
-      setMaintainStage("done");
-      const thread = await invoke<ChatThread>("read_current_maintain_thread").catch(() => null);
-      if (thread) {
-        setMaintainThread(thread);
-        markMaintainThreadSeen(thread);
+      const stillViewingLaunchedThread = currentMaintainThreadIdRef.current === launchedThreadId;
+      if (stillViewingLaunchedThread) {
+        setMaintainLastResult({
+          taskId: launchedTask.id,
+          success: false,
+          code: null,
+        });
+        setMaintainStage("done");
+        const thread = await invoke<ChatThread>("read_current_maintain_thread").catch(() => null);
+        if (thread) {
+          setMaintainThread(thread);
+          markMaintainThreadSeen(thread);
+        }
       }
+      await refreshMaintainHistorySummaries();
     } finally {
       await refreshWorkspaceOperationProgressOnce();
+      setMaintainWriteRun(null);
       setBusy(null);
     }
+  }
+
+  async function submitMaintainComposer() {
+    if (maintainAskOnly) {
+      await askMaintainDraftInMaintain();
+      return;
+    }
+    await runMaintainCommand();
   }
 
   async function selectChatModelChoice(value: string) {
@@ -3104,6 +3387,10 @@ function App() {
       setError("Choose a Maintain task first.");
       return;
     }
+    if (exploreBlockedReason) {
+      setError(exploreBlockedReason);
+      return;
+    }
     const question = maintainInstruction.trim();
     if (!question) {
       setError("Ask a question first.");
@@ -3120,19 +3407,22 @@ function App() {
       setError("Maintain discussion is already answering.");
       return;
     }
+    const launchedThreadId = maintainThread.id;
     setBusy("Starting Maintain discussion");
     setError(null);
     try {
       const thread = await invoke<ChatThread>("start_maintain_discussion", {
-        threadId: maintainThread.id,
+        threadId: launchedThreadId,
         command: selectedMaintainTask.command,
         question,
         selectedPath,
       });
-      setMaintainThread(thread);
-      markMaintainThreadSeen(thread);
-      setMaintainInstruction("");
-      setMaintainStage(maintainStageFromThread(thread));
+      if (currentMaintainThreadIdRef.current === launchedThreadId) {
+        setMaintainThread(thread);
+        markMaintainThreadSeen(thread);
+        setMaintainInstruction("");
+        setMaintainStage(maintainStageFromThread(thread));
+      }
       await refreshMaintainHistorySummaries();
     } catch (err) {
       setError(String(err));
@@ -3818,8 +4108,12 @@ function App() {
     status: ThreadActivityStatus;
     label: string;
   } {
-    if (maintainThread?.id === thread.id && isMaintainOperationRunning && selectedMaintainTask) {
-      return { status: "running", label: selectedMaintainTask.label };
+    if (
+      activeMaintainOperationThreadId === thread.id &&
+      isMaintainOperationRunning &&
+      activeMaintainOperationTask
+    ) {
+      return { status: "running", label: activeMaintainOperationTask.label };
     }
     const status = normalizeThreadActivityStatus(thread.activityStatus);
     return { status, label: thread.activityLabel || defaultThreadActivityLabel(status) };
@@ -4148,6 +4442,35 @@ function App() {
               canOpenPath={canOpenDocumentReference}
               compact
             />
+          ) : showBuildCompletionSummary ? (
+            <section className="build-summary-panel" aria-label="Build wiki completion summary">
+              <div className="build-summary-header">
+                <div className="build-summary-title-block">
+                  <span className="build-summary-title">Build wiki</span>
+                  <span className="build-summary-state">Completed</span>
+                </div>
+                <button
+                  type="button"
+                  className="build-summary-dismiss"
+                  aria-label="Dismiss build summary"
+                  title="Dismiss build summary"
+                  onClick={() =>
+                    setDismissedBuildSummaryOperationId(buildCompletionSummaryOperationId)
+                  }
+                >
+                  <X size={15} strokeWidth={2.2} aria-hidden="true" />
+                </button>
+              </div>
+              <div className="build-summary-body">
+                <WorkspaceAwareMarkdown
+                  content={buildCompletionSummaryText}
+                  currentPath={selectedPath}
+                  workspacePath={workspace.workspacePath}
+                  availableDocuments={availableDocuments}
+                  onOpenDocument={openWorkspaceDocument}
+                />
+              </div>
+            </section>
           ) : null}
           <div className="sidebar-tree-scroll">
             <TreeView
@@ -4280,7 +4603,20 @@ function App() {
           (hasPptxInSources && sofficeInstalling) ||
           (hasPptxInSources && sofficeStatus && !sofficeStatus.installed) ? (
             <div className="center-notices">
-              {error ? <div className="banner banner-error">{error}</div> : null}
+              {error ? (
+                <div className="banner banner-error banner-dismissible" role="alert">
+                  <span className="banner-message">{error}</span>
+                  <button
+                    type="button"
+                    className="banner-dismiss"
+                    aria-label="Dismiss error"
+                    title="Dismiss error"
+                    onClick={() => setError(null)}
+                  >
+                    <X size={16} strokeWidth={2.2} aria-hidden="true" />
+                  </button>
+                </div>
+              ) : null}
 
               {interruptedOp?.interrupted ? (
                 <div className="banner banner-warn">
@@ -4644,6 +4980,7 @@ function App() {
                           <WorkspaceAwareMarkdown
                             content={message.text}
                             currentPath={message.contextPath ?? selectedPath}
+                            workspacePath={workspace.workspacePath}
                             availableDocuments={availableDocuments}
                             onOpenDocument={openWorkspaceDocument}
                           />
@@ -4796,8 +5133,8 @@ function App() {
                     type="button"
                     className="explore-chat-header-btn"
                     onClick={() => void createNewMaintainThread()}
-                    disabled={!workspace.workspacePath || anyOperationBusy}
-                    title={maintainBlockedReason ?? "New maintain chat"}
+                    disabled={!workspace.workspacePath}
+                    title="New maintain chat"
                   >
                     +
                   </button>
@@ -4806,8 +5143,8 @@ function App() {
                     type="button"
                     className="explore-chat-header-btn"
                     onClick={() => void toggleMaintainHistory()}
-                    disabled={!workspace.workspacePath || anyOperationBusy}
-                    title={maintainBlockedReason ?? "History"}
+                    disabled={!workspace.workspacePath}
+                    title="History"
                   >
                     History
                   </button>
@@ -4833,8 +5170,7 @@ function App() {
                                   thread.id === maintainThread?.id ? " active" : ""
                                 } status-${activity.status}`}
                                 onClick={() => void openMaintainThread(thread.id)}
-                                disabled={anyOperationBusy}
-                                title={maintainBlockedReason ?? `${thread.title} - ${activity.label}`}
+                                title={`${thread.title} - ${activity.label}`}
                               >
                                 <span className="explore-chat-history-main">
                                   <span className="explore-chat-history-name">{thread.title}</span>
@@ -4860,8 +5196,8 @@ function App() {
                         type="button"
                         className="explore-chat-delete"
                         onClick={() => void deleteCurrentMaintainThread()}
-                        disabled={anyOperationBusy}
-                        title={maintainBlockedReason ?? "Delete current chat"}
+                        disabled={maintainDeleteDisabled}
+                        title={maintainDeleteBlockedReason ?? "Delete current chat"}
                       >
                         Delete current chat
                       </button>
@@ -4881,10 +5217,10 @@ function App() {
                           <OperationFeedPanel
                             progress={chatRunProgressById[message.runId] ?? null}
                             title="Progress"
-                            fallbackSteps={chatRunningSteps}
+                            fallbackSteps={maintainDiscussionRunningSteps}
                             fallbackActiveIndex={Math.min(
                               chatStatusStep,
-                              chatRunningSteps.length - 1,
+                              maintainDiscussionRunningSteps.length - 1,
                             )}
                             fallbackRunning={message.status === "streaming"}
                             open={
@@ -4910,6 +5246,7 @@ function App() {
                         <WorkspaceAwareMarkdown
                           content={message.text}
                           currentPath={message.contextPath ?? selectedPath}
+                          workspacePath={workspace.workspacePath}
                           availableDocuments={availableDocuments}
                           onOpenDocument={openWorkspaceDocument}
                         />
@@ -4922,11 +5259,17 @@ function App() {
                   </div>
                 ))}
 
+                {maintainDiscussionBusy ? (
+                  <div className="maintain-thinking chat-thinking" role="status" aria-live="polite">
+                    {maintainDiscussionRunningLabel}
+                  </div>
+                ) : null}
+
                 {showMaintainTaskChoices ? (
                   <div className="maintain-empty-prompt">
                     <p className="maintain-empty-title">What do you want to do?</p>
-                    {maintainBlockedReason ? (
-                      <p className="maintain-message-note">{maintainBlockedReason}</p>
+                    {maintainTaskChoiceNotice ? (
+                      <p className="maintain-message-note">{maintainTaskChoiceNotice}</p>
                     ) : null}
                   </div>
                 ) : null}
@@ -4937,8 +5280,7 @@ function App() {
                         key={task.id}
                         type="button"
                         className="maintain-task-card"
-                        disabled={Boolean(maintainBlockedReason)}
-                        title={maintainBlockedReason ?? task.label}
+                        title={task.label}
                         onClick={() => selectMaintainTask(task.id)}
                       >
                         <span className="maintain-task-card-copy">
@@ -4976,7 +5318,7 @@ function App() {
                     <button
                       type="button"
                       onClick={() => void createNewMaintainThread()}
-                      disabled={anyOperationBusy}
+                      disabled={!workspace.workspacePath}
                     >
                       Start task
                     </button>
@@ -4987,15 +5329,7 @@ function App() {
 
               {showMaintainCompletionBar ? (
                 <div className="maintain-result-bar" role="status">
-                  <span>
-                    {maintainLastResult?.success === false
-                      ? "Operation needs review."
-                      : maintainChangedFiles.length === 0
-                        ? "No reviewable generated changes reported."
-                        : `${maintainChangedFiles.length} generated change${
-                            maintainChangedFiles.length === 1 ? "" : "s"
-                          } ready to review.`}
-                  </span>
+                  <span>{maintainResultMessage}</span>
                   {workspace.reportMd && maintainOperationIsCurrent ? (
                     <button type="button" onClick={openReportTab}>
                       Show report
@@ -5009,7 +5343,7 @@ function App() {
                   className="maintain-composer"
                   onSubmit={(event) => {
                     event.preventDefault();
-                    void runMaintainCommand();
+                    void submitMaintainComposer();
                   }}
                 >
                   {!activeProviderReady ? (
@@ -5033,7 +5367,7 @@ function App() {
                       type="button"
                       className="maintain-task-context-change"
                       onClick={() => void changeMaintainTask()}
-                      disabled={anyOperationBusy}
+                      disabled={!workspace.workspacePath}
                       title={
                         maintainThread?.messages.length
                           ? "Start another Maintain task"
@@ -5114,20 +5448,15 @@ function App() {
                     <div className="maintain-composer-actions">
                       <button
                         type="button"
-                        className="maintain-ask-only"
-                        disabled={
-                          Boolean(exploreBlockedReason) ||
-                          maintainDiscussionBusy ||
-                          !activeProviderReady ||
-                          !workspace.workspacePath ||
-                          !maintainInstruction.trim()
-                        }
+                        className={`maintain-ask-only ${maintainAskOnly ? "active" : ""}`}
+                        aria-pressed={maintainAskOnly}
+                        disabled={!workspace.workspacePath}
                         title={
-                          maintainDiscussionBusy
-                            ? "Maintain discussion is already answering"
-                            : exploreBlockedReason ?? "Ask in read-only Maintain discussion"
+                          maintainAskOnly
+                            ? "Ask only is on. Submit asks without changing files."
+                            : "Ask only is off. Turn on to submit without changing files."
                         }
-                        onClick={() => void askMaintainDraftInMaintain()}
+                        onClick={() => setMaintainAskOnly((askOnly) => !askOnly)}
                       >
                         <HelpCircle size={14} strokeWidth={2.2} aria-hidden="true" />
                         Ask only
@@ -5135,9 +5464,9 @@ function App() {
                       <button
                         type="submit"
                         className="maintain-primary"
-                        disabled={!maintainCanRun || !activeProviderReady}
-                        aria-label={selectedMaintainTask.actionLabel}
-                        title={maintainBlockedReason ?? selectedMaintainTask.actionLabel}
+                        disabled={maintainSubmitDisabled}
+                        aria-label={maintainSubmitLabel}
+                        title={maintainSubmitTitle}
                       >
                         ↑
                       </button>
@@ -6293,11 +6622,13 @@ function humanizeMarkdownCalloutType(type: string) {
 function WorkspaceAwareMarkdown({
   content,
   currentPath,
+  workspacePath,
   availableDocuments,
   onOpenDocument,
 }: {
   content: string;
   currentPath: string;
+  workspacePath: string;
   availableDocuments: string[];
   onOpenDocument: (path: string, anchor?: string | null) => void;
 }) {
@@ -6311,6 +6642,24 @@ function WorkspaceAwareMarkdown({
           <span className="broken-wikilink" title={`No page named "${target}" yet`}>
             {children}
           </span>
+        );
+      }
+
+      const target = href
+        ? resolveWorkspaceDocumentReference(href, currentPath, availableDocuments, workspacePath)
+        : null;
+      if (target) {
+        return (
+          <a
+            {...props}
+            href={href}
+            onClick={(event) => {
+              event.preventDefault();
+              onOpenDocument(target.path, target.anchor);
+            }}
+          >
+            {children}
+          </a>
         );
       }
 
@@ -6329,21 +6678,11 @@ function WorkspaceAwareMarkdown({
         );
       }
 
-      const target = href
-        ? resolveWorkspaceDocumentReference(href, currentPath, availableDocuments)
-        : null;
-      if (target) {
+      if (isUnresolvedLocalReference(href)) {
         return (
-          <a
-            {...props}
-            href={href}
-            onClick={(event) => {
-              event.preventDefault();
-              onOpenDocument(target.path, target.anchor);
-            }}
-          >
+          <span className="broken-wikilink" title={`Cannot open "${href}" in this workspace`}>
             {children}
-          </a>
+          </span>
         );
       }
 
@@ -6403,6 +6742,24 @@ function MarkdownDocument({
         );
       }
 
+      const target = href
+        ? resolveWorkspaceDocumentReference(href, currentPath, availableDocuments, workspacePath)
+        : null;
+      if (target) {
+        return (
+          <a
+            {...props}
+            href={href}
+            onClick={(event) => {
+              event.preventDefault();
+              onOpenDocument(target.path, target.anchor);
+            }}
+          >
+            {children}
+          </a>
+        );
+      }
+
       if (href && isExternalUrl(href)) {
         return (
           <a
@@ -6418,36 +6775,11 @@ function MarkdownDocument({
         );
       }
 
-      let targetPath: string | null = null;
-      let targetAnchor: string | null = null;
-      if (href) {
-        const hashIndex = href.indexOf("#");
-        const pathPart = hashIndex === -1 ? href : href.slice(0, hashIndex);
-        targetAnchor = hashIndex === -1 ? null : href.slice(hashIndex + 1) || null;
-        if (pathPart && availableDocuments.includes(pathPart)) {
-          targetPath = pathPart;
-        } else if (pathPart) {
-          const resolved = resolveWorkspacePath(currentPath, pathPart);
-          if (resolved && availableDocuments.includes(resolved)) {
-            targetPath = resolved;
-          }
-        }
-      }
-
-      if (targetPath) {
-        const finalTarget = targetPath;
-        const finalAnchor = targetAnchor;
+      if (isUnresolvedLocalReference(href)) {
         return (
-          <a
-            {...props}
-            href={href}
-            onClick={(event) => {
-              event.preventDefault();
-              onOpenDocument(finalTarget, finalAnchor);
-            }}
-          >
+          <span className="broken-wikilink" title={`Cannot open "${href}" in this workspace`}>
             {children}
-          </a>
+          </span>
         );
       }
 
@@ -7131,6 +7463,11 @@ function safeDecode(value: string) {
 
 function isExternalUrl(value: string | undefined) {
   return Boolean(value && /^[a-z][a-z\d+.-]*:/i.test(value));
+}
+
+function isUnresolvedLocalReference(value: string | undefined) {
+  const trimmed = value?.trim();
+  return Boolean(trimmed && !trimmed.startsWith("#") && !isExternalUrl(trimmed));
 }
 
 export default App;

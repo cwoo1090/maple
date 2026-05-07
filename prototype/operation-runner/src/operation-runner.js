@@ -56,6 +56,7 @@ const EXPLORE_SOURCE_VISUAL_PAGE_LIMIT = 3;
 const EXPLORE_SOURCE_VISUAL_EXPLICIT_PAGE_LIMIT = 5;
 const EXPLORE_SOURCE_VISUAL_SELECTION_TIMEOUT_MS = 60 * 1000;
 const BUILD_WIKI_ALLOWED_PATHS = [
+  "sources/**",
   "wiki/**",
   "index.md",
   "log.md",
@@ -107,6 +108,20 @@ const WORKSPACE_DIRECTORIES = [
   ".aiwiki/chat-threads",
   ".aiwiki/maintain-threads",
 ];
+
+function shouldIgnoreWorkspaceEntry(name) {
+  return name.startsWith(".");
+}
+
+function shouldIgnoreWorkspacePath(relPath, name) {
+  if (!shouldIgnoreWorkspaceEntry(name)) return false;
+  return !(
+    relPath === METADATA_DIR ||
+    relPath.startsWith(`${METADATA_DIR}/`) ||
+    relPath === LEGACY_METADATA_DIR ||
+    relPath.startsWith(`${LEGACY_METADATA_DIR}/`)
+  );
+}
 
 async function main(argv = process.argv.slice(2)) {
   const { command, args, flags } = parseArgs(argv);
@@ -431,7 +446,7 @@ async function collectRewritableFiles(current, files) {
   const entries = await fsp.readdir(current, { withFileTypes: true });
   entries.sort((a, b) => a.name.localeCompare(b.name));
   for (const entry of entries) {
-    if (entry.name === ".DS_Store") continue;
+    if (shouldIgnoreWorkspaceEntry(entry.name)) continue;
     const entryPath = path.join(current, entry.name);
     if (entry.isDirectory()) {
       await collectRewritableFiles(entryPath, files);
@@ -997,7 +1012,13 @@ async function runBuildWiki(workspace, options = {}) {
 
   const { changedFiles, validatedChanges } = await measure("diffValidation", async () => {
     const changedFiles = await diffSnapshot(workspace, snapshot);
-    const validatedChanges = await validateAndRestoreChanges(workspace, snapshot, changedFiles);
+    const validatedChanges = await validateAndRestoreChanges(
+      workspace,
+      snapshot,
+      changedFiles,
+      BUILD_WIKI_ALLOWED_PATHS,
+      { sourceMoveOnly: true },
+    );
     return { changedFiles, validatedChanges };
   });
   const userVisibleChangedFiles = getUserVisibleChangedFiles(validatedChanges);
@@ -1393,7 +1414,12 @@ async function runApplyChat(workspace, options = {}) {
   });
 
   const changedFiles = await diffSnapshot(workspace, snapshot);
-  const validatedChanges = await validateAndRestoreChanges(workspace, snapshot, changedFiles);
+  const validatedChanges = await validateAndRestoreChanges(
+    workspace,
+    snapshot,
+    changedFiles,
+    WIKI_WRITE_ALLOWED_PATHS,
+  );
   const userVisibleChangedFiles = getUserVisibleChangedFiles(validatedChanges);
   const reviewableChangedFiles = getReviewableChangedFiles(userVisibleChangedFiles);
   const completedAt = new Date().toISOString();
@@ -1426,7 +1452,7 @@ async function runApplyChat(workspace, options = {}) {
     workspace,
     startedAt,
     completedAt,
-    allowedPathRules: BUILD_WIKI_ALLOWED_PATHS,
+    allowedPathRules: WIKI_WRITE_ALLOWED_PATHS,
     payloadSummary: {
       scope: payload.scope || "",
       targetPath: payload.targetPath || "",
@@ -2262,12 +2288,14 @@ Required writes:
 - Update schema.md only if the user explicitly asks for a durable wiki rule.
 
 Permission boundary:
-- Allowed write paths: wiki/**, index.md, log.md, schema.md, .aiwiki/**
-- Do not edit, rename, delete, or create files under sources/**.
+- Allowed write paths: sources/**, wiki/**, index.md, log.md, schema.md, .aiwiki/**
+- Source files may be moved or renamed under sources/**, but source file contents must not be edited.
 - Do not edit .aiwiki/source-manifest.json; the runner updates it only after a successful build.
 
 Source handling:
-- Treat sources/ as immutable.
+- Treat source file contents as immutable.
+- Move or rename scoped source files/folders when the user asks, when pending source filenames are temporary or unclear, or when a clearer existing workspace convention is obvious from the source.
+- If you move or rename a source, cite the new source path in generated wiki pages and update existing wiki citations, index.md, and log.md references as needed.
 - Read only the scoped sources first; inspect existing wiki pages only when needed.
 - Use extracted text as the complete source coverage for PDF/PPTX files.
 - Use attached contact sheets and selected slide images only as visual context; not every rendered page image is attached.
@@ -2283,6 +2311,7 @@ Finish protocol:
 - Run at most one concise verification command only if needed.
 - The Maple runner validates paths, changed files, and report state after you exit.
 - Once required files are written, provide a short final summary and stop.
+- In the final summary, briefly name the main sources handled, the major wiki pages created or updated, and anything the user should review.
 `;
 
   if (workspaceContext) {
@@ -4351,7 +4380,9 @@ async function validateAndRestoreChanges(
   options = {},
 ) {
   const results = [];
-  const sourceMoveOnlyValid = options.sourceMoveOnly
+  const protectsSourceContents =
+    options.sourceMoveOnly === true || allowedRules.includes("sources/**");
+  const sourceMoveOnlyValid = protectsSourceContents
     ? await sourceContentMultisetMatchesSnapshot(workspace, snapshot)
     : true;
 
@@ -4360,7 +4391,7 @@ async function validateAndRestoreChanges(
     if (allowed && isAllowedPath(change.path, options.forbiddenPathRules || [])) {
       allowed = false;
     }
-    if (allowed && options.sourceMoveOnly && change.path.startsWith("sources/")) {
+    if (allowed && protectsSourceContents && change.path.startsWith("sources/")) {
       allowed = sourceMoveOnlyValid && change.status !== "modified";
     }
     const result = {
@@ -4551,10 +4582,9 @@ async function walkFiles(root, current, visitor) {
   names.sort();
 
   for (const name of names) {
-    if (name === ".DS_Store") continue;
-
     const absolutePath = path.join(current, name);
     const relPath = toPosixRelative(root, absolutePath);
+    if (shouldIgnoreWorkspacePath(relPath, name)) continue;
     if (isRunnerMetadataPath(relPath)) continue;
 
     const stat = await fsp.lstat(absolutePath);
@@ -4572,10 +4602,9 @@ async function copyFilteredDirectory(sourceRoot, targetRoot, workspaceRoot) {
   names.sort();
 
   for (const name of names) {
-    if (name === ".DS_Store") continue;
-
     const sourcePath = path.join(sourceRoot, name);
     const relPath = toPosixRelative(workspaceRoot, sourcePath);
+    if (shouldIgnoreWorkspacePath(relPath, name)) continue;
     if (isRunnerMetadataPath(relPath)) continue;
 
     const targetPath = path.join(targetRoot, name);

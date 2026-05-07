@@ -37,6 +37,7 @@ struct WorkspaceState {
     log_md: Option<String>,
     schema_md: Option<String>,
     report_md: Option<String>,
+    last_operation_message: Option<String>,
     root_files: Vec<String>,
     source_files: Vec<String>,
     wiki_files: Vec<String>,
@@ -53,6 +54,7 @@ impl WorkspaceState {
             log_md: None,
             schema_md: None,
             report_md: None,
+            last_operation_message: None,
             root_files: Vec::new(),
             source_files: Vec::new(),
             wiki_files: Vec::new(),
@@ -1934,19 +1936,20 @@ fn read_text_tail(path: &Path, max_bytes: u64) -> Result<Option<String>, String>
         .metadata()
         .map_err(|error| format!("Failed to stat {}: {error}", path.display()))?
         .len();
+    let starts_mid_file = len > max_bytes;
     if len > max_bytes {
         file.seek(SeekFrom::Start(len - max_bytes))
             .map_err(|error| format!("Failed to seek {}: {error}", path.display()))?;
     }
-    let mut text = String::new();
-    file.read_to_string(&mut text)
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
         .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
-    if len > max_bytes {
-        if let Some(index) = text.find('\n') {
-            text = text[index + 1..].to_string();
+    if starts_mid_file {
+        if let Some(index) = bytes.iter().position(|byte| *byte == b'\n') {
+            bytes.drain(..=index);
         }
     }
-    Ok(Some(text))
+    Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
 }
 
 fn feed_event(
@@ -2766,9 +2769,10 @@ async fn read_workspace_operation_progress(
         .as_deref()
         .and_then(|id| read_operation_report(&workspace, id))
         .is_some();
-    let running = marker
+    let marker_process_running = marker
         .as_ref()
-        .is_some_and(|marker| !report_exists && running_marker_process_is_running(marker));
+        .is_some_and(running_marker_process_is_running);
+    let running = marker_process_running;
     let error = if marker.is_some() && !report_exists && !running {
         Some("Operation stopped before writing a report.".to_string())
     } else {
@@ -2822,9 +2826,10 @@ async fn read_chat_run_progress(
     };
 
     let report_exists = read_explore_chat_report(&workspace, &run_id).is_some();
-    let running = marker
+    let marker_process_running = marker
         .as_ref()
-        .is_some_and(|marker| !report_exists && running_marker_process_is_running(marker));
+        .is_some_and(running_marker_process_is_running);
+    let running = marker_process_running;
     let error = if marker.is_some() && !report_exists && !running {
         Some("Explore Chat stopped before writing a report.".to_string())
     } else {
@@ -4803,6 +4808,8 @@ fn load_state_at(workspace: &Path) -> Result<WorkspaceState, String> {
         .and_then(|relative| {
             read_text_if_exists(&resolve_existing_workspace_path(workspace, relative))
         });
+    let last_operation_message = changed_marker_operation_id(changed_marker.as_ref())
+        .and_then(|operation_id| read_operation_last_message(workspace, &operation_id));
 
     Ok(WorkspaceState {
         workspace_path: workspace.display().to_string(),
@@ -4816,6 +4823,7 @@ fn load_state_at(workspace: &Path) -> Result<WorkspaceState, String> {
         log_md: read_text_if_exists(&workspace.join("log.md")),
         schema_md: read_text_if_exists(&workspace.join("schema.md")),
         report_md,
+        last_operation_message,
         root_files: list_root_markdown_files(workspace)?,
         source_files: list_source_files(workspace)?,
         wiki_files: list_wiki_files(workspace)?,
@@ -5185,7 +5193,7 @@ fn collect_files_with_prefix(
 }
 
 fn should_hide_workspace_file(name: &str) -> bool {
-    name == ".DS_Store"
+    name.starts_with('.')
 }
 
 #[cfg(test)]
@@ -5193,10 +5201,12 @@ mod tests {
     use super::{
         chat_thread_summary, chat_threads_dir, compose_maintain_operation_instruction,
         ensure_maintain_thread_task_matches, extract_partial_answer_from_events,
+        load_state_at,
         maintain_operation_assistant_text, maintain_operation_user_text, make_chat_thread,
         make_maintain_thread, normalize_operation_events, read_requested_or_new_chat_thread,
-        refresh_maintain_operation_messages, refresh_streaming_messages, shell_single_quote,
-        terminal_command_script, thread_activity_context, ChatThreadMessage, ThreadFileKind,
+        read_text_tail, refresh_maintain_operation_messages, refresh_streaming_messages,
+        shell_single_quote, terminal_command_script, thread_activity_context, ChatThreadMessage,
+        ThreadFileKind,
     };
     use std::{
         fs,
@@ -5235,13 +5245,22 @@ mod tests {
         operation_id: &str,
         changed_files: serde_json::Value,
     ) {
+        write_changed_marker_with_type(workspace, operation_id, "apply-chat", changed_files);
+    }
+
+    fn write_changed_marker_with_type(
+        workspace: &Path,
+        operation_id: &str,
+        operation_type: &str,
+        changed_files: serde_json::Value,
+    ) {
         let changed_dir = workspace.join(".aiwiki").join("changed");
         fs::create_dir_all(&changed_dir).unwrap();
         fs::write(
             changed_dir.join("last-operation.json"),
             serde_json::to_vec_pretty(&serde_json::json!({
                 "operationId": operation_id,
-                "operationType": "apply-chat",
+                "operationType": operation_type,
                 "status": "completed",
                 "changedFiles": changed_files
             }))
@@ -5273,6 +5292,49 @@ mod tests {
             created_at: "1000".to_string(),
             completed_at: Some("1000".to_string()),
         }
+    }
+
+    #[test]
+    fn read_text_tail_skips_partial_utf8_line() {
+        let workspace = unique_test_workspace("maple-read-text-tail");
+        fs::create_dir_all(&workspace).unwrap();
+        let path = workspace.join("events.jsonl");
+        let text = "first event with 한글\nsecond event\n";
+        let hangul_index = text.find('한').unwrap();
+        let max_bytes = text.len() as u64 - hangul_index as u64 - 1;
+        fs::write(&path, text).unwrap();
+
+        let tail = read_text_tail(&path, max_bytes).unwrap().unwrap();
+
+        assert_eq!(tail, "second event\n");
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn workspace_state_hides_dot_prefixed_files_and_directories() {
+        let workspace = unique_test_workspace("maple-hide-dotfiles");
+        fs::create_dir_all(workspace.join("sources/.aiwiki/chat-threads")).unwrap();
+        fs::create_dir_all(workspace.join("wiki/.aiwiki")).unwrap();
+        fs::write(workspace.join("index.md"), "# Index\n").unwrap();
+        fs::write(workspace.join(".hidden.md"), "# Hidden\n").unwrap();
+        fs::write(workspace.join("sources/notes.md"), "# Notes\n").unwrap();
+        fs::write(workspace.join("sources/.hidden.md"), "# Hidden source\n").unwrap();
+        fs::write(
+            workspace.join("sources/.aiwiki/chat-threads/thread.json"),
+            "{}\n",
+        )
+        .unwrap();
+        fs::write(workspace.join("wiki/page.md"), "# Page\n").unwrap();
+        fs::write(workspace.join("wiki/.aiwiki/state.json"), "{}\n").unwrap();
+
+        let state = load_state_at(&workspace).unwrap();
+
+        assert_eq!(state.root_files, vec!["index.md"]);
+        assert_eq!(state.source_files, vec!["sources/notes.md"]);
+        assert_eq!(state.wiki_files, vec!["wiki/page.md"]);
+
+        let _ = fs::remove_dir_all(workspace);
     }
 
     fn discussion_message(role: &str, text: &str) -> ChatThreadMessage {
@@ -5455,6 +5517,67 @@ not-json
         );
 
         assert!(text.contains("Converted figure source links"));
+    }
+
+    #[test]
+    fn workspace_state_reads_last_operation_message_from_current_marker() {
+        let workspace = unique_test_workspace("maple-build-last-message");
+        fs::create_dir_all(&workspace).unwrap();
+        write_changed_marker_with_type(
+            &workspace,
+            "op-build",
+            "build-wiki",
+            serde_json::json!([
+                {
+                    "path": "wiki/summaries/lecture-05.md",
+                    "status": "modified",
+                    "allowed": true,
+                    "restored": false
+                }
+            ]),
+        );
+        write_operation_last_message(
+            &workspace,
+            "op-build",
+            "Built lecture 5 summary and linked the key concepts.\n",
+        );
+
+        let state = load_state_at(&workspace).unwrap();
+
+        assert_eq!(
+            state.last_operation_message.as_deref(),
+            Some("Built lecture 5 summary and linked the key concepts.")
+        );
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn workspace_state_omits_missing_or_empty_last_operation_message() {
+        let workspace = unique_test_workspace("maple-build-empty-last-message");
+        fs::create_dir_all(&workspace).unwrap();
+        write_changed_marker_with_type(
+            &workspace,
+            "op-build",
+            "build-wiki",
+            serde_json::json!([
+                {
+                    "path": "wiki/summaries/lecture-05.md",
+                    "status": "modified",
+                    "allowed": true,
+                    "restored": false
+                }
+            ]),
+        );
+
+        let state = load_state_at(&workspace).unwrap();
+        assert_eq!(state.last_operation_message.as_deref(), None);
+
+        write_operation_last_message(&workspace, "op-build", "  \n");
+        let state = load_state_at(&workspace).unwrap();
+        assert_eq!(state.last_operation_message.as_deref(), None);
+
+        let _ = fs::remove_dir_all(workspace);
     }
 
     #[test]

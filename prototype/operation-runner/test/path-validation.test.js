@@ -95,9 +95,51 @@ test("allows Build Wiki write targets", () => {
   assert.equal(isAllowedPath(".aiwiki/extracted/sample.json"), true);
 });
 
-test("forbids source edits during Build Wiki", () => {
-  assert.equal(isAllowedPath("sources/sample-note.md"), false);
-  assert.equal(isAllowedPath("sources/new-source.md"), false);
+test("allows source move targets during Build Wiki", () => {
+  assert.equal(isAllowedPath("sources/sample-note.md"), true);
+  assert.equal(isAllowedPath("sources/new-source.md"), true);
+});
+
+test("Build Wiki restores source content edits", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "maple-build-source-guard-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  await fs.mkdir(path.join(workspace, "sources"), { recursive: true });
+  await fs.writeFile(path.join(workspace, "sources", "a.md"), "alpha\n");
+
+  const snapshot = await createSnapshot(workspace, "test-op");
+  await fs.writeFile(path.join(workspace, "sources", "a.md"), "changed\n");
+
+  const changes = await diffSnapshot(workspace, snapshot);
+  const validated = await validateAndRestoreChanges(workspace, snapshot, changes);
+  const sourceChange = validated.find((change) => change.path === "sources/a.md");
+
+  assert.equal(sourceChange?.allowed, false);
+  assert.equal(sourceChange?.restored, true);
+  assert.equal(await fs.readFile(path.join(workspace, "sources", "a.md"), "utf8"), "alpha\n");
+});
+
+test("Build Wiki allows move-only source renames with unchanged hashes", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "maple-build-source-move-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  await fs.mkdir(path.join(workspace, "sources"), { recursive: true });
+  await fs.writeFile(path.join(workspace, "sources", "a.md"), "alpha\n");
+
+  const snapshot = await createSnapshot(workspace, "test-op");
+  await fs.mkdir(path.join(workspace, "sources", "week-1"), { recursive: true });
+  await fs.rename(
+    path.join(workspace, "sources", "a.md"),
+    path.join(workspace, "sources", "week-1", "a.md"),
+  );
+
+  const changes = await diffSnapshot(workspace, snapshot);
+  const validated = await validateAndRestoreChanges(workspace, snapshot, changes);
+
+  assert.equal(validated.every((change) => change.allowed), true);
+  assert.equal(validated.some((change) => change.restored), false);
+  assert.equal(
+    await fs.readFile(path.join(workspace, "sources", "week-1", "a.md"), "utf8"),
+    "alpha\n",
+  );
 });
 
 test("restores provider edits to the source manifest", async (t) => {
@@ -792,6 +834,26 @@ test("marks current sources as an existing wiki baseline", async (t) => {
   assert.match(await fs.readFile(path.join(workspace, "log.md"), "utf8"), /Existing wiki baseline/);
 });
 
+test("source status ignores dot-prefixed files and directories under sources", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "maple-source-hidden-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  await fs.mkdir(path.join(workspace, "sources", ".aiwiki", "chat-threads"), { recursive: true });
+  await fs.writeFile(path.join(workspace, "sources", "a.md"), "alpha\n");
+  await fs.writeFile(path.join(workspace, "sources", ".hidden.md"), "hidden\n");
+  await fs.writeFile(
+    path.join(workspace, "sources", ".aiwiki", "chat-threads", "thread.json"),
+    "{}\n",
+  );
+
+  const status = await getSourceStatus(workspace);
+
+  assert.equal(status.pendingCount, 1);
+  assert.deepEqual(
+    status.files.map((file) => file.path),
+    ["sources/a.md"],
+  );
+});
+
 test("infers source status from legacy successful Build Wiki report", async (t) => {
   const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "maple-source-infer-"));
   t.after(() => fs.rm(workspace, { recursive: true, force: true }));
@@ -905,6 +967,10 @@ test("Build Wiki prompt is a thin operation brief", async (t) => {
   assert.match(prompt, /sources\/a\.md/);
   assert.doesNotMatch(prompt, /raw\/a\.md/);
   assert.match(prompt, /Focus on exam review/);
+  assert.match(prompt, /Source files may be moved or renamed under sources\/\*\*/);
+  assert.match(prompt, /source file contents must not be edited/);
+  assert.match(prompt, /major wiki pages created or updated/);
+  assert.match(prompt, /anything the user should review/);
   assert.doesNotMatch(prompt, /Math and equations:/);
   assert.doesNotMatch(prompt, /Use Obsidian-style wikilinks/);
 });

@@ -1607,6 +1607,15 @@ button.tree-name-clickable {
   opacity: 0.85;
 }
 
+.banner-dismissible {
+  position: relative;
+  padding-right: 42px;
+}
+
+.banner-message {
+  display: block;
+}
+
 .banner code {
   background: rgba(0, 0, 0, 0.06);
   padding: 1px 5px;
@@ -1630,6 +1639,34 @@ button.tree-name-clickable {
 .banner button:hover:not(:disabled) {
   background: currentColor;
   color: var(--bg);
+}
+
+.banner .banner-dismiss {
+  position: absolute;
+  top: 7px;
+  right: 7px;
+  display: inline-grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  color: inherit;
+  opacity: 0.72;
+}
+
+.banner .banner-dismiss:hover:not(:disabled),
+.banner .banner-dismiss:focus-visible {
+  background: rgba(0, 0, 0, 0.08);
+  color: inherit;
+  opacity: 1;
+}
+
+.banner .banner-dismiss:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 1px;
 }
 
 .banner-info {
@@ -1849,6 +1886,10 @@ button.tree-name-clickable {
 
 .maintain-message-note {
   color: var(--text-faint);
+}
+
+.maintain-thinking {
+  margin: -2px 0 2px 2px;
 }
 
 .maintain-empty-prompt {
@@ -2149,6 +2190,18 @@ button.tree-name-clickable {
   border-color: var(--accent-border);
   background: var(--accent-bg);
   color: var(--accent);
+}
+
+.maintain-ask-only.active {
+  border-color: var(--accent-border);
+  background: var(--accent-bg);
+  color: var(--accent);
+}
+
+.maintain-ask-only:focus-visible {
+  outline: none;
+  border-color: var(--accent-border);
+  box-shadow: 0 0 0 2px var(--accent-bg);
 }
 
 .maintain-primary {
@@ -2742,6 +2795,121 @@ button.tree-name-clickable {
   overflow: hidden;
   margin: 8px 0;
   background: rgba(255, 255, 255, 0.78);
+}
+
+.build-summary-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  max-height: min(42vh, 420px);
+  overflow: hidden;
+  margin: 8px 0;
+  padding: 9px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.78);
+  color: var(--text);
+}
+
+.build-summary-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+
+.build-summary-title-block {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.build-summary-title {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 12.5px;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.build-summary-state {
+  overflow: hidden;
+  color: var(--success);
+  font-size: 11.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.build-summary-dismiss {
+  flex: 0 0 auto;
+  display: inline-grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-muted);
+}
+
+.build-summary-dismiss:hover {
+  border-color: var(--border);
+  color: var(--text);
+  background: var(--bg-elevated);
+}
+
+.build-summary-body {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-right: 4px;
+  color: var(--text);
+  font-size: 12.5px;
+  line-height: 1.5;
+  scrollbar-gutter: stable;
+}
+
+.build-summary-body > :first-child {
+  margin-top: 0;
+}
+
+.build-summary-body > :last-child {
+  margin-bottom: 0;
+}
+
+.build-summary-body p,
+.build-summary-body ul,
+.build-summary-body ol {
+  margin: 0 0 8px;
+}
+
+.build-summary-body ul,
+.build-summary-body ol {
+  padding-left: 18px;
+}
+
+.build-summary-body li + li {
+  margin-top: 4px;
+}
+
+.build-summary-body a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.build-summary-body a:hover {
+  text-decoration: underline;
+}
+
+.build-summary-body code {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  font-size: 11.5px;
 }
 
 .explore-chat-msg .operation-feed-panel,
