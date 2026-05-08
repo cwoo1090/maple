@@ -1546,6 +1546,9 @@ function App() {
   useEffect(() => {
     if (aiSetupPromptReason && activeProviderReady) {
       setAiSetupPromptReason(null);
+      setError((current) =>
+        current?.includes("setup is needed before") ? null : current,
+      );
     }
   }, [activeProviderReady, aiSetupPromptReason]);
   const maintainCanAskOnly = Boolean(
@@ -3291,7 +3294,11 @@ function App() {
       if (updated.models[provider] !== modelId) {
         updated = await invoke<AppSettings>("set_model", { provider, modelId });
       }
-      setAppSettings({ provider: updated.provider, models: { ...updated.models } });
+      setAppSettings({
+        provider: updated.provider,
+        models: { ...updated.models },
+        providerPaths: { ...updated.providerPaths },
+      });
     } catch (err) {
       setError(`Failed to update model: ${String(err)}`);
     }
@@ -3312,7 +3319,11 @@ function App() {
       if (updated.models[provider] !== modelId) {
         updated = await invoke<AppSettings>("set_model", { provider, modelId });
       }
-      setAppSettings({ provider: updated.provider, models: { ...updated.models } });
+      setAppSettings({
+        provider: updated.provider,
+        models: { ...updated.models },
+        providerPaths: { ...updated.providerPaths },
+      });
     } catch (err) {
       setError(`Failed to update build model: ${String(err)}`);
     }

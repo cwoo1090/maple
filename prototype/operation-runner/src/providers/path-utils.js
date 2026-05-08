@@ -183,13 +183,32 @@ function userBinDirs(baseEnv = process.env) {
 
 function buildPathEnv(basePath = process.env.PATH || "", baseEnv = process.env) {
   const parts = [];
+  for (const name of ["codex", "claude"]) {
+    const override = providerOverridePath(name, baseEnv);
+    if (override) pushPathPart(parts, path.dirname(override), baseEnv);
+  }
   pushPathParts(parts, basePath, baseEnv);
   for (const dir of userBinDirs(baseEnv)) pushPathPart(parts, dir, baseEnv);
   for (const dir of COMMON_BIN_DIRS) pushPathPart(parts, dir, baseEnv);
   return parts.join(path.delimiter);
 }
 
+function providerOverrideEnvName(name) {
+  if (name === "codex") return "MAPLE_CODEX_PATH";
+  if (name === "claude") return "MAPLE_CLAUDE_PATH";
+  return null;
+}
+
+function providerOverridePath(name, baseEnv = process.env) {
+  const envName = providerOverrideEnvName(name);
+  const value = envName ? baseEnv[envName] : "";
+  return value && path.basename(value) === name ? value : null;
+}
+
 function findBinary(name, baseEnv = process.env) {
+  const override = providerOverridePath(name, baseEnv);
+  if (override) return override;
+
   const pathEnv = buildPathEnv(baseEnv.PATH || "", baseEnv);
   for (const dir of pathEnv.split(path.delimiter)) {
     const candidate = path.join(dir, name);
@@ -214,4 +233,5 @@ module.exports = {
   buildPathEnv,
   findBinary,
   homeDir,
+  providerOverridePath,
 };

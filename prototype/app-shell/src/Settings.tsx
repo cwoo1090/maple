@@ -3,22 +3,19 @@ import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { Minus, Plus, RotateCcw } from "lucide-react";
 import {
-  parseProviderStatus,
+  ProviderCandidatePanel,
+  providerStatusFromReport,
   ProviderDiagnostics,
+  helperName,
   providerSetupMessage,
   providerSetupStatus,
+  singleReadyProviderCandidatePath,
   type AppSettings,
   type NodeRuntimeStatus,
+  type ProviderCheckReport,
   type ProviderInfo,
   type ProviderStatus,
 } from "./ProviderSetup";
-
-type RunnerOutput = {
-  success: boolean;
-  code: number | null;
-  stdout: string;
-  stderr: string;
-};
 
 function sleep(ms: number) {
   return new Promise<void>((resolve) => window.setTimeout(resolve, ms));
@@ -50,6 +47,9 @@ export function Settings({
   const [statuses, setStatuses] = useState<Record<string, ProviderStatus | null>>({});
   const [providerCheckErrors, setProviderCheckErrors] = useState<Record<string, string | null>>({});
   const [refreshing, setRefreshing] = useState<Record<string, boolean>>({});
+  const [candidatePanelsOpen, setCandidatePanelsOpen] = useState<Record<string, boolean>>({});
+  const [savingPaths, setSavingPaths] = useState<Record<string, string | null>>({});
+  const [clearingPaths, setClearingPaths] = useState<Record<string, boolean>>({});
   const [error, setError] = useState<string | null>(null);
 
   const refreshRuntime = useCallback(async () => {
@@ -70,27 +70,14 @@ export function Settings({
     setRefreshing((prev) => ({ ...prev, [name]: true }));
     setProviderCheckErrors((prev) => ({ ...prev, [name]: null }));
     try {
-      const result = await invoke<RunnerOutput>("check_provider", { name });
-      if (!result.success) {
-        const detail = (result.stderr || result.stdout).trim();
-        setStatuses((prev) => ({ ...prev, [name]: null }));
-        setProviderCheckErrors((prev) => ({
-          ...prev,
-          [name]: detail || `Command exited with code ${result.code ?? "unknown"}.`,
-        }));
-        return null;
+      const report = await invoke<ProviderCheckReport>("check_provider", { name });
+      const status = providerStatusFromReport(report);
+      setStatuses((prev) => ({ ...prev, [name]: status }));
+      setProviderCheckErrors((prev) => ({ ...prev, [name]: status.checkError }));
+      if (status.choiceRequired) {
+        setCandidatePanelsOpen((prev) => ({ ...prev, [name]: true }));
       }
-      const parsed = parseProviderStatus(result.stdout);
-      if (!parsed) {
-        setStatuses((prev) => ({ ...prev, [name]: null }));
-        setProviderCheckErrors((prev) => ({
-          ...prev,
-          [name]: "Maple could not read the provider status returned by the local helper.",
-        }));
-        return null;
-      }
-      setStatuses((prev) => ({ ...prev, [name]: parsed }));
-      return parsed;
+      return status;
     } catch (err) {
       setStatuses((prev) => ({ ...prev, [name]: null }));
       setProviderCheckErrors((prev) => ({ ...prev, [name]: String(err) }));
@@ -146,6 +133,76 @@ export function Settings({
     }
   }
 
+  async function handleFindInstalledHelper(name: string) {
+    setRefreshing((prev) => ({ ...prev, [name]: true }));
+    setError(null);
+    try {
+      const report = await invoke<ProviderCheckReport>("discover_provider_helpers", { name });
+      let status = providerStatusFromReport(report);
+      const autoSavePath = singleReadyProviderCandidatePath(status);
+      if (autoSavePath) {
+        setSavingPaths((prev) => ({ ...prev, [name]: autoSavePath }));
+        try {
+          const savedReport = await invoke<ProviderCheckReport>("save_provider_path", {
+            name,
+            path: autoSavePath,
+          });
+          status = providerStatusFromReport(savedReport);
+          const updated = await invoke<AppSettings>("get_settings");
+          setSettings(updated);
+        } catch (saveErr) {
+          setError(`Found a working helper, but failed to save it: ${String(saveErr)}`);
+        } finally {
+          setSavingPaths((prev) => ({ ...prev, [name]: null }));
+        }
+      }
+      setStatuses((prev) => ({ ...prev, [name]: status }));
+      setProviderCheckErrors((prev) => ({ ...prev, [name]: status.checkError }));
+      setCandidatePanelsOpen((prev) => ({ ...prev, [name]: true }));
+    } catch (err) {
+      setProviderCheckErrors((prev) => ({ ...prev, [name]: String(err) }));
+      setCandidatePanelsOpen((prev) => ({ ...prev, [name]: true }));
+    } finally {
+      setRefreshing((prev) => ({ ...prev, [name]: false }));
+    }
+  }
+
+  async function handleSaveProviderPath(name: string, path: string) {
+    setSavingPaths((prev) => ({ ...prev, [name]: path }));
+    setError(null);
+    try {
+      const report = await invoke<ProviderCheckReport>("save_provider_path", { name, path });
+      const status = providerStatusFromReport(report);
+      setStatuses((prev) => ({ ...prev, [name]: status }));
+      setProviderCheckErrors((prev) => ({ ...prev, [name]: status.checkError }));
+      setCandidatePanelsOpen((prev) => ({ ...prev, [name]: true }));
+      const updated = await invoke<AppSettings>("get_settings");
+      setSettings(updated);
+    } catch (err) {
+      setError(`Failed to save helper path: ${String(err)}`);
+    } finally {
+      setSavingPaths((prev) => ({ ...prev, [name]: null }));
+    }
+  }
+
+  async function handleClearProviderPath(name: string) {
+    setClearingPaths((prev) => ({ ...prev, [name]: true }));
+    setError(null);
+    try {
+      const report = await invoke<ProviderCheckReport>("clear_provider_path", { name });
+      const status = providerStatusFromReport(report);
+      setStatuses((prev) => ({ ...prev, [name]: status }));
+      setProviderCheckErrors((prev) => ({ ...prev, [name]: status.checkError }));
+      setCandidatePanelsOpen((prev) => ({ ...prev, [name]: true }));
+      const updated = await invoke<AppSettings>("get_settings");
+      setSettings(updated);
+    } catch (err) {
+      setError(`Failed to forget helper path: ${String(err)}`);
+    } finally {
+      setClearingPaths((prev) => ({ ...prev, [name]: false }));
+    }
+  }
+
   async function handleOpenNodeDownload() {
     try {
       await openUrl(runtimeStatus?.installUrl || "https://nodejs.org/en/download");
@@ -193,7 +250,10 @@ export function Settings({
   async function handleLogin(name: string) {
     try {
       await invoke("login_provider", { name });
-      void pollStatus(name, (status) => Boolean(status?.installed && status.loggedIn));
+      void pollStatus(
+        name,
+        (status) => Boolean(status?.installed && status.loggedIn && !status.choiceRequired),
+      );
     } catch (err) {
       setError(`Failed to launch sign-in: ${String(err)}`);
     }
@@ -372,6 +432,16 @@ export function Settings({
               "settings",
             );
             const ready = setupStatus === "provider_ready";
+            const providerMissing = setupStatus === "provider_missing";
+            const canFindHelper =
+              Boolean(runtimeStatus?.nodeInstalled && runtimeStatus.nodeVersionSupported) &&
+              [
+                "npm_missing",
+                "provider_missing",
+                "provider_logged_out",
+                "provider_choice_required",
+                "provider_check_failed",
+              ].includes(setupStatus);
 
             return (
               <div
@@ -446,6 +516,28 @@ export function Settings({
                       ) : null}
                     </div>
                     <div className="provider-row-actions">
+                      {providerMissing ? (
+                        <button
+                          type="button"
+                          className="provider-row-primary"
+                          onClick={() => void handleFindInstalledHelper(provider.name)}
+                          disabled={isRefreshing}
+                        >
+                          {isRefreshing ? "Finding..." : `Find installed ${helperName(provider)}`}
+                        </button>
+                      ) : null}
+                      {providerMissing ? (
+                        <button
+                          type="button"
+                          onClick={() => handleInstall(provider.name)}
+                          disabled={providerInstallBlocked || isRefreshing}
+                          title={
+                            providerInstallBlocked ? "Finish Node.js/npm setup first" : undefined
+                          }
+                        >
+                          {`Install ${helperName(provider)}`}
+                        </button>
+                      ) : null}
                       {setupMessage.actionKind === "node" ? (
                         <button
                           type="button"
@@ -489,8 +581,28 @@ export function Settings({
                       >
                         {isRefreshing ? "Checking..." : "Recheck"}
                       </button>
+                      {canFindHelper && !providerMissing ? (
+                        <button
+                          type="button"
+                          onClick={() => void handleFindInstalledHelper(provider.name)}
+                          disabled={isRefreshing}
+                        >
+                          {isRefreshing ? "Finding..." : "Find installed helper"}
+                        </button>
+                      ) : null}
                     </div>
                   </div>
+                ) : null}
+
+                {candidatePanelsOpen[provider.name] ? (
+                  <ProviderCandidatePanel
+                    provider={provider}
+                    status={status ?? null}
+                    savingPath={savingPaths[provider.name] ?? null}
+                    clearingPath={Boolean(clearingPaths[provider.name])}
+                    onUsePath={(path) => void handleSaveProviderPath(provider.name, path)}
+                    onClearPath={() => void handleClearProviderPath(provider.name)}
+                  />
                 ) : null}
 
                 {needsDiagnostics ? (

@@ -95,7 +95,7 @@ struct ProviderStatusCache {
 #[derive(Clone)]
 struct CachedProviderStatus {
     checked_at: Instant,
-    output: RunnerOutput,
+    report: ProviderCheckReport,
 }
 
 const PROVIDER_STATUS_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
@@ -108,12 +108,15 @@ const EXPLORE_CHAT_OPERATION: &str = "explore-chat";
 const OPERATION_START_GRACE_MS: u128 = 15_000;
 const RUNNER_ROOT_ENV: &str = "MAPLE_RUNNER_ROOT";
 const REQUIRED_NODE_MAJOR: u32 = 20;
+const PROVIDER_COMMAND_TIMEOUT_MS: u64 = 8_000;
 
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct AppSettings {
     provider: String,
     models: HashMap<String, String>,
+    #[serde(default)]
+    provider_paths: HashMap<String, String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -273,6 +276,7 @@ fn default_settings() -> AppSettings {
     AppSettings {
         provider: "codex".to_string(),
         models,
+        provider_paths: HashMap::new(),
     }
 }
 
@@ -290,6 +294,9 @@ fn normalize_settings(mut settings: AppSettings) -> AppSettings {
             .models
             .insert("claude".to_string(), "claude-sonnet-4-6".to_string());
     }
+    settings
+        .provider_paths
+        .retain(|provider, path| is_known_provider(provider) && !path.trim().is_empty());
     settings
 }
 
@@ -319,7 +326,64 @@ fn write_settings(app: &AppHandle, settings: &AppSettings) -> Result<(), String>
     let path = settings_path(app)?;
     let json = serde_json::to_vec_pretty(settings)
         .map_err(|error| format!("Failed to serialize settings: {error}"))?;
-    fs::write(&path, json).map_err(|error| format!("Failed to write settings: {error}"))
+    fs::write(&path, json).map_err(|error| format!("Failed to write settings: {error}"))?;
+    apply_provider_path_env(settings);
+    Ok(())
+}
+
+fn is_known_provider(name: &str) -> bool {
+    matches!(name, "codex" | "claude")
+}
+
+fn provider_binary_name(name: &str) -> Result<&'static str, String> {
+    match name {
+        "codex" => Ok("codex"),
+        "claude" => Ok("claude"),
+        other => Err(format!("Unknown provider: {other}")),
+    }
+}
+
+fn provider_env_var(name: &str) -> Result<&'static str, String> {
+    match name {
+        "codex" => Ok("MAPLE_CODEX_PATH"),
+        "claude" => Ok("MAPLE_CLAUDE_PATH"),
+        other => Err(format!("Unknown provider: {other}")),
+    }
+}
+
+fn provider_install_command(name: &str) -> Result<&'static str, String> {
+    match name {
+        "codex" => Ok("npm i -g @openai/codex"),
+        "claude" => Ok("npm i -g @anthropic-ai/claude-code"),
+        other => Err(format!("Unknown provider: {other}")),
+    }
+}
+
+fn provider_login_command(name: &str) -> Result<&'static str, String> {
+    match name {
+        "codex" => Ok("codex login"),
+        "claude" => Ok("claude auth login --claudeai"),
+        other => Err(format!("Unknown provider: {other}")),
+    }
+}
+
+fn apply_provider_path_env(settings: &AppSettings) {
+    for provider in ["codex", "claude"] {
+        let Ok(var_name) = provider_env_var(provider) else {
+            continue;
+        };
+        if let Some(path) = settings
+            .provider_paths
+            .get(provider)
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+        {
+            env::set_var(var_name, path);
+        } else {
+            env::remove_var(var_name);
+        }
+    }
 }
 
 #[tauri::command]
@@ -379,6 +443,90 @@ struct NodeRuntimeStatus {
     node_version: Option<String>,
     npm_version: Option<String>,
     install_url: String,
+    node_candidates: Vec<NodeCandidate>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct NodeCandidate {
+    path: String,
+    version: Option<String>,
+    source: String,
+    supported: bool,
+    selected: bool,
+    error: Option<String>,
+    #[serde(skip)]
+    priority: u8,
+    #[serde(skip)]
+    order: usize,
+}
+
+#[derive(Clone)]
+struct NodePathCandidate {
+    path: PathBuf,
+    source: String,
+    priority: u8,
+    order: usize,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ProviderCandidate {
+    path: String,
+    source: String,
+    saved: bool,
+    exists: bool,
+    runnable: bool,
+    version: Option<String>,
+    logged_in: bool,
+    status_text: Option<String>,
+    warnings: Vec<String>,
+    error: Option<String>,
+    version_output: Option<String>,
+    auth_output: Option<String>,
+    recommended: bool,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ProviderCheckReport {
+    provider: String,
+    saved_path: Option<String>,
+    install_path: Option<String>,
+    version: Option<String>,
+    installed: bool,
+    logged_in: bool,
+    status_text: Option<String>,
+    warnings: Vec<String>,
+    candidates: Vec<ProviderCandidate>,
+    recommended_path: Option<String>,
+    check_error: Option<String>,
+    install_command: String,
+    login_command: String,
+}
+
+#[derive(Clone)]
+struct ProviderPathCandidate {
+    path: PathBuf,
+    source: String,
+    saved: bool,
+}
+
+#[derive(Clone)]
+struct CommandProbe {
+    success: bool,
+    code: Option<i32>,
+    stdout: String,
+    stderr: String,
+    timed_out: bool,
+    start_error: Option<String>,
+}
+
+struct ProviderAuthCheck {
+    logged_in: bool,
+    status_text: Option<String>,
+    warnings: Vec<String>,
+    output: Option<String>,
 }
 
 #[tauri::command]
@@ -448,12 +596,63 @@ async fn check_node_runtime() -> Result<NodeRuntimeStatus, String> {
 
 #[tauri::command]
 async fn check_provider(
+    app: AppHandle,
     name: String,
     cache: State<'_, ProviderStatusCache>,
-) -> Result<RunnerOutput, String> {
-    let output = run_provider_check(&name)?;
-    cache_provider_status(&cache, &name, &output);
-    Ok(output)
+) -> Result<ProviderCheckReport, String> {
+    let report = run_provider_check(&app, &name)?;
+    cache_provider_status(&cache, &name, &report);
+    Ok(report)
+}
+
+#[tauri::command]
+async fn discover_provider_helpers(
+    app: AppHandle,
+    name: String,
+    cache: State<'_, ProviderStatusCache>,
+) -> Result<ProviderCheckReport, String> {
+    provider_binary_name(&name)?;
+    let settings = read_settings(&app);
+    apply_provider_path_env(&settings);
+    let report = build_provider_check_report(&name, &settings);
+    cache_provider_status(&cache, &name, &report);
+    Ok(report)
+}
+
+#[tauri::command]
+async fn save_provider_path(
+    app: AppHandle,
+    name: String,
+    path: String,
+    cache: State<'_, ProviderStatusCache>,
+) -> Result<ProviderCheckReport, String> {
+    let binary = provider_binary_name(&name)?;
+    let path = validate_provider_path(binary, &path)?;
+    let mut settings = read_settings(&app);
+    settings
+        .provider_paths
+        .insert(name.clone(), path.display().to_string());
+    write_settings(&app, &settings)?;
+    invalidate_provider_status(&cache, &name);
+    let report = run_provider_check(&app, &name)?;
+    cache_provider_status(&cache, &name, &report);
+    Ok(report)
+}
+
+#[tauri::command]
+async fn clear_provider_path(
+    app: AppHandle,
+    name: String,
+    cache: State<'_, ProviderStatusCache>,
+) -> Result<ProviderCheckReport, String> {
+    provider_binary_name(&name)?;
+    let mut settings = read_settings(&app);
+    settings.provider_paths.remove(&name);
+    write_settings(&app, &settings)?;
+    invalidate_provider_status(&cache, &name);
+    let report = run_provider_check(&app, &name)?;
+    cache_provider_status(&cache, &name, &report);
+    Ok(report)
 }
 
 #[tauri::command]
@@ -492,16 +691,13 @@ async fn install_provider(
 
 #[tauri::command]
 async fn login_provider(
+    app: AppHandle,
     name: String,
     cache: State<'_, ProviderStatusCache>,
 ) -> Result<RunnerOutput, String> {
-    let cmd = match name.as_str() {
-        "codex" => "codex login",
-        "claude" => "claude auth login --claudeai",
-        other => return Err(format!("Unknown provider: {other}")),
-    };
+    let cmd = login_command_for_settings(&read_settings(&app), &name)?;
     invalidate_provider_status(&cache, &name);
-    open_terminal_with(cmd)
+    open_terminal_with(&cmd)
 }
 
 fn open_terminal_with(command: &str) -> Result<RunnerOutput, String> {
@@ -569,19 +765,62 @@ fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-fn run_provider_check(name: &str) -> Result<RunnerOutput, String> {
-    if let Some(output) = simulated_provider_check(name) {
-        return Ok(output);
+fn validate_provider_path(binary: &str, path: &str) -> Result<PathBuf, String> {
+    let path = PathBuf::from(path.trim());
+    if !path.is_absolute() {
+        return Err("Choose an absolute helper path.".to_string());
     }
-
-    run_runner_with_args(&[
-        "check".to_string(),
-        "--provider".to_string(),
-        name.to_string(),
-    ])
+    if path.file_name().and_then(|name| name.to_str()) != Some(binary) {
+        return Err(format!("Expected a {binary} executable path."));
+    }
+    if !path.is_file() {
+        return Err(format!(
+            "{} does not exist or is not a file.",
+            path.display()
+        ));
+    }
+    Ok(path)
 }
 
-fn simulated_provider_check(name: &str) -> Option<RunnerOutput> {
+fn login_command_for_settings(settings: &AppSettings, name: &str) -> Result<String, String> {
+    let binary = provider_binary_name(name)?;
+    if let Some(path) = settings
+        .provider_paths
+        .get(name)
+        .filter(|path| !path.is_empty())
+    {
+        let path = shell_single_quote(path);
+        return match name {
+            "codex" => Ok(format!("{path} login")),
+            "claude" => Ok(format!("{path} auth login --claudeai")),
+            _ => Err(format!("Unknown provider: {name}")),
+        };
+    }
+    let command = provider_login_command(name)?;
+    if command.starts_with(binary) {
+        Ok(command.to_string())
+    } else {
+        Err(format!("Invalid login command for {name}."))
+    }
+}
+
+fn run_provider_check(app: &AppHandle, name: &str) -> Result<ProviderCheckReport, String> {
+    provider_binary_name(name)?;
+    let settings = read_settings(app);
+    apply_provider_path_env(&settings);
+    let saved_path = settings.provider_paths.get(name).cloned();
+    if saved_path.is_none() {
+        if let Some(report) = simulated_provider_check(name, saved_path)? {
+            return Ok(report);
+        }
+    }
+    Ok(build_provider_check_report(name, &settings))
+}
+
+fn simulated_provider_check(
+    name: &str,
+    saved_path: Option<String>,
+) -> Result<Option<ProviderCheckReport>, String> {
     let (
         legacy_missing_env,
         legacy_logged_out_env,
@@ -603,20 +842,29 @@ fn simulated_provider_check(name: &str) -> Option<RunnerOutput> {
             "npm i -g @anthropic-ai/claude-code",
             "claude auth login --claudeai",
         ),
-        _ => return None,
+        _ => return Ok(None),
     };
 
     if env_provider_flag("MAPLE_SIMULATE_PROVIDER_CHECK_FAILED", name)
         || env_flag(legacy_failed_env)
     {
-        return Some(RunnerOutput {
-            success: false,
-            code: Some(1),
-            stdout: String::new(),
-            stderr: format!(
+        return Ok(Some(ProviderCheckReport {
+            provider: name.to_string(),
+            saved_path,
+            install_path: None,
+            version: None,
+            installed: false,
+            logged_in: false,
+            status_text: None,
+            warnings: Vec::new(),
+            candidates: Vec::new(),
+            recommended_path: None,
+            check_error: Some(format!(
                 "Simulated provider check failure for {name}. MAPLE_SIMULATE_PROVIDER_CHECK_FAILED is enabled."
-            ),
-        });
+            )),
+            install_command: install_command.to_string(),
+            login_command: login_command.to_string(),
+        }));
     }
 
     let missing =
@@ -624,40 +872,687 @@ fn simulated_provider_check(name: &str) -> Option<RunnerOutput> {
     let logged_out = env_provider_flag("MAPLE_SIMULATE_PROVIDER_LOGGED_OUT", name)
         || env_flag(legacy_logged_out_env);
     if !missing && !logged_out {
-        return None;
+        return Ok(None);
     }
 
-    let stdout = serde_json::json!({
-        "provider": name,
-        "installed": {
-            "installed": !missing,
-            "path": if missing { Value::Null } else { Value::String(format!("/tmp/maple-simulated/{name}")) },
-            "version": if missing { Value::Null } else { Value::String(format!("{name} simulated")) }
-        },
-        "auth": {
-            "loggedIn": !missing && !logged_out,
-            "statusText": if missing {
-                Value::Null
-            } else if logged_out {
-                Value::String("Not signed in (simulated)".to_string())
-            } else {
-                Value::String("Signed in (simulated)".to_string())
-            },
-            "warnings": []
-        },
-        "installCommand": install_command,
-        "loginCommand": login_command
+    let simulated_path = (!missing).then(|| format!("/tmp/maple-simulated/{name}"));
+    let status_text = if missing {
+        None
+    } else if logged_out {
+        Some("Not signed in (simulated)".to_string())
+    } else {
+        Some("Signed in (simulated)".to_string())
+    };
+    let candidate = simulated_path.as_ref().map(|path| ProviderCandidate {
+        path: path.clone(),
+        source: "simulation".to_string(),
+        saved: false,
+        exists: true,
+        runnable: true,
+        version: Some(format!("{name} simulated")),
+        logged_in: !logged_out,
+        status_text: status_text.clone(),
+        warnings: Vec::new(),
+        error: None,
+        version_output: Some(format!("{name} simulated")),
+        auth_output: status_text.clone(),
+        recommended: !logged_out,
     });
 
-    Some(RunnerOutput {
-        success: true,
-        code: Some(0),
-        stdout: format!(
-            "{}\n",
-            serde_json::to_string_pretty(&stdout).unwrap_or_else(|_| "{}".to_string())
-        ),
-        stderr: String::new(),
+    Ok(Some(ProviderCheckReport {
+        provider: name.to_string(),
+        saved_path,
+        install_path: simulated_path,
+        version: (!missing).then(|| format!("{name} simulated")),
+        installed: !missing,
+        logged_in: !missing && !logged_out,
+        status_text,
+        warnings: Vec::new(),
+        candidates: candidate.into_iter().collect(),
+        recommended_path: if missing || logged_out {
+            None
+        } else {
+            Some(format!("/tmp/maple-simulated/{name}"))
+        },
+        check_error: None,
+        install_command: install_command.to_string(),
+        login_command: login_command.to_string(),
+    }))
+}
+
+fn build_provider_check_report(name: &str, settings: &AppSettings) -> ProviderCheckReport {
+    let install_command = provider_install_command(name).unwrap_or("").to_string();
+    let login_command = provider_login_command(name).unwrap_or("").to_string();
+    let saved_path = settings.provider_paths.get(name).cloned();
+    let candidates = collect_provider_path_candidates(name, settings)
+        .into_iter()
+        .map(|candidate| validate_provider_candidate(name, candidate))
+        .collect::<Vec<_>>();
+    finalize_provider_check_report(name, saved_path, install_command, login_command, candidates)
+}
+
+fn finalize_provider_check_report(
+    name: &str,
+    saved_path: Option<String>,
+    install_command: String,
+    login_command: String,
+    mut candidates: Vec<ProviderCandidate>,
+) -> ProviderCheckReport {
+    let recommended_path =
+        recommended_candidate(&candidates).map(|candidate| candidate.path.clone());
+    for candidate in &mut candidates {
+        candidate.recommended = recommended_path.as_deref() == Some(candidate.path.as_str());
+    }
+    sort_provider_candidates(&mut candidates);
+
+    let selected = saved_path
+        .as_ref()
+        .and_then(|saved| candidates.iter().find(|candidate| candidate.path == *saved))
+        .or_else(|| {
+            recommended_path
+                .as_ref()
+                .and_then(|path| candidates.iter().find(|candidate| candidate.path == *path))
+        });
+
+    let installed = selected
+        .map(|candidate| candidate.runnable)
+        .unwrap_or(false);
+    let logged_in = selected
+        .map(|candidate| candidate.logged_in)
+        .unwrap_or(false);
+    let check_error = if let Some(candidate) = selected {
+        if candidate.runnable {
+            None
+        } else {
+            candidate.error.clone().or_else(|| {
+                Some(format!(
+                    "{} was found but could not be executed.",
+                    candidate.path
+                ))
+            })
+        }
+    } else if candidates
+        .iter()
+        .any(|candidate| candidate.exists && !candidate.runnable)
+    {
+        candidates
+            .iter()
+            .find_map(|candidate| candidate.error.clone())
+    } else {
+        None
+    };
+
+    ProviderCheckReport {
+        provider: name.to_string(),
+        saved_path,
+        install_path: selected.map(|candidate| candidate.path.clone()),
+        version: selected.and_then(|candidate| candidate.version.clone()),
+        installed,
+        logged_in,
+        status_text: selected.and_then(|candidate| candidate.status_text.clone()),
+        warnings: selected
+            .map(|candidate| candidate.warnings.clone())
+            .unwrap_or_default(),
+        candidates,
+        recommended_path,
+        check_error,
+        install_command,
+        login_command,
+    }
+}
+
+fn recommended_candidate(candidates: &[ProviderCandidate]) -> Option<&ProviderCandidate> {
+    candidates
+        .iter()
+        .find(|candidate| candidate.runnable && candidate.logged_in)
+        .or_else(|| candidates.iter().find(|candidate| candidate.runnable))
+}
+
+fn sort_provider_candidates(candidates: &mut [ProviderCandidate]) {
+    candidates.sort_by(|a, b| candidate_sort_key(a).cmp(&candidate_sort_key(b)));
+}
+
+fn candidate_sort_key(candidate: &ProviderCandidate) -> (u8, String) {
+    let rank = if candidate.saved {
+        0
+    } else if candidate.runnable && candidate.logged_in {
+        1
+    } else if candidate.runnable {
+        2
+    } else if candidate.exists {
+        3
+    } else {
+        4
+    };
+    (rank, candidate.path.clone())
+}
+
+fn collect_provider_path_candidates(
+    name: &str,
+    settings: &AppSettings,
+) -> Vec<ProviderPathCandidate> {
+    let Ok(binary) = provider_binary_name(name) else {
+        return Vec::new();
+    };
+    let mut candidates = Vec::new();
+    if let Some(path) = settings
+        .provider_paths
+        .get(name)
+        .filter(|path| !path.is_empty())
+    {
+        candidates.push(ProviderPathCandidate {
+            path: PathBuf::from(path),
+            source: "Saved in Maple".to_string(),
+            saved: true,
+        });
+    }
+    if let Ok(var_name) = provider_env_var(name) {
+        if let Ok(path) = env::var(var_name) {
+            if !path.trim().is_empty() {
+                candidates.push(ProviderPathCandidate {
+                    path: PathBuf::from(path),
+                    source: format!("{var_name}"),
+                    saved: false,
+                });
+            }
+        }
+    }
+    for path in executable_paths_from_path(binary, &runtime_path_env()) {
+        candidates.push(ProviderPathCandidate {
+            path,
+            source: "Maple search path".to_string(),
+            saved: false,
+        });
+    }
+    for path in login_shell_which_all(binary) {
+        candidates.push(ProviderPathCandidate {
+            path,
+            source: "Login shell".to_string(),
+            saved: false,
+        });
+    }
+    dedupe_provider_path_candidates(candidates)
+}
+
+fn executable_paths_from_path(binary: &str, path_value: &str) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for part in path_value.split(':') {
+        let candidate = Path::new(part).join(binary);
+        if candidate.is_file() {
+            paths.push(candidate);
+        }
+    }
+    paths
+}
+
+fn login_shell_which_all(binary: &str) -> Vec<PathBuf> {
+    let Ok(output) = Command::new("/bin/zsh")
+        .args([
+            "-lc",
+            &format!("which -a {}", shell_escape_for_zsh_word(binary)),
+        ])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(PathBuf::from)
+        .collect()
+}
+
+fn shell_escape_for_zsh_word(value: &str) -> String {
+    shell_single_quote(value)
+}
+
+fn dedupe_provider_path_candidates(
+    candidates: Vec<ProviderPathCandidate>,
+) -> Vec<ProviderPathCandidate> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for candidate in candidates {
+        let key = fs::canonicalize(&candidate.path)
+            .unwrap_or_else(|_| candidate.path.clone())
+            .display()
+            .to_string();
+        if seen.insert(key) {
+            out.push(candidate);
+        }
+    }
+    out
+}
+
+fn validate_provider_candidate(name: &str, candidate: ProviderPathCandidate) -> ProviderCandidate {
+    let binary = provider_binary_name(name).unwrap_or(name);
+    let path_text = candidate.path.display().to_string();
+    let exists = candidate.path.is_file();
+    if !exists {
+        return ProviderCandidate {
+            path: path_text,
+            source: candidate.source,
+            saved: candidate.saved,
+            exists: false,
+            runnable: false,
+            version: None,
+            logged_in: false,
+            status_text: None,
+            warnings: Vec::new(),
+            error: Some("File was not found.".to_string()),
+            version_output: None,
+            auth_output: None,
+            recommended: false,
+        };
+    }
+
+    if candidate.path.file_name().and_then(|value| value.to_str()) != Some(binary) {
+        return ProviderCandidate {
+            path: path_text,
+            source: candidate.source,
+            saved: candidate.saved,
+            exists: true,
+            runnable: false,
+            version: None,
+            logged_in: false,
+            status_text: None,
+            warnings: Vec::new(),
+            error: Some(format!("Expected executable name `{binary}`.")),
+            version_output: None,
+            auth_output: None,
+            recommended: false,
+        };
+    }
+
+    let env_path = provider_candidate_path_env(&candidate.path);
+    let version_probe = run_command_probe(
+        &candidate.path,
+        &["--version"],
+        &env_path,
+        Duration::from_millis(PROVIDER_COMMAND_TIMEOUT_MS),
+    );
+    let version_output = clean_probe_text(&version_probe);
+    if !version_probe.success {
+        return ProviderCandidate {
+            path: path_text,
+            source: candidate.source,
+            saved: candidate.saved,
+            exists: true,
+            runnable: false,
+            version: version_output.clone(),
+            logged_in: false,
+            status_text: None,
+            warnings: Vec::new(),
+            error: Some(probe_error_text(&version_probe, "Version check failed")),
+            version_output,
+            auth_output: None,
+            recommended: false,
+        };
+    }
+
+    let auth = provider_auth_status(name, &candidate.path, &env_path);
+    ProviderCandidate {
+        path: path_text,
+        source: candidate.source,
+        saved: candidate.saved,
+        exists: true,
+        runnable: true,
+        version: version_output.clone(),
+        logged_in: auth.logged_in,
+        status_text: auth.status_text,
+        warnings: auth.warnings,
+        error: None,
+        version_output,
+        auth_output: auth.output,
+        recommended: false,
+    }
+}
+
+fn provider_candidate_path_env(path: &Path) -> String {
+    let mut parts = Vec::new();
+    if let Some(parent) = path.parent() {
+        push_path_part(&mut parts, parent.display().to_string());
+    }
+    push_path_parts(&mut parts, &runtime_path_env());
+    parts.join(":")
+}
+
+fn provider_auth_status(name: &str, path: &Path, path_env: &str) -> ProviderAuthCheck {
+    match name {
+        "codex" => codex_auth_status(path, path_env),
+        "claude" => claude_auth_status(path, path_env),
+        _ => ProviderAuthCheck {
+            logged_in: false,
+            status_text: Some("Unknown provider.".to_string()),
+            warnings: Vec::new(),
+            output: None,
+        },
+    }
+}
+
+fn codex_auth_status(path: &Path, path_env: &str) -> ProviderAuthCheck {
+    let probe = run_command_probe(
+        path,
+        &["login", "status"],
+        path_env,
+        Duration::from_millis(PROVIDER_COMMAND_TIMEOUT_MS),
+    );
+    let status_text = clean_probe_text(&probe);
+    ProviderAuthCheck {
+        logged_in: probe.success
+            && status_text
+                .as_deref()
+                .map(|text| text.to_ascii_lowercase().contains("logged in"))
+                .unwrap_or(false),
+        status_text,
+        warnings: Vec::new(),
+        output: clean_probe_text(&probe),
+    }
+}
+
+fn claude_auth_status(path: &Path, path_env: &str) -> ProviderAuthCheck {
+    let mut warnings = claude_api_key_warnings();
+    let probe = run_command_probe(
+        path,
+        &["auth", "status"],
+        path_env,
+        Duration::from_millis(PROVIDER_COMMAND_TIMEOUT_MS),
+    );
+    let status_text = clean_probe_text(&probe);
+    if let Some(parsed) = status_text
+        .as_deref()
+        .and_then(|text| serde_json::from_str::<Value>(text).ok())
+    {
+        if is_claude_subscription_auth(&parsed) {
+            return ProviderAuthCheck {
+                logged_in: true,
+                status_text: Some(claude_subscription_status_text(&parsed)),
+                warnings,
+                output: status_text,
+            };
+        }
+        if parsed
+            .get("loggedIn")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            return ProviderAuthCheck {
+                logged_in: false,
+                status_text: Some(
+                    "Claude is signed in with API billing. Run `claude auth login --claudeai` to use your subscription."
+                        .to_string(),
+                ),
+                warnings,
+                output: status_text,
+            };
+        }
+        return ProviderAuthCheck {
+            logged_in: false,
+            status_text: Some("Not signed in".to_string()),
+            warnings,
+            output: status_text,
+        };
+    }
+
+    if probe.success
+        && status_text
+            .as_deref()
+            .map(|text| {
+                let lowered = text.to_ascii_lowercase();
+                lowered.contains("logged in") || lowered.contains("authenticated")
+            })
+            .unwrap_or(false)
+    {
+        return ProviderAuthCheck {
+            logged_in: true,
+            status_text: Some("Signed in with Claude subscription".to_string()),
+            warnings,
+            output: status_text,
+        };
+    }
+
+    let unsupported_auth_status = status_text
+        .as_deref()
+        .map(|text| {
+            let lowered = text.to_ascii_lowercase();
+            lowered.contains("unknown command")
+                || lowered.contains("invalid command")
+                || lowered.contains("unrecognized command")
+        })
+        .unwrap_or(false);
+    if probe.success || unsupported_auth_status {
+        if let Some(source) = detect_legacy_claude_auth_source() {
+            return ProviderAuthCheck {
+                logged_in: true,
+                status_text: Some(match source.as_str() {
+                    "subscription_file" | "subscription_keychain" => {
+                        "Signed in with Claude subscription".to_string()
+                    }
+                    _ => "Signed in with Claude subscription".to_string(),
+                }),
+                warnings,
+                output: status_text,
+            };
+        }
+    }
+
+    if env::var("ANTHROPIC_API_KEY")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .is_some()
+    {
+        warnings.push(
+            "Maple does not use ANTHROPIC_API_KEY for the MVP because it can bill API credits. Run `claude auth login --claudeai` to use your Claude subscription."
+                .to_string(),
+        );
+        return ProviderAuthCheck {
+            logged_in: false,
+            status_text: Some(
+                "Only ANTHROPIC_API_KEY was found. Sign in with Claude subscription auth instead."
+                    .to_string(),
+            ),
+            warnings,
+            output: status_text,
+        };
+    }
+
+    ProviderAuthCheck {
+        logged_in: false,
+        status_text: status_text.or_else(|| Some("Not signed in".to_string())),
+        warnings,
+        output: None,
+    }
+}
+
+fn claude_api_key_warnings() -> Vec<String> {
+    if env::var("ANTHROPIC_API_KEY")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .is_some()
+    {
+        vec![
+            "ANTHROPIC_API_KEY is set in your shell. Maple ignores it when launching Claude so your Claude subscription is used instead of API billing."
+                .to_string(),
+        ]
+    } else {
+        Vec::new()
+    }
+}
+
+fn is_claude_subscription_auth(status: &Value) -> bool {
+    if status
+        .get("loggedIn")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        != true
+    {
+        return false;
+    }
+    let auth_method = status.get("authMethod").and_then(Value::as_str);
+    let api_provider = status.get("apiProvider").and_then(Value::as_str);
+    (auth_method.is_none() && api_provider.is_none())
+        || auth_method == Some("claude.ai")
+        || api_provider == Some("firstParty")
+}
+
+fn claude_subscription_status_text(status: &Value) -> String {
+    let tier = status
+        .get("subscriptionType")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|tier| !tier.is_empty());
+    if let Some(tier) = tier {
+        let mut chars = tier.chars();
+        let Some(first) = chars.next() else {
+            return "Signed in with Claude subscription".to_string();
+        };
+        format!(
+            "Signed in with Claude {}{} subscription",
+            first.to_uppercase(),
+            chars.collect::<String>()
+        )
+    } else {
+        "Signed in with Claude subscription".to_string()
+    }
+}
+
+fn detect_legacy_claude_auth_source() -> Option<String> {
+    let home = env::var("HOME").ok()?;
+    let credentials = Path::new(&home).join(".claude").join(".credentials.json");
+    if let Ok(metadata) = fs::metadata(credentials) {
+        if metadata.is_file() && metadata.len() > 0 {
+            return Some("subscription_file".to_string());
+        }
+    }
+
+    if cfg!(target_os = "macos") {
+        if let Ok(output) = Command::new("security")
+            .args(["find-generic-password", "-s", "Claude Code-credentials"])
+            .output()
+        {
+            if output.status.success() {
+                return Some("subscription_keychain".to_string());
+            }
+        }
+    }
+    None
+}
+
+fn run_command_probe(
+    program: &Path,
+    args: &[&str],
+    path_env: &str,
+    timeout: Duration,
+) -> CommandProbe {
+    let mut child = match Command::new(program)
+        .args(args)
+        .env("PATH", path_env)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            return CommandProbe {
+                success: false,
+                code: None,
+                stdout: String::new(),
+                stderr: String::new(),
+                timed_out: false,
+                start_error: Some(error.to_string()),
+            }
+        }
+    };
+
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {
+                if started.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let status = child.wait().ok();
+                    break status;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(_) => break None,
+        }
+    };
+
+    let timed_out = started.elapsed() >= timeout;
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        let _ = pipe.read_to_string(&mut stdout);
+    }
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_string(&mut stderr);
+    }
+    CommandProbe {
+        success: status.map(|status| status.success()).unwrap_or(false) && !timed_out,
+        code: status.and_then(|status| status.code()),
+        stdout: sanitize_command_text(&stdout),
+        stderr: sanitize_command_text(&stderr),
+        timed_out,
+        start_error: None,
+    }
+}
+
+fn clean_probe_text(probe: &CommandProbe) -> Option<String> {
+    let text = if probe.stdout.trim().is_empty() {
+        probe.stderr.trim()
+    } else {
+        probe.stdout.trim()
+    };
+    if text.is_empty() {
+        None
+    } else {
+        Some(text.to_string())
+    }
+}
+
+fn probe_error_text(probe: &CommandProbe, fallback: &str) -> String {
+    if let Some(error) = &probe.start_error {
+        return error.clone();
+    }
+    if probe.timed_out {
+        return "Command timed out.".to_string();
+    }
+    clean_probe_text(probe).unwrap_or_else(|| {
+        format!(
+            "{fallback}; exit code {}.",
+            probe
+                .code
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        )
     })
+}
+
+fn sanitize_command_text(text: &str) -> String {
+    text.lines()
+        .map(|line| {
+            let lowered = line.to_ascii_lowercase();
+            if lowered.contains("token")
+                || lowered.contains("api_key")
+                || lowered.contains("apikey")
+                || lowered.contains("authorization")
+                || lowered.contains("password")
+                || lowered.contains("secret")
+            {
+                "[redacted]".to_string()
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
 }
 
 fn env_provider_flag(name: &str, provider: &str) -> bool {
@@ -688,13 +1583,13 @@ fn env_flag(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn cache_provider_status(cache: &ProviderStatusCache, name: &str, output: &RunnerOutput) {
+fn cache_provider_status(cache: &ProviderStatusCache, name: &str, report: &ProviderCheckReport) {
     if let Ok(mut entries) = cache.entries.lock() {
         entries.insert(
             name.to_string(),
             CachedProviderStatus {
                 checked_at: Instant::now(),
-                output: output.clone(),
+                report: report.clone(),
             },
         );
     }
@@ -706,72 +1601,75 @@ fn invalidate_provider_status(cache: &ProviderStatusCache, name: &str) {
     }
 }
 
-fn cached_ready_provider_status(cache: &ProviderStatusCache, name: &str) -> Option<RunnerOutput> {
+fn cached_ready_provider_status(
+    cache: &ProviderStatusCache,
+    name: &str,
+) -> Option<ProviderCheckReport> {
     let entries = cache.entries.lock().ok()?;
     let cached = entries.get(name)?;
     if cached.checked_at.elapsed() > PROVIDER_STATUS_CACHE_TTL {
         return None;
     }
-    if provider_check_is_ready(&cached.output) {
-        Some(cached.output.clone())
+    if provider_check_is_ready(&cached.report) {
+        Some(cached.report.clone())
     } else {
         None
     }
 }
 
-fn ensure_provider_ready(cache: &ProviderStatusCache, name: &str) -> Result<(), String> {
+fn ensure_provider_ready(
+    app: &AppHandle,
+    cache: &ProviderStatusCache,
+    name: &str,
+) -> Result<(), String> {
     if cached_ready_provider_status(cache, name).is_some() {
         return Ok(());
     }
 
-    let output = run_provider_check(name)?;
-    cache_provider_status(cache, name, &output);
-    parse_provider_ready(&output, name)
+    let report = run_provider_check(app, name)?;
+    cache_provider_status(cache, name, &report);
+    parse_provider_ready(&report, name)
 }
 
-fn provider_check_is_ready(output: &RunnerOutput) -> bool {
-    parse_provider_ready(output, "provider").is_ok()
+fn provider_check_is_ready(report: &ProviderCheckReport) -> bool {
+    parse_provider_ready(report, "provider").is_ok()
 }
 
-fn parse_provider_ready(output: &RunnerOutput, name: &str) -> Result<(), String> {
-    if !output.success {
-        let details = if output.stderr.trim().is_empty() {
-            output.stdout.trim()
-        } else {
-            output.stderr.trim()
-        };
-        return Err(format!("Failed to check {name} provider. {details}"));
+fn provider_ready_candidate_count(report: &ProviderCheckReport) -> usize {
+    report
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.runnable && candidate.logged_in)
+        .count()
+}
+
+fn provider_choice_required(report: &ProviderCheckReport) -> bool {
+    report.saved_path.is_none() && provider_ready_candidate_count(report) > 1
+}
+
+fn parse_provider_ready(report: &ProviderCheckReport, name: &str) -> Result<(), String> {
+    if let Some(error) = report
+        .check_error
+        .as_ref()
+        .filter(|error| !error.is_empty())
+    {
+        return Err(format!("Failed to check {name} provider. {error}"));
     }
-
-    let parsed: Value = serde_json::from_str(&output.stdout)
-        .map_err(|error| format!("Failed to parse {name} provider status: {error}"))?;
-    let installed = parsed
-        .get("installed")
-        .and_then(|installed| installed.get("installed"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let logged_in = parsed
-        .get("auth")
-        .and_then(|auth| auth.get("loggedIn"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let install_command = parsed
-        .get("installCommand")
-        .and_then(Value::as_str)
-        .unwrap_or("the provider install command");
-    let login_command = parsed
-        .get("loginCommand")
-        .and_then(Value::as_str)
-        .unwrap_or("the provider login command");
-
-    if !installed {
+    if provider_choice_required(report) {
         return Err(format!(
-            "{name} CLI is not installed. Run: {install_command}"
+            "Multiple working {name} CLIs were found. Choose one helper in Maple before continuing."
         ));
     }
-    if !logged_in {
+    if !report.installed {
         return Err(format!(
-            "{name} login was not confirmed. Run: {login_command}"
+            "{name} CLI is not installed. Run: {}",
+            report.install_command
+        ));
+    }
+    if !report.logged_in {
+        return Err(format!(
+            "{name} login was not confirmed. Run: {}",
+            report.login_command
         ));
     }
 
@@ -2363,6 +3261,7 @@ fn refresh_streaming_messages(
         ])
         .unwrap_or_else(|| workspace.join(METADATA_DIR).join("chat").join(&run_id));
         let report_path = chat_dir.join("report.json");
+        let marker_path = chat_dir.join("running.json");
 
         if report_path.exists() {
             let report_text = fs::read_to_string(&report_path)
@@ -2404,6 +3303,20 @@ fn refresh_streaming_messages(
                     }
                 }
             }
+        }
+
+        let marker = read_operation_marker(&marker_path).unwrap_or(None);
+        let marker_stopped = marker
+            .as_ref()
+            .is_some_and(|marker| !running_marker_process_is_running(marker));
+        let marker_missing_after_start =
+            marker.is_none() && streaming_message_is_past_start_grace(message);
+        if marker_stopped || marker_missing_after_start {
+            message.text = "Explore Chat stopped before writing a report.".to_string();
+            message.status = Some("failed".to_string());
+            message.completed_at = Some(now_string());
+            changed = true;
+            should_save = true;
         }
     }
 
@@ -3314,7 +4227,7 @@ async fn build_wiki(
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| settings.provider.clone());
-    ensure_provider_ready(&provider_cache, &provider)?;
+    ensure_provider_ready(&app, &provider_cache, &provider)?;
     let model = model
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
@@ -3736,7 +4649,7 @@ async fn ask_wiki(
     }
     let settings = read_settings(&app);
     let provider = settings.provider.clone();
-    ensure_provider_ready(&provider_cache, &provider)?;
+    ensure_provider_ready(&app, &provider_cache, &provider)?;
     let history_json = history_json.unwrap_or_default();
     let model =
         settings
@@ -3784,7 +4697,7 @@ async fn start_explore_chat(
 
     let settings = read_settings(&app);
     let provider = settings.provider.clone();
-    ensure_provider_ready(&provider_cache, &provider)?;
+    ensure_provider_ready(&app, &provider_cache, &provider)?;
     let model =
         settings
             .models
@@ -3902,7 +4815,7 @@ async fn start_maintain_discussion(
 
     let settings = read_settings(&app);
     let provider = settings.provider.clone();
-    ensure_provider_ready(&provider_cache, &provider)?;
+    ensure_provider_ready(&app, &provider_cache, &provider)?;
     let model =
         settings
             .models
@@ -4017,7 +4930,7 @@ async fn apply_chat_to_wiki(
     ensure_no_pending_generated_changes(&workspace)?;
     let settings = read_settings(&app);
     let provider = settings.provider.clone();
-    ensure_provider_ready(&provider_cache, &provider)?;
+    ensure_provider_ready(&app, &provider_cache, &provider)?;
     let model =
         settings
             .models
@@ -4520,7 +5433,6 @@ fn run_runner(
 fn run_runner_with_args(args: &[String]) -> Result<RunnerOutput, String> {
     let runner_root = runner_root()?;
     let node = node_executable()?;
-    ensure_node_executable_supported(&node)?;
 
     let output = Command::new(&node)
         .arg("src/operation-runner.js")
@@ -4539,67 +5451,98 @@ fn run_runner_with_args(args: &[String]) -> Result<RunnerOutput, String> {
 }
 
 fn node_executable() -> Result<PathBuf, String> {
-    if env_flag("MAPLE_SIMULATE_MISSING_NODE") {
-        return Err("Failed to find Node.js. MAPLE_SIMULATE_MISSING_NODE is enabled.".to_string());
+    let runtime = resolve_node_runtime();
+    if let Some(path) = runtime
+        .node_candidates
+        .iter()
+        .find(|candidate| candidate.selected)
+        .map(|candidate| PathBuf::from(&candidate.path))
+    {
+        return Ok(path);
     }
 
-    if let Some(node) = find_executable_in_path("node", env::var("PATH").ok().as_deref()) {
-        return Ok(node);
-    }
-
-    for candidate in [
-        "/opt/homebrew/bin/node",
-        "/usr/local/bin/node",
-        "/usr/bin/node",
-    ] {
-        let path = PathBuf::from(candidate);
-        if path.is_file() {
-            return Ok(path);
-        }
-    }
-
-    if let Some(node) = find_nvm_node() {
-        return Ok(node);
-    }
-
-    if let Some(node) = login_shell_node() {
-        return Ok(node);
+    if runtime.node_installed {
+        return Err(unsupported_node_message(
+            runtime.node_path.as_deref(),
+            runtime.node_version.as_deref(),
+        ));
     }
 
     Err("Failed to find Node.js. Install Node.js or launch the app from a shell where node is on PATH.".to_string())
 }
 
 fn node_runtime_status() -> NodeRuntimeStatus {
-    let path_env = runtime_path_env();
-    let simulate_missing_node = env_flag("MAPLE_SIMULATE_MISSING_NODE");
-    let simulate_missing_npm = simulate_missing_node || env_flag("MAPLE_SIMULATE_MISSING_NPM");
-    let node = if simulate_missing_node {
+    resolve_node_runtime()
+}
+
+fn resolve_node_runtime() -> NodeRuntimeStatus {
+    let mut node_candidates = if env_flag("MAPLE_SIMULATE_MISSING_NODE") {
+        Vec::new()
+    } else {
+        collect_node_candidates()
+    };
+    select_node_candidate(&mut node_candidates);
+
+    let selected_node_path = node_candidates
+        .iter()
+        .find(|candidate| candidate.selected)
+        .map(|candidate| PathBuf::from(&candidate.path));
+    let display_node = selected_node_path
+        .as_ref()
+        .and_then(|path| {
+            node_candidates
+                .iter()
+                .find(|candidate| candidate.path == path.display().to_string())
+        })
+        .or_else(|| {
+            node_candidates
+                .iter()
+                .find(|candidate| candidate.version.is_some())
+        });
+    let node_path = display_node.map(|candidate| candidate.path.clone());
+    let node_version = display_node.and_then(|candidate| candidate.version.clone());
+    let npm = if env_flag("MAPLE_SIMULATE_MISSING_NODE") || env_flag("MAPLE_SIMULATE_MISSING_NPM") {
         None
     } else {
-        find_runtime_executable("node", &path_env)
+        let path_env = selected_node_path
+            .as_ref()
+            .map(|path| runtime_path_env_for_node(Some(path)))
+            .unwrap_or_else(|| runtime_path_env_for_node(None));
+        find_executable_in_path("npm", Some(&path_env))
     };
-    let npm = if simulate_missing_npm {
-        None
-    } else {
-        find_runtime_executable("npm", &path_env)
-    };
-    let node_version =
-        simulated_node_version().or_else(|| node.as_ref().and_then(|path| command_version(path)));
+
     NodeRuntimeStatus {
-        node_installed: node.is_some(),
+        node_installed: node_candidates
+            .iter()
+            .any(|candidate| candidate.version.is_some()),
         npm_installed: npm.is_some(),
-        node_version_supported: node_version_supported(node_version.as_deref()),
+        node_version_supported: selected_node_path.is_some(),
         required_node_major: REQUIRED_NODE_MAJOR,
+        node_path,
+        npm_path: npm.as_ref().map(|path| path.display().to_string()),
         node_version,
         npm_version: npm.as_ref().and_then(|path| command_version(path)),
-        node_path: node.map(|path| path.display().to_string()),
-        npm_path: npm.map(|path| path.display().to_string()),
         install_url: "https://nodejs.org/en/download".to_string(),
+        node_candidates,
     }
 }
 
 fn runtime_path_env() -> String {
+    let runtime = resolve_node_runtime();
+    let selected_node = runtime
+        .node_candidates
+        .iter()
+        .find(|candidate| candidate.selected)
+        .map(|candidate| PathBuf::from(&candidate.path));
+    runtime_path_env_for_node(selected_node.as_deref())
+}
+
+fn runtime_path_env_for_node(node: Option<&Path>) -> String {
     let mut parts = Vec::new();
+
+    if let Some(parent) = node.and_then(Path::parent) {
+        push_path_part(&mut parts, parent.display().to_string());
+    }
 
     if let Some(shell_path) = login_shell_path() {
         push_path_parts(&mut parts, &shell_path);
@@ -4611,7 +5554,7 @@ fn runtime_path_env() -> String {
 
     push_user_bin_dirs(&mut parts);
 
-    if let Some(node) = find_nvm_node() {
+    for node in find_nvm_nodes() {
         if let Some(parent) = node.parent() {
             push_path_part(&mut parts, parent.display().to_string());
         }
@@ -4620,10 +5563,6 @@ fn runtime_path_env() -> String {
     push_common_bin_dirs(&mut parts);
 
     parts.join(":")
-}
-
-fn find_runtime_executable(binary: &str, path_env: &str) -> Option<PathBuf> {
-    find_executable_in_path(binary, Some(path_env))
 }
 
 fn command_version(path: &Path) -> Option<String> {
@@ -4659,49 +5598,302 @@ fn node_version_supported(version: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
-fn unsupported_node_message(node: &Path, version: Option<&str>) -> String {
+fn unsupported_node_message(node: Option<&str>, version: Option<&str>) -> String {
     let version = version.unwrap_or("unknown version");
+    if let Some(node) = node {
+        return format!(
+            "Maple found Node.js {version} at {node}. Maple needs Node.js {REQUIRED_NODE_MAJOR} or newer before it can use AI features."
+        );
+    }
     format!(
-        "Maple found Node.js {version} at {}. Maple needs Node.js {REQUIRED_NODE_MAJOR} or newer before it can use AI features.",
-        node.display()
+        "Maple found Node.js {version}. Maple needs Node.js {REQUIRED_NODE_MAJOR} or newer before it can use AI features."
     )
 }
 
-fn ensure_node_executable_supported(node: &Path) -> Result<(), String> {
-    let version = simulated_node_version().or_else(|| command_version(node));
-    if node_version_supported(version.as_deref()) {
-        Ok(())
-    } else {
-        Err(unsupported_node_message(node, version.as_deref()))
+fn runner_path_env(node: &Path) -> String {
+    runtime_path_env_for_node(Some(node))
+}
+
+fn collect_node_candidates() -> Vec<NodeCandidate> {
+    let path_candidates = dedupe_node_path_candidates(collect_node_path_candidates());
+    path_candidates
+        .into_iter()
+        .map(validate_node_candidate)
+        .collect()
+}
+
+fn collect_node_path_candidates() -> Vec<NodePathCandidate> {
+    let mut candidates = Vec::new();
+    let mut order = 0usize;
+    push_node_path_candidate_env(&mut candidates, &mut order);
+    push_node_path_candidate_login_shell(&mut candidates, &mut order);
+    push_node_path_candidates_from_path(
+        &mut candidates,
+        &mut order,
+        env::var("PATH").ok().as_deref(),
+        "App PATH",
+        2,
+    );
+    push_node_path_candidate_version_managers(&mut candidates, &mut order);
+    push_node_path_candidate_common(&mut candidates, &mut order);
+    candidates
+}
+
+fn push_node_path_candidate(
+    candidates: &mut Vec<NodePathCandidate>,
+    order: &mut usize,
+    path: PathBuf,
+    source: &str,
+    priority: u8,
+) {
+    candidates.push(NodePathCandidate {
+        path,
+        source: source.to_string(),
+        priority,
+        order: *order,
+    });
+    *order += 1;
+}
+
+fn push_node_path_candidate_env(candidates: &mut Vec<NodePathCandidate>, order: &mut usize) {
+    if let Ok(path) = env::var("MAPLE_NODE_PATH") {
+        if !path.trim().is_empty() {
+            push_node_path_candidate(
+                candidates,
+                order,
+                PathBuf::from(path.trim()),
+                "MAPLE_NODE_PATH",
+                0,
+            );
+        }
     }
 }
 
-fn runner_path_env(node: &Path) -> String {
-    let mut parts = Vec::new();
-
-    if let Some(parent) = node.parent() {
-        push_path_part(&mut parts, parent.display().to_string());
+fn push_node_path_candidate_login_shell(
+    candidates: &mut Vec<NodePathCandidate>,
+    order: &mut usize,
+) {
+    if let Some(path) = login_shell_node() {
+        push_node_path_candidate(candidates, order, path, "Login shell", 1);
     }
+}
 
-    if let Some(shell_path) = login_shell_path() {
-        push_path_parts(&mut parts, &shell_path);
+fn push_node_path_candidates_from_path(
+    candidates: &mut Vec<NodePathCandidate>,
+    order: &mut usize,
+    path_env: Option<&str>,
+    source: &str,
+    priority: u8,
+) {
+    let Some(path_env) = path_env else {
+        return;
+    };
+    for path in executable_paths_from_path("node", path_env) {
+        push_node_path_candidate(candidates, order, path, source, priority);
     }
+}
 
-    if let Ok(current_path) = env::var("PATH") {
-        push_path_parts(&mut parts, &current_path);
+fn push_node_path_candidate_version_managers(
+    candidates: &mut Vec<NodePathCandidate>,
+    order: &mut usize,
+) {
+    for node in find_nvm_nodes() {
+        push_node_path_candidate(candidates, order, node, "nvm", 3);
     }
-
-    push_user_bin_dirs(&mut parts);
-
-    if let Some(nvm_node) = find_nvm_node() {
-        if let Some(parent) = nvm_node.parent() {
-            push_path_part(&mut parts, parent.display().to_string());
+    let Some(home) = env::var("HOME").ok() else {
+        return;
+    };
+    for path in [
+        Path::new(&home).join(".volta/bin/node"),
+        Path::new(&home).join(".asdf/shims/node"),
+        Path::new(&home).join(".local/share/mise/shims/node"),
+        Path::new(&home).join(".mise/shims/node"),
+    ] {
+        if path.is_file() {
+            push_node_path_candidate(candidates, order, path, "Version manager", 3);
         }
     }
+    push_node_path_candidates_from_fnm(candidates, order, &home);
+}
 
-    push_common_bin_dirs(&mut parts);
+fn push_node_path_candidates_from_fnm(
+    candidates: &mut Vec<NodePathCandidate>,
+    order: &mut usize,
+    home: &str,
+) {
+    let mut dirs = Vec::new();
+    if let Ok(multishell_path) = env::var("FNM_MULTISHELL_PATH") {
+        dirs.push(PathBuf::from(multishell_path));
+    }
+    let mut roots = Vec::new();
+    if let Ok(fnm_dir) = env::var("FNM_DIR") {
+        roots.push(PathBuf::from(fnm_dir));
+    }
+    if let Ok(xdg_data_home) = env::var("XDG_DATA_HOME") {
+        roots.push(Path::new(&xdg_data_home).join("fnm"));
+    }
+    roots.push(
+        Path::new(home)
+            .join("Library")
+            .join("Application Support")
+            .join("fnm"),
+    );
+    roots.push(Path::new(home).join(".local/share/fnm"));
+    for root in roots {
+        collect_nested_node_bin_dirs(&root.join("node-versions"), 4, &mut dirs);
+    }
+    let state_home = env::var("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| Path::new(home).join(".local/state"));
+    if let Ok(entries) = fs::read_dir(state_home.join("fnm_multishells")) {
+        for entry in entries.flatten() {
+            dirs.push(entry.path().join("bin"));
+        }
+    }
+    for dir in dirs {
+        let path = dir.join("node");
+        if path.is_file() {
+            push_node_path_candidate(candidates, order, path, "fnm", 3);
+        }
+    }
+}
 
-    parts.join(":")
+fn collect_nested_node_bin_dirs(root: &Path, max_depth: usize, out: &mut Vec<PathBuf>) {
+    fn visit(dir: &Path, depth: usize, max_depth: usize, out: &mut Vec<PathBuf>) {
+        if depth > max_depth {
+            return;
+        }
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+            let path = entry.path();
+            if path.file_name().and_then(|name| name.to_str()) == Some("bin") {
+                out.push(path.clone());
+            }
+            visit(&path, depth + 1, max_depth, out);
+        }
+    }
+    visit(root, 0, max_depth, out);
+}
+
+fn push_node_path_candidate_common(candidates: &mut Vec<NodePathCandidate>, order: &mut usize) {
+    for path in [
+        "/opt/homebrew/bin/node",
+        "/usr/local/bin/node",
+        "/usr/bin/node",
+        "/opt/local/bin/node",
+        "/nix/var/nix/profiles/default/bin/node",
+        "/run/current-system/sw/bin/node",
+    ] {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            push_node_path_candidate(candidates, order, path, "Common location", 4);
+        }
+    }
+}
+
+fn dedupe_node_path_candidates(candidates: Vec<NodePathCandidate>) -> Vec<NodePathCandidate> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for candidate in candidates {
+        let key = fs::canonicalize(&candidate.path)
+            .unwrap_or_else(|_| candidate.path.clone())
+            .display()
+            .to_string();
+        if seen.insert(key) {
+            out.push(candidate);
+        }
+    }
+    out
+}
+
+fn validate_node_candidate(candidate: NodePathCandidate) -> NodeCandidate {
+    let path = candidate.path.display().to_string();
+    let version = if candidate.path.is_file() {
+        simulated_node_version().or_else(|| command_version(&candidate.path))
+    } else {
+        None
+    };
+    let error = if !candidate.path.is_file() {
+        Some("File was not found.".to_string())
+    } else if candidate.path.file_name().and_then(|name| name.to_str()) != Some("node") {
+        Some("Expected executable name `node`.".to_string())
+    } else if version.is_none() {
+        Some("Could not run node --version.".to_string())
+    } else {
+        None
+    };
+    let supported = error.is_none() && node_version_supported(version.as_deref());
+    NodeCandidate {
+        path,
+        version,
+        source: candidate.source,
+        supported,
+        selected: false,
+        error,
+        priority: candidate.priority,
+        order: candidate.order,
+    }
+}
+
+fn select_node_candidate(candidates: &mut [NodeCandidate]) {
+    let Some(index) = selected_node_candidate_index(candidates) else {
+        return;
+    };
+    for (candidate_index, candidate) in candidates.iter_mut().enumerate() {
+        candidate.selected = candidate_index == index;
+    }
+}
+
+fn selected_node_candidate_index(candidates: &[NodeCandidate]) -> Option<usize> {
+    for priority in 0..=4 {
+        let mut matching = candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, candidate)| candidate.priority == priority && candidate.supported);
+        if priority == 3 {
+            return matching
+                .max_by(|(_, a), (_, b)| {
+                    compare_node_versions(a.version.as_deref(), b.version.as_deref())
+                        .then_with(|| b.order.cmp(&a.order))
+                })
+                .map(|(index, _)| index);
+        }
+        if let Some((index, _)) = matching.next() {
+            return Some(index);
+        }
+    }
+    None
+}
+
+fn compare_node_versions(a: Option<&str>, b: Option<&str>) -> std::cmp::Ordering {
+    parse_node_version_tuple(a.unwrap_or("")).cmp(&parse_node_version_tuple(b.unwrap_or("")))
+}
+
+fn parse_node_version_tuple(version: &str) -> (u32, u32, u32) {
+    let trimmed = version.trim();
+    let without_prefix = trimmed.strip_prefix('v').unwrap_or(trimmed);
+    let mut parts = without_prefix.split('.');
+    let major = parts
+        .next()
+        .and_then(|part| part.parse::<u32>().ok())
+        .unwrap_or(0);
+    let minor = parts
+        .next()
+        .and_then(|part| part.parse::<u32>().ok())
+        .unwrap_or(0);
+    let patch = parts
+        .next()
+        .and_then(|part| part.parse::<u32>().ok())
+        .unwrap_or(0);
+    (major, minor, patch)
 }
 
 fn push_user_bin_dirs(parts: &mut Vec<String>) {
@@ -4907,13 +6099,17 @@ fn find_executable_in_path(binary: &str, path_value: Option<&str>) -> Option<Pat
     None
 }
 
-fn find_nvm_node() -> Option<PathBuf> {
-    let home = env::var("HOME").ok()?;
+fn find_nvm_nodes() -> Vec<PathBuf> {
+    let Ok(home) = env::var("HOME") else {
+        return Vec::new();
+    };
     let versions_root = Path::new(&home).join(".nvm/versions/node");
     let mut candidates = Vec::new();
 
-    for entry in fs::read_dir(versions_root).ok()? {
-        let entry = entry.ok()?;
+    for entry in fs::read_dir(versions_root).ok().into_iter().flatten() {
+        let Ok(entry) = entry else {
+            continue;
+        };
         let candidate = entry.path().join("bin/node");
         if candidate.is_file() {
             candidates.push(candidate);
@@ -4921,7 +6117,7 @@ fn find_nvm_node() -> Option<PathBuf> {
     }
 
     candidates.sort();
-    candidates.pop()
+    candidates
 }
 
 fn login_shell_node() -> Option<PathBuf> {
@@ -5371,18 +6567,27 @@ fn should_hide_workspace_file(name: &str) -> bool {
 mod tests {
     use super::{
         chat_thread_summary, chat_threads_dir, compose_maintain_operation_instruction,
-        ensure_maintain_thread_task_matches, extract_partial_answer_from_events,
-        initialize_workspace_files, load_state_at, maintain_operation_assistant_text,
-        maintain_operation_user_text, make_chat_thread, make_maintain_thread,
-        node_version_supported, normalize_operation_events, parse_node_major,
-        provider_simulation_value_matches, read_requested_or_new_chat_thread, read_text_tail,
-        refresh_maintain_operation_messages, refresh_streaming_messages, shell_single_quote,
-        terminal_command_script, thread_activity_context, ChatThreadMessage, ThreadFileKind,
+        dedupe_node_path_candidates, ensure_maintain_thread_task_matches,
+        extract_partial_answer_from_events, finalize_provider_check_report,
+        initialize_workspace_files, load_state_at, login_command_for_settings,
+        maintain_operation_assistant_text, maintain_operation_user_text, make_chat_thread,
+        make_maintain_thread, node_version_supported, normalize_operation_events,
+        normalize_settings, parse_node_major, parse_provider_ready, provider_choice_required,
+        provider_ready_candidate_count, provider_simulation_value_matches,
+        read_requested_or_new_chat_thread, read_text_tail, read_thread_file,
+        refresh_maintain_operation_messages, refresh_streaming_messages, run_command_probe,
+        runner_path_env, select_node_candidate, shell_single_quote, terminal_command_script,
+        thread_activity_context, validate_provider_candidate, validate_provider_path, AppSettings,
+        ChatThreadMessage, NodeCandidate, NodePathCandidate, ProviderCandidate,
+        ProviderPathCandidate, ThreadFileKind,
     };
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::{
+        collections::HashMap,
         fs,
         path::{Path, PathBuf},
-        time::{SystemTime, UNIX_EPOCH},
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
     fn unique_test_workspace(prefix: &str) -> PathBuf {
@@ -5391,6 +6596,18 @@ mod tests {
             .map(|duration| duration.as_millis())
             .unwrap_or(0);
         std::env::temp_dir().join(format!("{prefix}-{millis}-{}", std::process::id()))
+    }
+
+    fn write_executable_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+        let path = dir.join(name);
+        fs::write(&path, body).unwrap();
+        #[cfg(unix)]
+        {
+            let mut permissions = fs::metadata(&path).unwrap().permissions();
+            permissions.set_mode(0o700);
+            fs::set_permissions(&path, permissions).unwrap();
+        }
+        path
     }
 
     #[test]
@@ -5436,6 +6653,111 @@ mod tests {
         assert!(!node_version_supported(None));
     }
 
+    fn test_node_candidate(
+        path: &str,
+        version: &str,
+        source: &str,
+        priority: u8,
+        order: usize,
+    ) -> NodeCandidate {
+        NodeCandidate {
+            path: path.to_string(),
+            version: Some(version.to_string()),
+            source: source.to_string(),
+            supported: node_version_supported(Some(version)),
+            selected: false,
+            error: None,
+            priority,
+            order,
+        }
+    }
+
+    #[test]
+    fn node_resolver_prefers_supported_login_shell_over_old_common_node() {
+        let mut candidates = vec![
+            test_node_candidate("/usr/local/bin/node", "v14.16.1", "Common location", 4, 0),
+            test_node_candidate(
+                "/Users/test/.nvm/versions/node/v24.0.0/bin/node",
+                "v24.0.0",
+                "Login shell",
+                1,
+                1,
+            ),
+        ];
+
+        select_node_candidate(&mut candidates);
+
+        assert!(candidates[1].selected);
+        assert!(!candidates[0].selected);
+    }
+
+    #[test]
+    fn node_resolver_prefers_login_shell_over_newer_homebrew_node() {
+        let mut candidates = vec![
+            test_node_candidate(
+                "/Users/test/.nvm/versions/node/v22.0.0/bin/node",
+                "v22.0.0",
+                "Login shell",
+                1,
+                0,
+            ),
+            test_node_candidate("/opt/homebrew/bin/node", "v24.0.0", "Common location", 4, 1),
+        ];
+
+        select_node_candidate(&mut candidates);
+
+        assert!(candidates[0].selected);
+        assert!(!candidates[1].selected);
+    }
+
+    #[test]
+    fn node_resolver_does_not_select_unsupported_node() {
+        let mut candidates = vec![test_node_candidate(
+            "/usr/local/bin/node",
+            "v14.16.1",
+            "Common location",
+            4,
+            0,
+        )];
+
+        select_node_candidate(&mut candidates);
+
+        assert!(!candidates[0].selected);
+        assert!(!candidates[0].supported);
+    }
+
+    #[test]
+    fn node_path_candidates_are_deduplicated_by_canonical_path() {
+        let workspace = unique_test_workspace("maple-node-dedupe");
+        fs::create_dir_all(&workspace).unwrap();
+        let node = write_executable_script(&workspace, "node", "#!/bin/sh\necho v24.0.0\n");
+        let candidates = dedupe_node_path_candidates(vec![
+            NodePathCandidate {
+                path: node.clone(),
+                source: "Login shell".to_string(),
+                priority: 1,
+                order: 0,
+            },
+            NodePathCandidate {
+                path: node.clone(),
+                source: "App PATH".to_string(),
+                priority: 2,
+                order: 1,
+            },
+        ]);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].source, "Login shell");
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn runner_path_env_starts_with_selected_node_parent() {
+        let node = PathBuf::from("/tmp/maple-node/bin/node");
+        let path_env = runner_path_env(&node);
+        assert_eq!(path_env.split(':').next(), Some("/tmp/maple-node/bin"));
+    }
+
     #[test]
     fn provider_simulation_flags_match_named_or_all_providers() {
         assert!(provider_simulation_value_matches("codex", "codex"));
@@ -5445,6 +6767,218 @@ mod tests {
         assert!(provider_simulation_value_matches("true", "claude"));
         assert!(!provider_simulation_value_matches("claude", "codex"));
         assert!(!provider_simulation_value_matches("", "codex"));
+    }
+
+    #[test]
+    fn settings_normalization_adds_empty_provider_paths() {
+        let settings = serde_json::from_str::<AppSettings>(
+            r#"{"provider":"codex","models":{"codex":"gpt-5.5"}}"#,
+        )
+        .unwrap();
+        let normalized = normalize_settings(settings);
+        assert!(normalized.provider_paths.is_empty());
+        assert_eq!(
+            normalized.models.get("claude").unwrap(),
+            "claude-sonnet-4-6"
+        );
+    }
+
+    #[test]
+    fn provider_report_sorts_candidates_and_recommends_ready_path() {
+        let candidates = vec![
+            ProviderCandidate {
+                path: "/tmp/broken/codex".to_string(),
+                source: "test".to_string(),
+                saved: false,
+                exists: true,
+                runnable: false,
+                version: None,
+                logged_in: false,
+                status_text: None,
+                warnings: Vec::new(),
+                error: Some("broken".to_string()),
+                version_output: None,
+                auth_output: None,
+                recommended: false,
+            },
+            ProviderCandidate {
+                path: "/tmp/ready/codex".to_string(),
+                source: "test".to_string(),
+                saved: false,
+                exists: true,
+                runnable: true,
+                version: Some("codex fake".to_string()),
+                logged_in: true,
+                status_text: Some("Logged in".to_string()),
+                warnings: Vec::new(),
+                error: None,
+                version_output: Some("codex fake".to_string()),
+                auth_output: Some("Logged in".to_string()),
+                recommended: false,
+            },
+        ];
+        let report = finalize_provider_check_report(
+            "codex",
+            None,
+            "npm i -g @openai/codex".to_string(),
+            "codex login".to_string(),
+            candidates,
+        );
+        assert_eq!(report.recommended_path.as_deref(), Some("/tmp/ready/codex"));
+        assert_eq!(report.install_path.as_deref(), Some("/tmp/ready/codex"));
+        assert!(report.installed);
+        assert!(report.logged_in);
+        assert!(report.candidates[0].recommended);
+    }
+
+    #[test]
+    fn provider_report_with_multiple_ready_paths_requires_choice() {
+        let ready_candidate = |path: &str| ProviderCandidate {
+            path: path.to_string(),
+            source: "test".to_string(),
+            saved: false,
+            exists: true,
+            runnable: true,
+            version: Some("codex fake".to_string()),
+            logged_in: true,
+            status_text: Some("Logged in".to_string()),
+            warnings: Vec::new(),
+            error: None,
+            version_output: Some("codex fake".to_string()),
+            auth_output: Some("Logged in".to_string()),
+            recommended: false,
+        };
+        let report = finalize_provider_check_report(
+            "codex",
+            None,
+            "npm i -g @openai/codex".to_string(),
+            "codex login".to_string(),
+            vec![
+                ready_candidate("/tmp/first/codex"),
+                ready_candidate("/tmp/second/codex"),
+            ],
+        );
+
+        assert_eq!(provider_ready_candidate_count(&report), 2);
+        assert!(provider_choice_required(&report));
+        assert!(parse_provider_ready(&report, "codex").is_err());
+
+        let saved_report = finalize_provider_check_report(
+            "codex",
+            Some("/tmp/first/codex".to_string()),
+            "npm i -g @openai/codex".to_string(),
+            "codex login".to_string(),
+            vec![
+                ready_candidate("/tmp/first/codex"),
+                ready_candidate("/tmp/second/codex"),
+            ],
+        );
+        assert!(!provider_choice_required(&saved_report));
+        assert!(parse_provider_ready(&saved_report, "codex").is_ok());
+    }
+
+    #[test]
+    fn saved_provider_path_validation_rejects_bad_paths() {
+        let workspace = unique_test_workspace("maple-provider-path");
+        fs::create_dir_all(&workspace).unwrap();
+        let wrong_name = write_executable_script(&workspace, "not-codex", "#!/bin/sh\nexit 0\n");
+        assert!(validate_provider_path("codex", wrong_name.to_str().unwrap()).is_err());
+        assert!(validate_provider_path("codex", "relative/codex").is_err());
+        assert!(
+            validate_provider_path("codex", workspace.join("codex").to_str().unwrap()).is_err()
+        );
+        let codex = write_executable_script(&workspace, "codex", "#!/bin/sh\nexit 0\n");
+        assert_eq!(
+            validate_provider_path("codex", codex.to_str().unwrap()).unwrap(),
+            codex
+        );
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn fake_codex_candidate_can_be_ready_logged_out_or_broken() {
+        let workspace = unique_test_workspace("maple-fake-codex");
+        fs::create_dir_all(&workspace).unwrap();
+        let ready = write_executable_script(
+            &workspace,
+            "codex",
+            r#"#!/bin/sh
+if [ "$1" = "--version" ]; then echo "codex fake"; exit 0; fi
+if [ "$1" = "login" ] && [ "$2" = "status" ]; then echo "Logged in"; exit 0; fi
+exit 1
+"#,
+        );
+        let candidate = validate_provider_candidate(
+            "codex",
+            ProviderPathCandidate {
+                path: ready.clone(),
+                source: "test".to_string(),
+                saved: false,
+            },
+        );
+        assert!(candidate.runnable);
+        assert!(candidate.logged_in);
+
+        fs::write(
+            &ready,
+            r#"#!/bin/sh
+if [ "$1" = "--version" ]; then echo "codex fake"; exit 0; fi
+if [ "$1" = "login" ] && [ "$2" = "status" ]; then echo "Not signed in"; exit 1; fi
+exit 1
+"#,
+        )
+        .unwrap();
+        let candidate = validate_provider_candidate(
+            "codex",
+            ProviderPathCandidate {
+                path: ready.clone(),
+                source: "test".to_string(),
+                saved: false,
+            },
+        );
+        assert!(candidate.runnable);
+        assert!(!candidate.logged_in);
+
+        fs::write(&ready, "#!/bin/sh\nexit 2\n").unwrap();
+        let candidate = validate_provider_candidate(
+            "codex",
+            ProviderPathCandidate {
+                path: ready,
+                source: "test".to_string(),
+                saved: false,
+            },
+        );
+        assert!(!candidate.runnable);
+        assert!(candidate.error.is_some());
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn command_probe_times_out() {
+        let workspace = unique_test_workspace("maple-probe-timeout");
+        fs::create_dir_all(&workspace).unwrap();
+        let script = write_executable_script(&workspace, "slow", "#!/bin/sh\nsleep 1\n");
+        let probe = run_command_probe(&script, &[], "", Duration::from_millis(50));
+        assert!(probe.timed_out);
+        assert!(!probe.success);
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn saved_provider_path_is_used_for_login_command() {
+        let mut settings = AppSettings {
+            provider: "codex".to_string(),
+            models: HashMap::new(),
+            provider_paths: HashMap::new(),
+        };
+        settings.provider_paths.insert(
+            "codex".to_string(),
+            "/Applications/Fake Helper/codex".to_string(),
+        );
+        assert_eq!(
+            login_command_for_settings(&settings, "codex").unwrap(),
+            "'/Applications/Fake Helper/codex' login"
+        );
     }
 
     fn write_operation_report(workspace: &Path, operation_id: &str, status: &str) {
@@ -5957,6 +7491,81 @@ not-json
     }
 
     #[test]
+    fn refresh_streaming_messages_marks_stale_explore_run_failed() {
+        let workspace = unique_test_workspace("maple-chat-stale-run");
+        let chat_dir = workspace.join(".aiwiki").join("chat").join("run-test");
+        fs::create_dir_all(&chat_dir).unwrap();
+        fs::write(
+            chat_dir.join("running.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "operationId": "run-test",
+                "type": "explore-chat",
+                "pid": 999_999_999_u64
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut thread = make_chat_thread(Some("wiki/page.md".to_string()));
+        thread.messages.push(ChatThreadMessage {
+            id: "assistant-test".to_string(),
+            role: "assistant".to_string(),
+            text: String::new(),
+            context_path: Some("wiki/page.md".to_string()),
+            provider: None,
+            model: None,
+            web_search_enabled: None,
+            run_id: Some("run-test".to_string()),
+            status: Some("streaming".to_string()),
+            created_at: "1000".to_string(),
+            completed_at: None,
+        });
+
+        assert!(refresh_streaming_messages(&workspace, &mut thread, ThreadFileKind::Chat).unwrap());
+        assert_eq!(thread.messages[0].status.as_deref(), Some("failed"));
+        assert_eq!(
+            thread.messages[0].text,
+            "Explore Chat stopped before writing a report."
+        );
+        assert!(thread.messages[0].completed_at.is_some());
+
+        let saved_thread = read_thread_file(&workspace, &thread.id).unwrap();
+        assert_eq!(saved_thread.messages[0].status.as_deref(), Some("failed"));
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn refresh_streaming_messages_marks_missing_marker_after_grace_failed() {
+        let workspace = unique_test_workspace("maple-chat-missing-marker");
+        fs::create_dir_all(workspace.join(".aiwiki").join("chat").join("run-test")).unwrap();
+
+        let mut thread = make_chat_thread(Some("wiki/page.md".to_string()));
+        thread.messages.push(ChatThreadMessage {
+            id: "assistant-test".to_string(),
+            role: "assistant".to_string(),
+            text: String::new(),
+            context_path: Some("wiki/page.md".to_string()),
+            provider: None,
+            model: None,
+            web_search_enabled: None,
+            run_id: Some("run-test".to_string()),
+            status: Some("streaming".to_string()),
+            created_at: "1000".to_string(),
+            completed_at: None,
+        });
+
+        assert!(refresh_streaming_messages(&workspace, &mut thread, ThreadFileKind::Chat).unwrap());
+        assert_eq!(thread.messages[0].status.as_deref(), Some("failed"));
+        assert_eq!(
+            thread.messages[0].text,
+            "Explore Chat stopped before writing a report."
+        );
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
     fn missing_requested_chat_thread_starts_new_context_thread() {
         let workspace = unique_test_workspace("maple-missing-chat-thread");
         fs::create_dir_all(chat_threads_dir(&workspace)).unwrap();
@@ -5997,6 +7606,8 @@ pub fn run() {
                     env::set_var(RUNNER_ROOT_ENV, runner_root);
                 }
             }
+            let settings = read_settings(app.handle());
+            apply_provider_path_env(&settings);
             app.manage(WorkspaceStore {
                 path: Mutex::new(None),
             });
@@ -6052,6 +7663,9 @@ pub fn run() {
             list_providers,
             check_node_runtime,
             check_provider,
+            discover_provider_helpers,
+            save_provider_path,
+            clear_provider_path,
             install_provider,
             login_provider,
             restart_app,

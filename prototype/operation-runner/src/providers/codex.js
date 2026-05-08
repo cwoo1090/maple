@@ -1,5 +1,5 @@
 const { spawnSync } = require("node:child_process");
-const { buildPathEnv, findBinary } = require("./path-utils");
+const { buildPathEnv, findBinary, providerOverridePath } = require("./path-utils");
 
 function cleanCommandText(text) {
   return (text || "").trim() || null;
@@ -90,7 +90,7 @@ async function finalizeLastMessage() {
 
 module.exports = {
   name: "codex",
-  binary: "codex",
+  binary: providerOverridePath("codex") || "codex",
   supportsImageAttachments: true,
   defaultModel: "gpt-5.5",
   supportedModels: [

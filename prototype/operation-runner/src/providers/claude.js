@@ -2,7 +2,7 @@ const fs = require("node:fs");
 const fsp = require("node:fs/promises");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
-const { buildPathEnv, findBinary, homeDir } = require("./path-utils");
+const { buildPathEnv, findBinary, homeDir, providerOverridePath } = require("./path-utils");
 
 function cleanCommandText(text) {
   return (text || "").trim() || null;
@@ -200,7 +200,7 @@ async function finalizeLastMessage(ctx) {
 
 module.exports = {
   name: "claude",
-  binary: "claude",
+  binary: providerOverridePath("claude") || "claude",
   supportsImageAttachments: false,
   defaultModel: "claude-sonnet-4-6",
   supportedModels: [
