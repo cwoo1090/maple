@@ -246,12 +246,15 @@ code {
   height: auto;
 }
 
+.guide-section,
 .privacy-section,
 .workflow-section {
+  scroll-margin-top: 84px;
   width: min(1120px, calc(100% - 48px));
   margin: 0 auto;
 }
 
+.guide-section h2,
 .workflow-section h2,
 .privacy-copy h2 {
   margin: 0;
@@ -330,6 +333,134 @@ code {
 
 .workflow-grid p,
 .principles p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.92rem;
+}
+
+.guide-section {
+  padding: 72px 0 86px;
+  border-top: 1px solid var(--line);
+}
+
+.guide-primer {
+  display: grid;
+  grid-template-columns: minmax(0, 0.82fr) minmax(0, 1.18fr);
+  gap: 32px;
+  align-items: start;
+  margin-top: 30px;
+  padding: 28px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--paper-strong);
+}
+
+.guide-primer h3 {
+  max-width: 460px;
+  margin: 0;
+  font-size: 1.4rem;
+  line-height: 1.18;
+  letter-spacing: 0;
+}
+
+.guide-primer p {
+  max-width: 520px;
+  margin: 14px 0 0;
+  color: var(--muted);
+}
+
+.guide-primer ol {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.guide-primer li {
+  min-width: 0;
+  padding: 16px;
+  border-radius: 8px;
+  background: #f7f3ea;
+}
+
+.guide-primer li span,
+.guide-cards article > div span {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  background: var(--forest-soft);
+  color: var(--forest);
+  font-size: 0.9rem;
+  font-weight: 800;
+}
+
+.guide-primer strong {
+  display: block;
+  margin-top: 12px;
+  color: var(--ink);
+  line-height: 1.25;
+}
+
+.guide-primer li p {
+  margin-top: 8px;
+  font-size: 0.9rem;
+}
+
+.guide-cards {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+  margin-top: 14px;
+}
+
+.guide-cards article {
+  display: grid;
+  grid-template-rows: 240px 1fr;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--paper-strong);
+}
+
+.guide-cards figure {
+  height: 240px;
+  margin: 0;
+  overflow: hidden;
+  border-bottom: 1px solid var(--line);
+  background: #f4f1e9;
+}
+
+.guide-cards img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  object-position: top left;
+}
+
+.guide-cards article:nth-child(2) img {
+  object-position: top center;
+}
+
+.guide-cards article:nth-child(5) img {
+  object-position: top center;
+}
+
+.guide-cards article > div {
+  padding: 18px;
+}
+
+.guide-cards h3 {
+  margin: 16px 0 8px;
+  font-size: 1.04rem;
+  line-height: 1.25;
+  letter-spacing: 0;
+}
+
+.guide-cards p {
   margin: 0;
   color: var(--muted);
   font-size: 0.92rem;
@@ -440,8 +571,13 @@ code {
   }
 
   .workflow-grid,
+  .guide-cards,
   .principles {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .guide-primer {
+    grid-template-columns: 1fr;
   }
 }
 
@@ -465,8 +601,10 @@ code {
   }
 
   .hero-inner,
+  .guide-section,
   .privacy-section,
   .workflow-section {
+    scroll-margin-top: 126px;
     width: min(100% - 32px, 1120px);
   }
 
@@ -498,18 +636,34 @@ code {
   }
 
   .workflow-section,
+  .guide-section,
   .privacy-section {
     padding: 48px 0;
   }
 
+  .guide-section h2,
   .workflow-section h2,
   .privacy-copy h2 {
     font-size: 1.85rem;
   }
 
   .workflow-grid,
+  .guide-cards,
+  .guide-primer ol,
   .principles {
     grid-template-columns: 1fr;
+  }
+
+  .guide-primer {
+    padding: 20px;
+  }
+
+  .guide-cards article {
+    grid-template-rows: 210px 1fr;
+  }
+
+  .guide-cards figure {
+    height: 210px;
   }
 
   .workflow-grid article,

@@ -510,6 +510,12 @@ code {
   background: var(--bg-hover);
 }
 
+.topbar-workspace-dropdown-separator {
+  height: 1px;
+  margin: 6px 0;
+  background: var(--border);
+}
+
 .empty-state-error {
   margin: 12px 0 0;
   padding: 8px 12px;

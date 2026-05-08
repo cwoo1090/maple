@@ -3825,15 +3825,20 @@ function App() {
     }
   }
 
-  async function pickWorkspace(title: string, initializeRootFiles = false) {
+  async function chooseWorkspaceDirectory(title: string): Promise<string | null> {
     setError(null);
     let defaultPath: string | undefined;
     try {
       defaultPath = await documentDir();
     } catch (_error) {}
     const selected = await open({ directory: true, title, defaultPath });
-    if (!selected) return;
-    const path = Array.isArray(selected) ? selected[0] : selected;
+    if (!selected) return null;
+    return (Array.isArray(selected) ? selected[0] : selected) ?? null;
+  }
+
+  async function pickWorkspace(title: string, initializeRootFiles = false) {
+    const path = await chooseWorkspaceDirectory(title);
+    if (!path) return;
     try {
       const state = await invoke<WorkspaceState>("set_workspace", {
         workspacePath: path,
@@ -3846,22 +3851,29 @@ function App() {
     }
   }
 
-  async function switchWorkspace() {
-    setError(null);
-    let defaultPath: string | undefined;
+  async function switchWorkspace({
+    title = "Open existing workspace",
+    initializeRootFiles = false,
+  }: {
+    title?: string;
+    initializeRootFiles?: boolean;
+  } = {}) {
+    const path = await chooseWorkspaceDirectory(title);
+    if (!path) return;
     try {
-      defaultPath = await documentDir();
-    } catch (_error) {}
-    const selected = await open({
-      directory: true,
-      title: "Switch workspace",
-      defaultPath,
-    });
-    if (!selected) return;
-    const path = Array.isArray(selected) ? selected[0] : selected;
-    try {
-      await invoke<WorkspaceState>("set_workspace", { workspacePath: path });
+      await invoke<WorkspaceState>("set_workspace", { workspacePath: path, initializeRootFiles });
       localStorage.setItem("workspacePath", path);
+      window.location.reload();
+    } catch (err) {
+      setError(String(err));
+    }
+  }
+
+  async function closeWorkspace() {
+    setError(null);
+    try {
+      await invoke<void>("close_workspace");
+      localStorage.removeItem("workspacePath");
       window.location.reload();
     } catch (err) {
       setError(String(err));
@@ -4211,10 +4223,32 @@ function App() {
                   type="button"
                   onClick={() => {
                     if (topbarWorkspaceMenuRef.current) topbarWorkspaceMenuRef.current.open = false;
-                    void switchWorkspace();
+                    void switchWorkspace({
+                      title: "Create new workspace",
+                      initializeRootFiles: true,
+                    });
                   }}
                 >
-                  Switch workspace…
+                  Create new workspace…
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (topbarWorkspaceMenuRef.current) topbarWorkspaceMenuRef.current.open = false;
+                    void switchWorkspace({ title: "Open existing workspace" });
+                  }}
+                >
+                  Open existing workspace…
+                </button>
+                <div className="topbar-workspace-dropdown-separator" role="separator" />
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (topbarWorkspaceMenuRef.current) topbarWorkspaceMenuRef.current.open = false;
+                    void closeWorkspace();
+                  }}
+                >
+                  Close workspace
                 </button>
               </div>
             </details>
