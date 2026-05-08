@@ -6,6 +6,7 @@ import {
   parseProviderStatus,
   ProviderDiagnostics,
   providerSetupMessage,
+  providerSetupStatus,
   type AppSettings,
   type NodeRuntimeStatus,
   type ProviderInfo,
@@ -47,6 +48,7 @@ export function Settings({
   const [runtimeStatus, setRuntimeStatus] = useState<NodeRuntimeStatus | null>(null);
   const [checkingRuntime, setCheckingRuntime] = useState(false);
   const [statuses, setStatuses] = useState<Record<string, ProviderStatus | null>>({});
+  const [providerCheckErrors, setProviderCheckErrors] = useState<Record<string, string | null>>({});
   const [refreshing, setRefreshing] = useState<Record<string, boolean>>({});
   const [error, setError] = useState<string | null>(null);
 
@@ -66,13 +68,32 @@ export function Settings({
 
   const refreshStatus = useCallback(async (name: string) => {
     setRefreshing((prev) => ({ ...prev, [name]: true }));
+    setProviderCheckErrors((prev) => ({ ...prev, [name]: null }));
     try {
       const result = await invoke<RunnerOutput>("check_provider", { name });
+      if (!result.success) {
+        const detail = (result.stderr || result.stdout).trim();
+        setStatuses((prev) => ({ ...prev, [name]: null }));
+        setProviderCheckErrors((prev) => ({
+          ...prev,
+          [name]: detail || `Command exited with code ${result.code ?? "unknown"}.`,
+        }));
+        return null;
+      }
       const parsed = parseProviderStatus(result.stdout);
+      if (!parsed) {
+        setStatuses((prev) => ({ ...prev, [name]: null }));
+        setProviderCheckErrors((prev) => ({
+          ...prev,
+          [name]: "Maple could not read the provider status returned by the local helper.",
+        }));
+        return null;
+      }
       setStatuses((prev) => ({ ...prev, [name]: parsed }));
       return parsed;
     } catch (err) {
-      setError(`Failed to check ${name}: ${String(err)}`);
+      setStatuses((prev) => ({ ...prev, [name]: null }));
+      setProviderCheckErrors((prev) => ({ ...prev, [name]: String(err) }));
       return null;
     } finally {
       setRefreshing((prev) => ({ ...prev, [name]: false }));
@@ -102,7 +123,7 @@ export function Settings({
         setProviders(list);
         setSettings(current);
         const runtime = await refreshRuntime();
-        if (runtime?.nodeInstalled) {
+        if (runtime?.nodeInstalled && runtime.nodeVersionSupported) {
           for (const provider of list) {
             refreshStatus(provider.name);
           }
@@ -118,7 +139,7 @@ export function Settings({
 
   async function handleRuntimeRecheck() {
     const runtime = await refreshRuntime();
-    if (runtime?.nodeInstalled) {
+    if (runtime?.nodeInstalled && runtime.nodeVersionSupported) {
       for (const provider of providers) {
         refreshStatus(provider.name);
       }
@@ -277,24 +298,37 @@ export function Settings({
             Claude Pro/Max subscription. Both run via local CLIs that you sign into once.
           </p>
 
-          {runtimeStatus && (!runtimeStatus.nodeInstalled || !runtimeStatus.npmInstalled) ? (
+          {runtimeStatus &&
+          (!runtimeStatus.nodeInstalled ||
+            !runtimeStatus.nodeVersionSupported ||
+            !runtimeStatus.npmInstalled) ? (
             <div className="settings-runtime-warning">
               <div>
                 <strong>
-                  {runtimeStatus.nodeInstalled ? "npm needed first" : "Node.js needed first"}
+                  {!runtimeStatus.nodeInstalled
+                    ? "Node.js needed first"
+                    : !runtimeStatus.nodeVersionSupported
+                      ? "Update Node.js"
+                      : "npm needed for npm installs"}
                 </strong>
                 <p>
-                  Maple installs AI helpers with npm, which comes with Node.js. Install Node.js,
-                  then recheck setup.
+                  {!runtimeStatus.nodeInstalled
+                    ? "Maple needs Node.js before it can use AI features."
+                    : !runtimeStatus.nodeVersionSupported
+                      ? `Maple found ${runtimeStatus.nodeVersion ?? "an old Node.js version"} at ${runtimeStatus.nodePath ?? "an unknown path"}. Maple needs Node.js ${runtimeStatus.requiredNodeMajor} or newer.`
+                      : "Maple can use already-installed AI helpers, but npm is needed for npm-based installs."}
                 </p>
                 <span>
                   {runtimeStatus.nodeInstalled ? "Node.js found" : "Node.js not found"} ·{" "}
+                  {runtimeStatus.nodeVersionSupported ? "version supported" : "version unsupported"} ·{" "}
                   {runtimeStatus.npmInstalled ? "npm found" : "npm not found"}
                 </span>
               </div>
               <div className="settings-runtime-actions">
                 <button type="button" onClick={handleOpenNodeDownload}>
-                  Get Node.js
+                  {runtimeStatus.nodeInstalled && !runtimeStatus.nodeVersionSupported
+                    ? "Update Node.js"
+                    : "Get Node.js"}
                 </button>
                 <button type="button" onClick={() => void handleRuntimeRecheck()}>
                   {checkingRuntime ? "Checking…" : "Recheck"}
@@ -305,23 +339,39 @@ export function Settings({
 
           {providers.map((provider) => {
             const status = statuses[provider.name];
+            const providerCheckError = providerCheckErrors[provider.name] ?? null;
             const active = settings.provider === provider.name;
             const selectedModel = settings.models[provider.name] || provider.defaultModel;
             const isRefreshing = Boolean(refreshing[provider.name]);
             const providerInstallBlocked = Boolean(
-              status && !status.installed && (!runtimeStatus?.nodeInstalled || !runtimeStatus?.npmInstalled),
+              status &&
+                !status.installed &&
+                (!runtimeStatus?.nodeInstalled ||
+                  !runtimeStatus?.nodeVersionSupported ||
+                  !runtimeStatus?.npmInstalled),
+            );
+            const setupStatus = providerSetupStatus(
+              runtimeStatus,
+              status ?? null,
+              isRefreshing,
+              providerCheckError,
             );
             const needsDiagnostics = Boolean(
-              status && (!status.installed || !status.loggedIn || status.warnings.length > 0),
+              providerCheckError ||
+                (setupStatus !== "provider_ready" &&
+                  setupStatus !== "not_checked" &&
+                  setupStatus !== "checking") ||
+                (status && status.warnings.length > 0),
             );
             const setupMessage = providerSetupMessage(
               provider,
               runtimeStatus,
               status ?? null,
               isRefreshing,
+              providerCheckError,
               "settings",
             );
-            const ready = Boolean(status?.installed && status.loggedIn);
+            const ready = setupStatus === "provider_ready";
 
             return (
               <div
@@ -402,7 +452,7 @@ export function Settings({
                           className="provider-row-primary"
                           onClick={handleOpenNodeDownload}
                         >
-                          Get Node.js
+                          {setupStatus === "node_too_old" ? "Update Node.js" : "Get Node.js"}
                         </button>
                       ) : null}
                       {setupMessage.actionKind === "install" ? (
@@ -412,7 +462,7 @@ export function Settings({
                           onClick={() => handleInstall(provider.name)}
                           disabled={providerInstallBlocked || isRefreshing}
                           title={
-                            providerInstallBlocked ? "Install Node.js with npm first" : undefined
+                            providerInstallBlocked ? "Finish Node.js/npm setup first" : undefined
                           }
                         >
                           Install in Terminal
@@ -430,7 +480,11 @@ export function Settings({
                       ) : null}
                       <button
                         type="button"
-                        onClick={() => void refreshStatus(provider.name)}
+                        onClick={() =>
+                          void (setupStatus === "node_missing" || setupStatus === "node_too_old"
+                            ? handleRuntimeRecheck()
+                            : refreshStatus(provider.name))
+                        }
                         disabled={isRefreshing}
                       >
                         {isRefreshing ? "Checking..." : "Recheck"}
@@ -444,6 +498,8 @@ export function Settings({
                     provider={provider}
                     runtime={runtimeStatus}
                     status={status ?? null}
+                    providerCheckError={providerCheckError}
+                    setupStatus={setupStatus}
                     defaultOpen={false}
                   />
                 ) : null}

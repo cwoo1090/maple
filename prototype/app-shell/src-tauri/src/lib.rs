@@ -107,6 +107,7 @@ const LEGACY_METADATA_DIR: &str = ".studywiki";
 const EXPLORE_CHAT_OPERATION: &str = "explore-chat";
 const OPERATION_START_GRACE_MS: u128 = 15_000;
 const RUNNER_ROOT_ENV: &str = "MAPLE_RUNNER_ROOT";
+const REQUIRED_NODE_MAJOR: u32 = 20;
 
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -371,6 +372,8 @@ struct ProviderInfo {
 struct NodeRuntimeStatus {
     node_installed: bool,
     npm_installed: bool,
+    node_version_supported: bool,
+    required_node_major: u32,
     node_path: Option<String>,
     npm_path: Option<String>,
     node_version: Option<String>,
@@ -459,9 +462,21 @@ async fn install_provider(
     cache: State<'_, ProviderStatusCache>,
 ) -> Result<RunnerOutput, String> {
     let runtime = node_runtime_status();
-    if !runtime.node_installed || !runtime.npm_installed {
+    if !runtime.node_installed {
         return Err(
-            "Node.js with npm is required before installing an AI provider. Install Node.js first, then recheck."
+            "Node.js is required before installing an AI provider. Install Node.js first, then recheck."
+                .to_string(),
+        );
+    }
+    if !runtime.node_version_supported {
+        return Err(format!(
+            "Maple needs Node.js {} or newer before installing an AI provider. Update Node.js first, then recheck.",
+            runtime.required_node_major
+        ));
+    }
+    if !runtime.npm_installed {
+        return Err(
+            "npm is required before installing this AI provider with Maple's current installer. Install Node.js with npm first, then recheck."
                 .to_string(),
         );
     }
@@ -567,24 +582,47 @@ fn run_provider_check(name: &str) -> Result<RunnerOutput, String> {
 }
 
 fn simulated_provider_check(name: &str) -> Option<RunnerOutput> {
-    let (missing_env, logged_out_env, install_command, login_command) = match name {
+    let (
+        legacy_missing_env,
+        legacy_logged_out_env,
+        legacy_failed_env,
+        install_command,
+        login_command,
+    ) = match name {
         "codex" => (
             "MAPLE_SIMULATE_MISSING_CODEX",
             "MAPLE_SIMULATE_CODEX_LOGGED_OUT",
+            "MAPLE_SIMULATE_CODEX_CHECK_FAILED",
             "npm i -g @openai/codex",
             "codex login",
         ),
         "claude" => (
             "MAPLE_SIMULATE_MISSING_CLAUDE",
             "MAPLE_SIMULATE_CLAUDE_LOGGED_OUT",
+            "MAPLE_SIMULATE_CLAUDE_CHECK_FAILED",
             "npm i -g @anthropic-ai/claude-code",
             "claude auth login --claudeai",
         ),
         _ => return None,
     };
 
-    let missing = env_flag(missing_env);
-    let logged_out = env_flag(logged_out_env);
+    if env_provider_flag("MAPLE_SIMULATE_PROVIDER_CHECK_FAILED", name)
+        || env_flag(legacy_failed_env)
+    {
+        return Some(RunnerOutput {
+            success: false,
+            code: Some(1),
+            stdout: String::new(),
+            stderr: format!(
+                "Simulated provider check failure for {name}. MAPLE_SIMULATE_PROVIDER_CHECK_FAILED is enabled."
+            ),
+        });
+    }
+
+    let missing =
+        env_provider_flag("MAPLE_SIMULATE_PROVIDER_MISSING", name) || env_flag(legacy_missing_env);
+    let logged_out = env_provider_flag("MAPLE_SIMULATE_PROVIDER_LOGGED_OUT", name)
+        || env_flag(legacy_logged_out_env);
     if !missing && !logged_out {
         return None;
     }
@@ -593,8 +631,8 @@ fn simulated_provider_check(name: &str) -> Option<RunnerOutput> {
         "provider": name,
         "installed": {
             "installed": !missing,
-            "path": if missing { Value::Null } else { Value::String(format!("simulated/{name}")) },
-            "version": if missing { Value::Null } else { Value::String("simulated".to_string()) }
+            "path": if missing { Value::Null } else { Value::String(format!("/tmp/maple-simulated/{name}")) },
+            "version": if missing { Value::Null } else { Value::String(format!("{name} simulated")) }
         },
         "auth": {
             "loggedIn": !missing && !logged_out,
@@ -619,6 +657,24 @@ fn simulated_provider_check(name: &str) -> Option<RunnerOutput> {
             serde_json::to_string_pretty(&stdout).unwrap_or_else(|_| "{}".to_string())
         ),
         stderr: String::new(),
+    })
+}
+
+fn env_provider_flag(name: &str, provider: &str) -> bool {
+    env::var(name)
+        .ok()
+        .map(|value| provider_simulation_value_matches(&value, provider))
+        .unwrap_or(false)
+}
+
+fn provider_simulation_value_matches(value: &str, provider: &str) -> bool {
+    let provider = provider.trim().to_ascii_lowercase();
+    value.split(',').any(|part| {
+        let normalized = part.trim().to_ascii_lowercase();
+        matches!(
+            normalized.as_str(),
+            "1" | "true" | "yes" | "on" | "all" | "*"
+        ) || normalized == provider
     })
 }
 
@@ -4354,6 +4410,10 @@ fn init_workspace_dirs(workspace: &Path) -> Result<(), String> {
     for dir in [
         SOURCE_DIR,
         "wiki",
+        "wiki/concepts",
+        "wiki/summaries",
+        "wiki/guides",
+        "wiki/assets",
         METADATA_DIR,
         ".aiwiki/chat-threads",
         ".aiwiki/maintain-threads",
@@ -4366,17 +4426,82 @@ fn init_workspace_dirs(workspace: &Path) -> Result<(), String> {
 }
 
 fn initialize_workspace_files(workspace: &Path) -> Result<(), String> {
-    let runner = run_runner(workspace, "init-workspace", &[])?;
-    if runner.success {
-        return Ok(());
-    }
+    init_workspace_dirs(workspace)?;
+    write_workspace_file_if_missing(&workspace.join("index.md"), "")?;
+    write_workspace_file_if_missing(&workspace.join("log.md"), "# Change Log\n\n")?;
+    write_workspace_file_if_missing(&workspace.join("schema.md"), default_workspace_schema())?;
+    write_workspace_file_if_missing(
+        &workspace.join("AGENTS.md"),
+        &default_workspace_agent_instructions("Workspace Agent Instructions"),
+    )?;
+    write_workspace_file_if_missing(
+        &workspace.join("CLAUDE.md"),
+        &default_workspace_agent_instructions("Claude Workspace Instructions"),
+    )?;
+    Ok(())
+}
 
-    let detail = if !runner.stderr.trim().is_empty() {
-        runner.stderr.trim()
-    } else {
-        runner.stdout.trim()
-    };
-    Err(format!("Failed to initialize workspace files: {detail}"))
+fn write_workspace_file_if_missing(path: &Path, content: &str) -> Result<(), String> {
+    if path.exists() {
+        if path.is_file() {
+            return Ok(());
+        }
+        return Err(format!("{} exists but is not a file", path.display()));
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Failed to create {}: {error}", parent.display()))?;
+    }
+    fs::write(path, content)
+        .map_err(|error| format!("Failed to create {}: {error}", path.display()))
+}
+
+fn default_workspace_agent_instructions(title: &str) -> String {
+    [
+        format!("# {title}"),
+        String::new(),
+        "This is a Maple workspace for a local, file-based AI wiki.".to_string(),
+        "Follow `schema.md` for durable wiki conventions and keep this file short.".to_string(),
+        String::new(),
+        "## Operation Boundary".to_string(),
+        String::new(),
+        "- Treat `sources/` as immutable source material. Do not edit source file contents.".to_string(),
+        "- Write generated wiki content under `wiki/` and derived assets under `wiki/assets/`.".to_string(),
+        "- Explore Chat is read-only unless the app explicitly starts a wiki update operation.".to_string(),
+        "- After wiki content changes, update `index.md` for navigation and append a concise entry to `log.md`.".to_string(),
+        String::new(),
+    ]
+    .join("\n")
+}
+
+fn default_workspace_schema() -> &'static str {
+    r#"# Maple Wiki Schema
+
+This file defines durable conventions for this local Maple wiki.
+
+## Workspace Structure
+
+```text
+workspace/
+  sources/                # Imported source material; do not edit source contents
+  wiki/
+    concepts/             # Canonical concept pages
+    summaries/            # Source or topic summaries
+    guides/               # Learning paths and synthesis guides
+    assets/               # Derived figures and supporting media
+  index.md                # Reader-facing navigation
+  log.md                  # Append-only operation history
+  schema.md               # Durable wiki conventions
+```
+
+## Working Model
+
+- Keep storage local and file-based.
+- Treat `sources/` as immutable.
+- Use `wiki/` for generated and maintained wiki pages.
+- Prefer one canonical page per durable concept and link to it instead of duplicating explanations.
+- Update `schema.md` only when the user asks to change durable wiki rules.
+"#
 }
 
 fn run_runner(
@@ -4395,6 +4520,7 @@ fn run_runner(
 fn run_runner_with_args(args: &[String]) -> Result<RunnerOutput, String> {
     let runner_root = runner_root()?;
     let node = node_executable()?;
+    ensure_node_executable_supported(&node)?;
 
     let output = Command::new(&node)
         .arg("src/operation-runner.js")
@@ -4413,6 +4539,10 @@ fn run_runner_with_args(args: &[String]) -> Result<RunnerOutput, String> {
 }
 
 fn node_executable() -> Result<PathBuf, String> {
+    if env_flag("MAPLE_SIMULATE_MISSING_NODE") {
+        return Err("Failed to find Node.js. MAPLE_SIMULATE_MISSING_NODE is enabled.".to_string());
+    }
+
     if let Some(node) = find_executable_in_path("node", env::var("PATH").ok().as_deref()) {
         return Ok(node);
     }
@@ -4453,10 +4583,14 @@ fn node_runtime_status() -> NodeRuntimeStatus {
     } else {
         find_runtime_executable("npm", &path_env)
     };
+    let node_version =
+        simulated_node_version().or_else(|| node.as_ref().and_then(|path| command_version(path)));
     NodeRuntimeStatus {
         node_installed: node.is_some(),
         npm_installed: npm.is_some(),
-        node_version: node.as_ref().and_then(|path| command_version(path)),
+        node_version_supported: node_version_supported(node_version.as_deref()),
+        required_node_major: REQUIRED_NODE_MAJOR,
+        node_version,
         npm_version: npm.as_ref().and_then(|path| command_version(path)),
         node_path: node.map(|path| path.display().to_string()),
         npm_path: npm.map(|path| path.display().to_string()),
@@ -4502,6 +4636,43 @@ fn command_version(path: &Path) -> Option<String> {
         None
     } else {
         Some(text)
+    }
+}
+
+fn simulated_node_version() -> Option<String> {
+    env::var("MAPLE_SIMULATE_NODE_VERSION")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn parse_node_major(version: &str) -> Option<u32> {
+    let trimmed = version.trim();
+    let without_prefix = trimmed.strip_prefix('v').unwrap_or(trimmed);
+    without_prefix.split('.').next()?.parse::<u32>().ok()
+}
+
+fn node_version_supported(version: Option<&str>) -> bool {
+    version
+        .and_then(parse_node_major)
+        .map(|major| major >= REQUIRED_NODE_MAJOR)
+        .unwrap_or(false)
+}
+
+fn unsupported_node_message(node: &Path, version: Option<&str>) -> String {
+    let version = version.unwrap_or("unknown version");
+    format!(
+        "Maple found Node.js {version} at {}. Maple needs Node.js {REQUIRED_NODE_MAJOR} or newer before it can use AI features.",
+        node.display()
+    )
+}
+
+fn ensure_node_executable_supported(node: &Path) -> Result<(), String> {
+    let version = simulated_node_version().or_else(|| command_version(node));
+    if node_version_supported(version.as_deref()) {
+        Ok(())
+    } else {
+        Err(unsupported_node_message(node, version.as_deref()))
     }
 }
 
@@ -5201,12 +5372,12 @@ mod tests {
     use super::{
         chat_thread_summary, chat_threads_dir, compose_maintain_operation_instruction,
         ensure_maintain_thread_task_matches, extract_partial_answer_from_events,
-        load_state_at,
-        maintain_operation_assistant_text, maintain_operation_user_text, make_chat_thread,
-        make_maintain_thread, normalize_operation_events, read_requested_or_new_chat_thread,
-        read_text_tail, refresh_maintain_operation_messages, refresh_streaming_messages,
-        shell_single_quote, terminal_command_script, thread_activity_context, ChatThreadMessage,
-        ThreadFileKind,
+        initialize_workspace_files, load_state_at, maintain_operation_assistant_text,
+        maintain_operation_user_text, make_chat_thread, make_maintain_thread,
+        node_version_supported, normalize_operation_events, parse_node_major,
+        provider_simulation_value_matches, read_requested_or_new_chat_thread, read_text_tail,
+        refresh_maintain_operation_messages, refresh_streaming_messages, shell_single_quote,
+        terminal_command_script, thread_activity_context, ChatThreadMessage, ThreadFileKind,
     };
     use std::{
         fs,
@@ -5220,6 +5391,60 @@ mod tests {
             .map(|duration| duration.as_millis())
             .unwrap_or(0);
         std::env::temp_dir().join(format!("{prefix}-{millis}-{}", std::process::id()))
+    }
+
+    #[test]
+    fn initialize_workspace_files_creates_empty_workspace_without_overwriting() {
+        let workspace = unique_test_workspace("maple-init-workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(workspace.join("schema.md"), "existing schema\n").unwrap();
+
+        initialize_workspace_files(&workspace).unwrap();
+
+        assert_eq!(fs::read_to_string(workspace.join("index.md")).unwrap(), "");
+        assert_eq!(
+            fs::read_to_string(workspace.join("schema.md")).unwrap(),
+            "existing schema\n"
+        );
+        for dir in [
+            "sources",
+            "wiki/concepts",
+            "wiki/summaries",
+            "wiki/guides",
+            "wiki/assets",
+            ".aiwiki",
+            ".aiwiki/chat-threads",
+            ".aiwiki/maintain-threads",
+        ] {
+            assert!(workspace.join(dir).is_dir(), "{dir} should exist");
+        }
+        for file in ["log.md", "schema.md", "AGENTS.md", "CLAUDE.md"] {
+            assert!(workspace.join(file).is_file(), "{file} should exist");
+        }
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn node_version_support_requires_node_twenty_or_newer() {
+        assert_eq!(parse_node_major("v14.16.1"), Some(14));
+        assert_eq!(parse_node_major("20.11.1"), Some(20));
+        assert!(!node_version_supported(Some("v14.16.1")));
+        assert!(!node_version_supported(Some("v18.20.0")));
+        assert!(node_version_supported(Some("v20.0.0")));
+        assert!(node_version_supported(Some("v22.20.0")));
+        assert!(!node_version_supported(None));
+    }
+
+    #[test]
+    fn provider_simulation_flags_match_named_or_all_providers() {
+        assert!(provider_simulation_value_matches("codex", "codex"));
+        assert!(provider_simulation_value_matches("claude,codex", "codex"));
+        assert!(provider_simulation_value_matches("all", "claude"));
+        assert!(provider_simulation_value_matches("*", "codex"));
+        assert!(provider_simulation_value_matches("true", "claude"));
+        assert!(!provider_simulation_value_matches("claude", "codex"));
+        assert!(!provider_simulation_value_matches("", "codex"));
     }
 
     fn write_operation_report(workspace: &Path, operation_id: &str, status: &str) {

@@ -3108,6 +3108,8 @@ button.tree-name-clickable {
 .provider-setup-card {
   display: grid;
   gap: 9px;
+  width: 100%;
+  max-width: 100%;
   min-width: 0;
   padding: 11px;
   border: 1px solid var(--border);
@@ -3149,9 +3151,14 @@ button.tree-name-clickable {
   min-width: 0;
 }
 
+.provider-setup-head > div {
+  min-width: 0;
+}
+
 .provider-setup-title {
   font-size: 12.5px;
   font-weight: 700;
+  overflow-wrap: anywhere;
 }
 
 .provider-setup-badge {
@@ -3190,16 +3197,19 @@ button.tree-name-clickable {
   color: var(--text-muted);
   font-size: 12px;
   line-height: 1.4;
+  overflow-wrap: anywhere;
 }
 
 .provider-setup-status {
   color: var(--text-dim);
   font-size: 11.5px;
+  overflow-wrap: anywhere;
 }
 
 .provider-setup-note {
   color: var(--text-dim);
   font-size: 11.5px;
+  overflow-wrap: anywhere;
 }
 
 .provider-setup-command {
@@ -3394,6 +3404,26 @@ button.tree-name-clickable {
   color: var(--warn);
   font-size: 11.5px;
   line-height: 1.35;
+}
+
+.provider-diagnostics-error {
+  display: grid;
+  gap: 6px;
+}
+
+.provider-diagnostics-error pre {
+  max-height: 160px;
+  margin: 0;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text-dim);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 10.5px;
+  line-height: 1.4;
+  overflow: auto;
+  white-space: pre-wrap;
 }
 
 .provider-diagnostics-help {

@@ -259,6 +259,7 @@ type BuildDraft = {
 } | null;
 
 type RightPanelMode = "explore" | "maintain";
+type AiSetupPromptReason = "build" | "chat" | "maintain" | null;
 type AppUpdateStatus =
   | "idle"
   | "checking"
@@ -1031,6 +1032,7 @@ function App() {
   const [seenMaintainThreadUpdates, setSeenMaintainThreadUpdates] = useState<SeenThreadMap>({});
   const [applyDraft, setApplyDraft] = useState<ApplyDraft>(null);
   const [buildDraft, setBuildDraft] = useState<BuildDraft>(null);
+  const [aiSetupPromptReason, setAiSetupPromptReason] = useState<AiSetupPromptReason>(null);
   const [rightPanelMode, setRightPanelMode] = useState<RightPanelMode>("explore");
   const [maintainStage, setMaintainStage] = useState<MaintainStage>("choose");
   const [selectedMaintainTaskId, setSelectedMaintainTaskId] = useState<MaintainTaskId | null>(null);
@@ -1536,15 +1538,22 @@ function App() {
     () => providers.find((provider) => provider.name === appSettings?.provider) ?? providers[0],
     [appSettings?.provider, providers],
   );
-  const providerSetup = useProviderSetup(activeProvider?.name ?? null, Boolean(activeProvider));
+  const providerSetup = useProviderSetup(
+    activeProvider?.name ?? null,
+    Boolean(activeProvider && aiSetupPromptReason),
+  );
   const activeProviderReady = providerSetup.ready;
+  useEffect(() => {
+    if (aiSetupPromptReason && activeProviderReady) {
+      setAiSetupPromptReason(null);
+    }
+  }, [activeProviderReady, aiSetupPromptReason]);
   const maintainCanAskOnly = Boolean(
     workspace.workspacePath &&
       maintainThread &&
       selectedMaintainTask &&
       !exploreBlockedReason &&
       !maintainDiscussionBusy &&
-      activeProviderReady &&
       maintainInstruction.trim(),
   );
   const maintainSubmitLabel = maintainAskOnly
@@ -1557,7 +1566,7 @@ function App() {
     : maintainBlockedReason ?? selectedMaintainTask?.actionLabel;
   const maintainSubmitDisabled = maintainAskOnly
     ? !maintainCanAskOnly
-    : !maintainCanRun || !activeProviderReady;
+    : !maintainCanRun;
   const activeModelId = activeProvider
     ? appSettings?.models[activeProvider.name] || activeProvider.defaultModel
     : "";
@@ -2984,6 +2993,7 @@ function App() {
       setError(buildBlockedReason);
       return;
     }
+    setAiSetupPromptReason("build");
     const provider = activeProvider ?? providers[0];
     setBuildDraft({
       instruction: "",
@@ -3019,6 +3029,7 @@ function App() {
     const draftProviderReady =
       draftProvider.name === activeProvider?.name ? activeProviderReady : buildProviderSetup.ready;
     if (!draftProviderReady) {
+      setAiSetupPromptReason("build");
       setError(
         `${displayProviderName(draftProvider)} setup is needed before building the wiki.`,
       );
@@ -3180,6 +3191,7 @@ function App() {
       return;
     }
     if (!activeProviderReady) {
+      setAiSetupPromptReason("maintain");
       setError(
         `${activeProvider ? displayProviderName(activeProvider) : "AI"} setup is needed before running maintenance.`,
       );
@@ -3324,6 +3336,7 @@ function App() {
   async function askExploreChat(questionOverride?: string): Promise<boolean> {
     if (exploreBlockedReason || !workspace.workspacePath) return false;
     if (!activeProviderReady) {
+      setAiSetupPromptReason("chat");
       setError(
         `${activeProvider ? displayProviderName(activeProvider) : "AI"} setup is needed before asking chat.`,
       );
@@ -3397,6 +3410,7 @@ function App() {
       return;
     }
     if (!activeProviderReady) {
+      setAiSetupPromptReason("maintain");
       setError(
         `${activeProvider ? displayProviderName(activeProvider) : "AI"} setup is needed before asking Maintain.`,
       );
@@ -3642,6 +3656,7 @@ function App() {
   async function applyChatToWiki() {
     if (!chatThread || !applyDraft || updateWikiBlockedReason) return;
     if (!activeProviderReady) {
+      setAiSetupPromptReason("chat");
       setError(
         `${activeProvider ? displayProviderName(activeProvider) : "AI"} setup is needed before updating the wiki.`,
       );
@@ -4723,7 +4738,7 @@ function App() {
               )
             ) : (
               <MarkdownDocument
-                content={selectedDocument.content || `${selectedDocument.path} is not available.`}
+                content={selectedDocument.content ?? `${selectedDocument.path} is not available.`}
                 currentPath={selectedDocument.path}
                 workspacePath={workspace.workspacePath}
                 availableDocuments={availableDocuments}
@@ -5007,7 +5022,7 @@ function App() {
                 void askExploreChat();
               }}
             >
-              {!activeProviderReady ? (
+              {aiSetupPromptReason === "chat" && !activeProviderReady ? (
                 <ProviderSetupCard
                   provider={activeProvider}
                   setup={providerSetup}
@@ -5021,14 +5036,14 @@ function App() {
               <textarea
                 className="explore-chat-input"
                 value={exploreQuestion}
-                disabled={Boolean(exploreBlockedReason) || !activeProviderReady || !workspace.workspacePath}
-                placeholder={activeProviderReady ? "Ask about this page…" : "Set up AI first…"}
+                disabled={Boolean(exploreBlockedReason) || !workspace.workspacePath}
+                placeholder="Ask about this page…"
                 rows={3}
                 onChange={(event) => setExploreQuestion(event.target.value)}
                 onKeyDown={(event) => {
                   if (event.key === "Enter" && !event.shiftKey) {
                     event.preventDefault();
-                    if (exploreBlockedReason || !activeProviderReady) {
+                    if (exploreBlockedReason) {
                       return;
                     }
                     void askExploreChat();
@@ -5079,7 +5094,7 @@ function App() {
                         ? "Web search on"
                         : "Web search off"
                     }
-                    disabled={exploreBusy || blockingUiBusy || !activeProviderReady}
+                    disabled={exploreBusy || blockingUiBusy}
                     onClick={() => setExploreWebSearchEnabled((enabled) => !enabled)}
                   >
                     <Globe size={18} strokeWidth={2.2} aria-hidden="true" />
@@ -5106,7 +5121,6 @@ function App() {
                     className="explore-chat-submit"
                     disabled={
                       Boolean(exploreBlockedReason) ||
-                      !activeProviderReady ||
                       !workspace.workspacePath ||
                       !exploreQuestion.trim()
                     }
@@ -5346,7 +5360,7 @@ function App() {
                     void submitMaintainComposer();
                   }}
                 >
-                  {!activeProviderReady ? (
+                  {aiSetupPromptReason === "maintain" && !activeProviderReady ? (
                     <ProviderSetupCard
                       provider={activeProvider}
                       setup={providerSetup}
@@ -5409,7 +5423,7 @@ function App() {
                     className="maintain-input"
                     value={maintainInstruction}
                     rows={3}
-                    disabled={Boolean(maintainComposerBlockedReason) || !activeProviderReady}
+                    disabled={Boolean(maintainComposerBlockedReason)}
                     title={maintainComposerBlockedReason ?? undefined}
                     placeholder={selectedMaintainTask.placeholder}
                     onChange={(event) => setMaintainInstruction(event.target.value)}
@@ -5672,7 +5686,10 @@ function App() {
                 <button
                   type="button"
                   className="apply-modal-secondary"
-                  onClick={() => setBuildDraft(null)}
+                  onClick={() => {
+                    setBuildDraft(null);
+                    setAiSetupPromptReason((reason) => (reason === "build" ? null : reason));
+                  }}
                   disabled={isStartingBuild}
                 >
                   Cancel
