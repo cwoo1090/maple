@@ -3699,6 +3699,42 @@ async fn apply_standard_schema_update(
 }
 
 #[tauri::command]
+async fn merge_standard_schema_update(
+    app: AppHandle,
+    state: State<'_, WorkspaceStore>,
+) -> Result<AppCommandResult, String> {
+    let workspace = current_workspace(&state)?;
+    let latest_schema = normalized_schema_text(default_workspace_schema());
+    let latest_hash = stable_text_hash(&latest_schema);
+    let instruction = format!(
+        r#"Update schema.md by merging this workspace's current schema.md with the latest standard workspace schema below.
+
+Use the latest standard schema as the main structure and default rule set, but make the final document belong to this specific workspace.
+Rewrite the title and opening section to describe this wiki or workspace when the current schema.md has useful subject, audience, scope, tone, or purpose context. If no specific context exists, use a neutral title such as Workspace Wiki Schema.
+Do not mention the app or product name "Maple" in schema.md. Do not copy product-positioning or marketing text into schema.md.
+Preserve user-specific workspace context, durable preferences, and project-specific rules from the current schema.md when they do not conflict with the standard workspace rules.
+Do not blindly replace schema.md if the current file contains useful custom context.
+Do not edit source files or wiki pages.
+Update AGENTS.md or CLAUDE.md only if they conflict with the merged schema direction.
+Append a concise log.md entry explaining that schema.md was updated by merging the latest standard workspace schema with existing workspace-specific rules.
+
+Latest standard workspace schema:
+
+```md
+{latest_schema}
+```"#,
+    );
+
+    let mut result =
+        run_maintenance_command(&app, &state, "update-rules", Some(instruction), true, None)?;
+    if result.runner.as_ref().is_some_and(|runner| runner.success) {
+        annotate_schema_merge_change_marker(&workspace, &latest_hash)?;
+        result.state = load_state_at(&workspace)?;
+    }
+    Ok(result)
+}
+
+#[tauri::command]
 async fn close_workspace(state: State<'_, WorkspaceStore>) -> Result<(), String> {
     *state.path.lock().unwrap() = None;
     Ok(())
@@ -4383,6 +4419,10 @@ async fn keep_generated_changes(
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    let schema_base_hash_on_accept = marker
+        .get("schemaBaseHashOnAccept")
+        .and_then(Value::as_str)
+        .map(str::to_string);
 
     if reviewed_files.is_empty() {
         return Ok(AppCommandResult {
@@ -4423,6 +4463,10 @@ async fn keep_generated_changes(
         render_reviewed_change_marker_text(&marker),
     )
     .map_err(|error| format!("Failed to update change marker summary: {error}"))?;
+
+    if let Some(schema_base_hash) = schema_base_hash_on_accept {
+        record_schema_standard_baseline(&workspace, &schema_base_hash)?;
+    }
 
     Ok(AppCommandResult {
         runner: None,
@@ -5753,6 +5797,33 @@ fn record_schema_baseline_if_current_standard(workspace: &Path) -> Result<(), St
     Ok(())
 }
 
+fn annotate_schema_merge_change_marker(workspace: &Path, latest_hash: &str) -> Result<(), String> {
+    let marker_path = workspace
+        .join(METADATA_DIR)
+        .join("changed")
+        .join("last-operation.json");
+    let Some(mut marker) = read_json_if_exists_normalized(&marker_path) else {
+        return Ok(());
+    };
+    let object = marker
+        .as_object_mut()
+        .ok_or_else(|| "Generated change marker is invalid.".to_string())?;
+    object.insert(
+        "schemaBaseHashOnAccept".to_string(),
+        Value::String(latest_hash.to_string()),
+    );
+    object.insert(
+        "schemaUpdateKind".to_string(),
+        Value::String("standard-schema-merge".to_string()),
+    );
+    fs::write(
+        &marker_path,
+        serde_json::to_vec_pretty(&marker)
+            .map_err(|error| format!("Failed to serialize change marker: {error}"))?,
+    )
+    .map_err(|error| format!("Failed to annotate schema update marker: {error}"))
+}
+
 fn backup_schema_before_update(
     workspace: &Path,
     latest_schema: &str,
@@ -5786,7 +5857,7 @@ fn append_schema_update_log(workspace: &Path, backup_path: Option<&str>) -> Resu
     if !log.ends_with("\n\n") {
         log.push('\n');
     }
-    log.push_str("- Updated `schema.md` to the latest standard Maple schema.\n");
+    log.push_str("- Updated `schema.md` to the latest standard workspace schema.\n");
     if let Some(path) = backup_path {
         log.push_str(&format!("  - Previous schema backed up to `{path}`.\n"));
     }
@@ -8128,6 +8199,7 @@ pub fn run() {
             check_schema_update_prompt,
             dismiss_schema_update_prompt,
             apply_standard_schema_update,
+            merge_standard_schema_update,
             close_workspace,
             load_workspace_state,
             list_chat_threads,

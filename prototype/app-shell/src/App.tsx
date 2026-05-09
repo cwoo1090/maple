@@ -1475,6 +1475,7 @@ function App() {
   const resetBlockedReason = getBlockedReason("reset");
   const sourceImportBlockedReason = getBlockedReason("source-import");
   const sourceRemoveBlockedReason = getBlockedReason("source-remove");
+  const schemaUpdateBusy = busy === "Merging schema.md";
   const schemaUpdateBlockedReason = hasPendingGeneratedChanges
     ? PENDING_GENERATED_CHANGES_ERROR
     : activeWorkspaceWriteLabel
@@ -3230,7 +3231,7 @@ function App() {
     try {
       const prompt = await invoke<SchemaUpdatePrompt>("check_schema_update_prompt");
       if (prompt.currentHash === prompt.latestHash) {
-        if (manual) setError("schema.md already uses the latest standard Maple schema.");
+        if (manual) setError("schema.md already uses the latest standard workspace schema.");
         return;
       }
       if (!manual && !prompt.available) return;
@@ -3248,22 +3249,39 @@ function App() {
     }
   }
 
-  async function applyStandardSchemaUpdate() {
+  async function mergeStandardSchemaUpdate() {
     if (!schemaUpdatePrompt) return;
     if (schemaUpdateBlockedReason) {
       setError(schemaUpdateBlockedReason);
       return;
     }
-    setBusy("Updating schema.md");
+    if (!activeProviderReady) {
+      showAiSetupPrompt("maintain");
+      setError(
+        `${activeProvider ? displayProviderName(activeProvider) : "AI"} setup is needed before updating schema.md.`,
+      );
+      void providerSetup.refresh();
+      return;
+    }
+    setBusy("Merging schema.md");
     setError(null);
 
     try {
-      const state = await invoke<WorkspaceState>("apply_standard_schema_update");
-      setWorkspace(state);
+      const result = await invoke<AppCommandResult>("merge_standard_schema_update");
+      setRunner(result.runner);
+      setWorkspace(result.state);
       setSchemaUpdatePrompt(null);
       setSchemaUpdateContentOpen(false);
       openWorkspaceFile("schema.md");
-      track("schema update applied", { reason: schemaUpdatePrompt.reason });
+      await refreshWorkspaceOperationProgressOnce();
+      track("schema update merge completed", {
+        reason: schemaUpdatePrompt.reason,
+        result: result.runner?.success === false ? "failed" : "success",
+        changed_file_count: reviewableChangedFileCount(result.state),
+      });
+      if (result.runner && !result.runner.success) {
+        setError(`Schema update exited with code ${result.runner.code ?? "unknown"}.`);
+      }
     } catch (err) {
       setError(String(err));
     } finally {
@@ -5068,7 +5086,7 @@ function App() {
                   disabled={Boolean(schemaUpdateBlockedReason)}
                   title={
                     schemaUpdateBlockedReason ??
-                    "Review the latest standard Maple schema before replacing schema.md"
+                    "Review the latest standard workspace schema before updating schema.md"
                   }
                   onClick={() => void openSchemaUpdatePrompt(true)}
                 >
@@ -6312,7 +6330,9 @@ function App() {
             role="dialog"
             aria-modal="true"
             aria-labelledby="schema-update-title"
-            onMouseDown={() => setSchemaUpdatePrompt(null)}
+            onMouseDown={() => {
+              if (!schemaUpdateBusy) setSchemaUpdatePrompt(null);
+            }}
           >
             <div
               className="apply-modal schema-update-modal"
@@ -6322,8 +6342,8 @@ function App() {
                 <div>
                   <h2 id="schema-update-title">schema.md update available</h2>
                   <p>
-                    Maple can replace this workspace&apos;s schema.md with the latest standard
-                    Maple wiki schema.
+                    Maple can ask AI to update schema.md using the latest standard workspace schema
+                    while preserving useful rules from this workspace.
                   </p>
                 </div>
                 <button
@@ -6331,25 +6351,23 @@ function App() {
                   className="apply-modal-close"
                   onClick={() => setSchemaUpdatePrompt(null)}
                   aria-label="Close schema update"
+                  disabled={schemaUpdateBusy}
                 >
                   ×
                 </button>
               </header>
               <div className="schema-update-copy">
-                <strong>Standard Maple schema</strong>
+                <strong>What this update does</strong>
                 <p>
-                  This replaces the entire schema.md file with the standard Maple schema shown
-                  below. It does not merge your current schema. Any custom context, durable
-                  preferences, or project-specific rules saved in schema.md will be removed unless
-                  you add them again after updating. Maple saves a backup of the current schema.md
-                  before replacing it.
+                  Maple will ask AI to create a new schema.md draft using the latest standard
+                  schema and your current workspace rules.
                 </p>
-              </div>
-              <div className="schema-update-warning">
-                Maple cannot always tell whether a hand-edited schema already contains the newest
-                rules. Keep the current schema.md if it contains workspace context you still want
-                Maple or AI agents to follow. You can reopen this update later from the Update
-                schema.md button at the top of the schema.md page.
+                <ul>
+                  <li>Uses the standard workspace schema as the main structure.</li>
+                  <li>Preserves useful workspace context and durable preferences when possible.</li>
+                  <li>Shows the generated schema.md change for review before you accept it.</li>
+                  <li>You can keep the current schema and reopen this later from schema.md.</li>
+                </ul>
               </div>
               <button
                 type="button"
@@ -6361,22 +6379,50 @@ function App() {
               {schemaUpdateContentOpen ? (
                 <pre className="schema-update-preview">{schemaUpdatePrompt.latestSchema}</pre>
               ) : null}
+              {visibleAiSetupReason === "maintain" ? (
+                <ProviderSetupCard
+                  provider={activeProvider}
+                  setup={providerSetup}
+                  context="maintain"
+                  className="build-provider-setup"
+                  showReady={showAiSetupReadyNotice}
+                />
+              ) : null}
+              {schemaUpdateBusy ? (
+                <div className="schema-update-running" role="status" aria-live="polite">
+                  <span className="chat-thinking">
+                    Updating schema.md. Maple is asking AI to merge the latest workspace schema
+                    with your current rules. Please wait a moment.
+                  </span>
+                  <div className="schema-update-running-detail">
+                    <p>
+                      Maple is reading the current schema, agent files, recent log, and wiki
+                      structure before writing the draft.
+                    </p>
+                    <p>
+                      This can take a few minutes with higher-reasoning models. The generated
+                      change will appear for review when it finishes.
+                    </p>
+                  </div>
+                </div>
+              ) : null}
               <footer className="apply-modal-actions">
                 <button
                   type="button"
                   className="apply-modal-secondary"
                   onClick={() => setSchemaUpdatePrompt(null)}
+                  disabled={schemaUpdateBusy}
                 >
                   Keep current schema
                 </button>
                 <button
                   type="button"
                   className="apply-modal-primary"
-                  disabled={Boolean(schemaUpdateBlockedReason) || busy === "Updating schema.md"}
+                  disabled={Boolean(schemaUpdateBlockedReason) || schemaUpdateBusy}
                   title={schemaUpdateBlockedReason ?? undefined}
-                  onClick={() => void applyStandardSchemaUpdate()}
+                  onClick={() => void mergeStandardSchemaUpdate()}
                 >
-                  {busy === "Updating schema.md" ? "Updating..." : "Update schema.md"}
+                  {schemaUpdateBusy ? "Updating..." : "Update schema.md"}
                 </button>
               </footer>
             </div>

@@ -1,9 +1,15 @@
-# Maple Wiki Schema
+# Workspace Wiki Schema
 
-This file defines durable content conventions for a Maple workspace.
+This file defines durable content conventions for this workspace.
 The wiki is a local, file-based knowledge graph compiled from immutable sources and explicit wiki update operations.
 
-Maple is an AI wiki builder, not a generic markdown editor or file chatbot. The goal is to maintain a persistent, compounding wiki that sits between the reader and the raw sources. New sources should strengthen the existing wiki instead of forcing future questions to rediscover the same knowledge from scratch.
+The goal is to maintain a persistent, compounding wiki that sits between the reader and the raw sources. New sources should strengthen the existing wiki instead of forcing future questions to rediscover the same knowledge from scratch.
+
+## Workspace Context
+
+- Use this section to capture durable context for this specific wiki, including subject, audience, scope, tone, and recurring preferences.
+- Keep the title and opening section about this wiki or workspace, not about the app that manages it.
+- If no workspace-specific context has been provided yet, keep this section concise and update it when the user gives durable context.
 
 ## Workspace Structure
 
@@ -34,7 +40,7 @@ workspace/
 
 ## Operation Model
 
-Maple should preserve this loop:
+The workspace should preserve this loop:
 
 ```text
 sources/ -> Build Wiki -> Explore -> Apply to Wiki -> Wiki Healthcheck -> Update Rules
@@ -90,6 +96,7 @@ Apply to Wiki should save durable value from Explore:
 ## Durable Preferences And Agent Files
 
 - Treat this `schema.md` file as the durable source of truth for wiki rules, workspace preferences, and operation behavior.
+- Keep `schema.md` written as workspace guidance, not product documentation; do not include app branding or marketing copy.
 - Save a user preference to `schema.md` only when the user explicitly asks for future behavior, for example "always", "from now on", "remember this", "make this the default", or "for this workspace".
 - Otherwise, treat user instructions as local to the current operation.
 - `AGENTS.md` and `CLAUDE.md` are short bootstrap files for AI tools. Keep detailed content conventions in `schema.md`.

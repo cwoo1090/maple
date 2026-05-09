@@ -2547,6 +2547,8 @@ ${workspaceContext}
 Use this as durable workspace context:
 - Update index.md with a concise reader-facing introduction when useful.
 - Update schema.md with workspace-specific context or preferences based on this purpose.
+- If this is a new workspace or schema.md still has a generic title/opening, rewrite the title, opening paragraph, and Workspace Context section to reflect the provided workspace purpose.
+- Do not mention Maple in schema.md.
 - Do not update AGENTS.md or CLAUDE.md for ordinary workspace context.
 `;
   }

@@ -1401,6 +1401,8 @@ test("Build Wiki prompt includes first-build workspace context", async (t) => {
   assert.match(prompt, /robotics class wiki/);
   assert.match(prompt, /Update index\.md with a concise reader-facing introduction/);
   assert.match(prompt, /Update schema\.md with workspace-specific context/);
+  assert.match(prompt, /rewrite the title, opening paragraph, and Workspace Context section/);
+  assert.match(prompt, /Do not mention Maple in schema\.md/);
   assert.match(prompt, /Do not update AGENTS\.md or CLAUDE\.md for ordinary workspace context/);
   assert.match(prompt, /Update AGENTS\.md or CLAUDE\.md only when the user explicitly asks/);
 });
