@@ -44,7 +44,8 @@
     "longDescription": "Maple helps learners, personal archivists, and small teams compile local source folders into a maintained, source-grounded wiki using their own AI subscriptions.",
     "resources": {
       "../../operation-runner/package.json": "operation-runner/package.json",
-      "../../operation-runner/src": "operation-runner/src"
+      "../../operation-runner/src": "operation-runner/src",
+      "../../workspace-template": "workspace-template"
     },
     "icon": [
       "icons/32x32.png",

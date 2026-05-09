@@ -16,6 +16,7 @@ const {
   buildMaintenancePrompt,
   buildWikiPrompt,
   calculateFullSlideBudget,
+  contactSheetRanges,
   collectExploreSourceVisualContext,
   collectWikiPageImageAttachments,
   createSnapshot,
@@ -36,9 +37,12 @@ const {
   normalizeRelativePath,
   parseExplorePageReferences,
   parseSlideSelectionJson,
+  parseVisualInspectionPlanJson,
+  readRenderedPdfResult,
   renderPreparedSourcesForPrompt,
   renderSourceStatusForPrompt,
   resolveOperationId,
+  selectBuildWikiVisualInputs,
   sourcePathsForBuild,
   validateAndRestoreChanges,
   workspaceAgentInstructions,
@@ -410,6 +414,19 @@ test("calculates balanced full-slide visual budget", () => {
   assert.equal(calculateFullSlideBudget(50), 10);
 });
 
+test("splits contact sheet ranges into 20-page chunks", () => {
+  assert.deepEqual(contactSheetRanges(20), [{ startPage: 1, endPage: 20 }]);
+  assert.deepEqual(contactSheetRanges(21), [
+    { startPage: 1, endPage: 20 },
+    { startPage: 21, endPage: 21 },
+  ]);
+  assert.deepEqual(contactSheetRanges(50), [
+    { startPage: 1, endPage: 20 },
+    { startPage: 21, endPage: 40 },
+    { startPage: 41, endPage: 50 },
+  ]);
+});
+
 test("fallback slide selection spreads pages and includes the last page", () => {
   assert.deepEqual(fallbackSelectPageNumbers(21, 5), [1, 6, 11, 16, 21]);
   assert.deepEqual(fallbackSelectPageNumbers(3, 10), [1, 2, 3]);
@@ -424,6 +441,36 @@ test("parses strict and fenced AI slide selection JSON", () => {
     [{ page: 17, reason: "" }],
   );
   assert.throws(() => parseSlideSelectionJson("not json"), /Unexpected token|not valid JSON/);
+});
+
+test("parses and normalizes visual inspection planning JSON", () => {
+  const plan = parseVisualInspectionPlanJson(
+    JSON.stringify({
+      materialType: "Worked Solution",
+      inspectionPolicy: "Inspect Most",
+      pagesToInspect: [
+        { page: 3, reason: "derivation" },
+        { page: 3, reason: "duplicate" },
+        { page: 99, reason: "invalid" },
+        { page: 1, reason: "overview" },
+      ],
+      assetCandidates: [
+        { page: 3, reason: "key equation" },
+        { page: 4, reason: "not inspected" },
+      ],
+      notes: "Use derivation pages.",
+    }),
+    5,
+  );
+
+  assert.equal(plan.materialType, "worked-solution");
+  assert.equal(plan.inspectionPolicy, "inspect-most");
+  assert.deepEqual(plan.pagesToInspect, [
+    { page: 1, reason: "overview" },
+    { page: 3, reason: "derivation" },
+  ]);
+  assert.deepEqual(plan.assetCandidates, [{ page: 3, reason: "key equation" }]);
+  assert.match(plan.notes, /derivation/);
 });
 
 test("prepared source prompt lists only selected slide attachments", () => {
@@ -455,6 +502,250 @@ test("prepared source prompt lists only selected slide attachments", () => {
   assert.match(text, /pages\/page-02\.png/);
   assert.doesNotMatch(text, /pages\/page-01\.png/);
   assert.doesNotMatch(text, /pages\/page-03\.png/);
+});
+
+test("reads chunked and legacy contact sheet manifests", async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "maple-rendered-manifest-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const chunkedDir = path.join(root, "chunked");
+  await fs.mkdir(path.join(chunkedDir, "pages"), { recursive: true });
+  await fs.mkdir(path.join(chunkedDir, "prompt-images"), { recursive: true });
+  await fs.writeFile(path.join(chunkedDir, "pages", "page-01.png"), "png");
+  await fs.writeFile(path.join(chunkedDir, "prompt-images", "page-01.jpg"), "jpg");
+  await fs.writeFile(path.join(chunkedDir, "prompt-images", "contact-sheet-01.jpg"), "sheet1");
+  await fs.writeFile(path.join(chunkedDir, "prompt-images", "contact-sheet-02.jpg"), "sheet2");
+  await fs.writeFile(
+    path.join(chunkedDir, "manifest.json"),
+    `${JSON.stringify({
+      contactSheet: "prompt-images/contact-sheet-01.jpg",
+      contactSheets: [
+        { path: "prompt-images/contact-sheet-01.jpg", startPage: 1, endPage: 20 },
+        { path: "prompt-images/contact-sheet-02.jpg", startPage: 21, endPage: 40 },
+      ],
+      pageCount: 40,
+      pages: [{ page: 1, image: "pages/page-01.png", promptImage: "prompt-images/page-01.jpg" }],
+      textPath: "text.md",
+    }, null, 2)}\n`,
+  );
+  await fs.writeFile(path.join(chunkedDir, "text.md"), "text");
+
+  const chunked = await readRenderedPdfResult(chunkedDir);
+  assert.equal(chunked.contactSheets.length, 2);
+  assert.equal(path.basename(chunked.contactSheetPath), "contact-sheet-01.jpg");
+  assert.deepEqual(
+    chunked.contactSheets.map((sheet) => [sheet.startPage, sheet.endPage]),
+    [[1, 20], [21, 40]],
+  );
+
+  const legacyDir = path.join(root, "legacy");
+  await fs.mkdir(path.join(legacyDir, "pages"), { recursive: true });
+  await fs.mkdir(path.join(legacyDir, "prompt-images"), { recursive: true });
+  await fs.writeFile(path.join(legacyDir, "pages", "page-01.png"), "png");
+  await fs.writeFile(path.join(legacyDir, "prompt-images", "page-01.jpg"), "jpg");
+  await fs.writeFile(path.join(legacyDir, "prompt-images", "contact-sheet.jpg"), "sheet");
+  await fs.writeFile(
+    path.join(legacyDir, "manifest.json"),
+    `${JSON.stringify({
+      contactSheet: "prompt-images/contact-sheet.jpg",
+      pageCount: 1,
+      pages: [{ page: 1, image: "pages/page-01.png", promptImage: "prompt-images/page-01.jpg" }],
+      textPath: "text.md",
+    }, null, 2)}\n`,
+  );
+  await fs.writeFile(path.join(legacyDir, "text.md"), "text");
+
+  const legacy = await readRenderedPdfResult(legacyDir);
+  assert.equal(legacy.contactSheets.length, 1);
+  assert.equal(path.basename(legacy.contactSheetPath), "contact-sheet.jpg");
+});
+
+test("Codex visual planning fallback attaches only pagesToInspect images", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "maple-codex-visual-plan-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  const deckDir = path.join(workspace, ".aiwiki", "extracted", "op", "deck");
+  await fs.mkdir(path.join(deckDir, "pages"), { recursive: true });
+  await fs.mkdir(path.join(deckDir, "prompt-images"), { recursive: true });
+  const pageImages = [];
+  const promptPageImages = [];
+  for (let page = 1; page <= 10; page += 1) {
+    const pageName = String(page).padStart(2, "0");
+    const pageImage = `.aiwiki/extracted/op/deck/pages/page-${pageName}.png`;
+    const promptImage = `.aiwiki/extracted/op/deck/prompt-images/page-${pageName}.jpg`;
+    await fs.writeFile(path.join(workspace, pageImage), `png-${page}`);
+    await fs.writeFile(path.join(workspace, promptImage), `jpg-${page}`);
+    pageImages.push(pageImage);
+    promptPageImages.push(promptImage);
+  }
+  await fs.writeFile(path.join(deckDir, "prompt-images", "contact-sheet-01.jpg"), "sheet1");
+  await fs.writeFile(path.join(deckDir, "prompt-images", "contact-sheet-02.jpg"), "sheet2");
+  const preparedSources = {
+    sources: [{
+      sourcePath: "sources/deck.pdf",
+      sourceSlug: "deck",
+      textPath: "",
+      pageImages,
+      promptPageImages,
+      contactSheetPath: ".aiwiki/extracted/op/deck/prompt-images/contact-sheet-01.jpg",
+      contactSheets: [
+        {
+          path: ".aiwiki/extracted/op/deck/prompt-images/contact-sheet-01.jpg",
+          startPage: 1,
+          endPage: 5,
+        },
+        {
+          path: ".aiwiki/extracted/op/deck/prompt-images/contact-sheet-02.jpg",
+          startPage: 6,
+          endPage: 10,
+        },
+      ],
+      selectedPromptImages: [],
+      pageCount: 10,
+    }],
+    imageAttachments: [],
+    visualInput: null,
+  };
+
+  await selectBuildWikiVisualInputs(
+    workspace,
+    { name: "codex", supportsImageAttachments: true, defaultModel: "test" },
+    { dryRun: true, operationId: "op", operationDir: path.join(workspace, ".aiwiki", "operations", "op") },
+    preparedSources,
+  );
+
+  assert.deepEqual(
+    preparedSources.sources[0].pagesToInspect.map((entry) => entry.page),
+    [1, 6, 10],
+  );
+  assert.deepEqual(
+    preparedSources.imageAttachments.map((filePath) => path.basename(filePath)),
+    ["page-01.jpg", "page-06.jpg", "page-10.jpg"],
+  );
+  assert.equal(preparedSources.visualInput.contactSheetCount, 2);
+  assert.equal(preparedSources.visualInput.visionInputCount, 3);
+  assert.equal(preparedSources.visualInput.sources[0].visualInspectionMode, "attached-images");
+  assert.equal(preparedSources.visualInput.sources[0].inspectionPolicy, "fallback");
+});
+
+test("Claude visual planning records transparent fallback without image attachments", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "maple-claude-visual-plan-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  const deckDir = path.join(workspace, ".aiwiki", "extracted", "op", "deck");
+  await fs.mkdir(path.join(deckDir, "pages"), { recursive: true });
+  await fs.mkdir(path.join(deckDir, "prompt-images"), { recursive: true });
+  const pageImages = [];
+  const promptPageImages = [];
+  for (let page = 1; page <= 8; page += 1) {
+    const pageName = String(page).padStart(2, "0");
+    const pageImage = `.aiwiki/extracted/op/deck/pages/page-${pageName}.png`;
+    const promptImage = `.aiwiki/extracted/op/deck/prompt-images/page-${pageName}.jpg`;
+    await fs.writeFile(path.join(workspace, pageImage), `png-${page}`);
+    await fs.writeFile(path.join(workspace, promptImage), `jpg-${page}`);
+    pageImages.push(pageImage);
+    promptPageImages.push(promptImage);
+  }
+  await fs.writeFile(path.join(deckDir, "prompt-images", "contact-sheet-01.jpg"), "sheet");
+  const preparedSources = {
+    sources: [{
+      sourcePath: "sources/deck.pdf",
+      sourceSlug: "deck",
+      textPath: "",
+      pageImages,
+      promptPageImages,
+      contactSheetPath: ".aiwiki/extracted/op/deck/prompt-images/contact-sheet-01.jpg",
+      contactSheets: [{
+        path: ".aiwiki/extracted/op/deck/prompt-images/contact-sheet-01.jpg",
+        startPage: 1,
+        endPage: 8,
+      }],
+      selectedPromptImages: [],
+      pageCount: 8,
+    }],
+    imageAttachments: [],
+    visualInput: null,
+  };
+
+  await selectBuildWikiVisualInputs(
+    workspace,
+    { name: "claude", supportsImageAttachments: false, defaultModel: "test" },
+    { dryRun: false, operationId: "op", operationDir: path.join(workspace, ".aiwiki", "operations", "op") },
+    preparedSources,
+  );
+
+  assert.deepEqual(preparedSources.imageAttachments, []);
+  assert.equal(
+    preparedSources.visualInput.sources[0].visualInspectionMode,
+    "provider-image-unsupported-fallback",
+  );
+  assert.equal(preparedSources.visualInput.visionInputCount, 0);
+  assert.equal(preparedSources.visualInput.sources[0].visionInputCount, 0);
+});
+
+test("path-referenced visual planning uses absolute image paths without attachments", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "maple-path-visual-plan-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  const deckDir = path.join(workspace, ".aiwiki", "extracted", "op", "deck");
+  await fs.mkdir(path.join(deckDir, "pages"), { recursive: true });
+  await fs.mkdir(path.join(deckDir, "prompt-images"), { recursive: true });
+  const pageImages = [];
+  const promptPageImages = [];
+  for (let page = 1; page <= 3; page += 1) {
+    const pageName = String(page).padStart(2, "0");
+    const pageImage = `.aiwiki/extracted/op/deck/pages/page-${pageName}.png`;
+    const promptImage = `.aiwiki/extracted/op/deck/prompt-images/page-${pageName}.jpg`;
+    await fs.writeFile(path.join(workspace, pageImage), `png-${page}`);
+    await fs.writeFile(path.join(workspace, promptImage), `jpg-${page}`);
+    pageImages.push(pageImage);
+    promptPageImages.push(promptImage);
+  }
+  await fs.writeFile(path.join(deckDir, "prompt-images", "contact-sheet-01.jpg"), "sheet");
+  const preparedSources = {
+    sources: [{
+      sourcePath: "sources/deck.pdf",
+      sourceSlug: "deck",
+      textPath: "",
+      pageImages,
+      promptPageImages,
+      contactSheetPath: ".aiwiki/extracted/op/deck/prompt-images/contact-sheet-01.jpg",
+      contactSheets: [{
+        path: ".aiwiki/extracted/op/deck/prompt-images/contact-sheet-01.jpg",
+        startPage: 1,
+        endPage: 3,
+      }],
+      selectedPromptImages: [],
+      pageCount: 3,
+    }],
+    imageAttachments: [],
+    visualInput: null,
+  };
+
+  await selectBuildWikiVisualInputs(
+    workspace,
+    {
+      name: "claude",
+      supportsImageAttachments: false,
+      supportsImagePathReferences: true,
+      defaultModel: "test",
+    },
+    { dryRun: false, operationId: "op", operationDir: path.join(workspace, ".aiwiki", "operations", "op") },
+    preparedSources,
+  );
+
+  assert.deepEqual(preparedSources.imageAttachments, []);
+  assert.equal(preparedSources.visualInput.providerSupportsImageAttachments, false);
+  assert.equal(preparedSources.visualInput.providerSupportsImagePathReferences, true);
+  assert.equal(preparedSources.visualInput.imageAttachmentCount, 0);
+  assert.equal(preparedSources.visualInput.visionInputCount, 3);
+  assert.equal(preparedSources.visualInput.pathReferencedImageCount, 3);
+  assert.equal(preparedSources.visualInput.sources[0].visualInspectionMode, "path-referenced-images");
+  assert.equal(preparedSources.visualInput.sources[0].visionInputCount, 3);
+  assert.equal(preparedSources.visualInput.sources[0].pathReferencedImageCount, 3);
+
+  const firstImagePath = path.join(workspace, promptPageImages[0]);
+  assert.equal(preparedSources.sources[0].pagesToInspect[0].imageInputPath, firstImagePath);
+
+  const promptText = renderPreparedSourcesForPrompt(preparedSources);
+  assert.match(promptText, /Pages inspected through path-referenced images/);
+  assert.match(promptText, new RegExp(firstImagePath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 });
 
 test("normalizes escaped math delimiters outside fenced code", () => {
@@ -992,19 +1283,31 @@ test("new workspace schema scaffold documents wiki structure and durable rules",
   assert.match(schema, /updated: 2026-05-03/);
   assert.match(schema, /Keep frontmatter minimal/);
   assert.doesNotMatch(schema, /type: summary \| concept \| guide/);
+  assert.match(schema, /persistent, compounding wiki/);
+  assert.match(schema, /## Operation Model/);
+  assert.match(schema, /sources\/ -> Build Wiki -> Explore -> Apply to Wiki -> Wiki Healthcheck -> Update Rules/);
+  assert.match(schema, /## Build Wiki Rules/);
+  assert.match(schema, /Build Wiki should integrate scoped source changes/);
+  assert.match(schema, /Do not rely only on extracted text for visually meaningful sources/);
+  assert.match(schema, /Distinguish pages inspected for understanding from images embedded/);
+  assert.match(schema, /## Explore And Apply Rules/);
+  assert.match(schema, /Apply to Wiki should save durable value from Explore/);
   assert.match(schema, /## Cross-References/);
   assert.match(schema, /## Math Formatting/);
   assert.match(schema, /## Source Citations/);
   assert.match(schema, /Web references are external links used during Explore Chat/);
   assert.match(schema, /found via Explore web search/);
   assert.match(schema, /## Visuals And Assets/);
+  assert.match(schema, /smallest useful set/);
   assert.match(schema, /\[!question\]/);
   assert.match(schema, /\[!warning\]/);
+  assert.match(schema, /## Uncertainty, Conflicts, And Knowledge Gaps/);
   assert.match(schema, /## Index And Log Rules/);
-  assert.match(schema, /## Maintain Operations/);
-  assert.match(schema, /Wiki healthcheck checks the existing wiki/);
+  assert.match(schema, /one-line context for each page/);
   assert.match(schema, /## Wiki Healthcheck Rules/);
   assert.match(schema, /Wiki healthcheck should conservatively check and fix/);
+  assert.match(schema, /Important concepts mentioned across multiple pages/);
+  assert.match(schema, /Contradictions between pages/);
 });
 
 test("initializes a blank workspace without sample sources", async (t) => {
@@ -1354,6 +1657,7 @@ test("maintenance prompts avoid control-file rereads except for rules updates", 
   assert.match(healthcheckPrompt, /Use workspace instructions already loaded by the CLI/);
   assert.doesNotMatch(healthcheckPrompt, /Read AGENTS\.md or CLAUDE\.md/);
   assert.match(healthcheckPrompt, /Wiki Healthcheck Rules/);
+  assert.match(healthcheckPrompt, /Update Rules is needed/);
 
   const rulesPrompt = await buildMaintenancePrompt("/tmp/workspace", {
     operationType: "update-rules",

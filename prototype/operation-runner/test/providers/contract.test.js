@@ -11,6 +11,8 @@ const REQUIRED_FIELDS = [
   "name",
   "binary",
   "defaultModel",
+  "defaultReasoningEffort",
+  "supportedReasoningEfforts",
   "supportedModels",
   "installCommand",
   "loginCommand",
@@ -37,8 +39,16 @@ for (const provider of [codex, claude]) {
     }
     assert.ok(Array.isArray(provider.supportedModels));
     assert.ok(provider.supportedModels.length > 0);
+    assert.ok(Array.isArray(provider.supportedReasoningEfforts));
+    assert.ok(provider.supportedReasoningEfforts.length > 0);
+    for (const model of provider.supportedModels) {
+      assert.equal(typeof model.defaultReasoningEffort, "string");
+      assert.ok(Array.isArray(model.supportedReasoningEfforts));
+      assert.ok(model.supportedReasoningEfforts.length > 0);
+    }
     assert.equal(typeof provider.defaultTimeoutMs, "number");
     assert.equal(typeof provider.supportsImageAttachments, "boolean");
+    assert.equal(typeof provider.supportsImagePathReferences, "boolean");
   });
 
   test(`${provider.name} declares required methods`, () => {
@@ -61,6 +71,24 @@ test("claude ask enables partial message streaming", () => {
 
   assert.ok(args.includes("--include-partial-messages"));
   assert.ok(args.includes("stream-json"));
+});
+
+test("provider visual input capabilities are explicit", () => {
+  assert.equal(codex.supportsImageAttachments, true);
+  assert.equal(codex.supportsImagePathReferences, false);
+  assert.equal(claude.supportsImageAttachments, false);
+  assert.equal(claude.supportsImagePathReferences, true);
+});
+
+test("claude build forwards selected reasoning effort", () => {
+  const args = claude.buildExecArgs({
+    workspace: "/tmp/workspace",
+    model: claude.defaultModel,
+    reasoningEffort: "max",
+    lastMessagePath: "/tmp/last.md",
+  });
+
+  assert.equal(args[args.indexOf("--effort") + 1], "max");
 });
 
 test("claude ask keeps web tools out of source-only explore", () => {
@@ -132,6 +160,17 @@ test("codex ask forwards image attachments", () => {
 
   assert.ok(args.includes("--image"));
   assert.ok(args.includes("/tmp/workspace/wiki/assets/chart.png"));
+});
+
+test("codex build forwards selected reasoning effort as config", () => {
+  const args = codex.buildExecArgs({
+    workspace: "/tmp/workspace",
+    model: codex.defaultModel,
+    reasoningEffort: "xhigh",
+    lastMessagePath: "/tmp/last.md",
+  });
+
+  assert.ok(args.includes('model_reasoning_effort="xhigh"'));
 });
 
 test("codex ask leaves source-only args unchanged", () => {

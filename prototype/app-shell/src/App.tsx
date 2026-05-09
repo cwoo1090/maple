@@ -11,6 +11,7 @@ import {
   type PointerEvent as ReactPointerEvent,
   type ReactNode,
 } from "react";
+import { getVersion } from "@tauri-apps/api/app";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -48,7 +49,13 @@ import {
   type AppSettings,
   type ProviderInfo,
 } from "./ProviderSetup";
+import {
+  ModelReasoningPicker,
+  modelEffort,
+  type ModelReasoningSelection,
+} from "./ModelReasoningPicker";
 import { Settings } from "./Settings";
+import { setAnalyticsContext, track } from "./analytics";
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
@@ -158,6 +165,7 @@ type ExploreChatMessage = {
   contextPath?: string;
   provider?: string;
   model?: string;
+  reasoningEffort?: string;
   webSearchEnabled?: boolean;
   runId?: string;
   status?: "completed" | "streaming" | "failed";
@@ -256,6 +264,7 @@ type BuildDraft = {
   force: boolean;
   provider: string;
   model: string;
+  reasoningEffort: string;
 } | null;
 
 type RightPanelMode = "explore" | "maintain";
@@ -989,6 +998,86 @@ function isManualReviewPath(path: string, status?: string): boolean {
   return true;
 }
 
+function sourceAnalyticsProperties(sourcePaths: string[]) {
+  const sourceTypes = Array.from(
+    new Set(
+      sourcePaths.map((path) => {
+        const fileName = path.split(/[\\/]/).pop() ?? "";
+        const extension = fileName.includes(".") ? fileName.split(".").pop()?.toLowerCase() : "";
+        return extension || "unknown";
+      }),
+    ),
+  ).sort();
+
+  return {
+    source_count: sourcePaths.length,
+    source_types: sourceTypes,
+  };
+}
+
+function reviewableChangedFileCount(state: WorkspaceState) {
+  return (state.changedMarker?.changedFiles ?? state.changedMarker?.allChangedFiles ?? []).filter(
+    isPendingReviewChange,
+  ).length;
+}
+
+function isWikiExplorationPath(path: string) {
+  return path === "index.md" || path.startsWith("wiki/") || path.startsWith("concepts/");
+}
+
+function errorKindFromText(message: string | null | undefined) {
+  const normalized = (message ?? "").toLowerCase();
+  if (!normalized) return "unknown";
+  if (normalized.includes("node")) return "node_setup";
+  if (normalized.includes("npm")) return "npm_setup";
+  if (normalized.includes("sign in") || normalized.includes("logged out")) return "provider_auth";
+  if (normalized.includes("setup")) return "provider_setup";
+  if (normalized.includes("review")) return "review_required";
+  if (normalized.includes("source")) return "source_required";
+  if (normalized.includes("workspace")) return "workspace_required";
+  if (normalized.includes("model")) return "model_required";
+  if (normalized.includes("context") || normalized.includes("what this wiki is for")) {
+    return "workspace_context_required";
+  }
+  return "other";
+}
+
+function sanitizeAnalyticsText(value: string, maxLength = 500) {
+  const normalized = value.replace(/\s+/g, " ").trim();
+  if (normalized.length <= maxLength) return normalized;
+  return `${normalized.slice(0, maxLength - 1).trimEnd()}…`;
+}
+
+function buildWikiTopicProperties(draft: NonNullable<BuildDraft>) {
+  const rawTopic = draft.requiresWorkspaceContext
+    ? draft.workspaceContext
+    : draft.instruction;
+  const wikiTopic = sanitizeAnalyticsText(rawTopic);
+  if (!wikiTopic) {
+    return {
+      wiki_topic_present: false,
+      wiki_topic_length: 0,
+      wiki_topic_source: draft.requiresWorkspaceContext ? "first_build_context" : "build_instruction",
+    };
+  }
+
+  return {
+    wiki_topic: wikiTopic,
+    wiki_topic_present: true,
+    wiki_topic_length: rawTopic.trim().length,
+    wiki_topic_source: draft.requiresWorkspaceContext ? "first_build_context" : "build_instruction",
+  };
+}
+
+function wikiTitleProperties(state: WorkspaceState) {
+  const title = state.indexMd ? extractFirstMarkdownTitle(state.indexMd).title : null;
+  const wikiTitle = title ? sanitizeAnalyticsText(title, 160) : "";
+  return {
+    wiki_title: wikiTitle || null,
+    wiki_title_present: Boolean(wikiTitle),
+  };
+}
+
 function App() {
   const appBodyRef = useRef<HTMLDivElement | null>(null);
   const exploreChatMessagesRef = useRef<HTMLDivElement | null>(null);
@@ -1059,6 +1148,10 @@ function App() {
   >(null);
   const handledBuildOperationIdRef = useRef<string | null>(null);
   const autoFinishedReviewOperationIdRef = useRef<string | null>(null);
+  const appOpenedTrackedRef = useRef(false);
+  const wikiExploredTrackedRef = useRef(false);
+  const onboardingStepTrackedRef = useRef<Set<string>>(new Set());
+  const providerSetupTrackedRef = useRef<Set<string>>(new Set());
   const [chatRunProgressById, setChatRunProgressById] = useState<Record<string, OperationProgress>>(
     {},
   );
@@ -1071,6 +1164,7 @@ function App() {
   const [exploreWebSearchEnabled, setExploreWebSearchEnabled] = useState(false);
   const [providers, setProviders] = useState<ProviderInfo[]>([]);
   const [appSettings, setAppSettings] = useState<AppSettings | null>(null);
+  const [appVersion, setAppVersion] = useState<string | null>(null);
   const [appUpdate, setAppUpdate] = useState<TauriUpdate | null>(null);
   const [appUpdateStatus, setAppUpdateStatus] = useState<AppUpdateStatus>("idle");
   const [appUpdateDownloaded, setAppUpdateDownloaded] = useState(0);
@@ -1395,6 +1489,9 @@ function App() {
       workspace.changedMarker?.operationId &&
       maintainThread.operationId === workspace.changedMarker.operationId,
   );
+  const maintainReviewCompleted = Boolean(
+    maintainOperationIsCurrent && workspace.changedMarker?.reviewedAt,
+  );
   const visibleMaintainThreadMessages = useMemo(
     () =>
       maintainThread?.operationType
@@ -1421,7 +1518,7 @@ function App() {
     selectedMaintainTask && (maintainStage === "compose" || maintainStage === "done"),
   );
   const showMaintainCompletionBar = Boolean(
-    maintainThread?.operationType && maintainStage === "done",
+    maintainThread?.operationType && maintainStage === "done" && !maintainReviewCompleted,
   );
   const showMaintainOperationFeed = Boolean(maintainStage === "running" && selectedMaintainTask);
   const maintainComposerBlockedReason = exploreBlockedReason;
@@ -1538,19 +1635,67 @@ function App() {
     () => providers.find((provider) => provider.name === appSettings?.provider) ?? providers[0],
     [appSettings?.provider, providers],
   );
-  const providerSetup = useProviderSetup(
-    activeProvider?.name ?? null,
-    Boolean(activeProvider && aiSetupPromptReason),
-  );
-  const activeProviderReady = providerSetup.ready;
-  useEffect(() => {
-    if (aiSetupPromptReason && activeProviderReady) {
-      setAiSetupPromptReason(null);
-      setError((current) =>
-        current?.includes("setup is needed before") ? null : current,
-      );
-    }
-  }, [activeProviderReady, aiSetupPromptReason]);
+	  const providerSetup = useProviderSetup(
+	    activeProvider?.name ?? null,
+	    Boolean(activeProvider && aiSetupPromptReason),
+	  );
+	  const activeProviderReady = providerSetup.ready;
+	  function trackOnboardingStepOnce(
+	    step: string,
+	    properties: Record<string, boolean | number | string | string[] | null | undefined> = {},
+	  ) {
+	    const key = `${step}:${JSON.stringify(properties)}`;
+	    if (onboardingStepTrackedRef.current.has(key)) return;
+	    onboardingStepTrackedRef.current.add(key);
+	    track("onboarding step viewed", {
+	      step,
+	      source_count: sourceFiles.length,
+	      pending_source_count: pendingSourceCount,
+	      ...properties,
+	    });
+	  }
+	  useEffect(() => {
+	    if (aiSetupPromptReason && activeProviderReady) {
+	      setAiSetupPromptReason(null);
+	      setError((current) =>
+	        current?.includes("setup is needed before") ? null : current,
+	      );
+	    }
+	  }, [activeProviderReady, aiSetupPromptReason]);
+	  useEffect(() => {
+	    if (!workspace.workspacePath) {
+	      trackOnboardingStepOnce("workspace");
+	      return;
+	    }
+	    if (sourceFiles.length === 0) {
+	      trackOnboardingStepOnce("source_import");
+	    } else if (pendingSourceCount > 0) {
+	      trackOnboardingStepOnce("build_wiki");
+	    } else if (hasPendingGeneratedChanges) {
+	      trackOnboardingStepOnce("review_changes", {
+	        changed_file_count: reviewableChangedFiles.length,
+	      });
+	    }
+	  }, [
+	    hasPendingGeneratedChanges,
+	    pendingSourceCount,
+	    reviewableChangedFiles.length,
+	    sourceFiles.length,
+	    workspace.workspacePath,
+	  ]);
+	  useEffect(() => {
+	    if (!activeProvider || !aiSetupPromptReason) return;
+	    const statusKind = providerSetup.statusKind;
+	    if (!statusKind || statusKind === "checking" || statusKind === "not_checked") return;
+	    const key = `${activeProvider.name}:${statusKind}`;
+	    if (providerSetupTrackedRef.current.has(key)) return;
+	    providerSetupTrackedRef.current.add(key);
+	    track(statusKind === "provider_ready" ? "provider setup completed" : "provider setup needed", {
+	      provider: activeProvider.name,
+	      setup_status: statusKind,
+	      reason: aiSetupPromptReason,
+	    });
+	  }, [activeProvider?.name, aiSetupPromptReason, providerSetup.statusKind]);
   const maintainCanAskOnly = Boolean(
     workspace.workspacePath &&
       maintainThread &&
@@ -1574,7 +1719,12 @@ function App() {
     ? appSettings?.models[activeProvider.name] || activeProvider.defaultModel
     : "";
   const activeModel = activeProvider?.supportedModels.find((model) => model.id === activeModelId);
-  const activeModelChoiceValue = activeProvider ? `${activeProvider.name}:${activeModelId}` : "";
+  const activeReasoningEffort = modelEffort(appSettings, activeProvider, activeModel);
+  const activeModelChoice: ModelReasoningSelection = {
+    provider: activeProvider?.name ?? "",
+    model: activeModelId,
+    reasoningEffort: activeReasoningEffort,
+  };
   const buildDraftProvider = buildDraft
     ? providers.find((provider) => provider.name === buildDraft.provider) ?? activeProvider
     : activeProvider;
@@ -1586,9 +1736,13 @@ function App() {
   const buildDraftModel = buildDraftProvider?.supportedModels.find(
     (model) => model.id === buildDraftModelId,
   );
-  const buildModelChoiceValue = buildDraftProvider
-    ? `${buildDraftProvider.name}:${buildDraftModelId}`
-    : "";
+  const buildDraftReasoningEffort =
+    buildDraft?.reasoningEffort || modelEffort(appSettings, buildDraftProvider, buildDraftModel);
+  const buildModelChoice: ModelReasoningSelection = {
+    provider: buildDraftProvider?.name ?? "",
+    model: buildDraftModelId,
+    reasoningEffort: buildDraftReasoningEffort,
+  };
   const buildProviderSetup = useProviderSetup(
     buildDraftProvider?.name ?? null,
     Boolean(buildDraft && buildDraftProvider),
@@ -1802,9 +1956,14 @@ function App() {
     });
   }
 
-  function openWorkspaceFile(path: string) {
+  function openWorkspaceFile(path: string, anchor: string | null = null) {
     const tab = workspaceCenterTab(path);
+    if (!wikiExploredTrackedRef.current && isWikiExplorationPath(path)) {
+      wikiExploredTrackedRef.current = true;
+      track("wiki explored");
+    }
     setSelectedPath(path);
+    setPendingAnchor(anchor);
     setViewMode("page");
     setActiveCenterTabId(tab.id);
     setCenterTabs((prev) => {
@@ -1841,14 +2000,12 @@ function App() {
       workspace.workspacePath,
     );
     if (!target) return false;
-    openWorkspaceFile(target.path);
-    setPendingAnchor(target.anchor);
+    openWorkspaceFile(target.path, target.anchor);
     return true;
   }
 
   function openWorkspaceDocument(path: string, anchor: string | null = null) {
-    openWorkspaceFile(path);
-    setPendingAnchor(anchor);
+    openWorkspaceFile(path, anchor);
   }
 
   function openGraphTab() {
@@ -2015,11 +2172,11 @@ function App() {
     return () => window.clearTimeout(timeoutId);
   }, [workspace.changedMarker?.undoneAt]);
 
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const [providerList, settings] = await Promise.all([
+	  useEffect(() => {
+	    let cancelled = false;
+	    (async () => {
+	      try {
+	        const [providerList, settings] = await Promise.all([
           invoke<ProviderInfo[]>("list_providers"),
           invoke<AppSettings>("get_settings"),
         ]);
@@ -2029,9 +2186,34 @@ function App() {
       } catch (_error) {}
     })();
     return () => {
-      cancelled = true;
-    };
-  }, []);
+	      cancelled = true;
+	    };
+	  }, []);
+
+	  useEffect(() => {
+	    let cancelled = false;
+	    getVersion()
+	      .then((version) => {
+	        if (cancelled) return;
+	        setAppVersion(version);
+	        setAnalyticsContext({ app_version: version });
+	      })
+	      .catch(() => {
+	        if (cancelled) return;
+	        setAppVersion("unknown");
+	        setAnalyticsContext({ app_version: "unknown" });
+	      });
+	    return () => {
+	      cancelled = true;
+	    };
+	  }, []);
+
+		  useEffect(() => {
+		    if (!appVersion) return;
+		    if (appOpenedTrackedRef.current) return;
+		    appOpenedTrackedRef.current = true;
+		    track("app opened");
+		  }, [appVersion]);
 
   useEffect(() => {
     const timerId = window.setTimeout(() => {
@@ -2387,6 +2569,20 @@ function App() {
         const state = await invoke<WorkspaceState>("load_workspace_state");
         if (cancelled) return;
         setWorkspace(state);
+        const progressFailed = Boolean(
+          progress.error ||
+            progress.events.some(
+              (event) =>
+                event.kind === "error" || event.status === "failed" || event.status === "error",
+            ),
+        );
+        track("wiki build completed", {
+          result: progressFailed ? "failed" : "success",
+          error_kind: progressFailed ? "build_failed" : null,
+          ...wikiTitleProperties(state),
+          changed_file_count: reviewableChangedFileCount(state),
+          source_count: state.sourceFiles.length,
+        });
         const nextPath = chooseDocumentAfterCommand("build_wiki", state);
         if (nextPath) {
           openWorkspaceFile(nextPath);
@@ -2433,11 +2629,25 @@ function App() {
               completedAtMs >= backgroundBuildStartedAt - 1000,
           );
           if (completedBuildWasObserved) {
+            track("wiki build completed", {
+              result: "success",
+              error_kind: null,
+              ...wikiTitleProperties(state),
+              changed_file_count: reviewableChangedFileCount(state),
+              source_count: state.sourceFiles.length,
+            });
             const nextPath = chooseDocumentAfterCommand("build_wiki", state);
             if (nextPath) {
               openWorkspaceFile(nextPath);
             }
           } else {
+            track("wiki build completed", {
+              result: "failed",
+              error_kind: "progress_missing",
+              ...wikiTitleProperties(state),
+              changed_file_count: 0,
+              source_count: state.sourceFiles.length,
+            });
             setError("Build wiki stopped before progress was reported. Check the operation setup and try again.");
           }
           setBackgroundBuildActive(false);
@@ -2957,6 +3167,9 @@ function App() {
       setWorkspace(result.state);
       setOpenedChangedFiles(new Set());
       await refreshChatThreadSummaries();
+      track("changes accepted", {
+        changed_file_count: reviewableChangedFiles.length,
+      });
     } catch (err) {
       setError(String(err));
     } finally {
@@ -2991,22 +3204,35 @@ function App() {
     workspace.changedMarker?.completedAt,
   ]);
 
-  function openBuildWiki(force = false) {
-    if (buildBlockedReason) {
-      setError(buildBlockedReason);
-      return;
-    }
+	  function openBuildWiki(force = false) {
+	    if (buildBlockedReason) {
+	      track("onboarding blocked", {
+	        step: "build_wiki",
+	        error_kind: errorKindFromText(buildBlockedReason),
+	      });
+	      setError(buildBlockedReason);
+	      return;
+	    }
     setAiSetupPromptReason("build");
     const provider = activeProvider ?? providers[0];
-    setBuildDraft({
+    const modelId = provider ? appSettings?.models[provider.name] || provider.defaultModel : "";
+    const model = provider?.supportedModels.find((item) => item.id === modelId);
+	    setBuildDraft({
       instruction: "",
       workspaceContext: "",
       requiresWorkspaceContext: !force && shouldAskFirstBuildContext,
       force,
       provider: provider?.name ?? "",
-      model: provider ? appSettings?.models[provider.name] || provider.defaultModel : "",
-    });
-  }
+      model: modelId,
+	      reasoningEffort: modelEffort(appSettings, provider, model),
+	    });
+	    track("build modal opened", {
+	      force,
+	      source_count: sourceFiles.length,
+	      pending_source_count: pendingSourceCount,
+	      provider: provider?.name,
+	    });
+	  }
 
   async function startBuildWiki() {
     if (!buildDraft) return;
@@ -3014,10 +3240,14 @@ function App() {
       setError(buildBlockedReason);
       return;
     }
-    if (buildDraft.requiresWorkspaceContext && !buildDraft.workspaceContext.trim()) {
-      setError("Tell Maple what this wiki is for before building.");
-      return;
-    }
+	    if (buildDraft.requiresWorkspaceContext && !buildDraft.workspaceContext.trim()) {
+	      track("onboarding blocked", {
+	        step: "workspace_context",
+	        error_kind: "workspace_context_required",
+	      });
+	      setError("Tell Maple what this wiki is for before building.");
+	      return;
+	    }
     const draft = buildDraft;
     const draftProvider =
       providers.find((provider) => provider.name === draft.provider) ?? activeProvider;
@@ -3027,15 +3257,24 @@ function App() {
     }
     const draftModel =
       draft.model || appSettings?.models[draftProvider.name] || draftProvider.defaultModel;
+    const draftModelInfo = draftProvider.supportedModels.find((model) => model.id === draftModel);
+    const draftReasoningEffort =
+      draft.reasoningEffort || modelEffort(appSettings, draftProvider, draftModelInfo);
     const draftProviderSetup =
       draftProvider.name === activeProvider?.name ? providerSetup : buildProviderSetup;
     const draftProviderReady =
       draftProvider.name === activeProvider?.name ? activeProviderReady : buildProviderSetup.ready;
-    if (!draftProviderReady) {
-      setAiSetupPromptReason("build");
-      setError(
-        `${displayProviderName(draftProvider)} setup is needed before building the wiki.`,
-      );
+	    if (!draftProviderReady) {
+	      setAiSetupPromptReason("build");
+	      track("onboarding blocked", {
+	        step: "provider_setup",
+	        error_kind: "provider_setup",
+	        provider: draftProvider.name,
+	        setup_status: draftProviderSetup.statusKind,
+	      });
+	      setError(
+	        `${displayProviderName(draftProvider)} setup is needed before building the wiki.`,
+	      );
       void draftProviderSetup.refresh();
       return;
     }
@@ -3048,12 +3287,21 @@ function App() {
     setBuildDraft(null);
 
     try {
+      track("wiki build started", {
+        provider: draftProvider.name,
+        model: draftModel,
+        force: draft.force,
+        ...buildWikiTopicProperties(draft),
+        pending_source_count: pendingSourceCount,
+        source_count: sourceFiles.length,
+      });
       const result = await invoke<AppCommandResult>("build_wiki", {
         instruction: draft.instruction,
         workspaceContext: draft.requiresWorkspaceContext ? draft.workspaceContext.trim() : null,
         force: draft.force,
         provider: draftProvider.name,
         model: draftModel,
+        reasoningEffort: draftReasoningEffort,
       });
       setRunner(result.runner);
       setWorkspace(result.state);
@@ -3066,6 +3314,14 @@ function App() {
         setBackgroundBuildStartedAt(Date.now());
       }
     } catch (err) {
+      track("wiki build completed", {
+        result: "start_failed",
+        error_kind: errorKindFromText(String(err)),
+        wiki_title: null,
+        wiki_title_present: false,
+        changed_file_count: 0,
+        source_count: sourceFiles.length,
+      });
       setError(String(err));
       await refreshWorkspaceStateAfterPendingGeneratedChangesError(err);
       setBackgroundBuildActive(false);
@@ -3281,49 +3537,64 @@ function App() {
     await runMaintainCommand();
   }
 
-  async function selectChatModelChoice(value: string) {
-    const [provider, ...modelParts] = value.split(":");
-    const modelId = modelParts.join(":");
-    if (!provider || !modelId) return;
+  function applySettingsUpdate(updated: AppSettings) {
+    setAppSettings({
+      provider: updated.provider,
+      models: { ...updated.models },
+      reasoningEfforts: { ...updated.reasoningEfforts },
+      providerPaths: { ...updated.providerPaths },
+    });
+  }
 
-    try {
-      let updated = appSettings;
-      if (!updated || updated.provider !== provider) {
-        updated = await invoke<AppSettings>("set_provider", { name: provider });
-      }
-      if (updated.models[provider] !== modelId) {
-        updated = await invoke<AppSettings>("set_model", { provider, modelId });
-      }
-      setAppSettings({
-        provider: updated.provider,
-        models: { ...updated.models },
-        providerPaths: { ...updated.providerPaths },
+  async function persistModelReasoningChoice(selection: ModelReasoningSelection) {
+    let updated = appSettings;
+    if (!updated || updated.provider !== selection.provider) {
+      updated = await invoke<AppSettings>("set_provider", { name: selection.provider });
+    }
+    if (updated.models[selection.provider] !== selection.model) {
+      updated = await invoke<AppSettings>("set_model", {
+        provider: selection.provider,
+        modelId: selection.model,
       });
+    }
+    if (
+      updated.reasoningEfforts?.[selection.provider]?.[selection.model] !==
+      selection.reasoningEffort
+    ) {
+      updated = await invoke<AppSettings>("set_reasoning_effort", {
+        provider: selection.provider,
+        modelId: selection.model,
+        effortId: selection.reasoningEffort,
+      });
+    }
+    applySettingsUpdate(updated);
+  }
+
+  async function selectChatModelChoice(selection: ModelReasoningSelection) {
+    if (!selection.provider || !selection.model || !selection.reasoningEffort) return;
+    try {
+      await persistModelReasoningChoice(selection);
     } catch (err) {
       setError(`Failed to update model: ${String(err)}`);
     }
   }
 
-  async function selectBuildModelChoice(value: string) {
-    const [provider, ...modelParts] = value.split(":");
-    const modelId = modelParts.join(":");
-    if (!provider || !modelId) return;
+  async function selectBuildModelChoice(selection: ModelReasoningSelection) {
+    if (!selection.provider || !selection.model || !selection.reasoningEffort) return;
 
-    setBuildDraft((prev) => (prev ? { ...prev, provider, model: modelId } : prev));
+    setBuildDraft((prev) =>
+      prev
+        ? {
+            ...prev,
+            provider: selection.provider,
+            model: selection.model,
+            reasoningEffort: selection.reasoningEffort,
+          }
+        : prev,
+    );
 
     try {
-      let updated = appSettings;
-      if (!updated || updated.provider !== provider) {
-        updated = await invoke<AppSettings>("set_provider", { name: provider });
-      }
-      if (updated.models[provider] !== modelId) {
-        updated = await invoke<AppSettings>("set_model", { provider, modelId });
-      }
-      setAppSettings({
-        provider: updated.provider,
-        models: { ...updated.models },
-        providerPaths: { ...updated.providerPaths },
-      });
+      await persistModelReasoningChoice(selection);
     } catch (err) {
       setError(`Failed to update build model: ${String(err)}`);
     }
@@ -3701,6 +3972,11 @@ function App() {
     setWikiUpdateFeedOpen(true);
     setApplyDraft(null);
     setError(null);
+    track("wiki update started", {
+      scope: draft.scope,
+      message_count: messageIds.length,
+      has_instruction: Boolean(draft.instruction.trim()),
+    });
     try {
       const result = await invoke<ApplyChatResult>("apply_chat_to_wiki", {
         threadId,
@@ -3722,11 +3998,23 @@ function App() {
         markChatThreadSeen(result.thread);
       }
       await refreshChatHistorySummaries();
+      track("wiki update completed", {
+        result: result.runner.success ? "success" : "failed",
+        error_kind: result.runner.success ? null : "update_failed",
+        changed_file_count: reviewableChangedFileCount(result.state),
+        message_count: messageIds.length,
+      });
       if (!result.runner.success) {
         setError(`Wiki update exited with code ${result.runner.code ?? "unknown"}.`);
       }
     } catch (err) {
       const message = String(err);
+      track("wiki update completed", {
+        result: "start_failed",
+        error_kind: errorKindFromText(message),
+        changed_file_count: 0,
+        message_count: messageIds.length,
+      });
       setError(message);
       appendLocalSystemMessage(threadId, `Wiki update failed before changes were written: ${message}`, "failed");
     } finally {
@@ -3770,7 +4058,16 @@ function App() {
       });
       setRunner(result.runner);
       setWorkspace(result.state);
+      track("source import completed", {
+        ...sourceAnalyticsProperties(supported),
+        result: result.runner?.success === false ? "failed" : "success",
+      });
     } catch (err) {
+      track("source import completed", {
+        ...sourceAnalyticsProperties(supported),
+        result: "failed",
+        error_kind: errorKindFromText(String(err)),
+      });
       setError(String(err));
     } finally {
       setBusy(null);
@@ -3780,6 +4077,7 @@ function App() {
   async function importSourceFiles() {
     if (sourceImportBlockedReason || !canRemoveSourceFiles) return;
     setError(null);
+    let sourcePaths: string[] = [];
 
     try {
       const selected = await open({
@@ -3793,7 +4091,7 @@ function App() {
         ],
       });
 
-      const sourcePaths = Array.isArray(selected) ? selected : selected ? [selected] : [];
+      sourcePaths = (Array.isArray(selected) ? selected : selected ? [selected] : []).map(String);
       if (sourcePaths.length === 0) {
         return;
       }
@@ -3802,7 +4100,16 @@ function App() {
       const result = await invoke<AppCommandResult>("import_sources", { sourcePaths });
       setRunner(result.runner);
       setWorkspace(result.state);
+      track("source import completed", {
+        ...sourceAnalyticsProperties(sourcePaths),
+        result: result.runner?.success === false ? "failed" : "success",
+      });
     } catch (err) {
+      track("source import completed", {
+        ...sourceAnalyticsProperties(sourcePaths),
+        result: "failed",
+        error_kind: errorKindFromText(String(err)),
+      });
       setError(String(err));
     } finally {
       setBusy(null);
@@ -3846,6 +4153,10 @@ function App() {
       });
       localStorage.setItem("workspacePath", path);
       setWorkspace(state);
+      track(initializeRootFiles ? "workspace created" : "workspace opened", {
+        source_count: state.sourceFiles.length,
+        wiki_file_count: state.wikiFiles.length,
+      });
     } catch (err) {
       setError(String(err));
     }
@@ -4563,7 +4874,12 @@ function App() {
                     key={file.path}
                     type="button"
                     className="review-change-file"
-                    onClick={() => openWorkspaceFile(file.path)}
+                    onClick={() => {
+                      track("review opened", {
+                        changed_file_count: reviewableChangedFiles.length,
+                      });
+                      openWorkspaceFile(file.path);
+                    }}
                     title={`${file.path} (${file.status})`}
                   >
                     <span className="review-change-path">{displayFileName(file.path)}</span>
@@ -4763,12 +5079,16 @@ function App() {
               <PdfViewer
                 key={selectedPath}
                 src={makeWorkspaceAssetUrl(workspace.workspacePath, selectedPath)}
+                anchor={pendingAnchor}
+                onAnchorConsumed={() => setPendingAnchor(null)}
               />
             ) : PPTX_EXT_REGEX.test(selectedPath) && workspace.workspacePath ? (
               pptxRender?.sourcePath === selectedPath && pptxRender.status === "ready" && pptxRender.pdfPath ? (
                 <PdfViewer
                   key={pptxRender.pdfPath}
                   src={makeWorkspaceAssetUrl(workspace.workspacePath, pptxRender.pdfPath)}
+                  anchor={pendingAnchor}
+                  onAnchorConsumed={() => setPendingAnchor(null)}
                 />
               ) : pptxRender?.sourcePath === selectedPath && pptxRender.status === "error" ? (
                 <div className="pptx-status pptx-status-error">
@@ -5098,32 +5418,19 @@ function App() {
                 <div className="explore-chat-composer-footer">
                   <div className="explore-chat-model-controls">
                   {providers.length > 0 && appSettings && activeProvider ? (
-                    <span className="explore-chat-select-wrap explore-chat-model-select-wrap">
-                      <select
-                        className="explore-chat-select explore-chat-model-select"
-                        value={activeModelChoiceValue}
+                    <ModelReasoningPicker
+                        providers={providers}
+                        settings={appSettings}
+                        value={activeModelChoice}
                         disabled={exploreBusy || blockingUiBusy}
-                        onChange={(event) => void selectChatModelChoice(event.target.value)}
-                        aria-label="AI model"
-                        title={
-                          activeModel
-                            ? `${displayProviderName(activeProvider)} - ${activeModel.label}`
-                            : undefined
-                        }
-                      >
-                        {providers.map((provider) => (
-                          <optgroup key={provider.name} label={displayProviderName(provider)}>
-                            {provider.supportedModels.map((model) => (
-                              <option key={model.id} value={`${provider.name}:${model.id}`}>
-                                {model.label}
-                              </option>
-                            ))}
-                          </optgroup>
-                        ))}
-                      </select>
-                    </span>
+                        ariaLabel="AI model"
+                        className="explore-chat-model-picker"
+                        onChange={(selection) => void selectChatModelChoice(selection)}
+                      />
                   ) : activeModel ? (
-                    <span className="explore-chat-model-fallback">{activeModel.label}</span>
+                    <span className="explore-chat-model-fallback">
+                      {activeModel.label} · {activeReasoningEffort}
+                    </span>
                   ) : null}
                   <button
                     type="button"
@@ -5476,32 +5783,20 @@ function App() {
                   <div className="maintain-composer-footer">
                     <div className="explore-chat-model-controls maintain-model-controls">
                       {providers.length > 0 && appSettings && activeProvider ? (
-                        <span className="explore-chat-select-wrap explore-chat-model-select-wrap">
-                          <select
-                            className="explore-chat-select explore-chat-model-select"
-                            value={activeModelChoiceValue}
+                        <ModelReasoningPicker
+                            providers={providers}
+                            settings={appSettings}
+                            value={activeModelChoice}
                             disabled={anyOperationBusy}
-                            onChange={(event) => void selectChatModelChoice(event.target.value)}
-                            aria-label="Maintain AI model"
-                            title={
-                              activeModel
-                                ? `${displayProviderName(activeProvider)} - ${activeModel.label}`
-                                : undefined
-                            }
-                          >
-                            {providers.map((provider) => (
-                              <optgroup key={provider.name} label={displayProviderName(provider)}>
-                                {provider.supportedModels.map((model) => (
-                                  <option key={model.id} value={`${provider.name}:${model.id}`}>
-                                    {model.label}
-                                  </option>
-                                ))}
-                              </optgroup>
-                            ))}
-                          </select>
-                        </span>
+                            ariaLabel="Maintain AI model"
+                            className="explore-chat-model-picker"
+                            align="right"
+                            onChange={(selection) => void selectChatModelChoice(selection)}
+                          />
                       ) : activeModel ? (
-                        <span className="explore-chat-model-fallback">{activeModel.label}</span>
+                        <span className="explore-chat-model-fallback">
+                          {activeModel.label} · {activeReasoningEffort}
+                        </span>
                       ) : null}
                     </div>
                     <div className="maintain-composer-actions">
@@ -5657,30 +5952,19 @@ function App() {
               <label className="build-model-field">
                 <span>AI model</span>
                 {providers.length > 0 && buildDraftProvider ? (
-                  <select
-                    className="build-model-select"
-                    value={buildModelChoiceValue}
+                  <ModelReasoningPicker
+                    providers={providers}
+                    settings={appSettings}
+                    value={buildModelChoice}
                     disabled={isStartingBuild || Boolean(buildBlockedReason)}
-                    onChange={(event) => void selectBuildModelChoice(event.target.value)}
-                    aria-label="Build wiki AI model"
-                    title={
-                      buildDraftModel
-                        ? `${displayProviderName(buildDraftProvider)} - ${buildDraftModel.label}`
-                        : undefined
-                    }
-                  >
-                    {providers.map((provider) => (
-                      <optgroup key={provider.name} label={displayProviderName(provider)}>
-                        {provider.supportedModels.map((model) => (
-                          <option key={model.id} value={`${provider.name}:${model.id}`}>
-                            {model.recommended ? `${model.label} (Recommended)` : model.label}
-                          </option>
-                        ))}
-                      </optgroup>
-                    ))}
-                  </select>
+                    ariaLabel="Build wiki AI model"
+                    className="build-model-picker"
+                    onChange={(selection) => void selectBuildModelChoice(selection)}
+                  />
                 ) : activeModel ? (
-                  <span className="build-model-fallback">{activeModel.label}</span>
+                  <span className="build-model-fallback">
+                    {activeModel.label} · {activeReasoningEffort}
+                  </span>
                 ) : null}
               </label>
 
@@ -6266,10 +6550,44 @@ function nodeLabel(path: string): string {
   return trimmed.split("/").pop() || trimmed;
 }
 
-function PdfViewer({ src }: { src: string }) {
+function PdfViewer({
+  src,
+  anchor,
+  onAnchorConsumed,
+}: {
+  src: string;
+  anchor?: string | null;
+  onAnchorConsumed?: () => void;
+}) {
   const containerRef = useRef<HTMLDivElement>(null);
+  const consumedAnchorRef = useRef<string | null>(null);
+  const onAnchorConsumedRef = useRef(onAnchorConsumed);
+  const targetPageRef = useRef<number | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const targetPage = parsePdfTargetPage(anchor);
+
+  useEffect(() => {
+    onAnchorConsumedRef.current = onAnchorConsumed;
+  }, [onAnchorConsumed]);
+
+  useEffect(() => {
+    consumedAnchorRef.current = null;
+    targetPageRef.current = targetPage;
+  }, [src, targetPage]);
+
+  function scrollToTargetPage() {
+    const pageNumber = targetPageRef.current;
+    if (!pageNumber || consumedAnchorRef.current === `${src}:${pageNumber}`) return false;
+    const page = containerRef.current?.querySelector<HTMLElement>(
+      `[data-page-number="${pageNumber}"]`,
+    );
+    if (!page) return false;
+    page.scrollIntoView({ behavior: "smooth", block: "start" });
+    consumedAnchorRef.current = `${src}:${pageNumber}`;
+    onAnchorConsumedRef.current?.();
+    return true;
+  }
 
   useEffect(() => {
     let cancelled = false;
@@ -6300,6 +6618,7 @@ function PdfViewer({ src }: { src: string }) {
           const viewport = page.getViewport({ scale });
           const canvas = document.createElement("canvas");
           canvas.className = "pdf-page";
+          canvas.dataset.pageNumber = String(i);
           canvas.width = viewport.width * dpr;
           canvas.height = viewport.height * dpr;
           canvas.style.maxWidth = `${viewport.width}px`;
@@ -6309,9 +6628,21 @@ function PdfViewer({ src }: { src: string }) {
           if (!ctx) continue;
           ctx.scale(dpr, dpr);
           await page.render({ canvasContext: ctx, viewport }).promise;
+          if (!cancelled && i === targetPageRef.current) {
+            requestAnimationFrame(() => {
+              if (!cancelled) scrollToTargetPage();
+            });
+          }
         }
 
-        if (!cancelled) setLoading(false);
+        if (!cancelled) {
+          setLoading(false);
+          if (targetPageRef.current) {
+            requestAnimationFrame(() => {
+              if (!cancelled) scrollToTargetPage();
+            });
+          }
+        }
       } catch (err) {
         if (!cancelled) {
           setError(String(err));
@@ -6326,6 +6657,14 @@ function PdfViewer({ src }: { src: string }) {
     };
   }, [src]);
 
+  useEffect(() => {
+    if (!targetPage || loading) return;
+    const raf = requestAnimationFrame(() => {
+      scrollToTargetPage();
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [src, targetPage, loading]);
+
   return (
     <div className="pdf-canvas-viewer">
       {loading ? <div className="pdf-status">Loading PDF…</div> : null}
@@ -6333,6 +6672,17 @@ function PdfViewer({ src }: { src: string }) {
       <div ref={containerRef} className="pdf-pages" />
     </div>
   );
+}
+
+function parsePdfTargetPage(anchor: string | null | undefined) {
+  if (!anchor) return null;
+  const normalized = safeDecode(anchor).trim();
+  const match = normalized.match(
+    /(?:^|[&;,\s])(?:page|p|slide)s?\s*[:=_-]?\s*(\d+)(?:\D|$)/i,
+  );
+  if (!match) return null;
+  const page = Number(match[1]);
+  return Number.isInteger(page) && page > 0 ? page : null;
 }
 
 type TreeNode = {

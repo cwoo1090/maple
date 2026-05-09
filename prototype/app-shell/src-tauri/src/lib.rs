@@ -110,11 +110,13 @@ const RUNNER_ROOT_ENV: &str = "MAPLE_RUNNER_ROOT";
 const REQUIRED_NODE_MAJOR: u32 = 20;
 const PROVIDER_COMMAND_TIMEOUT_MS: u64 = 8_000;
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 struct AppSettings {
     provider: String,
     models: HashMap<String, String>,
+    #[serde(default)]
+    reasoning_efforts: HashMap<String, HashMap<String, String>>,
     #[serde(default)]
     provider_paths: HashMap<String, String>,
 }
@@ -157,6 +159,8 @@ struct ChatThreadMessage {
     context_path: Option<String>,
     provider: Option<String>,
     model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     web_search_enabled: Option<bool>,
     run_id: Option<String>,
@@ -202,6 +206,8 @@ struct ExploreChatRunnerReport {
     status: String,
     provider: String,
     model: String,
+    #[serde(default)]
+    reasoning_effort: String,
     #[serde(default)]
     web_search_enabled: bool,
     selected_path: String,
@@ -269,13 +275,83 @@ enum ThreadFileKind {
     Maintain,
 }
 
+fn known_provider_models(provider: &str) -> &'static [&'static str] {
+    match provider {
+        "codex" => &["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"],
+        "claude" => &[
+            "claude-sonnet-4-6",
+            "claude-opus-4-7",
+            "claude-haiku-4-5-20251001",
+        ],
+        _ => &[],
+    }
+}
+
+fn default_model_for_provider(provider: &str) -> &'static str {
+    match provider {
+        "claude" => "claude-sonnet-4-6",
+        _ => "gpt-5.5",
+    }
+}
+
+fn supported_reasoning_efforts(provider: &str) -> &'static [&'static str] {
+    match provider {
+        "claude" => &["low", "medium", "high", "xhigh", "max"],
+        "codex" => &["low", "medium", "high", "xhigh"],
+        _ => &[],
+    }
+}
+
+fn default_reasoning_effort_for_model(provider: &str, model: &str) -> &'static str {
+    match (provider, model) {
+        ("codex", "gpt-5.4-mini") => "medium",
+        ("claude", "claude-haiku-4-5-20251001") => "medium",
+        _ => "xhigh",
+    }
+}
+
+fn is_supported_reasoning_effort(provider: &str, effort: &str) -> bool {
+    supported_reasoning_efforts(provider).contains(&effort)
+}
+
+fn selected_model(settings: &AppSettings, provider: &str) -> String {
+    settings
+        .models
+        .get(provider)
+        .cloned()
+        .unwrap_or_else(|| default_model_for_provider(provider).to_string())
+}
+
+fn selected_reasoning_effort(settings: &AppSettings, provider: &str, model: &str) -> String {
+    settings
+        .reasoning_efforts
+        .get(provider)
+        .and_then(|models| models.get(model))
+        .map(String::as_str)
+        .filter(|effort| is_supported_reasoning_effort(provider, effort))
+        .unwrap_or_else(|| default_reasoning_effort_for_model(provider, model))
+        .to_string()
+}
+
 fn default_settings() -> AppSettings {
     let mut models = HashMap::new();
     models.insert("codex".to_string(), "gpt-5.5".to_string());
     models.insert("claude".to_string(), "claude-sonnet-4-6".to_string());
+    let mut reasoning_efforts = HashMap::new();
+    for provider in ["codex", "claude"] {
+        let mut provider_efforts = HashMap::new();
+        for model in known_provider_models(provider) {
+            provider_efforts.insert(
+                (*model).to_string(),
+                default_reasoning_effort_for_model(provider, model).to_string(),
+            );
+        }
+        reasoning_efforts.insert(provider.to_string(), provider_efforts);
+    }
     AppSettings {
         provider: "codex".to_string(),
         models,
+        reasoning_efforts,
         provider_paths: HashMap::new(),
     }
 }
@@ -293,6 +369,24 @@ fn normalize_settings(mut settings: AppSettings) -> AppSettings {
         settings
             .models
             .insert("claude".to_string(), "claude-sonnet-4-6".to_string());
+    }
+    settings
+        .reasoning_efforts
+        .retain(|provider, _| is_known_provider(provider));
+    for provider in ["codex", "claude"] {
+        let provider_efforts = settings
+            .reasoning_efforts
+            .entry(provider.to_string())
+            .or_default();
+        provider_efforts.retain(|model, effort| {
+            known_provider_models(provider).contains(&model.as_str())
+                && is_supported_reasoning_effort(provider, effort)
+        });
+        for model in known_provider_models(provider) {
+            provider_efforts
+                .entry((*model).to_string())
+                .or_insert_with(|| default_reasoning_effort_for_model(provider, model).to_string());
+        }
     }
     settings
         .provider_paths
@@ -317,9 +411,18 @@ fn read_settings(app: &AppHandle) -> AppSettings {
     let Ok(bytes) = fs::read(&path) else {
         return default_settings();
     };
-    serde_json::from_slice::<AppSettings>(&bytes)
-        .map(normalize_settings)
-        .unwrap_or_else(|_| default_settings())
+    match serde_json::from_slice::<AppSettings>(&bytes) {
+        Ok(settings) => {
+            let normalized = normalize_settings(settings.clone());
+            if normalized != settings {
+                if let Ok(json) = serde_json::to_vec_pretty(&normalized) {
+                    let _ = fs::write(&path, json);
+                }
+            }
+            normalized
+        }
+        Err(_) => default_settings(),
+    }
 }
 
 fn write_settings(app: &AppHandle, settings: &AppSettings) -> Result<(), String> {
@@ -406,9 +509,55 @@ async fn set_model(
     model_id: String,
 ) -> Result<AppSettings, String> {
     let mut settings = read_settings(&app);
-    settings.models.insert(provider, model_id);
+    settings.models.insert(provider.clone(), model_id.clone());
+    settings
+        .reasoning_efforts
+        .entry(provider.clone())
+        .or_default()
+        .entry(model_id.clone())
+        .or_insert_with(|| default_reasoning_effort_for_model(&provider, &model_id).to_string());
     write_settings(&app, &settings)?;
     Ok(settings)
+}
+
+#[tauri::command]
+async fn set_reasoning_effort(
+    app: AppHandle,
+    provider: String,
+    model_id: String,
+    effort_id: String,
+) -> Result<AppSettings, String> {
+    let provider = provider.trim().to_string();
+    let model_id = model_id.trim().to_string();
+    let effort_id = effort_id.trim().to_string();
+    if !is_known_provider(&provider) {
+        return Err(format!("Unknown provider: {provider}"));
+    }
+    if !known_provider_models(&provider).contains(&model_id.as_str()) {
+        return Err(format!("Unknown model for {provider}: {model_id}"));
+    }
+    if !is_supported_reasoning_effort(&provider, &effort_id) {
+        return Err(format!(
+            "Unsupported reasoning effort for {provider}: {effort_id}"
+        ));
+    }
+    let mut settings = read_settings(&app);
+    settings
+        .reasoning_efforts
+        .entry(provider)
+        .or_default()
+        .insert(model_id, effort_id);
+    write_settings(&app, &settings)?;
+    Ok(settings)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderReasoningEffort {
+    id: String,
+    label: String,
+    description: Option<String>,
+    recommended: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -418,6 +567,8 @@ struct ProviderModel {
     label: String,
     description: Option<String>,
     recommended: Option<bool>,
+    default_reasoning_effort: String,
+    supported_reasoning_efforts: Vec<ProviderReasoningEffort>,
 }
 
 #[derive(Serialize)]
@@ -428,6 +579,7 @@ struct ProviderInfo {
     install_command: String,
     login_command: String,
     default_model: String,
+    supported_reasoning_efforts: Vec<ProviderReasoningEffort>,
     supported_models: Vec<ProviderModel>,
 }
 
@@ -529,6 +681,31 @@ struct ProviderAuthCheck {
     output: Option<String>,
 }
 
+fn provider_reasoning_effort_options(provider: &str) -> Vec<ProviderReasoningEffort> {
+    supported_reasoning_efforts(provider)
+        .iter()
+        .map(|effort| ProviderReasoningEffort {
+            id: (*effort).to_string(),
+            label: match *effort {
+                "low" => "Low",
+                "medium" => "Medium",
+                "high" => "High",
+                "xhigh" => "XHigh",
+                "max" => "Max",
+                other => other,
+            }
+            .to_string(),
+            description: match *effort {
+                "medium" => Some("Balanced".into()),
+                "xhigh" => Some("Deepest".into()),
+                "max" => Some("Maximum".into()),
+                _ => None,
+            },
+            recommended: Some(*effort == "xhigh"),
+        })
+        .collect()
+}
+
 #[tauri::command]
 async fn list_providers() -> Result<Vec<ProviderInfo>, String> {
     Ok(vec![
@@ -538,24 +715,31 @@ async fn list_providers() -> Result<Vec<ProviderInfo>, String> {
             install_command: "npm i -g @openai/codex".into(),
             login_command: "codex login".into(),
             default_model: "gpt-5.5".into(),
+            supported_reasoning_efforts: provider_reasoning_effort_options("codex"),
             supported_models: vec![
                 ProviderModel {
                     id: "gpt-5.5".into(),
                     label: "GPT-5.5".into(),
                     description: None,
                     recommended: Some(true),
+                    default_reasoning_effort: "xhigh".into(),
+                    supported_reasoning_efforts: provider_reasoning_effort_options("codex"),
                 },
                 ProviderModel {
                     id: "gpt-5.4".into(),
                     label: "GPT-5.4".into(),
                     description: None,
                     recommended: None,
+                    default_reasoning_effort: "xhigh".into(),
+                    supported_reasoning_efforts: provider_reasoning_effort_options("codex"),
                 },
                 ProviderModel {
                     id: "gpt-5.4-mini".into(),
                     label: "GPT-5.4 Mini".into(),
                     description: Some("Fastest".into()),
                     recommended: None,
+                    default_reasoning_effort: "medium".into(),
+                    supported_reasoning_efforts: provider_reasoning_effort_options("codex"),
                 },
             ],
         },
@@ -565,24 +749,31 @@ async fn list_providers() -> Result<Vec<ProviderInfo>, String> {
             install_command: "npm i -g @anthropic-ai/claude-code".into(),
             login_command: "claude auth login --claudeai".into(),
             default_model: "claude-sonnet-4-6".into(),
+            supported_reasoning_efforts: provider_reasoning_effort_options("claude"),
             supported_models: vec![
                 ProviderModel {
                     id: "claude-sonnet-4-6".into(),
                     label: "Sonnet 4.6".into(),
                     description: None,
                     recommended: Some(true),
+                    default_reasoning_effort: "xhigh".into(),
+                    supported_reasoning_efforts: provider_reasoning_effort_options("claude"),
                 },
                 ProviderModel {
                     id: "claude-opus-4-7".into(),
                     label: "Opus 4.7".into(),
                     description: Some("Heavy rate limits on Pro; Max recommended".into()),
                     recommended: None,
+                    default_reasoning_effort: "xhigh".into(),
+                    supported_reasoning_efforts: provider_reasoning_effort_options("claude"),
                 },
                 ProviderModel {
                     id: "claude-haiku-4-5-20251001".into(),
                     label: "Haiku 4.5".into(),
                     description: Some("Fastest".into()),
                     recommended: None,
+                    default_reasoning_effort: "medium".into(),
+                    supported_reasoning_efforts: provider_reasoning_effort_options("claude"),
                 },
             ],
         },
@@ -2569,6 +2760,11 @@ fn healthcheck_chat_thread(workspace: &Path, thread: &mut ChatThread) -> bool {
             if thread.messages[user_index].model.is_none() {
                 thread.messages[user_index].model = Some(report.model.clone());
             }
+            if thread.messages[user_index].reasoning_effort.is_none()
+                && !report.reasoning_effort.is_empty()
+            {
+                thread.messages[user_index].reasoning_effort = Some(report.reasoning_effort.clone());
+            }
             if thread.messages[user_index].web_search_enabled.is_none() {
                 thread.messages[user_index].web_search_enabled = Some(report.web_search_enabled);
             }
@@ -3281,6 +3477,9 @@ fn refresh_streaming_messages(
             });
             message.provider = Some(report.provider);
             message.model = Some(report.model);
+            if !report.reasoning_effort.is_empty() {
+                message.reasoning_effort = Some(report.reasoning_effort);
+            }
             message.web_search_enabled = Some(report.web_search_enabled);
             message.context_path = if report.selected_path.is_empty() {
                 message.context_path.clone()
@@ -3351,6 +3550,9 @@ fn finish_chat_run(
                     message.status = Some("completed".to_string());
                     message.provider = Some(report.provider);
                     message.model = Some(report.model);
+                    if !report.reasoning_effort.is_empty() {
+                        message.reasoning_effort = Some(report.reasoning_effort);
+                    }
                     message.web_search_enabled = Some(report.web_search_enabled);
                     if !report.selected_path.is_empty() {
                         message.context_path = Some(report.selected_path);
@@ -3362,6 +3564,9 @@ fn finish_chat_run(
                     message.status = Some("failed".to_string());
                     message.provider = Some(report.provider);
                     message.model = Some(report.model);
+                    if !report.reasoning_effort.is_empty() {
+                        message.reasoning_effort = Some(report.reasoning_effort);
+                    }
                     message.web_search_enabled = Some(report.web_search_enabled);
                     message.completed_at = Some(report.completed_at);
                 }
@@ -4217,6 +4422,7 @@ async fn build_wiki(
     force: Option<bool>,
     provider: Option<String>,
     model: Option<String>,
+    reasoning_effort: Option<String>,
     state: State<'_, WorkspaceStore>,
     provider_cache: State<'_, ProviderStatusCache>,
 ) -> Result<AppCommandResult, String> {
@@ -4232,10 +4438,11 @@ async fn build_wiki(
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .or_else(|| settings.models.get(&provider).cloned())
-        .unwrap_or_else(|| match provider.as_str() {
-            "claude" => "claude-sonnet-4-6".to_string(),
-            _ => "gpt-5.5".to_string(),
-        });
+        .unwrap_or_else(|| default_model_for_provider(&provider).to_string());
+    let reasoning_effort = reasoning_effort
+        .map(|value| value.trim().to_string())
+        .filter(|value| is_supported_reasoning_effort(&provider, value))
+        .unwrap_or_else(|| selected_reasoning_effort(&settings, &provider, &model));
     let mut args = vec![
         "build".to_string(),
         workspace.to_string_lossy().to_string(),
@@ -4243,6 +4450,8 @@ async fn build_wiki(
         provider,
         "--model".to_string(),
         model,
+        "--reasoning-effort".to_string(),
+        reasoning_effort,
         "--skip-provider-check".to_string(),
     ];
     if let Some(instruction) = instruction.map(|value| value.trim().to_string()) {
@@ -4334,15 +4543,8 @@ fn run_maintenance_command(
     ensure_no_pending_generated_changes(&workspace)?;
     let settings = read_settings(app);
     let provider = settings.provider.clone();
-    let model =
-        settings
-            .models
-            .get(&provider)
-            .cloned()
-            .unwrap_or_else(|| match provider.as_str() {
-                "claude" => "claude-sonnet-4-6".to_string(),
-                _ => "gpt-5.5".to_string(),
-            });
+    let model = selected_model(&settings, &provider);
+    let reasoning_effort = selected_reasoning_effort(&settings, &provider, &model);
     let instruction = instruction.unwrap_or_default().trim().to_string();
     if require_instruction && instruction.is_empty() {
         return Err("Add an instruction first.".to_string());
@@ -4354,6 +4556,8 @@ fn run_maintenance_command(
         provider,
         "--model".to_string(),
         model,
+        "--reasoning-effort".to_string(),
+        reasoning_effort,
     ];
     if !instruction.is_empty() {
         args.push("--instruction".to_string());
@@ -4461,15 +4665,8 @@ async fn run_maintain_thread_operation(
     ensure_no_pending_generated_changes(&workspace)?;
     let settings = read_settings(&app);
     let provider = settings.provider.clone();
-    let model =
-        settings
-            .models
-            .get(&provider)
-            .cloned()
-            .unwrap_or_else(|| match provider.as_str() {
-                "claude" => "claude-sonnet-4-6".to_string(),
-                _ => "gpt-5.5".to_string(),
-            });
+    let model = selected_model(&settings, &provider);
+    let reasoning_effort = selected_reasoning_effort(&settings, &provider, &model);
     let trimmed_instruction = instruction.unwrap_or_default().trim().to_string();
     if require_instruction && trimmed_instruction.is_empty() {
         return Err("Add an instruction first.".to_string());
@@ -4495,6 +4692,7 @@ async fn run_maintain_thread_operation(
         context_path: None,
         provider: Some(provider.clone()),
         model: Some(model.clone()),
+        reasoning_effort: Some(reasoning_effort.clone()),
         web_search_enabled: None,
         run_id: None,
         status: Some("completed".to_string()),
@@ -4582,6 +4780,7 @@ async fn run_maintain_thread_operation(
                 context_path: None,
                 provider: Some(provider),
                 model: Some(model),
+                reasoning_effort: Some(reasoning_effort),
                 web_search_enabled: None,
                 run_id: None,
                 status: Some(if runner_success {
@@ -4614,6 +4813,7 @@ async fn run_maintain_thread_operation(
                 context_path: None,
                 provider: Some(provider),
                 model: Some(model),
+                reasoning_effort: Some(reasoning_effort),
                 web_search_enabled: None,
                 run_id: None,
                 status: Some("failed".to_string()),
@@ -4651,15 +4851,8 @@ async fn ask_wiki(
     let provider = settings.provider.clone();
     ensure_provider_ready(&app, &provider_cache, &provider)?;
     let history_json = history_json.unwrap_or_default();
-    let model =
-        settings
-            .models
-            .get(&provider)
-            .cloned()
-            .unwrap_or_else(|| match provider.as_str() {
-                "claude" => "claude-sonnet-4-6".to_string(),
-                _ => "gpt-5.5".to_string(),
-            });
+    let model = selected_model(&settings, &provider);
+    let reasoning_effort = selected_reasoning_effort(&settings, &provider, &model);
     run_runner(
         &workspace,
         EXPLORE_CHAT_OPERATION,
@@ -4668,6 +4861,8 @@ async fn ask_wiki(
             &provider,
             "--model",
             &model,
+            "--reasoning-effort",
+            &reasoning_effort,
             "--question",
             &question,
             "--selected-path",
@@ -4698,15 +4893,8 @@ async fn start_explore_chat(
     let settings = read_settings(&app);
     let provider = settings.provider.clone();
     ensure_provider_ready(&app, &provider_cache, &provider)?;
-    let model =
-        settings
-            .models
-            .get(&provider)
-            .cloned()
-            .unwrap_or_else(|| match provider.as_str() {
-                "claude" => "claude-sonnet-4-6".to_string(),
-                _ => "gpt-5.5".to_string(),
-            });
+    let model = selected_model(&settings, &provider);
+    let reasoning_effort = selected_reasoning_effort(&settings, &provider, &model);
 
     let mut thread =
         read_requested_or_new_chat_thread(&workspace, thread_id, Some(selected_path.clone()))?;
@@ -4731,6 +4919,7 @@ async fn start_explore_chat(
         context_path: Some(selected_path.clone()),
         provider: Some(provider.clone()),
         model: Some(model.clone()),
+        reasoning_effort: Some(reasoning_effort.clone()),
         web_search_enabled: Some(web_search_enabled),
         run_id: None,
         status: Some("completed".to_string()),
@@ -4744,6 +4933,7 @@ async fn start_explore_chat(
         context_path: Some(selected_path.clone()),
         provider: Some(provider.clone()),
         model: Some(model.clone()),
+        reasoning_effort: Some(reasoning_effort.clone()),
         web_search_enabled: Some(web_search_enabled),
         run_id: Some(run_id.clone()),
         status: Some("streaming".to_string()),
@@ -4769,6 +4959,8 @@ async fn start_explore_chat(
         provider,
         "--model".to_string(),
         model,
+        "--reasoning-effort".to_string(),
+        reasoning_effort,
         "--question".to_string(),
         question,
         "--selected-path".to_string(),
@@ -4816,15 +5008,8 @@ async fn start_maintain_discussion(
     let settings = read_settings(&app);
     let provider = settings.provider.clone();
     ensure_provider_ready(&app, &provider_cache, &provider)?;
-    let model =
-        settings
-            .models
-            .get(&provider)
-            .cloned()
-            .unwrap_or_else(|| match provider.as_str() {
-                "claude" => "claude-sonnet-4-6".to_string(),
-                _ => "gpt-5.5".to_string(),
-            });
+    let model = selected_model(&settings, &provider);
+    let reasoning_effort = selected_reasoning_effort(&settings, &provider, &model);
 
     let mut thread = read_maintain_thread_file(&workspace, &thread_id)?;
     ensure_maintain_thread_task_matches(&thread, runner_command)?;
@@ -4849,6 +5034,7 @@ async fn start_maintain_discussion(
         context_path: Some(selected_path.clone()),
         provider: Some(provider.clone()),
         model: Some(model.clone()),
+        reasoning_effort: Some(reasoning_effort.clone()),
         web_search_enabled: Some(false),
         run_id: None,
         status: Some("completed".to_string()),
@@ -4862,6 +5048,7 @@ async fn start_maintain_discussion(
         context_path: Some(selected_path.clone()),
         provider: Some(provider.clone()),
         model: Some(model.clone()),
+        reasoning_effort: Some(reasoning_effort.clone()),
         web_search_enabled: Some(false),
         run_id: Some(run_id.clone()),
         status: Some("streaming".to_string()),
@@ -4890,6 +5077,8 @@ async fn start_maintain_discussion(
         provider,
         "--model".to_string(),
         model,
+        "--reasoning-effort".to_string(),
+        reasoning_effort,
         "--question".to_string(),
         question,
         "--selected-path".to_string(),
@@ -4931,15 +5120,8 @@ async fn apply_chat_to_wiki(
     let settings = read_settings(&app);
     let provider = settings.provider.clone();
     ensure_provider_ready(&app, &provider_cache, &provider)?;
-    let model =
-        settings
-            .models
-            .get(&provider)
-            .cloned()
-            .unwrap_or_else(|| match provider.as_str() {
-                "claude" => "claude-sonnet-4-6".to_string(),
-                _ => "gpt-5.5".to_string(),
-            });
+    let model = selected_model(&settings, &provider);
+    let reasoning_effort = selected_reasoning_effort(&settings, &provider, &model);
 
     let thread = read_thread_file(&workspace, &thread_id)?;
     let selected_messages: Vec<ApplyChatMessagePayload> = thread
@@ -5004,6 +5186,8 @@ async fn apply_chat_to_wiki(
             &provider,
             "--model",
             &model,
+            "--reasoning-effort",
+            &reasoning_effort,
             "--payload-file",
             &payload_relative,
             "--operation-id",
@@ -5027,6 +5211,7 @@ async fn apply_chat_to_wiki(
                 context_path: None,
                 provider: Some(provider),
                 model: Some(model),
+                reasoning_effort: Some(reasoning_effort),
                 web_search_enabled: None,
                 run_id: None,
                 status: Some("failed".to_string()),
@@ -5107,6 +5292,7 @@ async fn apply_chat_to_wiki(
         context_path: None,
         provider: Some(provider),
         model: Some(model),
+        reasoning_effort: Some(reasoning_effort),
         web_search_enabled: None,
         run_id: None,
         status: Some(if runner.success {
@@ -5388,33 +5574,7 @@ fn default_workspace_agent_instructions(title: &str) -> String {
 }
 
 fn default_workspace_schema() -> &'static str {
-    r#"# Maple Wiki Schema
-
-This file defines durable conventions for this local Maple wiki.
-
-## Workspace Structure
-
-```text
-workspace/
-  sources/                # Imported source material; do not edit source contents
-  wiki/
-    concepts/             # Canonical concept pages
-    summaries/            # Source or topic summaries
-    guides/               # Learning paths and synthesis guides
-    assets/               # Derived figures and supporting media
-  index.md                # Reader-facing navigation
-  log.md                  # Append-only operation history
-  schema.md               # Durable wiki conventions
-```
-
-## Working Model
-
-- Keep storage local and file-based.
-- Treat `sources/` as immutable.
-- Use `wiki/` for generated and maintained wiki pages.
-- Prefer one canonical page per durable concept and link to it instead of duplicating explanations.
-- Update `schema.md` only when the user asks to change durable wiki rules.
-"#
+    include_str!("../../../workspace-template/schema.md")
 }
 
 fn run_runner(
@@ -6567,7 +6727,7 @@ fn should_hide_workspace_file(name: &str) -> bool {
 mod tests {
     use super::{
         chat_thread_summary, chat_threads_dir, compose_maintain_operation_instruction,
-        dedupe_node_path_candidates, ensure_maintain_thread_task_matches,
+        dedupe_node_path_candidates, default_workspace_schema, ensure_maintain_thread_task_matches,
         extract_partial_answer_from_events, finalize_provider_check_report,
         initialize_workspace_files, load_state_at, login_command_for_settings,
         maintain_operation_assistant_text, maintain_operation_user_text, make_chat_thread,
@@ -6640,6 +6800,16 @@ mod tests {
         }
 
         let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn default_workspace_schema_includes_wiki_operation_rules() {
+        let schema = default_workspace_schema();
+
+        assert!(schema.contains("persistent, compounding wiki"));
+        assert!(schema.contains("## Build Wiki Rules"));
+        assert!(schema.contains("## Explore And Apply Rules"));
+        assert!(schema.contains("## Wiki Healthcheck Rules"));
     }
 
     #[test]
@@ -6770,7 +6940,7 @@ mod tests {
     }
 
     #[test]
-    fn settings_normalization_adds_empty_provider_paths() {
+    fn settings_normalization_adds_provider_paths_and_reasoning_defaults() {
         let settings = serde_json::from_str::<AppSettings>(
             r#"{"provider":"codex","models":{"codex":"gpt-5.5"}}"#,
         )
@@ -6780,6 +6950,30 @@ mod tests {
         assert_eq!(
             normalized.models.get("claude").unwrap(),
             "claude-sonnet-4-6"
+        );
+        assert_eq!(
+            normalized
+                .reasoning_efforts
+                .get("codex")
+                .and_then(|models| models.get("gpt-5.5"))
+                .map(String::as_str),
+            Some("xhigh")
+        );
+        assert_eq!(
+            normalized
+                .reasoning_efforts
+                .get("codex")
+                .and_then(|models| models.get("gpt-5.4-mini"))
+                .map(String::as_str),
+            Some("medium")
+        );
+        assert_eq!(
+            normalized
+                .reasoning_efforts
+                .get("claude")
+                .and_then(|models| models.get("claude-haiku-4-5-20251001"))
+                .map(String::as_str),
+            Some("medium")
         );
     }
 
@@ -6969,6 +7163,7 @@ exit 1
         let mut settings = AppSettings {
             provider: "codex".to_string(),
             models: HashMap::new(),
+            reasoning_efforts: HashMap::new(),
             provider_paths: HashMap::new(),
         };
         settings.provider_paths.insert(
@@ -7045,6 +7240,7 @@ exit 1
             context_path: None,
             provider: None,
             model: None,
+            reasoning_effort: None,
             web_search_enabled: None,
             run_id: None,
             status: Some("completed".to_string()),
@@ -7104,6 +7300,7 @@ exit 1
             context_path: Some("index.md".to_string()),
             provider: Some("codex".to_string()),
             model: Some("gpt-5.5".to_string()),
+            reasoning_effort: Some("xhigh".to_string()),
             web_search_enabled: Some(false),
             run_id: None,
             status: Some("completed".to_string()),
@@ -7476,6 +7673,7 @@ not-json
             context_path: Some("wiki/page.md".to_string()),
             provider: None,
             model: None,
+            reasoning_effort: None,
             web_search_enabled: None,
             run_id: Some("run-test".to_string()),
             status: Some("streaming".to_string()),
@@ -7514,6 +7712,7 @@ not-json
             context_path: Some("wiki/page.md".to_string()),
             provider: None,
             model: None,
+            reasoning_effort: None,
             web_search_enabled: None,
             run_id: Some("run-test".to_string()),
             status: Some("streaming".to_string()),
@@ -7548,6 +7747,7 @@ not-json
             context_path: Some("wiki/page.md".to_string()),
             provider: None,
             model: None,
+            reasoning_effort: None,
             web_search_enabled: None,
             run_id: Some("run-test".to_string()),
             status: Some("streaming".to_string()),
@@ -7660,6 +7860,7 @@ pub fn run() {
             get_settings,
             set_provider,
             set_model,
+            set_reasoning_effort,
             list_providers,
             check_node_runtime,
             check_provider,

@@ -22,6 +22,7 @@
     "katex": "^0.16.45",
     "lucide-react": "^1.14.0",
     "pdfjs-dist": "^4.10.38",
+    "posthog-js": "^1.372.10",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
     "react-force-graph-2d": "^1.29.1",

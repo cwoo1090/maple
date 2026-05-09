@@ -9,6 +9,8 @@ const { spawn, spawnSync } = require("node:child_process");
 const { selectProvider } = require("./providers");
 
 const PROTOTYPE_ROOT = path.resolve(__dirname, "..");
+const WORKSPACE_TEMPLATE_DIR = path.resolve(PROTOTYPE_ROOT, "..", "workspace-template");
+const WORKSPACE_SCHEMA_TEMPLATE_PATH = path.join(WORKSPACE_TEMPLATE_DIR, "schema.md");
 const DEFAULT_WORKSPACE = path.join(PROTOTYPE_ROOT, "sample-workspace");
 const SOURCE_DIR = "sources";
 const LEGACY_SOURCE_DIR = "raw";
@@ -36,13 +38,15 @@ const LEGACY_RUNNER_METADATA_PREFIXES = [
 const DEFAULT_CODEX_TIMEOUT_MS = 15 * 60 * 1000;
 const RUNNING_MARKER_PATH = ".aiwiki/running/operation.json";
 const LEGACY_RUNNING_MARKER_PATH = ".studywiki/running/operation.json";
-const EXTRACTOR_VERSION = 2;
+const EXTRACTOR_VERSION = 3;
 const FULL_PAGE_RENDER_WIDTH = 1600;
 const PROMPT_PAGE_RENDER_WIDTH = 1000;
 const PROMPT_PAGE_JPEG_QUALITY = 0.82;
 const CONTACT_SHEET_COLUMNS = 4;
 const CONTACT_SHEET_THUMB_WIDTH = 360;
+const CONTACT_SHEET_MAX_PAGES = 20;
 const CONTACT_SHEET_JPEG_QUALITY = 0.78;
+const VISUAL_PLANNING_CONCURRENCY = 5;
 const SMALL_DOCUMENT_PAGE_THRESHOLD = 5;
 const FULL_SLIDE_SELECTION_RATIO = 0.2;
 const MIN_FULL_SLIDE_ATTACHMENTS = 3;
@@ -163,6 +167,7 @@ async function main(argv = process.argv.slice(2)) {
         await runBuildWiki(resolveWorkspace(args[0]), {
           provider: flags.provider || "codex",
           model: flags.model || "",
+          reasoningEffort: flags["reasoning-effort"] || "",
           extraInstruction: flags.instruction || "",
           workspaceContext: flags["workspace-context"] || "",
           promptFile: flags["prompt-file"] || "",
@@ -182,6 +187,7 @@ async function main(argv = process.argv.slice(2)) {
           operationType: "wiki-healthcheck",
           provider: flags.provider || "codex",
           model: flags.model || "",
+          reasoningEffort: flags["reasoning-effort"] || "",
           extraInstruction: flags.instruction || "",
           operationId: flags["operation-id"] || "",
           timeoutMs: parsePositiveInteger(flags["timeout-ms"], 0),
@@ -192,6 +198,7 @@ async function main(argv = process.argv.slice(2)) {
           operationType: "improve-wiki",
           provider: flags.provider || "codex",
           model: flags.model || "",
+          reasoningEffort: flags["reasoning-effort"] || "",
           extraInstruction: flags.instruction || "",
           operationId: flags["operation-id"] || "",
           timeoutMs: parsePositiveInteger(flags["timeout-ms"], 0),
@@ -202,6 +209,7 @@ async function main(argv = process.argv.slice(2)) {
           operationType: "organize-sources",
           provider: flags.provider || "codex",
           model: flags.model || "",
+          reasoningEffort: flags["reasoning-effort"] || "",
           extraInstruction: flags.instruction || "",
           operationId: flags["operation-id"] || "",
           timeoutMs: parsePositiveInteger(flags["timeout-ms"], 0),
@@ -212,6 +220,7 @@ async function main(argv = process.argv.slice(2)) {
           operationType: "update-rules",
           provider: flags.provider || "codex",
           model: flags.model || "",
+          reasoningEffort: flags["reasoning-effort"] || "",
           extraInstruction: flags.instruction || "",
           operationId: flags["operation-id"] || "",
           timeoutMs: parsePositiveInteger(flags["timeout-ms"], 0),
@@ -223,6 +232,7 @@ async function main(argv = process.argv.slice(2)) {
         await runExploreChat(resolveWorkspace(args[0]), {
           provider: flags.provider || "codex",
           model: flags.model || "",
+          reasoningEffort: flags["reasoning-effort"] || "",
           chatId: flags["chat-id"] || "",
           question: flags.question || "",
           selectedPath: flags["selected-path"] || "",
@@ -236,6 +246,7 @@ async function main(argv = process.argv.slice(2)) {
         await runApplyChat(resolveWorkspace(args[0]), {
           provider: flags.provider || "codex",
           model: flags.model || "",
+          reasoningEffort: flags["reasoning-effort"] || "",
           payloadFile: flags["payload-file"] || "",
           payloadJson: flags["payload-json"] || "",
           operationId: flags["operation-id"] || "",
@@ -286,15 +297,15 @@ Usage:
   node src/operation-runner.js create-sample [workspace] [--force]
   node src/operation-runner.js init-workspace [workspace]
   node src/operation-runner.js check [--provider codex|claude]
-  node src/operation-runner.js build [workspace] [--provider codex|claude] [--model <id>] [--instruction "..."] [--workspace-context "..."] [--force] [--strict-validation] [--timeout-ms 600000] [--skip-provider-check]
+  node src/operation-runner.js build [workspace] [--provider codex|claude] [--model <id>] [--reasoning-effort low|medium|high|xhigh|max] [--instruction "..."] [--workspace-context "..."] [--force] [--strict-validation] [--timeout-ms 600000] [--skip-provider-check]
   node src/operation-runner.js baseline-sources [workspace]
-  node src/operation-runner.js wiki-healthcheck [workspace] [--provider codex|claude] [--model <id>] [--instruction "..."] [--operation-id <id>]
-  node src/operation-runner.js improve-wiki [workspace] [--provider codex|claude] [--model <id>] --instruction "..." [--operation-id <id>]
-  node src/operation-runner.js organize-sources [workspace] [--provider codex|claude] [--model <id>] --instruction "..." [--operation-id <id>]
-  node src/operation-runner.js update-rules [workspace] [--provider codex|claude] [--model <id>] --instruction "..." [--operation-id <id>]
-  node src/operation-runner.js ask [workspace] [--provider codex|claude] [--model <id>] --question "..." [--selected-path wiki/page.md] [--history-json "[...]"] [--chat-id <id>] [--skip-provider-check]
-  node src/operation-runner.js explore-chat [workspace] [--provider codex|claude] [--model <id>] --question "..." [--selected-path wiki/page.md] [--history-json "[...]"] [--chat-id <id>] [--skip-provider-check]
-  node src/operation-runner.js apply-chat [workspace] [--provider codex|claude] [--model <id>] --payload-file .aiwiki/chat-threads/apply-payload.json [--operation-id <id>] [--skip-provider-check]
+  node src/operation-runner.js wiki-healthcheck [workspace] [--provider codex|claude] [--model <id>] [--reasoning-effort <id>] [--instruction "..."] [--operation-id <id>]
+  node src/operation-runner.js improve-wiki [workspace] [--provider codex|claude] [--model <id>] [--reasoning-effort <id>] --instruction "..." [--operation-id <id>]
+  node src/operation-runner.js organize-sources [workspace] [--provider codex|claude] [--model <id>] [--reasoning-effort <id>] --instruction "..." [--operation-id <id>]
+  node src/operation-runner.js update-rules [workspace] [--provider codex|claude] [--model <id>] [--reasoning-effort <id>] --instruction "..." [--operation-id <id>]
+  node src/operation-runner.js ask [workspace] [--provider codex|claude] [--model <id>] [--reasoning-effort <id>] --question "..." [--selected-path wiki/page.md] [--history-json "[...]"] [--chat-id <id>] [--skip-provider-check]
+  node src/operation-runner.js explore-chat [workspace] [--provider codex|claude] [--model <id>] [--reasoning-effort <id>] --question "..." [--selected-path wiki/page.md] [--history-json "[...]"] [--chat-id <id>] [--skip-provider-check]
+  node src/operation-runner.js apply-chat [workspace] [--provider codex|claude] [--model <id>] [--reasoning-effort <id>] --payload-file .aiwiki/chat-threads/apply-payload.json [--operation-id <id>] [--skip-provider-check]
   node src/operation-runner.js status [workspace]
   node src/operation-runner.js undo [workspace]
 
@@ -671,144 +682,8 @@ function workspaceAgentInstructions(title) {
 }
 
 function wikiSchemaTemplate() {
-  return [
-    "# Maple Wiki Schema",
-    "",
-    "This file defines durable content conventions for a Maple workspace.",
-    "The wiki is a local, file-based knowledge graph compiled from immutable sources and explicit wiki update operations.",
-    "",
-    "## Workspace Structure",
-    "",
-    "```text",
-    "workspace/",
-    "  sources/                # Human-curated sources; never edit source contents",
-    "  wiki/",
-    "    concepts/             # Canonical concept pages, one durable idea per file",
-    "    summaries/            # Source digests for substantial source units",
-    "    guides/               # Useful routes across multiple wiki pages",
-    "    assets/               # Derived figures extracted or generated for wiki pages",
-    "  index.md                # Reader-facing catalog and navigation map",
-    "  log.md                  # Append-only history of wiki operations",
-    "  schema.md               # This file; durable wiki conventions",
-    "```",
-    "",
-    "## Working Model",
-    "",
-    "- `sources/` stores immutable source material.",
-    "- `wiki/` stores generated and maintained wiki pages.",
-    "- Explore Chat is read-only; write operations update the wiki only when explicitly invoked by the app.",
-    "- Keep one canonical page per durable concept and link to it instead of repeating the full explanation elsewhere.",
-    "- `index.md` is for navigation. `log.md` records operation history and is not the source of truth for wiki facts.",
-    "",
-    "## Maintain Operations",
-    "",
-    "Maintain is the app area for explicit upkeep tasks. These operations may change local workspace files only inside their allowed boundaries and should leave reviewable changes.",
-    "",
-    "- Wiki healthcheck checks the existing wiki against the Wiki Healthcheck Rules below and fixes only conservative issues.",
-    "- Improve wiki creates guides, improves structure, connects pages, and reshapes content around a user instruction.",
-    "- Organize sources moves or renames source files without changing their contents and updates wiki citations that point to them.",
-    "- Update rules changes durable workspace conventions in this schema when the user asks.",
-    "",
-    "## Page Types",
-    "",
-    "- Summary pages live under `wiki/summaries/` and capture substantial source units.",
-    "- Concept pages live under `wiki/concepts/` and explain one reusable idea.",
-    "- Guide pages live under `wiki/guides/` and create useful routes across multiple wiki pages.",
-    "- Do not create mechanical summaries for every small file when concepts, guides, or citations represent the source better.",
-    "- Do not create mechanical guide pages for every source or concept; use guides for overviews, learning paths, review paths, onboarding, or synthesis.",
-    "",
-    "## Page Standards",
-    "",
-    "Use YAML frontmatter for generated wiki pages:",
-    "",
-    "```yaml",
-    "---",
-    "sources:",
-    "  - sources/sample-note.md",
-    "created: 2026-05-03",
-    "updated: 2026-05-03",
-    "---",
-    "```",
-    "",
-    "- Keep frontmatter minimal: `sources`, `created`, and `updated` only unless the user changes this schema.",
-    "- Do not repeat page-level metadata as a visible `Source: ... Created: ... Updated: ...` paragraph after the title; the app renders frontmatter as the page header.",
-    "- Use the first `#` heading as the page title. Use the page folder for page type.",
-    "- Use `YYYY-MM-DD` dates. Preserve `created` after first creation and refresh `updated` when page content changes.",
-    "- Use `kebab-case.md` filenames.",
-    "- Prefer one concept per page. Split pages that mix durable ideas.",
-    "- Write for a non-technical individual or team member.",
-    "- Prefer short sections, concrete examples, and source-grounded synthesis over copy-paste.",
-    "",
-    "## Cross-References",
-    "",
-    "- Use Obsidian-style wikilinks such as `[[retrieval-practice]]` or `[[retrieval-practice|retrieval practice]]`.",
-    "- In concept pages, link the first meaningful in-body mention where a reader may want to branch.",
-    "- In guide pages, keep reading order clear and avoid repeating navigation prose already handled by concept links.",
-    "- Do not over-link repeated terms in the same short section.",
-    "- Keep `Related` sections compact; they should not be the only place important concepts connect.",
-    "",
-    "## Math Formatting",
-    "",
-    "- Use `$...$` for short inline variables or expressions.",
-    "- Use `$$...$$` display blocks for important equations, derivations, fractions, or chained equality.",
-    "- Inside math, prefer LaTeX notation such as `\\frac{...}{...}`, `\\sqrt{...}`, `^2`, and `\\times`.",
-    "- Do not use escaped LaTeX delimiters like `\\(...\\)` or `\\[...\\]` in wiki pages.",
-    "",
-    "## Source Citations",
-    "",
-    "- Frontmatter `sources` lists the source files that contributed to a page.",
-    "- Summaries must cite their source file path.",
-    "- Concept and guide pages should list all contributing source paths.",
-    "- For high-risk claims, cite the exact source span near the claim when available.",
-    "- High-risk claims include equations, derivations, numerical values, component specs, slide corrections, and convention-dependent definitions.",
-    "- Use compact source notes, for example: _Source: `sources/Lec3_HW.pptx`, slide 2._",
-    "- Web references are external links used during Explore Chat; they are not curated source files and must not be added to frontmatter `sources`.",
-    "- If web-derived content is applied to the wiki, cite it inline or in a `## Web References` section with title, URL, access date, and `found via Explore web search`.",
-    "",
-    "## Visuals And Assets",
-    "",
-    "- Use visuals when they materially clarify a concept, equation, architecture, plot, or comparison.",
-    "- Keep `sources/` immutable. Save extracted or cropped derived images under `wiki/assets/<source-slug>/`.",
-    "- Place visuals near the explanation they support and include a short caption with source path/page when possible.",
-    "- Do not add decorative images or dump every source image into the wiki.",
-    "",
-    "## Uncertainty And Conflicts",
-    "",
-    "- When uncertain, flag the gap with an Obsidian question callout:",
-    "",
-    "> [!question]",
-    "> State what is uncertain and what source would resolve it.",
-    "",
-    "- When sources conflict, flag both claims with an Obsidian warning callout:",
-    "",
-    "> [!warning]",
-    "> Note the conflicting claims and their sources.",
-    "",
-    "## Index And Log Rules",
-    "",
-    "- Update `index.md` after wiki pages are added, removed, renamed, or reorganized.",
-    "- Keep `index.md` grouped by page type with short descriptions.",
-    "- Treat `log.md` as append-only operation history.",
-    "- Append a concise dated entry to `log.md` after ingests, Apply-to-Wiki updates, healthchecks, organization changes, and rules updates.",
-    "",
-    "## Wiki Healthcheck Rules",
-    "",
-    "Wiki healthcheck should conservatively check and fix:",
-    "",
-    "- Broken wikilinks when the intended target is obvious; report ambiguous links instead of guessing.",
-    "- Orphan pages that can be connected naturally from `index.md`, guides, or related concept pages.",
-    "- Stale `index.md` entries and missing important pages.",
-    "- Summary pages that do not cite their source.",
-    "- Concept pages that make source-specific claims without source citations.",
-    "- Duplicate concept pages only when they are clearly duplicative; otherwise add cross-links.",
-    "- Empty, very short, or vague pages using only existing wiki/source evidence.",
-    "- Broken image references and captions that lack original source paths when known.",
-    "- A short `log.md` entry after the healthcheck.",
-    "",
-    "Wiki healthcheck should not make major subjective improvements or restructures; use Improve wiki for that.",
-    "Never edit source file contents.",
-    "",
-  ].join("\n");
+  const schema = fs.readFileSync(WORKSPACE_SCHEMA_TEMPLATE_PATH, "utf8");
+  return schema.endsWith("\n") ? schema : `${schema}\n`;
 }
 
 
@@ -866,6 +741,24 @@ function checkSoffice() {
   };
 }
 
+function selectedReasoningEffort(provider, model, options = {}) {
+  const requested = (options.reasoningEffort || "").trim();
+  const supported = new Set((provider.supportedReasoningEfforts || []).map((effort) => effort.id));
+  if (requested) {
+    if (supported.size > 0 && !supported.has(requested)) {
+      throw new Error(
+        `${provider.name} does not support reasoning effort "${requested}". ` +
+          `Choose one of: ${Array.from(supported).join(", ")}`,
+      );
+    }
+    return requested;
+  }
+  if (typeof provider.defaultReasoningEffort === "function") {
+    return provider.defaultReasoningEffort(model);
+  }
+  return "xhigh";
+}
+
 async function runBuildWiki(workspace, options = {}) {
   await assertWorkspace(workspace);
   await assertNoPendingGeneratedChanges(workspace);
@@ -883,6 +776,8 @@ async function runBuildWiki(workspace, options = {}) {
   }
 
   const operationId = createOperationId();
+  const model = options.model || provider.defaultModel;
+  const reasoningEffort = selectedReasoningEffort(provider, model, options);
   const operationDir = path.join(workspace, ".aiwiki", "operations", operationId);
   const changedDir = path.join(workspace, ".aiwiki", "changed");
   await ensureDir(operationDir);
@@ -941,9 +836,11 @@ async function runBuildWiki(workspace, options = {}) {
     const preparedSources = await measure("sourceExtraction", () =>
       prepareSourceArtifacts(workspace, operationId, buildSourcePaths),
     );
-    await measure("slideSelection", () =>
+    await measure("visualInspectionPlanning", () =>
       selectBuildWikiVisualInputs(workspace, provider, {
         ...options,
+        model,
+        reasoningEffort,
         operationId,
         operationDir,
         dryRun: Boolean(options.dryRun),
@@ -951,6 +848,8 @@ async function runBuildWiki(workspace, options = {}) {
     );
     const prompt = await measure("promptBuild", () => buildWikiPrompt(workspace, {
       ...options,
+      model,
+      reasoningEffort,
       sourceStatus,
       buildSourcePaths,
     }, preparedSources));
@@ -962,7 +861,8 @@ async function runBuildWiki(workspace, options = {}) {
 
   const args = provider.buildExecArgs({
     workspace,
-    model: options.model || provider.defaultModel,
+    model,
+    reasoningEffort,
     lastMessagePath,
     imageAttachments: preparedSources.imageAttachments,
     maxTurns,
@@ -1021,6 +921,7 @@ async function runBuildWiki(workspace, options = {}) {
     );
     return { changedFiles, validatedChanges };
   });
+  annotateFinalWikiAssetCounts(preparedSources, validatedChanges);
   const userVisibleChangedFiles = getUserVisibleChangedFiles(validatedChanges);
   const reviewableChangedFiles = getReviewableChangedFiles(userVisibleChangedFiles);
   const completedAt = new Date().toISOString();
@@ -1072,7 +973,8 @@ async function runBuildWiki(workspace, options = {}) {
     id: operationId,
     type: "build-wiki",
     provider: provider.name,
-	    model: options.model || provider.defaultModel,
+	    model,
+	    reasoningEffort,
 	    status,
 	    workspace,
 	    startedAt,
@@ -1174,7 +1076,8 @@ async function runBuildWiki(workspace, options = {}) {
       id: operationId,
       type: "build-wiki",
       provider: provider.name,
-      model: options.model || provider.defaultModel,
+      model,
+      reasoningEffort,
       status: "runner_failed",
       workspace,
       startedAt,
@@ -1240,6 +1143,8 @@ async function runExploreChat(workspace, options = {}) {
   }
 
   const chatId = normalizeOperationId(options.chatId) || createOperationId();
+  const model = options.model || provider.defaultModel;
+  const reasoningEffort = selectedReasoningEffort(provider, model, options);
   const chatDir = path.join(workspace, ".aiwiki", "chat", chatId);
   await ensureDir(chatDir);
 
@@ -1255,7 +1160,8 @@ async function runExploreChat(workspace, options = {}) {
     question,
     operationId: chatId,
     chatDir,
-    model: options.model || provider.defaultModel,
+    model,
+    reasoningEffort,
   });
   const imageAttachments = mergeExploreImageAttachments(
     wikiImageAttachments,
@@ -1264,6 +1170,8 @@ async function runExploreChat(workspace, options = {}) {
   const imageAttachmentBytes = await sumImageAttachmentBytes(imageAttachments);
   const prompt = await buildExploreChatPrompt(workspace, {
     ...options,
+    model,
+    reasoningEffort,
     history,
     operationId: chatId,
     wikiImageAttachments,
@@ -1279,7 +1187,8 @@ async function runExploreChat(workspace, options = {}) {
 
   const args = provider.askExecArgs({
     workspace,
-    model: options.model || provider.defaultModel,
+    model,
+    reasoningEffort,
     lastMessagePath,
     maxTurns: 8,
     imageAttachments: imageAttachments.map((image) => image.absolutePath),
@@ -1318,7 +1227,8 @@ async function runExploreChat(workspace, options = {}) {
     id: chatId,
     type: "explore-chat",
     provider: provider.name,
-    model: options.model || provider.defaultModel,
+    model,
+    reasoningEffort,
     status,
     workspace,
     selectedPath: options.selectedPath || "",
@@ -1367,6 +1277,8 @@ async function runApplyChat(workspace, options = {}) {
 
   const payload = await readApplyChatPayload(workspace, options);
   const operationId = resolveOperationId(options.operationId);
+  const model = options.model || provider.defaultModel;
+  const reasoningEffort = selectedReasoningEffort(provider, model, options);
   const operationDir = path.join(workspace, ".aiwiki", "operations", operationId);
   const changedDir = path.join(workspace, ".aiwiki", "changed");
   await ensureDir(operationDir);
@@ -1386,7 +1298,8 @@ async function runApplyChat(workspace, options = {}) {
 
   const args = provider.buildExecArgs({
     workspace,
-    model: options.model || provider.defaultModel,
+    model,
+    reasoningEffort,
     lastMessagePath,
     maxTurns: 12,
   });
@@ -1447,7 +1360,8 @@ async function runApplyChat(workspace, options = {}) {
     id: operationId,
     type: "apply-chat",
     provider: provider.name,
-    model: options.model || provider.defaultModel,
+    model,
+    reasoningEffort,
     status,
     workspace,
     startedAt,
@@ -1517,6 +1431,8 @@ async function runMaintenanceOperation(workspace, options = {}) {
   }
 
   const operationId = resolveOperationId(options.operationId);
+  const model = options.model || provider.defaultModel;
+  const reasoningEffort = selectedReasoningEffort(provider, model, options);
   const operationDir = path.join(workspace, ".aiwiki", "operations", operationId);
   const changedDir = path.join(workspace, ".aiwiki", "changed");
   await ensureDir(operationDir);
@@ -1544,7 +1460,8 @@ async function runMaintenanceOperation(workspace, options = {}) {
 
   const args = provider.buildExecArgs({
     workspace,
-    model: options.model || provider.defaultModel,
+    model,
+    reasoningEffort,
     lastMessagePath,
     maxTurns: config.maxTurns,
   });
@@ -1609,7 +1526,8 @@ async function runMaintenanceOperation(workspace, options = {}) {
     id: operationId,
     type: config.type,
     provider: provider.name,
-    model: options.model || provider.defaultModel,
+    model,
+    reasoningEffort,
     status,
     workspace,
     startedAt,
@@ -1884,141 +1802,249 @@ async function runProviderExec(provider, args, prompt, paths) {
 }
 
 async function selectBuildWikiVisualInputs(workspace, provider, options, preparedSources) {
-  const supportsImages = provider.supportsImageAttachments === true;
+  const imageInputMode = getProviderImageInputMode(provider);
+  const supportsImages = imageInputMode === "attached-images";
+  const supportsImagePathReferences = imageInputMode === "path-referenced-images";
+  const supportsVisionInputs = imageInputMode !== "provider-image-unsupported-fallback";
   const visualSources = [];
   const imageAttachments = [];
-  let remainingFullSlideBudget = MAX_FULL_SLIDE_ATTACHMENTS_TOTAL;
   let totalPages = 0;
+  let renderedImageCount = 0;
   let contactSheetCount = 0;
-  let selectedFullSlideCount = 0;
+  let visionInputCount = 0;
+  let assetCandidateCount = 0;
   let promptImageBytes = 0;
+  const visualDocumentSources = [];
 
   for (const source of preparedSources.sources) {
     if (source.sourceImage) {
+      const promptImage = {
+        page: 1,
+        reason: "source image",
+        promptImage: source.sourceImage,
+        fullImage: source.sourceImage,
+      };
+      if (supportsImagePathReferences) {
+        promptImage.imageInputPath = safeJoin(workspace, source.sourceImage);
+      }
+      source.pagesToInspect = [promptImage];
+      source.selectedPromptImages = [promptImage];
+      source.selectedPromptImagesAttached = supportsImages;
+      source.contactSheetAttached = false;
+      source.visualInspectionPlan = {
+        materialType: "source-image",
+        inspectionPolicy: supportsVisionInputs ? "inspect-source-image" : "fallback",
+        pagesToInspect: [{ page: 1, reason: "source image" }],
+        assetCandidates: [],
+        notes: "",
+      };
+      source.visualInspectionMode = imageInputMode;
       if (supportsImages) {
         const imagePath = safeJoin(workspace, source.sourceImage);
         imageAttachments.push(imagePath);
         promptImageBytes += await fileSizeOrZero(imagePath);
+      } else if (supportsImagePathReferences) {
+        promptImageBytes += await fileSizeOrZero(promptImage.imageInputPath);
+      }
+      if (supportsVisionInputs) {
+        visionInputCount += 1;
       }
       visualSources.push({
         sourcePath: source.sourcePath,
         pageCount: 1,
-        selectionMode: "source-image",
-        fullImageBudget: 1,
-        contactSheet: null,
-        selectedPages: [1],
-        selectedFullSlides: [],
-        skippedFullSlides: 0,
+        renderedImageCount: 0,
+        contactSheetCount: 0,
+        visualInspectionMode: imageInputMode,
+        materialType: "source-image",
+        inspectionPolicy: supportsVisionInputs ? "inspect-source-image" : "fallback",
+        pagesToInspect: [promptImage],
+        assetCandidates: [],
+        visionInputCount: supportsVisionInputs ? 1 : 0,
+        pathReferencedImageCount: supportsImagePathReferences ? 1 : 0,
+        assetCandidateCount: 0,
+        finalWikiAssetCount: 0,
         providerSupportsImageAttachments: supportsImages,
+        providerSupportsImagePathReferences: supportsImagePathReferences,
       });
       continue;
     }
 
     const pageCount = Number(source.pageCount) || source.promptPageImages.length;
     totalPages += pageCount;
+    renderedImageCount += source.pageImages?.length || 0;
+    contactSheetCount += getSourceContactSheets(source).length;
     if (pageCount <= 0) continue;
+    visualDocumentSources.push(source);
+  }
 
-    const baseBudget = calculateFullSlideBudget(pageCount);
-    const fullImageBudget = Math.min(baseBudget, remainingFullSlideBudget);
-    let selection;
+  const plannedSources = await mapWithConcurrency(
+    visualDocumentSources,
+    VISUAL_PLANNING_CONCURRENCY,
+    async (source) => {
+      const pageCount = Number(source.pageCount) || source.promptPageImages.length;
+      const fallbackBudget = calculateFullSlideBudget(pageCount);
+      const contactSheets = getSourceContactSheets(source);
+      const sourceContactSheetCount = contactSheets.length;
+      let selection;
 
-    if (pageCount <= SMALL_DOCUMENT_PAGE_THRESHOLD) {
-      selection = {
-        mode: "small-document-all-pages",
-        selectedPages: Array.from({ length: pageCount }, (_value, index) => ({
-          page: index + 1,
-          reason: "small document",
-        })),
-      };
-    } else if (options.dryRun) {
-      selection = fallbackSlideSelection(pageCount, fullImageBudget, "dry run");
-    } else if (!supportsImages) {
-      selection = fallbackSlideSelection(pageCount, fullImageBudget, "provider does not support image attachments");
-      selection.mode = "provider-image-unsupported-fallback";
-    } else {
-      selection = await selectSlidesWithProvider(workspace, provider, options, source, fullImageBudget)
-        .catch((error) => ({
-          ...fallbackSlideSelection(pageCount, fullImageBudget, error.message),
-          error: error.message,
-        }));
-    }
+      if (pageCount <= SMALL_DOCUMENT_PAGE_THRESHOLD) {
+        selection = normalizeVisualInspectionPlan({
+          mode: imageInputMode,
+          materialType: "small-document",
+          inspectionPolicy: "inspect-all",
+          pagesToInspect: Array.from({ length: pageCount }, (_value, index) => ({
+            page: index + 1,
+            reason: "small document",
+          })),
+          assetCandidates: [],
+          notes: "All pages selected because the source is short.",
+        }, pageCount);
+      } else if (options.dryRun) {
+        selection = fallbackVisualInspectionPlan(pageCount, fallbackBudget, "dry run");
+      } else if (!supportsVisionInputs) {
+        selection = fallbackVisualInspectionPlan(
+          pageCount,
+          fallbackBudget,
+          "provider does not support image visual inputs",
+        );
+        selection.mode = "provider-image-unsupported-fallback";
+      } else {
+        selection = await planVisualInspectionWithProvider(workspace, provider, options, source, imageInputMode)
+          .catch((error) => ({
+            ...fallbackVisualInspectionPlan(pageCount, fallbackBudget, error.message),
+            error: error.message,
+          }));
+      }
 
-    const selected = normalizeSelectedSlideEntries(selection.selectedPages, pageCount, fullImageBudget);
-    const selectedPromptImages = selected
-      .map((entry) => {
-        const promptImage = source.promptPageImages[entry.page - 1];
-        const fullImage = source.pageImages[entry.page - 1];
-        if (!promptImage || !fullImage) return null;
-        return {
+      const normalizedPlan = normalizeVisualInspectionPlan(
+        selection,
+        pageCount,
+        selection.mode === "fallback" || selection.error
+          ? {
+            fallbackBudget,
+            fallbackReason: selection.error || selection.notes || "fallback selection",
+          }
+          : {},
+      );
+      const pagesToInspect = mapVisualPlanPagesToImages(
+        workspace,
+        source,
+        normalizedPlan.pagesToInspect,
+        imageInputMode,
+      );
+      const inspectedPageNumbers = new Set(pagesToInspect.map((entry) => entry.page));
+      const assetCandidates = mapVisualPlanPagesToImages(
+        workspace,
+        source,
+        normalizedPlan.assetCandidates.filter((entry) => inspectedPageNumbers.has(entry.page)),
+        imageInputMode,
+      );
+
+      source.pagesToInspect = pagesToInspect;
+      source.assetCandidates = assetCandidates;
+      source.selectedPromptImages = pagesToInspect;
+      source.selectedPromptImagesAttached = supportsImages;
+      source.contactSheetAttached = false;
+      source.visualInspectionMode = supportsVisionInputs
+        ? imageInputMode
+        : "provider-image-unsupported-fallback";
+      source.visualInspectionPlan = {
+        materialType: normalizedPlan.materialType,
+        inspectionPolicy: normalizedPlan.inspectionPolicy,
+        pagesToInspect: pagesToInspect.map((entry) => ({
           page: entry.page,
           reason: entry.reason || "",
-          promptImage,
-          fullImage,
-        };
-      })
-      .filter(Boolean);
+        })),
+        assetCandidates: assetCandidates.map((entry) => ({
+          page: entry.page,
+          reason: entry.reason || "",
+        })),
+        notes: normalizedPlan.notes,
+        error: selection.error || null,
+      };
+      source.visualSelection = {
+        mode: source.visualInspectionMode,
+        requestedBudget: fallbackBudget,
+        fullImageBudget: fallbackBudget,
+        selectedPages: pagesToInspect.map((entry) => entry.page),
+        error: selection.error || null,
+      };
 
-    source.selectedPromptImages = selectedPromptImages;
-    source.selectedPromptImagesAttached = supportsImages;
-    source.contactSheetAttached = false;
-    source.visualSelection = {
-      mode: selection.mode,
-      requestedBudget: baseBudget,
-      fullImageBudget,
-      selectedPages: selectedPromptImages.map((entry) => entry.page),
-      error: selection.error || null,
-    };
-
-    if (supportsImages && pageCount > SMALL_DOCUMENT_PAGE_THRESHOLD && source.contactSheetPath) {
-      const contactSheetAbsolutePath = safeJoin(workspace, source.contactSheetPath);
-      imageAttachments.push(contactSheetAbsolutePath);
-      promptImageBytes += await fileSizeOrZero(contactSheetAbsolutePath);
-      contactSheetCount += 1;
-      source.contactSheetAttached = true;
-    }
-
-    if (supportsImages) {
-      for (const entry of selectedPromptImages) {
-        const imagePath = safeJoin(workspace, entry.promptImage);
-        imageAttachments.push(imagePath);
-        promptImageBytes += await fileSizeOrZero(imagePath);
+      const attachments = [];
+      let sourcePromptImageBytes = 0;
+      for (const entry of pagesToInspect) {
+        const imagePath = entry.imageInputPath || safeJoin(workspace, entry.promptImage);
+        if (supportsVisionInputs) {
+          sourcePromptImageBytes += await fileSizeOrZero(imagePath);
+        }
+        if (supportsImages) {
+          attachments.push(imagePath);
+        }
       }
-    }
 
-    selectedFullSlideCount += selectedPromptImages.length;
-    remainingFullSlideBudget = Math.max(0, remainingFullSlideBudget - selectedPromptImages.length);
-    visualSources.push({
-      sourcePath: source.sourcePath,
-      pageCount,
-      selectionMode: selection.mode,
-      fullImageBudget,
-      requestedBudget: baseBudget,
-      contactSheet: source.contactSheetPath || null,
-      selectedPages: selectedPromptImages.map((entry) => entry.page),
-      selectedFullSlides: selectedPromptImages.map((entry) => ({
-        page: entry.page,
-        promptImage: entry.promptImage,
-        fullImage: entry.fullImage,
-        reason: entry.reason,
-      })),
-      skippedFullSlides: Math.max(0, pageCount - selectedPromptImages.length),
-      providerSupportsImageAttachments: supportsImages,
-      error: selection.error || null,
-    });
+      return {
+        attachments,
+        promptImageBytes: sourcePromptImageBytes,
+        report: {
+          sourcePath: source.sourcePath,
+          pageCount,
+          renderedImageCount: source.pageImages?.length || 0,
+          contactSheetCount: sourceContactSheetCount,
+          contactSheets,
+          contactSheet: source.contactSheetPath || contactSheets[0]?.path || null,
+          visualInspectionMode: source.visualInspectionMode,
+          materialType: normalizedPlan.materialType,
+          inspectionPolicy: normalizedPlan.inspectionPolicy,
+          pagesToInspect: pagesToInspect.map((entry) => ({
+            page: entry.page,
+            reason: entry.reason || "",
+            promptImage: entry.promptImage,
+            fullImage: entry.fullImage,
+            imageInputPath: entry.imageInputPath || "",
+          })),
+          assetCandidates: assetCandidates.map((entry) => ({
+            page: entry.page,
+            reason: entry.reason || "",
+            promptImage: entry.promptImage,
+            fullImage: entry.fullImage,
+            imageInputPath: entry.imageInputPath || "",
+          })),
+          visionInputCount: supportsVisionInputs ? pagesToInspect.length : 0,
+          pathReferencedImageCount: supportsImagePathReferences ? pagesToInspect.length : 0,
+          assetCandidateCount: assetCandidates.length,
+          finalWikiAssetCount: 0,
+          providerSupportsImageAttachments: supportsImages,
+          providerSupportsImagePathReferences: supportsImagePathReferences,
+          error: selection.error || null,
+        },
+      };
+    },
+  );
+
+  for (const planned of plannedSources) {
+    imageAttachments.push(...planned.attachments);
+    promptImageBytes += planned.promptImageBytes;
+    visionInputCount += planned.report.visionInputCount;
+    assetCandidateCount += planned.report.assetCandidateCount;
+    visualSources.push(planned.report);
   }
 
   preparedSources.imageAttachments = imageAttachments;
   preparedSources.visualInput = {
-    mode: "balanced",
+    mode: "visual-inspection-planning",
     provider: provider.name,
     providerSupportsImageAttachments: supportsImages,
+    providerSupportsImagePathReferences: supportsImagePathReferences,
     totalPages,
+    renderedImageCount,
     contactSheetCount,
-    selectedFullSlideCount,
-    skippedFullSlideCount: Math.max(0, totalPages - selectedFullSlideCount),
+    visionInputCount,
+    selectedFullSlideCount: visionInputCount,
+    skippedFullSlideCount: Math.max(0, totalPages - visionInputCount),
+    assetCandidateCount,
     promptImageBytes,
     fullImageBudget: Math.min(MAX_FULL_SLIDE_ATTACHMENTS_TOTAL, visualSources.reduce(
-      (total, source) => total + (source.fullImageBudget || 0),
+      (total, source) => total + calculateFullSlideBudget(source.pageCount || 0),
       0,
     )),
     fullImageBudgetPolicy: {
@@ -2027,27 +2053,97 @@ async function selectBuildWikiVisualInputs(workspace, provider, options, prepare
       maxPerSource: MAX_FULL_SLIDE_ATTACHMENTS_PER_SOURCE,
       maxTotal: MAX_FULL_SLIDE_ATTACHMENTS_TOTAL,
       smallDocumentPageThreshold: SMALL_DOCUMENT_PAGE_THRESHOLD,
+      hardCapRemovedForVisualPlanning: true,
+      fallbackOnly: true,
     },
     imageAttachmentCount: imageAttachments.length,
+    pathReferencedImageCount: supportsImagePathReferences ? visionInputCount : 0,
+    visualPlanningConcurrency: VISUAL_PLANNING_CONCURRENCY,
+    finalWikiAssetCount: 0,
     sources: visualSources,
   };
 }
 
-async function selectSlidesWithProvider(workspace, provider, options, source, fullImageBudget) {
-  if (!source.contactSheetPath) {
-    return fallbackSlideSelection(source.pageCount, fullImageBudget, "missing contact sheet");
+async function mapWithConcurrency(items, concurrency, mapper) {
+  const limit = Math.max(1, Math.trunc(Number(concurrency)) || 1);
+  const results = new Array(items.length);
+  let nextIndex = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (nextIndex < items.length) {
+      const currentIndex = nextIndex;
+      nextIndex += 1;
+      results[currentIndex] = await mapper(items[currentIndex], currentIndex);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+function getProviderImageInputMode(provider) {
+  if (provider?.supportsImageAttachments === true) return "attached-images";
+  if (provider?.supportsImagePathReferences === true) return "path-referenced-images";
+  return "provider-image-unsupported-fallback";
+}
+
+function getSourceContactSheets(source) {
+  if (Array.isArray(source.contactSheets) && source.contactSheets.length) {
+    return source.contactSheets
+      .filter((sheet) => sheet?.path)
+      .map((sheet) => ({
+        path: sheet.path,
+        startPage: Math.max(1, Math.trunc(Number(sheet.startPage)) || 1),
+        endPage: Math.max(1, Math.trunc(Number(sheet.endPage)) || Number(source.pageCount) || 1),
+      }));
+  }
+  if (source.contactSheetPath) {
+    return [{
+      path: source.contactSheetPath,
+      startPage: 1,
+      endPage: Number(source.pageCount) || 1,
+    }];
+  }
+  return [];
+}
+
+function mapVisualPlanPagesToImages(workspace, source, entries, imageInputMode = "attached-images") {
+  return (entries || [])
+    .map((entry) => {
+      const promptImage = source.promptPageImages[entry.page - 1];
+      const fullImage = source.pageImages[entry.page - 1];
+      if (!promptImage || !fullImage) return null;
+      return {
+        page: entry.page,
+        reason: entry.reason || "",
+        promptImage,
+        fullImage,
+        imageInputPath: imageInputMode === "path-referenced-images"
+          ? safeJoin(workspace, promptImage)
+          : "",
+      };
+    })
+    .filter(Boolean);
+}
+
+async function planVisualInspectionWithProvider(workspace, provider, options, source, imageInputMode) {
+  const contactSheets = getSourceContactSheets(source);
+  const fallbackBudget = calculateFullSlideBudget(source.pageCount);
+  if (!contactSheets.length) {
+    return fallbackVisualInspectionPlan(source.pageCount, fallbackBudget, "missing contact sheet");
   }
 
-  const selectionId = `${options.operationId}-slide-selection-${source.sourceSlug}`;
-  const eventsPath = path.join(options.operationDir, `${source.sourceSlug}-slide-selection-events.jsonl`);
-  const stderrPath = path.join(options.operationDir, `${source.sourceSlug}-slide-selection-stderr.log`);
-  const lastMessagePath = path.join(options.operationDir, `${source.sourceSlug}-slide-selection.json`);
-  const prompt = await buildSlideSelectionPrompt(workspace, source, fullImageBudget);
+  const selectionId = `${options.operationId}-visual-planning-${source.sourceSlug}`;
+  const eventsPath = path.join(options.operationDir, `${source.sourceSlug}-visual-planning-events.jsonl`);
+  const stderrPath = path.join(options.operationDir, `${source.sourceSlug}-visual-planning-stderr.log`);
+  const lastMessagePath = path.join(options.operationDir, `${source.sourceSlug}-visual-inspection-plan.json`);
+  const prompt = await buildVisualInspectionPlanningPrompt(workspace, source, imageInputMode);
   const args = provider.buildExecArgs({
     workspace,
     model: options.model || provider.defaultModel,
+    reasoningEffort: selectedReasoningEffort(provider, options.model || provider.defaultModel, options),
     lastMessagePath,
-    imageAttachments: [safeJoin(workspace, source.contactSheetPath)],
+    imageAttachments: imageInputMode === "attached-images"
+      ? contactSheets.map((sheet) => safeJoin(workspace, sheet.path))
+      : [],
     maxTurns: 4,
     sandbox: "read-only",
   });
@@ -2057,61 +2153,84 @@ async function selectSlidesWithProvider(workspace, provider, options, source, fu
     eventsPath,
     stderrPath,
     lastMessagePath,
-    runningMarkerPath: path.join(options.operationDir, `${source.sourceSlug}-slide-selection-running.json`),
+    runningMarkerPath: path.join(options.operationDir, `${source.sourceSlug}-visual-planning-running.json`),
     timeoutMs: SLIDE_SELECTION_TIMEOUT_MS,
     operationId: selectionId,
-    operationType: "build-wiki-slide-selection",
+    operationType: "build-wiki-visual-planning",
     mirrorStdout: false,
     mirrorStderr: false,
   });
 
   if (result.timedOut) {
-    throw new Error("slide selection timed out");
+    throw new Error("visual inspection planning timed out");
   }
   if (result.exitCode !== 0) {
-    throw new Error(`slide selection failed with exit code ${result.exitCode}`);
+    throw new Error(`visual inspection planning failed with exit code ${result.exitCode}`);
   }
 
   const responseText = await fsp.readFile(lastMessagePath, "utf8").catch(() => "");
-  const selectedPages = parseSlideSelectionJson(responseText);
   return {
-    mode: "ai-selected",
-    selectedPages,
+    ...parseVisualInspectionPlanJson(responseText, source.pageCount),
+    mode: imageInputMode,
   };
 }
 
-async function buildSlideSelectionPrompt(workspace, source, fullImageBudget) {
+async function buildVisualInspectionPlanningPrompt(workspace, source, imageInputMode = "attached-images") {
   const extractedText = source.textPath
     ? await fsp.readFile(safeJoin(workspace, source.textPath), "utf8").catch(() => "")
     : "";
   const clippedText = extractedText.length > 20000
     ? `${extractedText.slice(0, 20000)}\n\n[truncated after 20000 characters]`
     : extractedText;
+  const contactSheetList = getSourceContactSheets(source)
+    .map((sheet) => {
+      const imagePath = imageInputMode === "path-referenced-images"
+        ? safeJoin(workspace, sheet.path)
+        : sheet.path;
+      return `- Pages ${sheet.startPage}-${sheet.endPage}: ${imagePath}`;
+    })
+    .join("\n") || "- none";
+  const contactSheetModeText = imageInputMode === "path-referenced-images"
+    ? "Contact sheet image files to inspect by absolute path:"
+    : "Contact sheets attached:";
+  const imageInputInstruction = imageInputMode === "path-referenced-images"
+    ? "Inspect the contact sheet image files from the listed absolute paths before choosing pages."
+    : "Inspect the attached contact sheet images before choosing pages.";
 
-  return `You are selecting visual slides for a Maple Build Wiki operation.
+  return `You are planning visual inspection for a Maple Build Wiki operation.
 
 Return strict JSON only. Do not write files. Do not run shell commands.
 
 Source: ${source.sourcePath}
 Page count: ${source.pageCount}
-Full slide image budget: ${fullImageBudget}
-Contact sheet attached: ${source.contactSheetPath}
+${contactSheetModeText}
+${contactSheetList}
 
-Pick the most useful slide pages for building a source-grounded wiki, not the prettiest slides.
-Prefer diagrams, tables, comparisons, screenshots, key claims, conclusions, and visuals needed for citations.
-Skip pure section-divider slides unless they define the structure of the talk.
+${imageInputInstruction}
+
+Choose the smallest sufficient set of rendered page or slide images that the final Build Wiki pass should inspect as actual vision inputs.
+Do not use a fixed percentage cap. Pick based on material type:
+- text-heavy sources may need few or no page images;
+- worked solutions, derivations, homework, screenshots, visual explanations, or diagram-heavy lectures may need more;
+- inspect all pages only when that is genuinely useful for understanding the source.
+
+Distinguish images inspected for understanding from images worth embedding in the final wiki.
+assetCandidates must be a subset of pagesToInspect.
 
 JSON shape:
 {
-  "selectedPages": [
-    { "page": 1, "reason": "short reason" }
-  ]
+  "materialType": "worked-solution",
+  "inspectionPolicy": "inspect-most",
+  "pagesToInspect": [{ "page": 3, "reason": "derivation step" }],
+  "assetCandidates": [{ "page": 7, "reason": "summary diagram" }],
+  "notes": "short planning note"
 }
 
 Rules:
-- Select at most ${fullImageBudget} pages.
 - Use 1-based page numbers.
 - Do not include pages outside 1..${source.pageCount}.
+- Keep pagesToInspect to a sufficient minimum for understanding.
+- Do not select pages only because they are decorative.
 - Keep each reason under 12 words.
 
 Extracted text:
@@ -2130,12 +2249,25 @@ function calculateFullSlideBudget(pageCount) {
 }
 
 function fallbackSlideSelection(pageCount, budget, reason) {
+  const plan = fallbackVisualInspectionPlan(pageCount, budget, reason);
+  return {
+    mode: plan.mode,
+    selectedPages: plan.pagesToInspect,
+    error: plan.error,
+  };
+}
+
+function fallbackVisualInspectionPlan(pageCount, budget, reason) {
   return {
     mode: "fallback",
-    selectedPages: fallbackSelectPageNumbers(pageCount, budget).map((page) => ({
+    materialType: "unknown",
+    inspectionPolicy: "fallback",
+    pagesToInspect: fallbackSelectPageNumbers(pageCount, budget).map((page) => ({
       page,
       reason: reason || "fallback selection",
     })),
+    assetCandidates: [],
+    notes: reason || "",
     error: reason || null,
   };
 }
@@ -2159,27 +2291,42 @@ function fallbackSelectPageNumbers(pageCount, budget) {
 }
 
 function parseSlideSelectionJson(text) {
+  return parseVisualInspectionPlanJson(text).pagesToInspect;
+}
+
+function parseVisualInspectionPlanJson(text, pageCount = 0) {
   const trimmed = String(text || "").trim();
-  if (!trimmed) throw new Error("slide selection returned empty output");
+  if (!trimmed) throw new Error("visual inspection planning returned empty output");
 
   const jsonText = extractJsonObjectText(trimmed);
   const parsed = JSON.parse(jsonText);
-  const rawPages = Array.isArray(parsed)
-    ? parsed
-    : Array.isArray(parsed.selectedPages)
-      ? parsed.selectedPages
-      : Array.isArray(parsed.pages)
-        ? parsed.pages
-        : null;
-  if (!rawPages) throw new Error("slide selection JSON did not include selectedPages");
-
-  return rawPages.map((entry) => {
-    if (typeof entry === "number") return { page: entry, reason: "" };
-    return {
-      page: Number(entry.page),
-      reason: cleanCommandText(entry.reason || ""),
+  if (!parsed || (typeof parsed !== "object" && !Array.isArray(parsed))) {
+    throw new Error("visual inspection JSON must be an object or array");
+  }
+  const hasPagesToInspect = !Array.isArray(parsed) && (
+    Array.isArray(parsed.pagesToInspect) ||
+    Array.isArray(parsed.selectedPages) ||
+    Array.isArray(parsed.pages)
+  );
+  const rawPlan = Array.isArray(parsed)
+    ? { pagesToInspect: parsed }
+    : {
+      materialType: parsed.materialType,
+      inspectionPolicy: parsed.inspectionPolicy,
+      pagesToInspect: Array.isArray(parsed.pagesToInspect)
+        ? parsed.pagesToInspect
+        : Array.isArray(parsed.selectedPages)
+          ? parsed.selectedPages
+          : Array.isArray(parsed.pages)
+            ? parsed.pages
+            : [],
+      assetCandidates: Array.isArray(parsed.assetCandidates) ? parsed.assetCandidates : [],
+      notes: parsed.notes,
     };
-  });
+  if (!Array.isArray(parsed) && !hasPagesToInspect) {
+    throw new Error("visual inspection JSON did not include pagesToInspect");
+  }
+  return normalizeVisualInspectionPlan(rawPlan, pageCount);
 }
 
 function extractJsonObjectText(text) {
@@ -2199,25 +2346,82 @@ function extractJsonObjectText(text) {
 }
 
 function normalizeSelectedSlideEntries(entries, pageCount, budget) {
-  const selected = [];
-  const seen = new Set();
-  for (const entry of entries || []) {
-    const page = Math.trunc(Number(entry.page));
-    if (!Number.isFinite(page) || page < 1 || page > pageCount || seen.has(page)) continue;
-    seen.add(page);
-    selected.push({
-      page,
-      reason: cleanCommandText(entry.reason || ""),
-    });
-    if (selected.length >= budget) break;
-  }
+  const selected = normalizeVisualPageEntries(entries, pageCount, budget);
   if (selected.length === 0 && budget > 0) {
     return fallbackSelectPageNumbers(pageCount, budget).map((page) => ({
       page,
       reason: "fallback selection",
     }));
   }
+  return selected;
+}
+
+function normalizeVisualInspectionPlan(plan, pageCount, options = {}) {
+  const normalized = {
+    mode: cleanCommandText(plan?.mode || ""),
+    materialType: cleanPlanField(plan?.materialType, "unknown"),
+    inspectionPolicy: cleanPlanField(plan?.inspectionPolicy, "selective"),
+    pagesToInspect: normalizeVisualPageEntries(plan?.pagesToInspect, pageCount),
+    assetCandidates: normalizeVisualPageEntries(plan?.assetCandidates, pageCount),
+    notes: cleanCommandText(plan?.notes || ""),
+    error: plan?.error || null,
+  };
+
+  if (normalized.pagesToInspect.length === 0 && options.fallbackBudget > 0) {
+    normalized.pagesToInspect = fallbackSelectPageNumbers(pageCount, options.fallbackBudget).map((page) => ({
+      page,
+      reason: options.fallbackReason || "fallback selection",
+    }));
+    normalized.materialType = normalized.materialType || "unknown";
+    normalized.inspectionPolicy = "fallback";
+  }
+
+  const inspectedPages = new Set(normalized.pagesToInspect.map((entry) => entry.page));
+  normalized.assetCandidates = normalized.assetCandidates
+    .filter((entry) => inspectedPages.has(entry.page));
+  return normalized;
+}
+
+function normalizeVisualPageEntries(entries, pageCount, budget = Infinity) {
+  const selected = [];
+  const seen = new Set();
+  const maxPage = Math.trunc(Number(pageCount)) || Number.MAX_SAFE_INTEGER;
+  const limit = Number.isFinite(budget) ? Math.max(0, Math.trunc(Number(budget)) || 0) : Infinity;
+  for (const entry of entries || []) {
+    const page = typeof entry === "number"
+      ? Math.trunc(Number(entry))
+      : Math.trunc(Number(entry?.page));
+    if (!Number.isFinite(page) || page < 1 || page > maxPage || seen.has(page)) continue;
+    seen.add(page);
+    selected.push({
+      page,
+      reason: typeof entry === "number" ? "" : cleanCommandText(entry?.reason || ""),
+    });
+    if (selected.length >= limit) break;
+  }
   return selected.sort((a, b) => a.page - b.page);
+}
+
+function cleanPlanField(value, fallback) {
+  const cleaned = cleanCommandText(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 60);
+  return cleaned || fallback;
+}
+
+function contactSheetRanges(pageCount, maxPages = CONTACT_SHEET_MAX_PAGES) {
+  const count = Math.max(0, Math.trunc(Number(pageCount)) || 0);
+  const size = Math.max(1, Math.trunc(Number(maxPages)) || CONTACT_SHEET_MAX_PAGES);
+  const ranges = [];
+  for (let start = 1; start <= count; start += size) {
+    ranges.push({
+      startPage: start,
+      endPage: Math.min(count, start + size - 1),
+    });
+  }
+  return ranges;
 }
 
 async function fileSizeOrZero(filePath) {
@@ -2241,11 +2445,41 @@ function buildTimingReport(timingsMs, startedMs) {
 
 function buildVisualInputReport(preparedSources, provider) {
   return {
-    mode: "balanced",
+    mode: "visual-inspection-planning",
     provider: provider.name,
     providerSupportsImageAttachments: provider.supportsImageAttachments === true,
+    providerSupportsImagePathReferences: provider.supportsImagePathReferences === true,
     ...(preparedSources.visualInput || {}),
   };
+}
+
+function annotateFinalWikiAssetCounts(preparedSources, validatedChanges) {
+  const assetChanges = (validatedChanges || []).filter((change) =>
+    change.allowed &&
+    !change.restored &&
+    (change.status === "added" || change.status === "modified") &&
+    change.path.startsWith("wiki/assets/"));
+  const total = assetChanges.length;
+  if (!preparedSources.visualInput) return total;
+
+  preparedSources.visualInput.finalWikiAssetCount = total;
+  for (const sourceReport of preparedSources.visualInput.sources || []) {
+    sourceReport.finalWikiAssetCount = countFinalWikiAssetsForSource(assetChanges, sourceReport.sourcePath);
+  }
+  for (const source of preparedSources.sources || []) {
+    source.finalWikiAssetCount = countFinalWikiAssetsForSource(assetChanges, source.sourcePath);
+  }
+  return total;
+}
+
+function countFinalWikiAssetsForSource(assetChanges, sourcePath) {
+  const slug = slugFromSourcePath(sourcePath || "");
+  if (!slug) return 0;
+  return assetChanges.filter((change) => {
+    const assetPath = change.path || "";
+    const base = path.posix.basename(assetPath);
+    return assetPath.startsWith(`wiki/assets/${slug}/`) || base.startsWith(`${slug}-`);
+  }).length;
 }
 
 function buildSourceExtractionCacheReport(preparedSources) {
@@ -2271,6 +2505,7 @@ async function buildWikiPrompt(workspace, options, preparedSources = { sources: 
 
 Goal:
 - Compile pending source changes into the local wiki.
+- Integrate new source knowledge into existing summaries, concepts, guides, links, index, and log instead of only creating disconnected source notes.
 
 Required reading:
 - AGENTS.md or CLAUDE.md
@@ -2284,6 +2519,7 @@ ${preparedSourceList}
 
 Required writes:
 - Create or update source-grounded summary, concept, guide, and asset pages as needed.
+- Prefer updating existing canonical pages when new sources refine, extend, or contradict them.
 - Update index.md and append a short dated entry to log.md.
 - Update schema.md only if the user explicitly asks for a durable wiki rule.
 
@@ -2297,8 +2533,9 @@ Source handling:
 - Move or rename scoped source files/folders when the user asks, when pending source filenames are temporary or unclear, or when a clearer existing workspace convention is obvious from the source.
 - If you move or rename a source, cite the new source path in generated wiki pages and update existing wiki citations, index.md, and log.md references as needed.
 - Read only the scoped sources first; inspect existing wiki pages only when needed.
-- Use extracted text as the complete source coverage for PDF/PPTX files.
-- Use attached contact sheets and selected slide images only as visual context; not every rendered page image is attached.
+- Use extracted text for broad source coverage, but do not treat it as complete for visually meaningful PDF/PPTX material.
+- Use the visual inspection plan below to understand which rendered pages are attached as actual vision input.
+- Do not embed every inspected image. Embed only the smallest useful set of visuals that materially clarifies the wiki.
 - When copying a visual into wiki/assets, copy from the listed full-resolution PNG path, not the prompt JPEG path.
 - Cite original source paths in wiki pages.
 - Use minimal wiki page frontmatter: sources, created, and updated. Use the first # heading for the page title.
@@ -2372,6 +2609,7 @@ ${forbiddenPaths}
       "Use workspace instructions already loaded by the CLI; do not re-read AGENTS.md or CLAUDE.md unless they are missing or ambiguous.",
       "Read schema.md, index.md, and log.md only as needed for the healthcheck.",
       "Apply the Wiki Healthcheck Rules in schema.md.",
+      "If schema.md has no Wiki Healthcheck Rules section, stop and report that Update Rules is needed instead of inventing durable rules.",
       "Fix only obvious wiki health issues; do not make major subjective restructures.",
       "Append a short dated entry to log.md.",
     ];
@@ -3049,6 +3287,7 @@ async function selectExploreSourcePagesWithProvider(workspace, provider, options
   const args = provider.buildExecArgs({
     workspace,
     model: options.model || provider.defaultModel,
+    reasoningEffort: selectedReasoningEffort(provider, options.model || provider.defaultModel, options),
     lastMessagePath,
     imageAttachments: [safeJoin(workspace, options.source.contactSheetPath)],
     maxTurns: 4,
@@ -3502,31 +3741,68 @@ function renderPreparedSourcesForPrompt(preparedSources) {
   for (const source of preparedSources.sources) {
     lines.push(`- ${source.sourcePath}`);
     if (source.textPath) lines.push(`  - Extracted text: ${source.textPath}`);
-    if (source.sourceImage) lines.push(`  - Source image attached to this prompt: ${source.sourceImage}`);
-    if (source.contactSheetAttached && source.contactSheetPath) {
-      lines.push(`  - Contact sheet attached to this prompt: ${source.contactSheetPath}`);
-    } else if (source.contactSheetPath) {
-      lines.push(`  - Contact sheet available locally: ${source.contactSheetPath}`);
+    if (source.sourceImage) {
+      if (source.visualInspectionMode === "path-referenced-images" && source.pagesToInspect?.[0]?.imageInputPath) {
+        lines.push(`  - Source image path for inspection: ${source.pagesToInspect[0].imageInputPath}`);
+      } else {
+        lines.push(`  - Source image attached to this prompt: ${source.sourceImage}`);
+      }
     }
-    if (source.selectedPromptImages?.length) {
+    const contactSheets = getSourceContactSheets(source);
+    if (contactSheets.length) {
+      lines.push("  - Contact sheets used for visual inspection planning:");
+      for (const sheet of contactSheets) {
+        lines.push(`    - Pages ${sheet.startPage}-${sheet.endPage}: ${sheet.path}`);
+      }
+    }
+    if (source.visualInspectionPlan) {
+      lines.push("  - Visual inspection plan:");
+      lines.push(`    - materialType: ${source.visualInspectionPlan.materialType || "unknown"}`);
+      lines.push(`    - inspectionPolicy: ${source.visualInspectionPlan.inspectionPolicy || "selective"}`);
+      if (source.visualInspectionMode) {
+        lines.push(`    - visualInspectionMode: ${source.visualInspectionMode}`);
+      }
+      if (source.visualInspectionPlan.notes) {
+        lines.push(`    - notes: ${source.visualInspectionPlan.notes}`);
+      }
+      if (source.visualInspectionPlan.error) {
+        lines.push(`    - fallbackReason: ${source.visualInspectionPlan.error}`);
+      }
+    }
+    const pagesToInspect = source.pagesToInspect?.length
+      ? source.pagesToInspect
+      : source.selectedPromptImages || [];
+    if (pagesToInspect.length) {
+      const hasPathReferences = pagesToInspect.some((image) => image.imageInputPath);
       lines.push(
         source.selectedPromptImagesAttached
-          ? "  - Selected slide images attached to this prompt:"
-          : "  - Selected prompt slide images available locally:",
+          ? "  - Pages inspected as image attachments in this prompt:"
+          : hasPathReferences
+            ? "  - Pages inspected through path-referenced images in this prompt:"
+            : "  - Pages selected for inspection but not attached by this provider:",
       );
-      for (const image of source.selectedPromptImages) {
+      for (const image of pagesToInspect) {
         const reason = image.reason ? ` (${image.reason})` : "";
-        lines.push(`    - Page ${image.page}: ${image.promptImage}${reason}`);
+        if (image.imageInputPath) {
+          lines.push(
+            `    - Page ${image.page}: path-referenced image ${image.imageInputPath}; ` +
+              `full PNG: ${image.fullImage}${reason}`,
+          );
+        } else {
+          lines.push(`    - Page ${image.page}: ${image.promptImage}; full PNG: ${image.fullImage}${reason}`);
+        }
       }
     }
-    if (source.selectedPromptImages?.length) {
-      lines.push("  - Use these full-resolution PNGs when copying wiki assets:");
-      for (const image of source.selectedPromptImages) {
-        lines.push(`    - Page ${image.page}: ${image.fullImage}`);
+    if (source.assetCandidates?.length) {
+      lines.push("  - Asset candidate full-resolution PNGs:");
+      for (const image of source.assetCandidates) {
+        const reason = image.reason ? ` (${image.reason})` : "";
+        lines.push(`    - Page ${image.page}: ${image.fullImage}${reason}`);
       }
+      lines.push("  - Treat asset candidates as suggestions, not a requirement to embed every image.");
     }
-    if (source.pageImages?.length && !source.selectedPromptImages?.length) {
-      lines.push("  - Full-resolution page images are available locally but not attached to this prompt.");
+    if (source.pageImages?.length && !pagesToInspect.length) {
+      lines.push("  - Rendered page images exist locally, but none are attached to this Build Wiki prompt.");
     }
   }
   return lines.join("\n");
@@ -3538,13 +3814,18 @@ async function prepareSourceArtifacts(workspace, operationId, sourcePaths = null
     sources: [],
     imageAttachments: [],
     visualInput: {
-      mode: "balanced",
+      mode: "visual-inspection-planning",
       totalPages: 0,
+      renderedImageCount: 0,
       contactSheetCount: 0,
+      visionInputCount: 0,
       selectedFullSlideCount: 0,
       skippedFullSlideCount: 0,
+      assetCandidateCount: 0,
       promptImageBytes: 0,
       fullImageBudget: 0,
+      pathReferencedImageCount: 0,
+      finalWikiAssetCount: 0,
       sources: [],
     },
     sourceExtractionCache: {
@@ -3593,6 +3874,11 @@ async function prepareSourceArtifacts(workspace, operationId, sourcePaths = null
     const contactSheetPath = result.contactSheetPath
       ? toPosixRelative(workspace, result.contactSheetPath)
       : "";
+    const contactSheets = (result.contactSheets || []).map((sheet) => ({
+      path: toPosixRelative(workspace, sheet.path),
+      startPage: sheet.startPage,
+      endPage: sheet.endPage,
+    }));
     const { cacheDir, ...cacheMetadata } = extraction.cache;
     const cacheEntry = {
       ...cacheMetadata,
@@ -3608,6 +3894,7 @@ async function prepareSourceArtifacts(workspace, operationId, sourcePaths = null
       pageImages,
       promptPageImages,
       contactSheetPath,
+      contactSheets,
       selectedPromptImages: [],
       pageCount: result.pageCount,
       pages: result.pages,
@@ -3632,6 +3919,7 @@ async function extractSourceArtifactsWithCache(workspace, options) {
     promptPageJpegQuality: PROMPT_PAGE_JPEG_QUALITY,
     contactSheetColumns: CONTACT_SHEET_COLUMNS,
     contactSheetThumbWidth: CONTACT_SHEET_THUMB_WIDTH,
+    contactSheetMaxPages: CONTACT_SHEET_MAX_PAGES,
     contactSheetJpegQuality: CONTACT_SHEET_JPEG_QUALITY,
   };
   const cacheKey = sha256(JSON.stringify({ sourceSha256, sourceExtension, cacheSettings }));
@@ -3861,61 +4149,79 @@ for pageIndex in 0..<document.pageCount {
 
 let contactColumns = ${CONTACT_SHEET_COLUMNS}
 let thumbWidth = ${CONTACT_SHEET_THUMB_WIDTH}
+let contactSheetMaxPages = ${CONTACT_SHEET_MAX_PAGES}
 let thumbMaxHeight = 260
 let labelHeight = 30
 let gap = 16
 let margin = 16
-let rowCount = max(1, Int(ceil(Double(document.pageCount) / Double(contactColumns))))
 let cellWidth = thumbWidth
 let cellHeight = thumbMaxHeight + labelHeight
-let sheetWidth = margin * 2 + contactColumns * cellWidth + max(0, contactColumns - 1) * gap
-let sheetHeight = margin * 2 + rowCount * cellHeight + max(0, rowCount - 1) * gap
-let contactImage = NSImage(size: NSSize(width: sheetWidth, height: sheetHeight))
-contactImage.lockFocus()
-NSColor.white.setFill()
-NSRect(x: 0, y: 0, width: sheetWidth, height: sheetHeight).fill()
 let labelAttributes: [NSAttributedString.Key: Any] = [
   .font: NSFont.boldSystemFont(ofSize: 18),
   .foregroundColor: NSColor.black
 ]
-for pageIndex in 0..<document.pageCount {
-  guard let page = document.page(at: pageIndex) else { continue }
-  let bounds = page.bounds(for: .mediaBox)
-  let column = pageIndex % contactColumns
-  let row = pageIndex / contactColumns
-  let cellX = margin + column * (cellWidth + gap)
-  let cellY = sheetHeight - margin - (row + 1) * cellHeight - row * gap
-  let scale = min(CGFloat(thumbWidth) / bounds.width, CGFloat(thumbMaxHeight) / bounds.height)
-  let drawWidth = bounds.width * scale
-  let drawHeight = bounds.height * scale
-  let drawX = CGFloat(cellX) + (CGFloat(cellWidth) - drawWidth) / 2
-  let drawY = CGFloat(cellY)
-  let label = String(format: "Slide %02d", pageIndex + 1)
-  label.draw(
-    in: NSRect(x: cellX, y: cellY + thumbMaxHeight + 4, width: cellWidth, height: labelHeight - 4),
-    withAttributes: labelAttributes
-  )
-  NSColor(white: 0.96, alpha: 1).setFill()
-  NSRect(x: drawX, y: drawY, width: drawWidth, height: drawHeight).fill()
-  if let context = NSGraphicsContext.current?.cgContext {
-    context.saveGState()
-    context.translateBy(x: drawX, y: drawY)
-    context.scaleBy(x: drawWidth / bounds.width, y: drawHeight / bounds.height)
-    page.draw(with: .mediaBox, to: context)
-    context.restoreGState()
+var contactSheets: [[String: Any]] = []
+let contactSheetCount = max(1, Int(ceil(Double(max(document.pageCount, 1)) / Double(contactSheetMaxPages))))
+
+for sheetIndex in 0..<contactSheetCount {
+  let startPage = sheetIndex * contactSheetMaxPages + 1
+  let endPage = min(document.pageCount, (sheetIndex + 1) * contactSheetMaxPages)
+  let sheetPageCount = max(0, endPage - startPage + 1)
+  let rowCount = max(1, Int(ceil(Double(max(sheetPageCount, 1)) / Double(contactColumns))))
+  let sheetWidth = margin * 2 + contactColumns * cellWidth + max(0, contactColumns - 1) * gap
+  let sheetHeight = margin * 2 + rowCount * cellHeight + max(0, rowCount - 1) * gap
+  let contactImage = NSImage(size: NSSize(width: sheetWidth, height: sheetHeight))
+  contactImage.lockFocus()
+  NSColor.white.setFill()
+  NSRect(x: 0, y: 0, width: sheetWidth, height: sheetHeight).fill()
+
+  for localPageIndex in 0..<sheetPageCount {
+    let pageIndex = sheetIndex * contactSheetMaxPages + localPageIndex
+    guard let page = document.page(at: pageIndex) else { continue }
+    let bounds = page.bounds(for: .mediaBox)
+    let column = localPageIndex % contactColumns
+    let row = localPageIndex / contactColumns
+    let cellX = margin + column * (cellWidth + gap)
+    let cellY = sheetHeight - margin - (row + 1) * cellHeight - row * gap
+    let scale = min(CGFloat(thumbWidth) / bounds.width, CGFloat(thumbMaxHeight) / bounds.height)
+    let drawWidth = bounds.width * scale
+    let drawHeight = bounds.height * scale
+    let drawX = CGFloat(cellX) + (CGFloat(cellWidth) - drawWidth) / 2
+    let drawY = CGFloat(cellY)
+    let label = String(format: "Slide %02d", pageIndex + 1)
+    label.draw(
+      in: NSRect(x: cellX, y: cellY + thumbMaxHeight + 4, width: cellWidth, height: labelHeight - 4),
+      withAttributes: labelAttributes
+    )
+    NSColor(white: 0.96, alpha: 1).setFill()
+    NSRect(x: drawX, y: drawY, width: drawWidth, height: drawHeight).fill()
+    if let context = NSGraphicsContext.current?.cgContext {
+      context.saveGState()
+      context.translateBy(x: drawX, y: drawY)
+      context.scaleBy(x: drawWidth / bounds.width, y: drawHeight / bounds.height)
+      page.draw(with: .mediaBox, to: context)
+      context.restoreGState()
+    }
   }
-}
-contactImage.unlockFocus()
-if let tiff = contactImage.tiffRepresentation,
-   let rep = NSBitmapImageRep(data: tiff),
-   let jpeg = rep.representation(
-    using: .jpeg,
-    properties: [.compressionFactor: ${CONTACT_SHEET_JPEG_QUALITY}]
-   ) {
-  try jpeg.write(to: promptImagesDir.appendingPathComponent("contact-sheet.jpg"))
-} else {
-  fputs("Could not encode contact sheet\\n", stderr)
-  exit(9)
+
+  contactImage.unlockFocus()
+  let contactFilename = String(format: "contact-sheet-%02d.jpg", sheetIndex + 1)
+  if let tiff = contactImage.tiffRepresentation,
+     let rep = NSBitmapImageRep(data: tiff),
+     let jpeg = rep.representation(
+      using: .jpeg,
+      properties: [.compressionFactor: ${CONTACT_SHEET_JPEG_QUALITY}]
+     ) {
+    try jpeg.write(to: promptImagesDir.appendingPathComponent(contactFilename))
+    contactSheets.append([
+      "path": "prompt-images/\\(contactFilename)",
+      "startPage": startPage,
+      "endPage": endPage
+    ])
+  } else {
+    fputs("Could not encode contact sheet\\n", stderr)
+    exit(9)
+  }
 }
 
 let textURL = outputDir.appendingPathComponent("text.md")
@@ -3925,7 +4231,8 @@ let manifest: [String: Any] = [
   "source": pdfPath,
   "pageCount": document.pageCount,
   "textPath": "text.md",
-  "contactSheet": "prompt-images/contact-sheet.jpg",
+  "contactSheet": contactSheets.first?["path"] as? String ?? "prompt-images/contact-sheet-01.jpg",
+  "contactSheets": contactSheets,
   "pages": pages
 ]
 let manifestData = try JSONSerialization.data(withJSONObject: manifest, options: [.prettyPrinted, .sortedKeys])
@@ -3971,15 +4278,42 @@ async function readRenderedPdfResult(outputDir, known = {}) {
     await listRenderedImages(pagesDir, (name) => name.endsWith(".png"));
   const promptPageImages = known.promptPageImages ||
     await listRenderedImages(promptImagesDir, (name) => /^page-\d+\.jpg$/i.test(name));
-  const contactSheetPath = path.join(outputDir, manifest.contactSheet || "prompt-images/contact-sheet.jpg");
+  const pageCount = Number(manifest.pageCount) || pageImages.length;
+  const manifestContactSheets = Array.isArray(manifest.contactSheets) ? manifest.contactSheets : [];
+  const contactSheets = [];
+  for (const entry of manifestContactSheets) {
+    const relPath = normalizeRelativePath(entry?.path || "");
+    if (!relPath) continue;
+    const sheetPath = path.join(outputDir, relPath);
+    if (!(await exists(sheetPath))) continue;
+    contactSheets.push({
+      path: sheetPath,
+      startPage: Math.max(1, Math.trunc(Number(entry.startPage)) || 1),
+      endPage: Math.max(1, Math.trunc(Number(entry.endPage)) || pageCount),
+    });
+  }
+
+  const legacyContactSheetPath = path.join(
+    outputDir,
+    manifest.contactSheet || "prompt-images/contact-sheet.jpg",
+  );
+  if (contactSheets.length === 0 && await exists(legacyContactSheetPath)) {
+    contactSheets.push({
+      path: legacyContactSheetPath,
+      startPage: 1,
+      endPage: pageCount,
+    });
+  }
+  const contactSheetPath = contactSheets[0]?.path || "";
 
   return {
     textPath: path.join(outputDir, manifest.textPath || "text.md"),
     manifestPath,
     pageImages,
     promptPageImages,
-    contactSheetPath: (await exists(contactSheetPath)) ? contactSheetPath : "",
-    pageCount: Number(manifest.pageCount) || pageImages.length,
+    contactSheetPath,
+    contactSheets,
+    pageCount,
     pages: Array.isArray(manifest.pages) ? manifest.pages : [],
   };
 }
@@ -5155,6 +5489,9 @@ function renderReportMarkdown(report) {
     "",
     `- Type: ${report.type}`,
     `- Status: ${report.status}`,
+    `- Provider: ${report.provider || "unknown"}`,
+    `- Model: ${report.model || "unknown"}`,
+    `- Reasoning effort: ${report.reasoningEffort || "unknown"}`,
     `- Started: ${report.startedAt}`,
     `- Completed: ${report.completedAt}`,
     `- Codex exit code: ${report.codex.exitCode}`,
@@ -5201,15 +5538,23 @@ function renderReportMarkdown(report) {
 	    lines.push(`- Provider supports image attachments: ${
 	      report.visualInput.providerSupportsImageAttachments ? "yes" : "no"
 	    }`);
+	    lines.push(`- Provider supports image path references: ${
+	      report.visualInput.providerSupportsImagePathReferences ? "yes" : "no"
+	    }`);
 	    lines.push(`- Total pages: ${report.visualInput.totalPages || 0}`);
-	    lines.push(`- Contact sheets attached: ${report.visualInput.contactSheetCount || 0}`);
-	    lines.push(`- Full slide images selected: ${report.visualInput.selectedFullSlideCount || 0}`);
+	    lines.push(`- Rendered images: ${report.visualInput.renderedImageCount || 0}`);
+	    lines.push(`- Contact sheets: ${report.visualInput.contactSheetCount || 0}`);
+	    lines.push(`- Vision input pages: ${report.visualInput.visionInputCount || 0}`);
+	    lines.push(`- Path-referenced images: ${report.visualInput.pathReferencedImageCount || 0}`);
+	    lines.push(`- Asset candidates: ${report.visualInput.assetCandidateCount || 0}`);
+	    lines.push(`- Final wiki assets changed: ${report.visualInput.finalWikiAssetCount || 0}`);
 	    lines.push(`- Prompt image bytes: ${report.visualInput.promptImageBytes || 0}`);
 	    for (const source of report.visualInput.sources || []) {
+	      const pages = (source.pagesToInspect || []).map((entry) => entry.page).join(", ") || "none";
 	      lines.push(
-	        `- ${source.sourcePath}: ${source.selectionMode}, selected pages ${
-	          (source.selectedPages || []).join(", ") || "none"
-	        }`,
+	        `- ${source.sourcePath}: ${source.visualInspectionMode || "unknown"}, ` +
+	          `${source.materialType || "unknown"}/${source.inspectionPolicy || "unknown"}, ` +
+	          `inspect pages ${pages}, assets ${source.finalWikiAssetCount || 0}`,
 	      );
 	    }
 	    lines.push("");
@@ -5421,8 +5766,10 @@ module.exports = {
   getReviewableChangedFiles,
 	  normalizeMarkdownMathDelimiters,
 	  calculateFullSlideBudget,
+	  contactSheetRanges,
 	  fallbackSelectPageNumbers,
 	  parseSlideSelectionJson,
+	  parseVisualInspectionPlanJson,
 	  getSourceStatus,
   buildSourceManifest,
   migrateLegacyWorkspace,
@@ -5433,6 +5780,7 @@ module.exports = {
   wikiSchemaTemplate,
   workspaceAgentInstructions,
 	  buildWikiPrompt,
+	  selectBuildWikiVisualInputs,
 	  renderSourceStatusForPrompt,
 	  sourcePathsForBuild,
 	  renderPreparedSourcesForPrompt,
@@ -5445,6 +5793,8 @@ module.exports = {
   buildMaintenancePrompt,
   createSnapshot,
   diffSnapshot,
+  readRenderedPdfResult,
+  annotateFinalWikiAssetCounts,
   validateAndRestoreChanges,
   parseArgs,
 };

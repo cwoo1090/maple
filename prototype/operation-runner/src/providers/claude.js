@@ -132,8 +132,21 @@ function checkLoggedIn() {
   return { loggedIn: false, statusText: "Not signed in", warnings };
 }
 
+function defaultReasoningEffort(model) {
+  return model === "claude-haiku-4-5-20251001" ? "medium" : "xhigh";
+}
+
+const SUPPORTED_REASONING_EFFORTS = [
+  { id: "low", label: "Low" },
+  { id: "medium", label: "Medium", description: "Balanced" },
+  { id: "high", label: "High" },
+  { id: "xhigh", label: "XHigh", description: "Deepest", recommended: true },
+  { id: "max", label: "Max", description: "Maximum" },
+];
+
 function buildExecArgs(ctx) {
   const maxTurns = ctx.maxTurns && ctx.maxTurns > 0 ? ctx.maxTurns : 25;
+  const reasoningEffort = ctx.reasoningEffort || defaultReasoningEffort(ctx.model);
   return [
     "-p",
     "--output-format", "stream-json",
@@ -141,6 +154,7 @@ function buildExecArgs(ctx) {
     "--dangerously-skip-permissions",
     "--add-dir", ctx.workspace,
     "--model", ctx.model,
+    "--effort", reasoningEffort,
     "--max-turns", String(maxTurns),
   ];
 }
@@ -148,6 +162,7 @@ function buildExecArgs(ctx) {
 function askExecArgs(ctx) {
   const maxTurns = ctx.maxTurns && ctx.maxTurns > 0 ? ctx.maxTurns : 8;
   const tools = ctx.webSearch ? "Read,Grep,Glob,WebSearch,WebFetch" : "Read,Grep,Glob";
+  const reasoningEffort = ctx.reasoningEffort || defaultReasoningEffort(ctx.model);
   return [
     "-p",
     "--output-format", "stream-json",
@@ -157,6 +172,7 @@ function askExecArgs(ctx) {
     "--tools", tools,
     "--add-dir", ctx.workspace,
     "--model", ctx.model,
+    "--effort", reasoningEffort,
     "--max-turns", String(maxTurns),
   ];
 }
@@ -202,11 +218,32 @@ module.exports = {
   name: "claude",
   binary: providerOverridePath("claude") || "claude",
   supportsImageAttachments: false,
+  supportsImagePathReferences: true,
   defaultModel: "claude-sonnet-4-6",
+  defaultReasoningEffort,
+  supportedReasoningEfforts: SUPPORTED_REASONING_EFFORTS,
   supportedModels: [
-    { id: "claude-sonnet-4-6", label: "Sonnet 4.6", recommended: true },
-    { id: "claude-opus-4-7", label: "Opus 4.7", description: "Heavy rate limits on Pro; Max recommended" },
-    { id: "claude-haiku-4-5-20251001", label: "Haiku 4.5", description: "Fastest" },
+    {
+      id: "claude-sonnet-4-6",
+      label: "Sonnet 4.6",
+      recommended: true,
+      defaultReasoningEffort: "xhigh",
+      supportedReasoningEfforts: SUPPORTED_REASONING_EFFORTS,
+    },
+    {
+      id: "claude-opus-4-7",
+      label: "Opus 4.7",
+      description: "Heavy rate limits on Pro; Max recommended",
+      defaultReasoningEffort: "xhigh",
+      supportedReasoningEfforts: SUPPORTED_REASONING_EFFORTS,
+    },
+    {
+      id: "claude-haiku-4-5-20251001",
+      label: "Haiku 4.5",
+      description: "Fastest",
+      defaultReasoningEffort: "medium",
+      supportedReasoningEfforts: SUPPORTED_REASONING_EFFORTS,
+    },
   ],
   installCommand: "npm i -g @anthropic-ai/claude-code",
   loginCommand: "claude auth login --claudeai",

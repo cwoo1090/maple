@@ -42,7 +42,19 @@ function checkLoggedIn() {
   };
 }
 
+function defaultReasoningEffort(model) {
+  return model === "gpt-5.4-mini" ? "medium" : "xhigh";
+}
+
+const SUPPORTED_REASONING_EFFORTS = [
+  { id: "low", label: "Low" },
+  { id: "medium", label: "Medium", description: "Balanced" },
+  { id: "high", label: "High" },
+  { id: "xhigh", label: "XHigh", description: "Deepest", recommended: true },
+];
+
 function buildExecArgs(ctx) {
+  const reasoningEffort = ctx.reasoningEffort || defaultReasoningEffort(ctx.model);
   const args = [
     "exec",
     "--json",
@@ -50,6 +62,7 @@ function buildExecArgs(ctx) {
     "--skip-git-repo-check",
     "--sandbox", ctx.sandbox || "workspace-write",
     "-c", 'approval_policy="never"',
+    "-c", `model_reasoning_effort=${JSON.stringify(reasoningEffort)}`,
     "--output-last-message", ctx.lastMessagePath,
     "-m", ctx.model,
   ];
@@ -92,11 +105,31 @@ module.exports = {
   name: "codex",
   binary: providerOverridePath("codex") || "codex",
   supportsImageAttachments: true,
+  supportsImagePathReferences: false,
   defaultModel: "gpt-5.5",
+  defaultReasoningEffort,
+  supportedReasoningEfforts: SUPPORTED_REASONING_EFFORTS,
   supportedModels: [
-    { id: "gpt-5.5", label: "GPT-5.5", recommended: true },
-    { id: "gpt-5.4", label: "GPT-5.4" },
-    { id: "gpt-5.4-mini", label: "GPT-5.4 Mini", description: "Fastest" },
+    {
+      id: "gpt-5.5",
+      label: "GPT-5.5",
+      recommended: true,
+      defaultReasoningEffort: "xhigh",
+      supportedReasoningEfforts: SUPPORTED_REASONING_EFFORTS,
+    },
+    {
+      id: "gpt-5.4",
+      label: "GPT-5.4",
+      defaultReasoningEffort: "xhigh",
+      supportedReasoningEfforts: SUPPORTED_REASONING_EFFORTS,
+    },
+    {
+      id: "gpt-5.4-mini",
+      label: "GPT-5.4 Mini",
+      description: "Fastest",
+      defaultReasoningEffort: "medium",
+      supportedReasoningEfforts: SUPPORTED_REASONING_EFFORTS,
+    },
   ],
   installCommand: "npm i -g @openai/codex",
   loginCommand: "codex login",

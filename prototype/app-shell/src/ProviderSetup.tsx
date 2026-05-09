@@ -7,6 +7,15 @@ export interface ProviderModel {
   label: string;
   description?: string;
   recommended?: boolean;
+  defaultReasoningEffort: string;
+  supportedReasoningEfforts?: ProviderReasoningEffort[];
+}
+
+export interface ProviderReasoningEffort {
+  id: string;
+  label: string;
+  description?: string;
+  recommended?: boolean;
 }
 
 export interface ProviderInfo {
@@ -15,12 +24,14 @@ export interface ProviderInfo {
   installCommand: string;
   loginCommand: string;
   defaultModel: string;
+  supportedReasoningEfforts: ProviderReasoningEffort[];
   supportedModels: ProviderModel[];
 }
 
 export interface AppSettings {
   provider: string;
   models: Record<string, string>;
+  reasoningEfforts: Record<string, Record<string, string>>;
   providerPaths: Record<string, string>;
 }
 

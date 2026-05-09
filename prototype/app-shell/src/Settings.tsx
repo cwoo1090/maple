@@ -16,6 +16,11 @@ import {
   type ProviderInfo,
   type ProviderStatus,
 } from "./ProviderSetup";
+import {
+  ModelReasoningPicker,
+  modelEffort,
+  type ModelReasoningSelection,
+} from "./ModelReasoningPicker";
 
 function sleep(ms: number) {
   return new Promise<void>((resolve) => window.setTimeout(resolve, ms));
@@ -229,9 +234,25 @@ export function Settings({
     }
   }
 
-  async function handleSelectModel(provider: string, modelId: string) {
+  async function handleSelectModel(selection: ModelReasoningSelection) {
     try {
-      const updated = await invoke<AppSettings>("set_model", { provider, modelId });
+      let updated = settings;
+      if (!updated || updated.models[selection.provider] !== selection.model) {
+        updated = await invoke<AppSettings>("set_model", {
+          provider: selection.provider,
+          modelId: selection.model,
+        });
+      }
+      if (
+        updated.reasoningEfforts?.[selection.provider]?.[selection.model] !==
+        selection.reasoningEffort
+      ) {
+        updated = await invoke<AppSettings>("set_reasoning_effort", {
+          provider: selection.provider,
+          modelId: selection.model,
+          effortId: selection.reasoningEffort,
+        });
+      }
       setSettings(updated);
     } catch (err) {
       setError(`Failed to update model: ${String(err)}`);
@@ -402,6 +423,10 @@ export function Settings({
             const providerCheckError = providerCheckErrors[provider.name] ?? null;
             const active = settings.provider === provider.name;
             const selectedModel = settings.models[provider.name] || provider.defaultModel;
+            const selectedModelInfo = provider.supportedModels.find(
+              (model) => model.id === selectedModel,
+            );
+            const selectedReasoningEffort = modelEffort(settings, provider, selectedModelInfo);
             const isRefreshing = Boolean(refreshing[provider.name]);
             const providerInstallBlocked = Boolean(
               status &&
@@ -472,25 +497,18 @@ export function Settings({
                 <div className="provider-row-controls">
                   <label className="provider-row-model">
                     <span>Model</span>
-                    <select
-                      value={selectedModel}
-                      onChange={(event) => handleSelectModel(provider.name, event.target.value)}
-                    >
-                      {provider.supportedModels.map((model) => {
-                        const suffix = [
-                          model.recommended ? "Recommended" : null,
-                          model.description ?? null,
-                        ]
-                          .filter(Boolean)
-                          .join(" · ");
-                        return (
-                          <option key={model.id} value={model.id}>
-                            {model.label}
-                            {suffix ? ` — ${suffix}` : ""}
-                          </option>
-                        );
-                      })}
-                    </select>
+                    <ModelReasoningPicker
+                      providers={[provider]}
+                      settings={settings}
+                      value={{
+                        provider: provider.name,
+                        model: selectedModel,
+                        reasoningEffort: selectedReasoningEffort,
+                      }}
+                      ariaLabel={`${provider.label} model`}
+                      className="settings-model-picker"
+                      onChange={(selection) => void handleSelectModel(selection)}
+                    />
                   </label>
 
                   {ready ? (
