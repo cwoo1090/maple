@@ -123,6 +123,15 @@ type AppCommandResult = {
   state: WorkspaceState;
 };
 
+type SchemaUpdatePrompt = {
+  available: boolean;
+  reason: string;
+  currentSchema: string;
+  latestSchema: string;
+  currentHash: string;
+  latestHash: string;
+};
+
 type WorkspaceFile = {
   path: string;
   content: string;
@@ -269,6 +278,7 @@ type BuildDraft = {
 
 type RightPanelMode = "explore" | "maintain";
 type AiSetupPromptReason = "build" | "chat" | "maintain" | null;
+type AiSetupReason = Exclude<AiSetupPromptReason, null>;
 type AppUpdateStatus =
   | "idle"
   | "checking"
@@ -367,6 +377,7 @@ const BUILD_WIKI_STEPS = [
 const BUILD_WIKI_STEP_INTERVAL_MS = 4600;
 const MAINTAIN_STEP_INTERVAL_MS = 4600;
 const TRANSIENT_UNDONE_STATUS_MS = 10_000;
+const AI_SETUP_READY_NOTICE_MS = 3_000;
 const DEFAULT_WIKI_UPDATE_USER_MESSAGE = "Update this wiki using the selected chat.";
 const DEFAULT_WIKI_UPDATE_ASSISTANT_INTRO =
   "I'll update this wiki using the selected chat and current wiki context.";
@@ -1121,7 +1132,11 @@ function App() {
   const [seenMaintainThreadUpdates, setSeenMaintainThreadUpdates] = useState<SeenThreadMap>({});
   const [applyDraft, setApplyDraft] = useState<ApplyDraft>(null);
   const [buildDraft, setBuildDraft] = useState<BuildDraft>(null);
+  const [schemaUpdatePrompt, setSchemaUpdatePrompt] = useState<SchemaUpdatePrompt | null>(null);
+  const [schemaUpdateContentOpen, setSchemaUpdateContentOpen] = useState(false);
   const [aiSetupPromptReason, setAiSetupPromptReason] = useState<AiSetupPromptReason>(null);
+  const [aiSetupReadyNoticeReason, setAiSetupReadyNoticeReason] =
+    useState<AiSetupReason | null>(null);
   const [rightPanelMode, setRightPanelMode] = useState<RightPanelMode>("explore");
   const [maintainStage, setMaintainStage] = useState<MaintainStage>("choose");
   const [selectedMaintainTaskId, setSelectedMaintainTaskId] = useState<MaintainTaskId | null>(null);
@@ -1460,6 +1475,17 @@ function App() {
   const resetBlockedReason = getBlockedReason("reset");
   const sourceImportBlockedReason = getBlockedReason("source-import");
   const sourceRemoveBlockedReason = getBlockedReason("source-remove");
+  const schemaUpdateBlockedReason = hasPendingGeneratedChanges
+    ? PENDING_GENERATED_CHANGES_ERROR
+    : activeWorkspaceWriteLabel
+    ? `${activeWorkspaceWriteLabel} is running. Wait for it to finish before updating schema.md.`
+    : exploreBusy
+    ? "Explore Chat is answering. Wait for it to finish before updating schema.md."
+    : maintainDiscussionBusy
+    ? "Maintain discussion is answering. Wait for it to finish before updating schema.md."
+    : blockingUiBusy && activeOperationLabel
+    ? `${activeOperationLabel} is running. Wait for it to finish before updating schema.md.`
+    : null;
   const workspaceUpdateExploreNotice = activeWorkspaceWriteLabel
     ? "A workspace update is running. Chat can answer from the current saved files, but may not include changes still being generated."
     : null;
@@ -1635,11 +1661,29 @@ function App() {
     () => providers.find((provider) => provider.name === appSettings?.provider) ?? providers[0],
     [appSettings?.provider, providers],
   );
-	  const providerSetup = useProviderSetup(
-	    activeProvider?.name ?? null,
-	    Boolean(activeProvider && aiSetupPromptReason),
-	  );
-	  const activeProviderReady = providerSetup.ready;
+  const providerSetup = useProviderSetup(
+    activeProvider?.name ?? null,
+    Boolean(activeProvider && aiSetupPromptReason),
+  );
+  const activeProviderReady = providerSetup.ready;
+  const visibleAiSetupReason = aiSetupPromptReason ?? aiSetupReadyNoticeReason;
+  const showAiSetupReadyNotice = Boolean(aiSetupReadyNoticeReason);
+
+  function showAiSetupPrompt(reason: AiSetupReason) {
+    setAiSetupReadyNoticeReason(null);
+    setAiSetupPromptReason(reason);
+  }
+
+  function clearAiSetupPrompt(reason: AiSetupReason) {
+    setAiSetupPromptReason((current) => (current === reason ? null : current));
+    setAiSetupReadyNoticeReason((current) => (current === reason ? null : current));
+  }
+
+  function completeAiSetupPrompt(reason: AiSetupReason) {
+    setAiSetupReadyNoticeReason(reason);
+    setAiSetupPromptReason(null);
+    setError((current) => (current?.includes("setup is needed before") ? null : current));
+  }
 	  function trackOnboardingStepOnce(
 	    step: string,
 	    properties: Record<string, boolean | number | string | string[] | null | undefined> = {},
@@ -1654,14 +1698,20 @@ function App() {
 	      ...properties,
 	    });
 	  }
-	  useEffect(() => {
-	    if (aiSetupPromptReason && activeProviderReady) {
-	      setAiSetupPromptReason(null);
-	      setError((current) =>
-	        current?.includes("setup is needed before") ? null : current,
-	      );
-	    }
-	  }, [activeProviderReady, aiSetupPromptReason]);
+  useEffect(() => {
+    if (!aiSetupPromptReason || aiSetupPromptReason === "build" || !activeProviderReady) return;
+    completeAiSetupPrompt(aiSetupPromptReason);
+  }, [activeProviderReady, aiSetupPromptReason]);
+
+  useEffect(() => {
+    if (!aiSetupReadyNoticeReason) return;
+    const timeout = window.setTimeout(() => {
+      setAiSetupReadyNoticeReason((current) =>
+        current === aiSetupReadyNoticeReason ? null : current,
+      );
+    }, AI_SETUP_READY_NOTICE_MS);
+    return () => window.clearTimeout(timeout);
+  }, [aiSetupReadyNoticeReason]);
 	  useEffect(() => {
 	    if (!workspace.workspacePath) {
 	      trackOnboardingStepOnce("workspace");
@@ -1753,6 +1803,10 @@ function App() {
     buildDraftProvider?.name === activeProvider?.name
       ? activeProviderReady
       : buildProviderSetup.ready;
+  useEffect(() => {
+    if (aiSetupPromptReason !== "build" || !selectedBuildProviderReady) return;
+    completeAiSetupPrompt("build");
+  }, [aiSetupPromptReason, selectedBuildProviderReady]);
   const chatRunningSteps = useMemo(() => {
     const providerName = activeProvider ? displayProviderName(activeProvider) : "AI";
     return [
@@ -2377,6 +2431,26 @@ function App() {
       cancelled = true;
     };
   }, [workspace.workspacePath]);
+
+  useEffect(() => {
+    if (!workspace.workspacePath || writeActionBlocked) return;
+    let cancelled = false;
+    invoke<SchemaUpdatePrompt>("check_schema_update_prompt")
+      .then((prompt) => {
+        if (cancelled || !prompt.available) return;
+        setSchemaUpdatePrompt(prompt);
+        setSchemaUpdateContentOpen(false);
+        track("schema update prompt shown", {
+          reason: prompt.reason,
+          manual: false,
+        });
+        void invoke<void>("dismiss_schema_update_prompt").catch(() => {});
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [workspace.workspacePath, writeActionBlocked]);
 
   useEffect(() => {
     if (!chatThread?.id || !isAskingWiki) return;
@@ -3151,6 +3225,52 @@ function App() {
     }
   }
 
+  async function openSchemaUpdatePrompt(manual = false) {
+    if (!workspace.workspacePath) return;
+    try {
+      const prompt = await invoke<SchemaUpdatePrompt>("check_schema_update_prompt");
+      if (prompt.currentHash === prompt.latestHash) {
+        if (manual) setError("schema.md already uses the latest standard Maple schema.");
+        return;
+      }
+      if (!manual && !prompt.available) return;
+      setSchemaUpdatePrompt(prompt);
+      setSchemaUpdateContentOpen(false);
+      track("schema update prompt shown", {
+        reason: prompt.reason,
+        manual,
+      });
+      if (!manual) {
+        void invoke<void>("dismiss_schema_update_prompt").catch(() => {});
+      }
+    } catch (err) {
+      if (manual) setError(String(err));
+    }
+  }
+
+  async function applyStandardSchemaUpdate() {
+    if (!schemaUpdatePrompt) return;
+    if (schemaUpdateBlockedReason) {
+      setError(schemaUpdateBlockedReason);
+      return;
+    }
+    setBusy("Updating schema.md");
+    setError(null);
+
+    try {
+      const state = await invoke<WorkspaceState>("apply_standard_schema_update");
+      setWorkspace(state);
+      setSchemaUpdatePrompt(null);
+      setSchemaUpdateContentOpen(false);
+      openWorkspaceFile("schema.md");
+      track("schema update applied", { reason: schemaUpdatePrompt.reason });
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setBusy(null);
+    }
+  }
+
   async function finishGeneratedReview(label = "Finishing review", silent = false) {
     if (finishReviewBlockedReason) {
       setError(finishReviewBlockedReason);
@@ -3213,7 +3333,7 @@ function App() {
 	      setError(buildBlockedReason);
 	      return;
 	    }
-    setAiSetupPromptReason("build");
+    showAiSetupPrompt("build");
     const provider = activeProvider ?? providers[0];
     const modelId = provider ? appSettings?.models[provider.name] || provider.defaultModel : "";
     const model = provider?.supportedModels.find((item) => item.id === modelId);
@@ -3265,7 +3385,7 @@ function App() {
     const draftProviderReady =
       draftProvider.name === activeProvider?.name ? activeProviderReady : buildProviderSetup.ready;
 	    if (!draftProviderReady) {
-	      setAiSetupPromptReason("build");
+      showAiSetupPrompt("build");
 	      track("onboarding blocked", {
 	        step: "provider_setup",
 	        error_kind: "provider_setup",
@@ -3285,6 +3405,7 @@ function App() {
     setDismissedBuildSummaryOperationId(null);
     setBuildFeedOpen(true);
     setBuildDraft(null);
+    clearAiSetupPrompt("build");
 
     try {
       track("wiki build started", {
@@ -3346,6 +3467,7 @@ function App() {
       setRunner(result.runner);
       setWorkspace(result.state);
       setBuildDraft(null);
+      clearAiSetupPrompt("build");
     } catch (err) {
       setError(String(err));
     } finally {
@@ -3450,7 +3572,7 @@ function App() {
       return;
     }
     if (!activeProviderReady) {
-      setAiSetupPromptReason("maintain");
+      showAiSetupPrompt("maintain");
       setError(
         `${activeProvider ? displayProviderName(activeProvider) : "AI"} setup is needed before running maintenance.`,
       );
@@ -3618,7 +3740,7 @@ function App() {
   async function askExploreChat(questionOverride?: string): Promise<boolean> {
     if (exploreBlockedReason || !workspace.workspacePath) return false;
     if (!activeProviderReady) {
-      setAiSetupPromptReason("chat");
+      showAiSetupPrompt("chat");
       setError(
         `${activeProvider ? displayProviderName(activeProvider) : "AI"} setup is needed before asking chat.`,
       );
@@ -3692,7 +3814,7 @@ function App() {
       return;
     }
     if (!activeProviderReady) {
-      setAiSetupPromptReason("maintain");
+      showAiSetupPrompt("maintain");
       setError(
         `${activeProvider ? displayProviderName(activeProvider) : "AI"} setup is needed before asking Maintain.`,
       );
@@ -3938,7 +4060,7 @@ function App() {
   async function applyChatToWiki() {
     if (!chatThread || !applyDraft || updateWikiBlockedReason) return;
     if (!activeProviderReady) {
-      setAiSetupPromptReason("chat");
+      showAiSetupPrompt("chat");
       setError(
         `${activeProvider ? displayProviderName(activeProvider) : "AI"} setup is needed before updating the wiki.`,
       );
@@ -4939,6 +5061,20 @@ function App() {
               ))}
             </div>
             <div className="center-header-right">
+              {!activeReportContent && selectedPath === "schema.md" ? (
+                <button
+                  type="button"
+                  className="center-schema-update-btn"
+                  disabled={Boolean(schemaUpdateBlockedReason)}
+                  title={
+                    schemaUpdateBlockedReason ??
+                    "Review the latest standard Maple schema before replacing schema.md"
+                  }
+                  onClick={() => void openSchemaUpdatePrompt(true)}
+                >
+                  Update schema.md
+                </button>
+              ) : null}
               {activeReportContent ? (
                 <span className="center-subtitle">Read-only report</span>
               ) : viewMode === "page" ? (
@@ -5387,12 +5523,13 @@ function App() {
                 void askExploreChat();
               }}
             >
-              {aiSetupPromptReason === "chat" && !activeProviderReady ? (
+              {visibleAiSetupReason === "chat" ? (
                 <ProviderSetupCard
                   provider={activeProvider}
                   setup={providerSetup}
                   context="chat"
                   className="chat-provider-setup"
+                  showReady={showAiSetupReadyNotice}
                 />
               ) : null}
               {workspaceUpdateExploreNotice ? (
@@ -5712,12 +5849,13 @@ function App() {
                     void submitMaintainComposer();
                   }}
                 >
-                  {aiSetupPromptReason === "maintain" && !activeProviderReady ? (
+                  {visibleAiSetupReason === "maintain" ? (
                     <ProviderSetupCard
                       provider={activeProvider}
                       setup={providerSetup}
                       context="maintain"
                       className="maintain-provider-setup"
+                      showReady={showAiSetupReadyNotice}
                     />
                   ) : null}
                   <section className="maintain-task-context" aria-label="Selected Maintain task">
@@ -5865,7 +6003,10 @@ function App() {
             aria-modal="true"
             aria-labelledby="build-modal-title"
             onMouseDown={() => {
-              if (!isStartingBuild) setBuildDraft(null);
+              if (!isStartingBuild) {
+                setBuildDraft(null);
+                clearAiSetupPrompt("build");
+              }
             }}
           >
             <div className="apply-modal build-modal" onMouseDown={(event) => event.stopPropagation()}>
@@ -5889,7 +6030,10 @@ function App() {
                 <button
                   type="button"
                   className="apply-modal-close"
-                  onClick={() => setBuildDraft(null)}
+                  onClick={() => {
+                    setBuildDraft(null);
+                    clearAiSetupPrompt("build");
+                  }}
                   disabled={isStartingBuild}
                 >
                   Close
@@ -6002,12 +6146,14 @@ function App() {
                 />
               </label>
 
-              {buildDraftProvider && !selectedBuildProviderReady ? (
+              {buildDraftProvider &&
+              (!selectedBuildProviderReady || visibleAiSetupReason === "build") ? (
                 <ProviderSetupCard
                   provider={buildDraftProvider}
                   setup={selectedBuildProviderSetup}
                   context="build"
                   className="build-provider-setup"
+                  showReady={showAiSetupReadyNotice}
                 />
               ) : null}
 
@@ -6017,7 +6163,7 @@ function App() {
                   className="apply-modal-secondary"
                   onClick={() => {
                     setBuildDraft(null);
-                    setAiSetupPromptReason((reason) => (reason === "build" ? null : reason));
+                    clearAiSetupPrompt("build");
                   }}
                   disabled={isStartingBuild}
                 >
@@ -6154,6 +6300,83 @@ function App() {
                   title={updateWikiBlockedReason ?? undefined}
                 >
                   Apply
+                </button>
+              </footer>
+            </div>
+          </div>
+        ) : null}
+
+        {schemaUpdatePrompt ? (
+          <div
+            className="apply-modal-overlay"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="schema-update-title"
+            onMouseDown={() => setSchemaUpdatePrompt(null)}
+          >
+            <div
+              className="apply-modal schema-update-modal"
+              onMouseDown={(event) => event.stopPropagation()}
+            >
+              <header className="apply-modal-header">
+                <div>
+                  <h2 id="schema-update-title">schema.md update available</h2>
+                  <p>
+                    Maple can replace this workspace&apos;s schema.md with the latest standard
+                    Maple wiki schema.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  className="apply-modal-close"
+                  onClick={() => setSchemaUpdatePrompt(null)}
+                  aria-label="Close schema update"
+                >
+                  ×
+                </button>
+              </header>
+              <div className="schema-update-copy">
+                <strong>Standard Maple schema</strong>
+                <p>
+                  This replaces the entire schema.md file with the standard Maple schema shown
+                  below. It does not merge your current schema. Any custom context, durable
+                  preferences, or project-specific rules saved in schema.md will be removed unless
+                  you add them again after updating. Maple saves a backup of the current schema.md
+                  before replacing it.
+                </p>
+              </div>
+              <div className="schema-update-warning">
+                Maple cannot always tell whether a hand-edited schema already contains the newest
+                rules. Keep the current schema.md if it contains workspace context you still want
+                Maple or AI agents to follow. You can reopen this update later from the Update
+                schema.md button at the top of the schema.md page.
+              </div>
+              <button
+                type="button"
+                className="schema-update-toggle"
+                onClick={() => setSchemaUpdateContentOpen((open) => !open)}
+              >
+                {schemaUpdateContentOpen ? "Hide latest schema.md" : "View latest schema.md"}
+              </button>
+              {schemaUpdateContentOpen ? (
+                <pre className="schema-update-preview">{schemaUpdatePrompt.latestSchema}</pre>
+              ) : null}
+              <footer className="apply-modal-actions">
+                <button
+                  type="button"
+                  className="apply-modal-secondary"
+                  onClick={() => setSchemaUpdatePrompt(null)}
+                >
+                  Keep current schema
+                </button>
+                <button
+                  type="button"
+                  className="apply-modal-primary"
+                  disabled={Boolean(schemaUpdateBlockedReason) || busy === "Updating schema.md"}
+                  title={schemaUpdateBlockedReason ?? undefined}
+                  onClick={() => void applyStandardSchemaUpdate()}
+                >
+                  {busy === "Updating schema.md" ? "Updating..." : "Update schema.md"}
                 </button>
               </footer>
             </div>

@@ -571,9 +571,9 @@ export function providerSetupMessage(
   }
 
   return {
-    title: `${product} ready`,
-    body: `${helper} is installed and signed in.`,
-    statusText: "Installed · signed in",
+    title: `${product} connected`,
+    body: `${helper} is installed and signed in. Maple can use it now.`,
+    statusText: "AI connection confirmed",
     badgeLabel: status?.warnings.length ? "Ready with warning" : "Ready",
     tone: status?.warnings.length ? "warning" : "ready",
     command: null,
@@ -1280,6 +1280,8 @@ export function ProviderSetupCard({
   ]
     .filter(Boolean)
     .join(" ");
+  const showActions = !ready || Boolean(setup.error);
+  const showCandidatePanel = setup.showHelperCandidates && (!ready || Boolean(setup.error));
 
   return (
     <section className={classes} aria-live="polite">
@@ -1315,58 +1317,60 @@ export function ProviderSetupCard({
         ) : null}
         {setup.error ? <div className="provider-setup-error">{setup.error}</div> : null}
       </div>
-      <div className="provider-setup-actions">
-        {providerMissing ? (
-          <button
-            type="button"
-            className="provider-setup-primary"
-            onClick={() => void setup.findInstalledHelper()}
-            disabled={setup.discovering || setup.checking}
-          >
-            {setup.discovering ? "Finding..." : `Find installed ${helperName(provider)}`}
-          </button>
-        ) : null}
-        {providerMissing ? (
-          <button
-            type="button"
-            className="provider-setup-secondary"
-            onClick={setup.installProvider}
-            disabled={installBlocked || setup.checking || Boolean(setup.action)}
-            title={installBlocked ? "Finish Node.js/npm setup first" : undefined}
-          >
-            {`Install ${helperName(provider)}`}
-          </button>
-        ) : null}
-        {primaryAction ? (
-          <button
-            type="button"
-            className="provider-setup-primary"
-            onClick={primaryAction.onClick}
-            disabled={primaryAction.disabled || setup.checking || Boolean(setup.action)}
-          >
-            {primaryAction.label}
-          </button>
-        ) : null}
-        <button
-          type="button"
-          className="provider-setup-secondary"
-          onClick={() => void setup.refresh()}
-          disabled={setup.checking}
-        >
-          {setup.checking ? "Checking..." : "Recheck"}
-        </button>
-        {canFindHelper && !providerMissing ? (
+      {showActions ? (
+        <div className="provider-setup-actions">
+          {providerMissing ? (
+            <button
+              type="button"
+              className="provider-setup-primary"
+              onClick={() => void setup.findInstalledHelper()}
+              disabled={setup.discovering || setup.checking}
+            >
+              {setup.discovering ? "Finding..." : `Find installed ${helperName(provider)}`}
+            </button>
+          ) : null}
+          {providerMissing ? (
+            <button
+              type="button"
+              className="provider-setup-secondary"
+              onClick={setup.installProvider}
+              disabled={installBlocked || setup.checking || Boolean(setup.action)}
+              title={installBlocked ? "Finish Node.js/npm setup first" : undefined}
+            >
+              {`Install ${helperName(provider)}`}
+            </button>
+          ) : null}
+          {primaryAction ? (
+            <button
+              type="button"
+              className="provider-setup-primary"
+              onClick={primaryAction.onClick}
+              disabled={primaryAction.disabled || setup.checking || Boolean(setup.action)}
+            >
+              {primaryAction.label}
+            </button>
+          ) : null}
           <button
             type="button"
             className="provider-setup-secondary"
-            onClick={() => void setup.findInstalledHelper()}
-            disabled={setup.discovering || setup.checking}
+            onClick={() => void setup.refresh()}
+            disabled={setup.checking}
           >
-            {setup.discovering ? "Finding..." : "Find installed helper"}
+            {setup.checking ? "Checking..." : "Recheck"}
           </button>
-        ) : null}
-      </div>
-      {setup.showHelperCandidates ? (
+          {canFindHelper && !providerMissing ? (
+            <button
+              type="button"
+              className="provider-setup-secondary"
+              onClick={() => void setup.findInstalledHelper()}
+              disabled={setup.discovering || setup.checking}
+            >
+              {setup.discovering ? "Finding..." : "Find installed helper"}
+            </button>
+          ) : null}
+        </div>
+      ) : null}
+      {showCandidatePanel ? (
         <ProviderCandidatePanel
           provider={provider}
           status={status}

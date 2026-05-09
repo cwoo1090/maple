@@ -78,6 +78,17 @@ struct AppCommandResult {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct SchemaUpdatePrompt {
+    available: bool,
+    reason: String,
+    current_schema: String,
+    latest_schema: String,
+    current_hash: String,
+    latest_hash: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ApplyChatResult {
     runner: RunnerOutput,
     state: WorkspaceState,
@@ -109,6 +120,7 @@ const OPERATION_START_GRACE_MS: u128 = 15_000;
 const RUNNER_ROOT_ENV: &str = "MAPLE_RUNNER_ROOT";
 const REQUIRED_NODE_MAJOR: u32 = 20;
 const PROVIDER_COMMAND_TIMEOUT_MS: u64 = 8_000;
+const SCHEMA_UPDATE_METADATA_FILE: &str = "schema-update.json";
 
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -2763,7 +2775,8 @@ fn healthcheck_chat_thread(workspace: &Path, thread: &mut ChatThread) -> bool {
             if thread.messages[user_index].reasoning_effort.is_none()
                 && !report.reasoning_effort.is_empty()
             {
-                thread.messages[user_index].reasoning_effort = Some(report.reasoning_effort.clone());
+                thread.messages[user_index].reasoning_effort =
+                    Some(report.reasoning_effort.clone());
             }
             if thread.messages[user_index].web_search_enabled.is_none() {
                 thread.messages[user_index].web_search_enabled = Some(report.web_search_enabled);
@@ -3643,6 +3656,46 @@ async fn set_workspace(
         .map_err(|error| format!("Failed to resolve workspace path: {error}"))?;
     *state.path.lock().unwrap() = Some(canonical.clone());
     load_state_at(&canonical)
+}
+
+#[tauri::command]
+async fn check_schema_update_prompt(
+    state: State<'_, WorkspaceStore>,
+) -> Result<SchemaUpdatePrompt, String> {
+    let workspace = current_workspace(&state)?;
+    let prompt = schema_update_prompt_for_workspace(&workspace);
+    if prompt.current_hash == prompt.latest_hash {
+        record_schema_standard_baseline(&workspace, &prompt.latest_hash)?;
+    }
+    Ok(prompt)
+}
+
+#[tauri::command]
+async fn dismiss_schema_update_prompt(state: State<'_, WorkspaceStore>) -> Result<(), String> {
+    let workspace = current_workspace(&state)?;
+    write_schema_update_marker(&workspace, "dismissedLatestHash", "dismissedAt")
+}
+
+#[tauri::command]
+async fn apply_standard_schema_update(
+    state: State<'_, WorkspaceStore>,
+) -> Result<WorkspaceState, String> {
+    let workspace = current_workspace(&state)?;
+    ensure_no_pending_generated_changes(&workspace)?;
+    init_workspace_dirs(&workspace)?;
+
+    let latest_schema = normalized_schema_text(default_workspace_schema());
+    let backup_path = backup_schema_before_update(&workspace, &latest_schema)?;
+    fs::write(workspace.join("schema.md"), latest_schema)
+        .map_err(|error| format!("Failed to update schema.md: {error}"))?;
+    append_schema_update_log(&workspace, backup_path.as_deref())?;
+    write_schema_update_marker(&workspace, "appliedLatestHash", "appliedAt")?;
+    record_schema_standard_baseline(
+        &workspace,
+        &stable_text_hash(&normalized_schema_text(default_workspace_schema())),
+    )?;
+
+    load_state_at(&workspace)
 }
 
 #[tauri::command]
@@ -5537,6 +5590,7 @@ fn initialize_workspace_files(workspace: &Path) -> Result<(), String> {
         &workspace.join("CLAUDE.md"),
         &default_workspace_agent_instructions("Claude Workspace Instructions"),
     )?;
+    record_schema_baseline_if_current_standard(workspace)?;
     Ok(())
 }
 
@@ -5560,14 +5614,15 @@ fn default_workspace_agent_instructions(title: &str) -> String {
         format!("# {title}"),
         String::new(),
         "This is a Maple workspace for a local, file-based AI wiki.".to_string(),
-        "Follow `schema.md` for durable wiki conventions and keep this file short.".to_string(),
+        "Keep this file short. Follow `schema.md` for durable wiki rules, workspace preferences, and operation behavior.".to_string(),
         String::new(),
         "## Operation Boundary".to_string(),
         String::new(),
+        "- Explore Chat is read-only. Do not modify workspace files during normal Q&A.".to_string(),
+        "- Workspace files may be modified only by explicit app write operations: Build Wiki, Apply to Wiki, Wiki Healthcheck, Improve Wiki, Organize Sources, and Update Wiki Rules.".to_string(),
         "- Treat `sources/` as immutable source material. Do not edit source file contents.".to_string(),
-        "- Write generated wiki content under `wiki/` and derived assets under `wiki/assets/`.".to_string(),
-        "- Explore Chat is read-only unless the app explicitly starts a wiki update operation.".to_string(),
-        "- After wiki content changes, update `index.md` for navigation and append a concise entry to `log.md`.".to_string(),
+        "- Update `schema.md` only when the user explicitly asks to remember a durable rule or workspace preference.".to_string(),
+        "- Update `AGENTS.md` or `CLAUDE.md` only when the user explicitly asks for agent, bootstrap, or operation-boundary changes.".to_string(),
         String::new(),
     ]
     .join("\n")
@@ -5575,6 +5630,176 @@ fn default_workspace_agent_instructions(title: &str) -> String {
 
 fn default_workspace_schema() -> &'static str {
     include_str!("../../../workspace-template/schema.md")
+}
+
+fn schema_update_prompt_for_workspace(workspace: &Path) -> SchemaUpdatePrompt {
+    let latest_schema = normalized_schema_text(default_workspace_schema());
+    let current_schema = read_text_if_exists(&workspace.join("schema.md")).unwrap_or_default();
+    let normalized_current_schema = normalized_schema_text(&current_schema);
+    let current_hash = stable_text_hash(&normalized_current_schema);
+    let latest_hash = stable_text_hash(&latest_schema);
+    let exact_match = current_hash == latest_hash;
+    let known_current_standard =
+        schema_update_marker_matches(workspace, "schemaBaseHash", &latest_hash);
+    let dismissed = schema_update_marker_matches(workspace, "dismissedLatestHash", &latest_hash);
+    let applied = schema_update_marker_matches(workspace, "appliedLatestHash", &latest_hash);
+    let reason = if normalized_current_schema.trim().is_empty() {
+        "missing_schema"
+    } else if known_current_standard {
+        "customized_current_schema"
+    } else if schema_update_stored_hash(workspace, "schemaBaseHash").is_some() {
+        "schema_changed_since_known_standard"
+    } else {
+        "unknown_schema"
+    };
+
+    SchemaUpdatePrompt {
+        available: !exact_match && !known_current_standard && !dismissed && !applied,
+        reason: reason.to_string(),
+        current_schema: normalized_current_schema,
+        latest_schema,
+        current_hash,
+        latest_hash,
+    }
+}
+
+fn normalized_schema_text(text: &str) -> String {
+    let normalized = text.replace("\r\n", "\n").trim_end().to_string();
+    if normalized.is_empty() {
+        String::new()
+    } else {
+        format!("{normalized}\n")
+    }
+}
+
+fn schema_update_metadata_path(workspace: &Path) -> PathBuf {
+    workspace
+        .join(METADATA_DIR)
+        .join(SCHEMA_UPDATE_METADATA_FILE)
+}
+
+fn schema_update_stored_hash(workspace: &Path, key: &str) -> Option<String> {
+    read_json_if_exists_normalized(&schema_update_metadata_path(workspace))
+        .and_then(|value| value.get(key).and_then(Value::as_str).map(str::to_string))
+}
+
+fn schema_update_marker_matches(workspace: &Path, key: &str, latest_hash: &str) -> bool {
+    schema_update_stored_hash(workspace, key).is_some_and(|stored_hash| stored_hash == latest_hash)
+}
+
+fn write_schema_update_marker(
+    workspace: &Path,
+    hash_key: &str,
+    time_key: &str,
+) -> Result<(), String> {
+    let latest_hash = stable_text_hash(&normalized_schema_text(default_workspace_schema()));
+    let path = schema_update_metadata_path(workspace);
+    let mut metadata = read_json_if_exists_normalized(&path)
+        .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+    let object = metadata
+        .as_object_mut()
+        .ok_or_else(|| "Schema update metadata is invalid.".to_string())?;
+    object.insert(hash_key.to_string(), Value::String(latest_hash));
+    object.insert(time_key.to_string(), Value::String(now_string()));
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            format!("Failed to create schema update metadata directory: {error}")
+        })?;
+    }
+    fs::write(
+        &path,
+        serde_json::to_vec_pretty(&metadata)
+            .map_err(|error| format!("Failed to serialize schema update metadata: {error}"))?,
+    )
+    .map_err(|error| format!("Failed to update schema update metadata: {error}"))
+}
+
+fn record_schema_standard_baseline(workspace: &Path, latest_hash: &str) -> Result<(), String> {
+    let path = schema_update_metadata_path(workspace);
+    let mut metadata = read_json_if_exists_normalized(&path)
+        .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+    let object = metadata
+        .as_object_mut()
+        .ok_or_else(|| "Schema update metadata is invalid.".to_string())?;
+    object.insert(
+        "schemaBaseHash".to_string(),
+        Value::String(latest_hash.to_string()),
+    );
+    object.insert(
+        "schemaBaseRecordedAt".to_string(),
+        Value::String(now_string()),
+    );
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            format!("Failed to create schema update metadata directory: {error}")
+        })?;
+    }
+    fs::write(
+        &path,
+        serde_json::to_vec_pretty(&metadata)
+            .map_err(|error| format!("Failed to serialize schema update metadata: {error}"))?,
+    )
+    .map_err(|error| format!("Failed to update schema update metadata: {error}"))
+}
+
+fn record_schema_baseline_if_current_standard(workspace: &Path) -> Result<(), String> {
+    let current_schema = normalized_schema_text(
+        &read_text_if_exists(&workspace.join("schema.md")).unwrap_or_default(),
+    );
+    let latest_schema = normalized_schema_text(default_workspace_schema());
+    if current_schema == latest_schema {
+        record_schema_standard_baseline(workspace, &stable_text_hash(&latest_schema))?;
+    }
+    Ok(())
+}
+
+fn backup_schema_before_update(
+    workspace: &Path,
+    latest_schema: &str,
+) -> Result<Option<String>, String> {
+    let current_schema = read_text_if_exists(&workspace.join("schema.md")).unwrap_or_default();
+    let normalized_current = normalized_schema_text(&current_schema);
+    if normalized_current.trim().is_empty() || normalized_current == latest_schema {
+        return Ok(None);
+    }
+
+    let relative_path = format!(
+        "{METADATA_DIR}/schema-backups/schema-{}.md",
+        make_local_id("backup")
+    );
+    let backup_path = workspace.join(&relative_path);
+    if let Some(parent) = backup_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Failed to create schema backup directory: {error}"))?;
+    }
+    fs::write(&backup_path, normalized_current)
+        .map_err(|error| format!("Failed to back up schema.md: {error}"))?;
+    Ok(Some(relative_path))
+}
+
+fn append_schema_update_log(workspace: &Path, backup_path: Option<&str>) -> Result<(), String> {
+    let log_path = workspace.join("log.md");
+    let mut log = read_text_if_exists(&log_path).unwrap_or_else(|| "# Change Log\n\n".to_string());
+    if !log.ends_with('\n') {
+        log.push('\n');
+    }
+    if !log.ends_with("\n\n") {
+        log.push('\n');
+    }
+    log.push_str("- Updated `schema.md` to the latest standard Maple schema.\n");
+    if let Some(path) = backup_path {
+        log.push_str(&format!("  - Previous schema backed up to `{path}`.\n"));
+    }
+    fs::write(&log_path, log).map_err(|error| format!("Failed to update log.md: {error}"))
+}
+
+fn stable_text_hash(text: &str) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in text.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
 }
 
 fn run_runner(
@@ -6726,8 +6951,9 @@ fn should_hide_workspace_file(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        chat_thread_summary, chat_threads_dir, compose_maintain_operation_instruction,
-        dedupe_node_path_candidates, default_workspace_schema, ensure_maintain_thread_task_matches,
+        backup_schema_before_update, chat_thread_summary, chat_threads_dir,
+        compose_maintain_operation_instruction, dedupe_node_path_candidates,
+        default_workspace_schema, ensure_maintain_thread_task_matches,
         extract_partial_answer_from_events, finalize_provider_check_report,
         initialize_workspace_files, load_state_at, login_command_for_settings,
         maintain_operation_assistant_text, maintain_operation_user_text, make_chat_thread,
@@ -6736,9 +6962,10 @@ mod tests {
         provider_ready_candidate_count, provider_simulation_value_matches,
         read_requested_or_new_chat_thread, read_text_tail, read_thread_file,
         refresh_maintain_operation_messages, refresh_streaming_messages, run_command_probe,
-        runner_path_env, select_node_candidate, shell_single_quote, terminal_command_script,
-        thread_activity_context, validate_provider_candidate, validate_provider_path, AppSettings,
-        ChatThreadMessage, NodeCandidate, NodePathCandidate, ProviderCandidate,
+        runner_path_env, schema_update_prompt_for_workspace, select_node_candidate,
+        shell_single_quote, terminal_command_script, thread_activity_context,
+        validate_provider_candidate, validate_provider_path, write_schema_update_marker,
+        AppSettings, ChatThreadMessage, NodeCandidate, NodePathCandidate, ProviderCandidate,
         ProviderPathCandidate, ThreadFileKind,
     };
     #[cfg(unix)]
@@ -6810,6 +7037,86 @@ mod tests {
         assert!(schema.contains("## Build Wiki Rules"));
         assert!(schema.contains("## Explore And Apply Rules"));
         assert!(schema.contains("## Wiki Healthcheck Rules"));
+    }
+
+    #[test]
+    fn schema_update_prompt_skips_customized_current_schema() {
+        let workspace = unique_test_workspace("maple-current-schema-customized");
+        fs::create_dir_all(&workspace).unwrap();
+        write_schema_update_marker(&workspace, "schemaBaseHash", "schemaBaseRecordedAt").unwrap();
+        fs::write(
+            workspace.join("schema.md"),
+            format!(
+                "{}\n## Workspace Custom Rules\n\n- Keep this rule.\n",
+                default_workspace_schema()
+            ),
+        )
+        .unwrap();
+
+        let prompt = schema_update_prompt_for_workspace(&workspace);
+
+        assert!(!prompt.available);
+        assert_eq!(prompt.reason, "customized_current_schema");
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn schema_update_prompt_cannot_infer_customized_current_schema_without_baseline() {
+        let workspace = unique_test_workspace("maple-current-schema-customized-unknown");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(
+            workspace.join("schema.md"),
+            format!(
+                "{}\n## Workspace Custom Rules\n\n- Keep this rule.\n",
+                default_workspace_schema()
+            ),
+        )
+        .unwrap();
+
+        let prompt = schema_update_prompt_for_workspace(&workspace);
+
+        assert!(prompt.available);
+        assert_eq!(prompt.reason, "unknown_schema");
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn schema_update_prompt_is_one_time_per_latest_schema() {
+        let workspace = unique_test_workspace("maple-schema-update-once");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(workspace.join("schema.md"), "# Old Schema\n\n").unwrap();
+
+        let prompt = schema_update_prompt_for_workspace(&workspace);
+        assert!(prompt.available);
+        assert_eq!(prompt.reason, "unknown_schema");
+
+        write_schema_update_marker(&workspace, "dismissedLatestHash", "dismissedAt").unwrap();
+        let dismissed_prompt = schema_update_prompt_for_workspace(&workspace);
+        assert!(!dismissed_prompt.available);
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn schema_update_backup_preserves_previous_schema() {
+        let workspace = unique_test_workspace("maple-schema-update-backup");
+        fs::create_dir_all(&workspace).unwrap();
+        let previous = "# Custom Schema\n\n- Preserve this context.\n";
+        fs::write(workspace.join("schema.md"), previous).unwrap();
+
+        let backup = backup_schema_before_update(&workspace, default_workspace_schema())
+            .unwrap()
+            .expect("schema backup path");
+
+        assert!(backup.starts_with(".aiwiki/schema-backups/schema-backup-"));
+        assert_eq!(
+            fs::read_to_string(workspace.join(backup)).unwrap(),
+            previous
+        );
+
+        let _ = fs::remove_dir_all(workspace);
     }
 
     #[test]
@@ -7818,6 +8125,9 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             set_workspace,
+            check_schema_update_prompt,
+            dismiss_schema_update_prompt,
+            apply_standard_schema_update,
             close_workspace,
             load_workspace_state,
             list_chat_threads,

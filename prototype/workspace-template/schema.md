@@ -47,6 +47,7 @@ sources/ -> Build Wiki -> Explore -> Apply to Wiki -> Wiki Healthcheck -> Update
 - Improve Wiki handles subjective restructuring, synthesis, and page-quality work.
 - Organize Sources moves or renames source files without changing their contents.
 - Update Rules changes durable conventions in this schema.
+- Any write operation may update durable rules only when the user explicitly asks to remember a future rule, workspace preference, or operation behavior.
 
 ## Build Wiki Rules
 
@@ -85,6 +86,15 @@ Apply to Wiki should save durable value from Explore:
 - Create a new page only when the answer is worth finding later as a concept, guide, synthesis, or reference.
 - Cite local source paths or web references as appropriate.
 - Update `index.md` and append to `log.md` when navigation or content changes.
+
+## Durable Preferences And Agent Files
+
+- Treat this `schema.md` file as the durable source of truth for wiki rules, workspace preferences, and operation behavior.
+- Save a user preference to `schema.md` only when the user explicitly asks for future behavior, for example "always", "from now on", "remember this", "make this the default", or "for this workspace".
+- Otherwise, treat user instructions as local to the current operation.
+- `AGENTS.md` and `CLAUDE.md` are short bootstrap files for AI tools. Keep detailed content conventions in `schema.md`.
+- Update `AGENTS.md` or `CLAUDE.md` only when the user explicitly asks for agent behavior, bootstrap, or operation-boundary changes.
+- If `schema.md` and an agent bootstrap file overlap, keep the agent bootstrap file short and point it back to `schema.md`.
 
 ## Page Types
 
@@ -203,6 +213,8 @@ Wiki healthcheck should conservatively check and fix:
 - Stale `index.md` entries and missing important pages.
 - Summary pages that do not cite their source.
 - Concept pages that make source-specific claims without source citations.
+- Web URLs incorrectly listed in frontmatter `sources`; remove them from frontmatter and cite them as web references instead.
+- Web-derived claims that lack inline URL citations or a `## Web References` entry with title, URL, access date, and `found via Explore web search`.
 - Duplicate concept pages only when they are clearly duplicative; otherwise add cross-links.
 - Empty, very short, or vague pages using only existing wiki/source evidence.
 - Contradictions between pages, especially when newer sources supersede older claims.
@@ -212,5 +224,5 @@ Wiki healthcheck should conservatively check and fix:
 - A short `log.md` entry after the healthcheck.
 
 Wiki healthcheck should not make major subjective improvements or restructures; use Improve Wiki for that.
-Wiki healthcheck should not create or change durable rules; use Update Rules for that.
+Wiki healthcheck should not create or change durable rules unless the user explicitly asks to remember a future rule, workspace preference, or operation behavior; use Update Rules for rule-only changes.
 Never edit source file contents.

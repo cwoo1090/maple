@@ -10,6 +10,7 @@ const {
   ORGANIZE_SOURCES_ALLOWED_PATHS,
   SOURCE_MANIFEST_PATH,
   WIKI_HEALTHCHECK_ALLOWED_PATHS,
+  WIKI_WRITE_ALLOWED_PATHS,
   UPDATE_RULES_ALLOWED_PATHS,
   buildApplyChatPrompt,
   buildExploreChatPrompt,
@@ -96,6 +97,8 @@ test("allows Build Wiki write targets", () => {
   assert.equal(isAllowedPath("index.md"), true);
   assert.equal(isAllowedPath("log.md"), true);
   assert.equal(isAllowedPath("schema.md"), true);
+  assert.equal(isAllowedPath("AGENTS.md"), true);
+  assert.equal(isAllowedPath("CLAUDE.md"), true);
   assert.equal(isAllowedPath(".aiwiki/extracted/sample.json"), true);
 });
 
@@ -172,19 +175,29 @@ test("restores provider edits to the source manifest", async (t) => {
 
 test("uses per-operation allowlists", () => {
   assert.equal(isAllowedPath("wiki/concepts/a.md", WIKI_HEALTHCHECK_ALLOWED_PATHS), true);
-  assert.equal(isAllowedPath("schema.md", WIKI_HEALTHCHECK_ALLOWED_PATHS), false);
+  assert.equal(isAllowedPath("schema.md", WIKI_HEALTHCHECK_ALLOWED_PATHS), true);
+  assert.equal(isAllowedPath("AGENTS.md", WIKI_HEALTHCHECK_ALLOWED_PATHS), true);
+  assert.equal(isAllowedPath("CLAUDE.md", WIKI_HEALTHCHECK_ALLOWED_PATHS), true);
   assert.equal(isAllowedPath("sources/source.md", WIKI_HEALTHCHECK_ALLOWED_PATHS), false);
+
+  assert.equal(isAllowedPath("wiki/concepts/a.md", WIKI_WRITE_ALLOWED_PATHS), true);
+  assert.equal(isAllowedPath("schema.md", WIKI_WRITE_ALLOWED_PATHS), true);
+  assert.equal(isAllowedPath("AGENTS.md", WIKI_WRITE_ALLOWED_PATHS), false);
+  assert.equal(isAllowedPath("CLAUDE.md", WIKI_WRITE_ALLOWED_PATHS), false);
+  assert.equal(isAllowedPath("sources/source.md", WIKI_WRITE_ALLOWED_PATHS), false);
 
   assert.equal(isAllowedPath("wiki/concepts/a.md", IMPROVE_WIKI_ALLOWED_PATHS), true);
   assert.equal(isAllowedPath("schema.md", IMPROVE_WIKI_ALLOWED_PATHS), true);
   assert.equal(isAllowedPath("AGENTS.md", IMPROVE_WIKI_ALLOWED_PATHS), true);
   assert.equal(isAllowedPath("CLAUDE.md", IMPROVE_WIKI_ALLOWED_PATHS), true);
-  assert.equal(isAllowedPath("tools/wiki_lint.py", IMPROVE_WIKI_ALLOWED_PATHS), true);
-  assert.equal(isAllowedPath("sources/source.md", IMPROVE_WIKI_FORBIDDEN_PATHS), true);
+  assert.equal(isAllowedPath("sources/source.md", IMPROVE_WIKI_ALLOWED_PATHS), true);
+  assert.equal(isAllowedPath("tools/wiki_lint.py", IMPROVE_WIKI_ALLOWED_PATHS), false);
+  assert.equal(isAllowedPath("sources/source.md", IMPROVE_WIKI_FORBIDDEN_PATHS), false);
 
   assert.equal(isAllowedPath("sources/source.md", ORGANIZE_SOURCES_ALLOWED_PATHS), true);
   assert.equal(isAllowedPath("wiki/summaries/a.md", ORGANIZE_SOURCES_ALLOWED_PATHS), true);
-  assert.equal(isAllowedPath("schema.md", ORGANIZE_SOURCES_ALLOWED_PATHS), false);
+  assert.equal(isAllowedPath("schema.md", ORGANIZE_SOURCES_ALLOWED_PATHS), true);
+  assert.equal(isAllowedPath("AGENTS.md", ORGANIZE_SOURCES_ALLOWED_PATHS), false);
 
   assert.equal(isAllowedPath("schema.md", UPDATE_RULES_ALLOWED_PATHS), true);
   assert.equal(isAllowedPath("AGENTS.md", UPDATE_RULES_ALLOWED_PATHS), true);
@@ -213,7 +226,10 @@ test("Improve Wiki restores source edits while allowing rule files", async (t) =
     snapshot,
     changes,
     IMPROVE_WIKI_ALLOWED_PATHS,
-    { forbiddenPathRules: IMPROVE_WIKI_FORBIDDEN_PATHS },
+    {
+      sourceMoveOnly: true,
+      forbiddenPathRules: IMPROVE_WIKI_FORBIDDEN_PATHS,
+    },
   );
 
   const byPath = new Map(validated.map((change) => [change.path, change]));
@@ -224,6 +240,36 @@ test("Improve Wiki restores source edits while allowing rule files", async (t) =
   assert.equal(byPath.get("CLAUDE.md")?.allowed, true);
   assert.equal(await fs.readFile(path.join(workspace, "sources", "source.md"), "utf8"), "original source\n");
   assert.match(await fs.readFile(path.join(workspace, "CLAUDE.md"), "utf8"), /Follow schema/);
+});
+
+test("Improve Wiki allows move-only source renames with unchanged hashes", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "maple-improve-source-move-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  await fs.mkdir(path.join(workspace, "sources"), { recursive: true });
+  await fs.writeFile(path.join(workspace, "sources", "a.md"), "alpha\n");
+
+  const snapshot = await createSnapshot(workspace, "op-improve-source-move");
+  await fs.mkdir(path.join(workspace, "sources", "week-1"), { recursive: true });
+  await fs.rename(
+    path.join(workspace, "sources", "a.md"),
+    path.join(workspace, "sources", "week-1", "a.md"),
+  );
+
+  const changes = await diffSnapshot(workspace, snapshot);
+  const validated = await validateAndRestoreChanges(
+    workspace,
+    snapshot,
+    changes,
+    IMPROVE_WIKI_ALLOWED_PATHS,
+    { sourceMoveOnly: true },
+  );
+
+  assert.equal(validated.every((change) => change.allowed), true);
+  assert.equal(validated.some((change) => change.restored), false);
+  assert.equal(
+    await fs.readFile(path.join(workspace, "sources", "week-1", "a.md"), "utf8"),
+    "alpha\n",
+  );
 });
 
 test("identifies runner-owned metadata paths", () => {
@@ -1258,12 +1304,17 @@ test("Build Wiki prompt is a thin operation brief", async (t) => {
   assert.match(prompt, /sources\/a\.md/);
   assert.doesNotMatch(prompt, /raw\/a\.md/);
   assert.match(prompt, /Focus on exam review/);
-  assert.match(prompt, /Source files may be moved or renamed under sources\/\*\*/);
+  assert.match(prompt, /Allowed write paths/);
+  assert.match(prompt, /AGENTS\.md/);
+  assert.match(prompt, /CLAUDE\.md/);
+  assert.match(prompt, /source of truth for wiki rules/);
+  assert.match(prompt, /Source files under sources\/\*\* may be moved or renamed/);
   assert.match(prompt, /source file contents must not be edited/);
-  assert.match(prompt, /major wiki pages created or updated/);
+  assert.match(prompt, /major files created or updated/);
   assert.match(prompt, /anything the user should review/);
   assert.doesNotMatch(prompt, /Math and equations:/);
   assert.doesNotMatch(prompt, /Use Obsidian-style wikilinks/);
+  assert.doesNotMatch(prompt, /Use minimal wiki page frontmatter/);
 });
 
 test("new workspace schema scaffold documents wiki structure and durable rules", () => {
@@ -1292,6 +1343,9 @@ test("new workspace schema scaffold documents wiki structure and durable rules",
   assert.match(schema, /Distinguish pages inspected for understanding from images embedded/);
   assert.match(schema, /## Explore And Apply Rules/);
   assert.match(schema, /Apply to Wiki should save durable value from Explore/);
+  assert.match(schema, /## Durable Preferences And Agent Files/);
+  assert.match(schema, /Save a user preference to `schema\.md` only when the user explicitly asks/);
+  assert.match(schema, /AGENTS\.md` and `CLAUDE\.md` are short bootstrap files/);
   assert.match(schema, /## Cross-References/);
   assert.match(schema, /## Math Formatting/);
   assert.match(schema, /## Source Citations/);
@@ -1308,6 +1362,8 @@ test("new workspace schema scaffold documents wiki structure and durable rules",
   assert.match(schema, /Wiki healthcheck should conservatively check and fix/);
   assert.match(schema, /Important concepts mentioned across multiple pages/);
   assert.match(schema, /Contradictions between pages/);
+  assert.match(schema, /Web URLs incorrectly listed in frontmatter `sources`/);
+  assert.match(schema, /Web-derived claims that lack inline URL citations/);
 });
 
 test("initializes a blank workspace without sample sources", async (t) => {
@@ -1344,11 +1400,9 @@ test("Build Wiki prompt includes first-build workspace context", async (t) => {
   assert.match(prompt, /First-build workspace context/);
   assert.match(prompt, /robotics class wiki/);
   assert.match(prompt, /Update index\.md with a concise reader-facing introduction/);
-  assert.match(prompt, /Update schema\.md with a workspace-specific context section/);
-  assert.match(prompt, /guide convention/);
-  assert.match(prompt, /Leave AGENTS\.md and CLAUDE\.md unchanged/);
-  assert.doesNotMatch(prompt, /Update AGENTS\.md/);
-  assert.doesNotMatch(prompt, /Update CLAUDE\.md/);
+  assert.match(prompt, /Update schema\.md with workspace-specific context/);
+  assert.match(prompt, /Do not update AGENTS\.md or CLAUDE\.md for ordinary workspace context/);
+  assert.match(prompt, /Update AGENTS\.md or CLAUDE\.md only when the user explicitly asks/);
 });
 
 test("Explore Chat prompt uses extracted text for selected source decks", async (t) => {
@@ -1579,12 +1633,14 @@ test("agent scaffold keeps operation boundary short and delegates content rules"
   );
   assert.match(instructions, /Treat `sources\/` as immutable/);
   assert.doesNotMatch(instructions, /Treat `raw\/` as immutable/);
-  assert.match(instructions, /After any wiki content change, update `index\.md`/);
-  assert.match(instructions, /Follow `schema\.md` for page types/);
-  assert.match(instructions, /Keep this file and `CLAUDE\.md` semantically consistent/);
+  assert.match(instructions, /Follow `schema\.md` for durable wiki rules/);
+  assert.match(instructions, /Update `schema\.md` only when the user explicitly asks/);
+  assert.match(instructions, /Update `AGENTS\.md` or `CLAUDE\.md` only when the user explicitly asks/);
+  assert.doesNotMatch(instructions, /frontmatter/);
+  assert.doesNotMatch(instructions, /wikilinks/);
 });
 
-test("Apply to wiki prompt limits final checks", () => {
+test("Apply to wiki prompt is a thin operation brief", () => {
   const prompt = buildApplyChatPrompt("/tmp/workspace", {
     scope: "question-and-answer",
     targetPath: "wiki/concepts/motor-operating-region.md",
@@ -1602,16 +1658,15 @@ test("Apply to wiki prompt limits final checks", () => {
 
   assert.match(prompt, /Use workspace instructions already loaded by the CLI/);
   assert.doesNotMatch(prompt, /Read AGENTS\.md or CLAUDE\.md/);
-  assert.match(prompt, /Start with the context path/);
-  assert.match(prompt, /Read index\.md only if navigation may change/);
-  assert.match(prompt, /Read log\.md only before appending/);
-  assert.match(prompt, /Read schema\.md only when wiki conventions are needed/);
-  assert.match(prompt, /After editing, run at most one focused validation command/);
-  assert.match(prompt, /Do not run final handoff-only checks/);
-  assert.match(prompt, /git status/);
-  assert.match(prompt, /git diff --stat/);
-  assert.match(prompt, /line-number dumps/);
-  assert.match(prompt, /Keep the final response brief/);
+  assert.match(prompt, /Allowed write paths/);
+  assert.match(prompt, /wiki\/\*\*/);
+  assert.match(prompt, /schema\.md/);
+  assert.match(prompt, /Do not edit AGENTS\.md or CLAUDE\.md/);
+  assert.match(prompt, /Never edit, rename, delete, or create files under sources\/\*\*/);
+  assert.match(prompt, /Selected chat messages/);
+  assert.doesNotMatch(prompt, /git status/);
+  assert.doesNotMatch(prompt, /git diff --stat/);
+  assert.doesNotMatch(prompt, /Use Obsidian-style wikilinks/);
 });
 
 test("Apply to wiki prompt marks web-search content as web references", () => {
@@ -1639,14 +1694,14 @@ test("Apply to wiki prompt marks web-search content as web references", () => {
   });
 
   assert.match(prompt, /Some selected chat messages used Explore web search/);
-  assert.match(prompt, /## Web References/);
-  assert.match(prompt, /found via Explore web search/);
-  assert.match(prompt, /Never add web URLs to YAML frontmatter `sources`/);
+  assert.match(prompt, /Treat web-derived material according to schema\.md/);
   assert.match(prompt, /Do not perform fresh web search during Apply/);
   assert.match(prompt, /\[used Explore web search\]/);
+  assert.doesNotMatch(prompt, /## Web References/);
+  assert.doesNotMatch(prompt, /found via Explore web search/);
 });
 
-test("maintenance prompts avoid control-file rereads except for rules updates", async () => {
+test("maintenance prompts are thin operation briefs", async () => {
   const healthcheckPrompt = await buildMaintenancePrompt("/tmp/workspace", {
     operationType: "wiki-healthcheck",
     label: "Wiki healthcheck",
@@ -1654,10 +1709,15 @@ test("maintenance prompts avoid control-file rereads except for rules updates", 
     allowedPathRules: WIKI_HEALTHCHECK_ALLOWED_PATHS,
   });
 
-  assert.match(healthcheckPrompt, /Use workspace instructions already loaded by the CLI/);
-  assert.doesNotMatch(healthcheckPrompt, /Read AGENTS\.md or CLAUDE\.md/);
-  assert.match(healthcheckPrompt, /Wiki Healthcheck Rules/);
-  assert.match(healthcheckPrompt, /Update Rules is needed/);
+  assert.match(healthcheckPrompt, /Allowed write paths/);
+  assert.match(healthcheckPrompt, /schema\.md/);
+  assert.match(healthcheckPrompt, /AGENTS\.md/);
+  assert.match(healthcheckPrompt, /CLAUDE\.md/);
+  assert.match(healthcheckPrompt, /source of truth for wiki rules/);
+  assert.match(healthcheckPrompt, /Do not edit, create, rename, or delete files under sources\/\*\*/);
+  assert.match(healthcheckPrompt, /Update AGENTS\.md or CLAUDE\.md only when the user explicitly asks/);
+  assert.doesNotMatch(healthcheckPrompt, /Required workflow/);
+  assert.doesNotMatch(healthcheckPrompt, /Wiki Healthcheck Rules/);
 
   const rulesPrompt = await buildMaintenancePrompt("/tmp/workspace", {
     operationType: "update-rules",
@@ -1666,12 +1726,29 @@ test("maintenance prompts avoid control-file rereads except for rules updates", 
     allowedPathRules: UPDATE_RULES_ALLOWED_PATHS,
   });
 
-  assert.match(rulesPrompt, /Read schema\.md, AGENTS\.md, CLAUDE\.md, index\.md, and log\.md/);
-  assert.match(rulesPrompt, /Update schema\.md for durable content conventions/);
-  assert.match(rulesPrompt, /Update AGENTS\.md and CLAUDE\.md for durable agent behavior/);
-  assert.match(
-    rulesPrompt,
-    /If a rule affects both content conventions and agent behavior, update all three files/,
-  );
-  assert.match(rulesPrompt, /Keep AGENTS\.md and CLAUDE\.md short and semantically consistent/);
+  assert.match(rulesPrompt, /Update durable wiki rules according to the user instruction/);
+  assert.match(rulesPrompt, /Allowed write paths/);
+  assert.match(rulesPrompt, /AGENTS\.md/);
+  assert.match(rulesPrompt, /CLAUDE\.md/);
+  assert.doesNotMatch(rulesPrompt, /frontmatter/);
+  assert.doesNotMatch(rulesPrompt, /wikilinks/);
+});
+
+test("Improve Wiki prompt has build-level permissions without build ingestion language", async () => {
+  const prompt = await buildMaintenancePrompt("/tmp/workspace", {
+    operationType: "improve-wiki",
+    label: "Improve wiki",
+    instruction: "Improve the study guide and remember that guides should include quizzes.",
+    allowedPathRules: IMPROVE_WIKI_ALLOWED_PATHS,
+    sourceMoveOnly: true,
+  });
+
+  assert.match(prompt, /sources\/\*\*/);
+  assert.match(prompt, /wiki\/\*\*/);
+  assert.match(prompt, /schema\.md/);
+  assert.match(prompt, /AGENTS\.md/);
+  assert.match(prompt, /CLAUDE\.md/);
+  assert.match(prompt, /may be moved or renamed only when the user explicitly asks/);
+  assert.doesNotMatch(prompt, /pending source changes/);
+  assert.doesNotMatch(prompt, /source-manifest\.json.*successful build/);
 });

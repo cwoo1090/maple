@@ -65,6 +65,8 @@ const BUILD_WIKI_ALLOWED_PATHS = [
   "index.md",
   "log.md",
   "schema.md",
+  "AGENTS.md",
+  "CLAUDE.md",
   ".aiwiki/**",
 ];
 const WIKI_WRITE_ALLOWED_PATHS = [
@@ -78,17 +80,28 @@ const WIKI_HEALTHCHECK_ALLOWED_PATHS = [
   "wiki/**",
   "index.md",
   "log.md",
+  "schema.md",
+  "AGENTS.md",
+  "CLAUDE.md",
   ".aiwiki/**",
 ];
 const IMPROVE_WIKI_ALLOWED_PATHS = [
-  "**",
+  "sources/**",
+  "wiki/**",
+  "index.md",
+  "log.md",
+  "schema.md",
+  "AGENTS.md",
+  "CLAUDE.md",
+  ".aiwiki/**",
 ];
-const IMPROVE_WIKI_FORBIDDEN_PATHS = ["sources/**"];
+const IMPROVE_WIKI_FORBIDDEN_PATHS = [];
 const ORGANIZE_SOURCES_ALLOWED_PATHS = [
   "sources/**",
   "wiki/**",
   "index.md",
   "log.md",
+  "schema.md",
   ".aiwiki/**",
 ];
 const UPDATE_RULES_ALLOWED_PATHS = [
@@ -654,29 +667,16 @@ function workspaceAgentInstructions(title) {
   return [
     `# ${title}`,
     "",
-    "This is a Maple workspace for an individual or team wiki.",
-    "The CLI may load this file as workspace instructions; keep it short and aligned with `schema.md`.",
+    "This is a Maple workspace for a local, file-based AI wiki.",
+    "Keep this file short. Follow `schema.md` for durable wiki rules, workspace preferences, and operation behavior.",
     "",
     "## Operation Boundary",
     "",
     "- Explore Chat is read-only. Do not modify workspace files during normal Q&A.",
     "- Workspace files may be modified only by explicit app write operations: Build Wiki, Apply to Wiki, Wiki Healthcheck, Improve Wiki, Organize Sources, and Update Wiki Rules.",
     "- Treat `sources/` as immutable source material. Do not edit source file contents.",
-    "- Write generated wiki content under `wiki/` and keep derived visuals under `wiki/assets/`.",
-    "- After any wiki content change, update `index.md` for navigation and append a concise entry to `log.md`.",
-    "",
-    "## Source of Truth",
-    "",
-    "- Follow `schema.md` for page types, frontmatter, linking, citations, math, visuals, naming, healthcheck rules, and index/log conventions.",
-    "- Update `schema.md` only when the user asks to change durable wiki rules.",
-    "- Keep this file and `CLAUDE.md` semantically consistent; they should point to `schema.md` instead of duplicating every content rule.",
-    "",
-    "## Practical Notes",
-    "",
-    "- Prefer updating existing pages over creating duplicates.",
-    "- Keep one canonical page per durable concept and link to it instead of repeating its full explanation.",
-    "- If creating a new page, add enough incoming or outgoing links so it is not orphaned.",
-    "- User instructions in the current conversation take precedence over this file, followed by `schema.md` and existing workspace conventions.",
+    "- Update `schema.md` only when the user explicitly asks to remember a durable rule or workspace preference.",
+    "- Update `AGENTS.md` or `CLAUDE.md` only when the user explicitly asks for agent, bootstrap, or operation-boundary changes.",
     "",
   ].join("\n");
 }
@@ -1447,6 +1447,7 @@ async function runMaintenanceOperation(workspace, options = {}) {
     instruction,
     allowedPathRules: config.allowedPathRules,
     forbiddenPathRules: config.forbiddenPathRules || [],
+    sourceMoveOnly: config.sourceMoveOnly,
     sourceStatus,
   });
   const promptPath = path.join(operationDir, "prompt.md");
@@ -1592,7 +1593,7 @@ function maintenanceOperationConfig(operationType) {
       forbiddenPathRules: IMPROVE_WIKI_FORBIDDEN_PATHS,
       requiresInstruction: true,
       includeSourceStatus: false,
-      sourceMoveOnly: false,
+      sourceMoveOnly: true,
       maxTurns: 20,
     },
     "organize-sources": {
@@ -2493,6 +2494,12 @@ function buildSourceExtractionCacheReport(preparedSources) {
   };
 }
 
+function renderAllowedPathRulesForPrompt(rules) {
+  return rules
+    .map((rule) => (rule === "**" ? "- all workspace paths" : `- ${rule}`))
+    .join("\n");
+}
+
 async function buildWikiPrompt(workspace, options, preparedSources = { sources: [] }) {
   const sourceStatus = options.sourceStatus || await getSourceStatus(workspace);
   const today = new Date().toISOString().slice(0, 10);
@@ -2503,52 +2510,33 @@ async function buildWikiPrompt(workspace, options, preparedSources = { sources: 
   const preparedSourceList = renderPreparedSourcesForPrompt(preparedSources);
   let prompt = `You are running a Build Wiki operation for Maple.
 
-Goal:
-- Compile pending source changes into the local wiki.
-- Integrate new source knowledge into existing summaries, concepts, guides, links, index, and log instead of only creating disconnected source notes.
+Follow AGENTS.md or CLAUDE.md for workspace bootstrap instructions.
+Use schema.md as the durable source of truth for wiki rules, workspace preferences, and operation behavior.
 
-Required reading:
-- AGENTS.md or CLAUDE.md
-- schema.md
-- index.md
-- log.md
+Operation goal:
+- Compile pending source changes into the local wiki.
+- Integrate source knowledge into the existing wiki according to schema.md.
 
 Operation scope:
 ${pendingSourceList}
 ${preparedSourceList}
 
-Required writes:
-- Create or update source-grounded summary, concept, guide, and asset pages as needed.
-- Prefer updating existing canonical pages when new sources refine, extend, or contradict them.
-- Update index.md and append a short dated entry to log.md.
-- Update schema.md only if the user explicitly asks for a durable wiki rule.
+Operation-local context:
+- Current date: ${today}
 
 Permission boundary:
-- Allowed write paths: sources/**, wiki/**, index.md, log.md, schema.md, .aiwiki/**
-- Source files may be moved or renamed under sources/**, but source file contents must not be edited.
-- Do not edit .aiwiki/source-manifest.json; the runner updates it only after a successful build.
+Allowed write paths:
+${renderAllowedPathRulesForPrompt(BUILD_WIKI_ALLOWED_PATHS)}
 
-Source handling:
-- Treat source file contents as immutable.
-- Move or rename scoped source files/folders when the user asks, when pending source filenames are temporary or unclear, or when a clearer existing workspace convention is obvious from the source.
-- If you move or rename a source, cite the new source path in generated wiki pages and update existing wiki citations, index.md, and log.md references as needed.
-- Read only the scoped sources first; inspect existing wiki pages only when needed.
-- Use extracted text for broad source coverage, but do not treat it as complete for visually meaningful PDF/PPTX material.
-- Use the visual inspection plan below to understand which rendered pages are attached as actual vision input.
-- Do not embed every inspected image. Embed only the smallest useful set of visuals that materially clarifies the wiki.
+- Source files under sources/** may be moved or renamed, but source file contents must not be edited.
+- Do not edit .aiwiki/source-manifest.json; the runner updates it only after a successful build.
 - When copying a visual into wiki/assets, copy from the listed full-resolution PNG path, not the prompt JPEG path.
-- Cite original source paths in wiki pages.
-- Use minimal wiki page frontmatter: sources, created, and updated. Use the first # heading for the page title.
-- For new pages, set created and updated to ${today}. For edited pages, preserve created and set updated to ${today}.
-- If the scope includes removed sources, update wiki references/navigation where appropriate.
+- Update schema.md only when the user explicitly asks for a durable rule or workspace preference.
+- Update AGENTS.md or CLAUDE.md only when the user explicitly asks for agent, bootstrap, or operation-boundary changes.
 
 Finish protocol:
-- Do not run git status or git diff.
-- Do not re-read every generated page after writing.
-- Run at most one concise verification command only if needed.
 - The Maple runner validates paths, changed files, and report state after you exit.
-- Once required files are written, provide a short final summary and stop.
-- In the final summary, briefly name the main sources handled, the major wiki pages created or updated, and anything the user should review.
+- Provide a short final summary naming the main sources handled, major files created or updated, and anything the user should review.
 `;
 
   if (workspaceContext) {
@@ -2557,11 +2545,9 @@ First-build workspace context:
 ${workspaceContext}
 
 Use this as durable workspace context:
-- Update index.md with a concise reader-facing introduction for this wiki.
-- Update schema.md with a workspace-specific context section and guide convention based on this purpose.
-- Let the context shape what kinds of guide pages are useful, such as start-here, study, review, research, project onboarding, or synthesis routes.
-- Create guide pages only when they provide a useful route across multiple wiki pages; do not create mechanical guides for every source or concept.
-- Leave AGENTS.md and CLAUDE.md unchanged; they should continue to point agents to schema.md.
+- Update index.md with a concise reader-facing introduction when useful.
+- Update schema.md with workspace-specific context or preferences based on this purpose.
+- Do not update AGENTS.md or CLAUDE.md for ordinary workspace context.
 `;
   }
 
@@ -2583,13 +2569,11 @@ Use this as durable workspace context:
 async function buildMaintenancePrompt(workspace, options) {
   const instruction = options.instruction
     ? options.instruction
-    : "Run the default wiki healthcheck from schema.md and fix conservative, rule-based wiki issues.";
+    : "Run the default wiki healthcheck from schema.md.";
   const sourceStatusBlock = options.sourceStatus
     ? `\nCurrent source status:\n${renderSourceStatusForPrompt(options.sourceStatus)}\n`
     : "";
-  const allowedPaths = options.allowedPathRules
-    .map((rule) => (rule === "**" ? "- all workspace paths" : `- ${rule}`))
-    .join("\n");
+  const allowedPaths = renderAllowedPathRulesForPrompt(options.allowedPathRules);
   const forbiddenPathRules = Array.isArray(options.forbiddenPathRules)
     ? options.forbiddenPathRules
     : [];
@@ -2600,59 +2584,33 @@ Forbidden write paths:
 ${forbiddenPaths}
 `
     : "";
-
-  let operationGoal;
-  let workflow;
-  if (options.operationType === "wiki-healthcheck") {
-    operationGoal = "Check the existing wiki against the Wiki Healthcheck Rules in schema.md and fix conservative, rule-based issues.";
-    workflow = [
-      "Use workspace instructions already loaded by the CLI; do not re-read AGENTS.md or CLAUDE.md unless they are missing or ambiguous.",
-      "Read schema.md, index.md, and log.md only as needed for the healthcheck.",
-      "Apply the Wiki Healthcheck Rules in schema.md.",
-      "If schema.md has no Wiki Healthcheck Rules section, stop and report that Update Rules is needed instead of inventing durable rules.",
-      "Fix only obvious wiki health issues; do not make major subjective restructures.",
-      "Append a short dated entry to log.md.",
-    ];
-  } else if (options.operationType === "improve-wiki") {
-    operationGoal = "Improve the existing wiki according to the user instruction.";
-    workflow = [
-      "Use workspace instructions already loaded by the CLI; do not re-read AGENTS.md or CLAUDE.md unless they are missing or ambiguous.",
-      "Read schema.md for content conventions and index.md/log.md only as needed for navigation and bookkeeping.",
-      "Inspect relevant wiki pages before creating guides, improving structure, connecting pages, moving, renaming, splitting, merging, or rewriting them.",
-      "When the user asks for durable conventions or agent behavior changes, update schema.md, AGENTS.md, and CLAUDE.md as needed.",
-      "Keep AGENTS.md and CLAUDE.md short and semantically consistent; they should point agents to schema.md instead of duplicating every content rule.",
-      "Update links and index.md so navigation remains coherent.",
-      "Append a short dated entry to log.md.",
-    ];
-  } else if (options.operationType === "organize-sources") {
-    operationGoal = "Move or rename source files/folders according to the user instruction without changing source file contents.";
-    workflow = [
-      "Use workspace instructions already loaded by the CLI; do not re-read AGENTS.md or CLAUDE.md unless they are missing or ambiguous.",
-      "Read schema.md for source and citation conventions, and read index.md/log.md only as needed.",
-      "Move or rename source files/folders only when it makes the source collection clearer.",
-      "Do not edit source file contents.",
-      "Update wiki citations and index/log references if source paths change.",
-      "Append a short dated entry to log.md.",
-    ];
-  } else {
-    operationGoal = "Update durable wiki rules according to the user instruction.";
-    workflow = [
-      "Read schema.md, AGENTS.md, CLAUDE.md, index.md, and log.md.",
-      "Update schema.md for durable content conventions such as page shape, citations, links, math, visuals, naming, index/log rules, and healthcheck rules.",
-      "Update AGENTS.md and CLAUDE.md for durable agent behavior or app operation-boundary changes.",
-      "If a rule affects both content conventions and agent behavior, update all three files.",
-      "Keep AGENTS.md and CLAUDE.md short and semantically consistent; they should point agents to schema.md instead of duplicating every content rule.",
-      "Append a short dated entry to log.md.",
-    ];
-  }
+  const operationGoals = {
+    "wiki-healthcheck": "Check and conservatively fix the existing wiki according to schema.md.",
+    "improve-wiki": "Improve the existing wiki according to the user instruction and schema.md.",
+    "organize-sources": "Move or rename source files/folders according to the user instruction and schema.md.",
+    "update-rules": "Update durable wiki rules according to the user instruction.",
+  };
+  const operationGoal = operationGoals[options.operationType] || "Run the requested Maple operation.";
+  const allowsSources = options.allowedPathRules.includes("sources/**");
+  const allowsAgentFiles =
+    options.allowedPathRules.includes("AGENTS.md") ||
+    options.allowedPathRules.includes("CLAUDE.md");
+  const sourceBoundary = allowsSources
+    ? options.operationType === "organize-sources"
+      ? "- Source files under sources/** may be moved or renamed, but source file contents must not be edited."
+      : "- Source files under sources/** may be moved or renamed only when the user explicitly asks; source file contents must not be edited."
+    : "- Do not edit, create, rename, or delete files under sources/**.";
+  const agentBoundary = allowsAgentFiles
+    ? "- Update AGENTS.md or CLAUDE.md only when the user explicitly asks for agent, bootstrap, or operation-boundary changes."
+    : "- Do not edit AGENTS.md or CLAUDE.md.";
 
   return `You are running a ${options.label} operation for Maple.
 
-Goal:
-- ${operationGoal}
+Follow AGENTS.md or CLAUDE.md for workspace bootstrap instructions.
+Use schema.md as the durable source of truth for wiki rules, workspace preferences, and operation behavior.
 
-Required workflow:
-${workflow.map((item) => `- ${item}`).join("\n")}
+Operation goal:
+- ${operationGoal}
 
 User instruction:
 ${instruction}
@@ -2662,9 +2620,11 @@ Allowed write paths:
 ${allowedPaths}
 ${forbiddenPathBlock}
 
-Do not edit .aiwiki/source-manifest.json; the runner owns source ingestion state.
-
-The workspace files are the persistent context. Do not ask for extra context before doing the operation; read only the local files needed for this task.
+${sourceBoundary}
+- Do not edit .aiwiki/source-manifest.json; the runner owns source ingestion state.
+- Update schema.md only when the user explicitly asks for a durable rule or workspace preference, except when running Update Rules.
+${agentBoundary}
+- The Maple runner validates paths, changed files, and report state after you exit.
 
 Workspace path: ${workspace}
 
@@ -2811,16 +2771,12 @@ async function readApplyChatPayload(workspace, options) {
 
 function buildApplyChatPrompt(workspace, payload) {
   const hasWebSearchMessages = payload.messages.some((message) => message.webSearchEnabled);
-  const accessedDate = new Date().toISOString().slice(0, 10);
   const webReferenceRules = hasWebSearchMessages
     ? `
-Web reference rules:
+Web search context:
 - Some selected chat messages used Explore web search.
 - Do not perform fresh web search during Apply; use only the selected chat content and cited URLs.
-- Web-derived claims must cite their URL inline or under a \`## Web References\` section.
-- Use this format when a web reference section is appropriate: \`- [Title](https://example.com), accessed ${accessedDate}, found via Explore web search.\`
-- Never add web URLs to YAML frontmatter \`sources\`; \`sources\` is only for curated local files under sources/**.
-- Never create, edit, rename, or delete files under sources/** for web references.
+- Treat web-derived material according to schema.md.
 `
     : "";
   const contextLine = payload.targetPath
@@ -2843,39 +2799,25 @@ Web reference rules:
 
 You are running an Apply to wiki operation for Maple.
 
-Goal:
+Use schema.md as the durable source of truth for wiki rules, workspace preferences, and operation behavior.
+
+Operation goal:
 - Turn selected Explore Chat content into durable wiki improvements.
-- Do not dump the conversation into the wiki.
-- Preserve only reusable explanations, corrected concepts, structure, formulas, or concise guidance.
 
 Apply request:
 - Scope: ${payload.scope}
 - ${contextLine}
 - User instruction: ${instruction}
 
-Required workflow:
-- Start with the context path. Use it as a hint, not a destination constraint.
-- Read schema.md only when wiki conventions are needed beyond the loaded workspace instructions.
-- Read index.md only if navigation may change, such as adding, removing, renaming, or reorganizing pages.
-- Read log.md only before appending the final operation entry.
-- Inspect other wiki pages only when the selected chat or context page makes them relevant.
-- Update, create, split, or reshape wiki pages wherever the chat insight fits best.
-- Update index.md only if navigation changed or a new page was created.
-- Append a short dated entry to log.md.
-- Update schema.md only if the user explicitly asks for a durable convention.
-
-Execution limits:
-- Keep the run short once the necessary context is clear.
-- After editing, run at most one focused validation command, such as checking relevant links or git diff --check on changed Markdown files.
-- Do not run final handoff-only checks such as git status, git diff --stat, line-number dumps, or repeated file reads just to prepare a response.
-- Do not perform cosmetic polish passes unless they are needed to fix a validation issue.
-- Keep the final response brief: state what changed and whether the validation command passed.
-
 Permission boundary:
-- Allowed write paths: wiki/**, index.md, log.md, schema.md, .aiwiki/**
+Allowed write paths:
+${renderAllowedPathRulesForPrompt(WIKI_WRITE_ALLOWED_PATHS)}
+
 - Never edit, rename, delete, or create files under sources/**.
+- Do not edit AGENTS.md or CLAUDE.md.
 - Do not edit .aiwiki/source-manifest.json; the runner owns source ingestion state.
-- Keep the result concise and source-grounded. Cite source paths when the chat content points to a source.
+- Update schema.md only when the user explicitly asks for a durable rule or workspace preference.
+- The Maple runner validates paths, changed files, and report state after you exit.
 ${webReferenceRules}
 
 Selected chat messages:
@@ -5749,6 +5691,7 @@ function createOperationId() {
 
 module.exports = {
   BUILD_WIKI_ALLOWED_PATHS,
+  WIKI_WRITE_ALLOWED_PATHS,
   WIKI_HEALTHCHECK_ALLOWED_PATHS,
   IMPROVE_WIKI_ALLOWED_PATHS,
   IMPROVE_WIKI_FORBIDDEN_PATHS,

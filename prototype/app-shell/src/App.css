@@ -1239,6 +1239,22 @@ button.tree-name-clickable {
   min-width: 0;
 }
 
+.center-schema-update-btn {
+  height: 22px;
+  padding: 0 9px;
+  border: 1px solid var(--accent-border);
+  border-radius: 6px;
+  background: var(--accent-bg);
+  color: var(--accent);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+
+.center-schema-update-btn:hover:not(:disabled) {
+  background: var(--accent);
+  color: white;
+}
+
 .view-toggle {
   display: inline-flex;
   background: var(--bg-elevated);
@@ -4612,6 +4628,10 @@ button.tree-name-clickable {
   width: min(600px, 100%);
 }
 
+.apply-modal.schema-update-modal {
+  width: min(680px, 100%);
+}
+
 .apply-modal-header {
   display: flex;
   align-items: flex-start;
@@ -4920,6 +4940,68 @@ button.tree-name-clickable {
 
 .apply-modal-primary:hover:not(:disabled) {
   background: var(--accent-hover);
+}
+
+.schema-update-copy {
+  display: grid;
+  gap: 5px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+}
+
+.schema-update-copy strong {
+  color: var(--text);
+  font-size: 12.5px;
+  font-weight: 650;
+}
+
+.schema-update-copy p {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+.schema-update-warning {
+  padding: 10px 12px;
+  border: 1px solid rgba(190, 113, 42, 0.3);
+  border-radius: 8px;
+  background: rgba(190, 113, 42, 0.08);
+  color: var(--text);
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+
+.schema-update-toggle {
+  justify-self: start;
+  min-height: 30px;
+  padding: 0 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: 7px;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 12.5px;
+}
+
+.schema-update-toggle:hover {
+  background: var(--bg-hover);
+}
+
+.schema-update-preview {
+  max-height: min(44vh, 420px);
+  overflow: auto;
+  margin: 0;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11.5px;
+  line-height: 1.45;
+  white-space: pre-wrap;
 }
 
 .drop-overlay {
