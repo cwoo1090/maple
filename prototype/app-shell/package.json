@@ -10,6 +10,7 @@
     "tauri": "tauri",
     "build:mac:app": "sh scripts/build-mac.sh app",
     "build:mac:dmg": "sh scripts/build-mac.sh app,dmg",
+    "posthog:user-report": "node scripts/posthog-user-report.mjs",
     "release:latest-json": "node scripts/create-latest-json.mjs"
   },
   "dependencies": {

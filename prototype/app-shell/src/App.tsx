@@ -1992,6 +1992,17 @@ function App() {
     });
   }
 
+  function changeRightPanelMode(mode: RightPanelMode) {
+    if (rightPanelMode !== mode) {
+      track("right panel mode changed", {
+        mode,
+        previous_mode: rightPanelMode,
+        workspace_open: Boolean(workspace.workspacePath),
+      });
+    }
+    setRightPanelMode(mode);
+  }
+
   function toggleWindowMaximize() {
     getCurrentWindow().toggleMaximize().catch(() => {});
   }
@@ -3494,6 +3505,12 @@ function App() {
   }
 
   function selectMaintainTask(taskId: MaintainTaskId) {
+    const task = MAINTAIN_TASK_BY_ID[taskId];
+    track("maintain task selected", {
+      task: task.id,
+      command: task.command,
+      requires_instruction: task.requiresInstruction,
+    });
     setSelectedMaintainTaskId(taskId);
     setMaintainInstruction("");
     setMaintainAskOnly(false);
@@ -3614,6 +3631,13 @@ function App() {
       threadId: launchedThreadId,
       taskId: launchedTask.id,
     });
+    const maintainCommandProperties = {
+      task: launchedTask.id,
+      command: launchedTask.command,
+      has_instruction: Boolean(trimmedInstruction),
+      instruction_length: trimmedInstruction.length,
+    };
+    track("maintain command started", maintainCommandProperties);
 
     try {
       const result = await invoke<MaintainOperationResult>("run_maintain_thread_operation", {
@@ -3645,7 +3669,20 @@ function App() {
       } else if (result.runner && !result.runner.success) {
         setError(`Operation exited with code ${result.runner.code ?? "unknown"}.`);
       }
+      const commandSucceeded = !result.error && result.runner?.success !== false;
+      track("maintain command completed", {
+        ...maintainCommandProperties,
+        result: commandSucceeded ? "success" : "failed",
+        error_kind: commandSucceeded ? null : "maintain_failed",
+        changed_file_count: reviewableChangedFileCount(result.state),
+      });
     } catch (err) {
+      track("maintain command completed", {
+        ...maintainCommandProperties,
+        result: "start_failed",
+        error_kind: errorKindFromText(String(err)),
+        changed_file_count: 0,
+      });
       setError(String(err));
       const stillViewingLaunchedThread = currentMaintainThreadIdRef.current === launchedThreadId;
       if (stillViewingLaunchedThread) {
@@ -3769,6 +3806,13 @@ function App() {
     if (!question) return false;
     setBusy("Starting chat");
     setError(null);
+    const exploreQuestionProperties = {
+      question_length: question.length,
+      selected_path_present: Boolean(selectedPath),
+      web_search_enabled: exploreWebSearchEnabled,
+      existing_thread: Boolean(chatThread?.id),
+    };
+    track("explore question submitted", exploreQuestionProperties);
 
     try {
       const thread = await invoke<ChatThread>("start_explore_chat", {
@@ -3781,9 +3825,18 @@ function App() {
       setChatThread(thread);
       markChatThreadSeen(thread);
       await refreshChatHistorySummaries();
+      track("explore question completed", {
+        ...exploreQuestionProperties,
+        result: "success",
+      });
       return true;
     } catch (err) {
       if (!chatThread?.id || !isMissingChatThreadError(err)) {
+        track("explore question completed", {
+          ...exploreQuestionProperties,
+          result: "failed",
+          error_kind: errorKindFromText(String(err)),
+        });
         setError(String(err));
         return false;
       }
@@ -3806,8 +3859,19 @@ function App() {
         setChatHistoryOpen(false);
         await refreshChatHistorySummaries();
         setError(null);
+        track("explore question completed", {
+          ...exploreQuestionProperties,
+          result: "success",
+          recovered_thread: true,
+        });
         return true;
       } catch (retryErr) {
+        track("explore question completed", {
+          ...exploreQuestionProperties,
+          result: "failed",
+          error_kind: errorKindFromText(String(retryErr)),
+          recovered_thread: false,
+        });
         setError(String(retryErr));
         return false;
       }
@@ -3846,6 +3910,13 @@ function App() {
     const launchedThreadId = maintainThread.id;
     setBusy("Starting Maintain discussion");
     setError(null);
+    const maintainDiscussionProperties = {
+      task: selectedMaintainTask.id,
+      command: selectedMaintainTask.command,
+      question_length: question.length,
+      selected_path_present: Boolean(selectedPath),
+    };
+    track("maintain discussion started", maintainDiscussionProperties);
     try {
       const thread = await invoke<ChatThread>("start_maintain_discussion", {
         threadId: launchedThreadId,
@@ -3860,7 +3931,16 @@ function App() {
         setMaintainStage(maintainStageFromThread(thread));
       }
       await refreshMaintainHistorySummaries();
+      track("maintain discussion completed", {
+        ...maintainDiscussionProperties,
+        result: "success",
+      });
     } catch (err) {
+      track("maintain discussion completed", {
+        ...maintainDiscussionProperties,
+        result: "failed",
+        error_kind: errorKindFromText(String(err)),
+      });
       setError(String(err));
     } finally {
       setBusy(null);
@@ -4793,14 +4873,14 @@ function App() {
               <button
                 type="button"
                 className={rightPanelMode === "explore" ? "active" : ""}
-                onClick={() => setRightPanelMode("explore")}
+                onClick={() => changeRightPanelMode("explore")}
               >
                 Explore
               </button>
               <button
                 type="button"
                 className={rightPanelMode === "maintain" ? "active" : ""}
-                onClick={() => setRightPanelMode("maintain")}
+                onClick={() => changeRightPanelMode("maintain")}
               >
                 Maintain
               </button>
