@@ -302,7 +302,7 @@ code {
 
 .workflow-grid {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(6, minmax(0, 1fr));
   gap: 12px;
   margin-top: 30px;
 }
@@ -445,7 +445,8 @@ code {
   object-position: top center;
 }
 
-.guide-cards article:nth-child(5) img {
+.guide-cards article:nth-child(5) img,
+.guide-cards article:nth-child(6) img {
   object-position: top center;
 }
 

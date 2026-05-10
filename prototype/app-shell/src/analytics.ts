@@ -5,6 +5,9 @@ type AnalyticsProperties = Record<string, boolean | number | string | string[] |
 
 const posthogKey = import.meta.env.VITE_POSTHOG_KEY;
 const posthogHost = import.meta.env.VITE_POSTHOG_HOST || "https://us.i.posthog.com";
+const posthogReplayEnabled = import.meta.env.VITE_POSTHOG_REPLAY_ENABLED !== "false";
+const posthogFullReplay = import.meta.env.VITE_POSTHOG_FULL_REPLAY !== "false";
+const posthogReplaySampleRate = readSampleRate(import.meta.env.VITE_POSTHOG_REPLAY_SAMPLE_RATE);
 const redactedPropertyNames = new Set([
   "$city_name",
   "$current_url",
@@ -34,6 +37,13 @@ const redactedPropertyPrefixes = [
 
 let initialized = false;
 let analyticsContext: AnalyticsProperties = {};
+
+function readSampleRate(value: string | undefined): number {
+  if (value === undefined || value.trim() === "") return 1;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return 1;
+  return Math.min(Math.max(parsed, 0), 1);
+}
 
 function hasAnalyticsConfig() {
   return Boolean(posthogKey && posthogHost);
@@ -82,18 +92,51 @@ function initializePostHog() {
     capture_pageview: false,
     capture_pageleave: false,
     capture_dead_clicks: false,
-    disable_session_recording: true,
+    disable_session_recording: !posthogReplayEnabled,
+    enable_recording_console_log: false,
+    capture_performance: false,
+    session_recording: {
+      sampleRate: posthogReplaySampleRate,
+      maskAllInputs: !posthogFullReplay,
+      maskTextSelector: posthogFullReplay ? null : undefined,
+      maskInputOptions: posthogFullReplay
+        ? {
+            color: false,
+            date: false,
+            "datetime-local": false,
+            email: false,
+            month: false,
+            number: false,
+            range: false,
+            search: false,
+            select: false,
+            tel: false,
+            text: false,
+            time: false,
+            url: false,
+            week: false,
+            textarea: false,
+            password: false,
+          }
+        : undefined,
+      recordHeaders: false,
+      recordBody: false,
+    },
     disable_surveys: true,
     opt_out_capturing_by_default: false,
     person_profiles: "never",
     persistence: "localStorage",
-    advanced_disable_flags: true,
+    advanced_disable_flags: false,
+    advanced_disable_feature_flags_on_first_load: true,
     before_send: beforeSend,
     property_denylist: Array.from(redactedPropertyNames),
   });
 
   initialized = true;
   posthog.opt_in_capturing();
+  if (posthogReplayEnabled) {
+    posthog.startSessionRecording(true);
+  }
 }
 
 export function setAnalyticsContext(properties: AnalyticsProperties) {

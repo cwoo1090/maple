@@ -406,6 +406,7 @@ function parseRunnerJson<T>(runner: RunnerOutput | null): T | null {
 const IMAGE_EXT_REGEX = /\.(apng|avif|gif|jpe?g|png|svg|webp)$/i;
 const PDF_EXT_REGEX = /\.pdf$/i;
 const PPTX_EXT_REGEX = /\.pptx?$/i;
+const TEXT_EXT_REGEX = /\.txt$/i;
 const CHAT_PROGRESS_ERROR_PREFIX = "Failed to read chat progress:";
 const MAINTAIN_DISCUSSION_PROGRESS_ERROR_PREFIX = "Failed to read maintain discussion progress:";
 const OPERATION_PROGRESS_ERROR_PREFIX = "Failed to read operation progress:";
@@ -3108,7 +3109,7 @@ function App() {
         return;
       }
 
-      if (!selectedPath.endsWith(".md")) {
+      if (!selectedPath.endsWith(".md") && !TEXT_EXT_REGEX.test(selectedPath)) {
         setSelectedDocument({ path: selectedPath, content: null });
         return;
       }
@@ -5189,11 +5190,13 @@ function App() {
                       ? "PDF"
                       : PPTX_EXT_REGEX.test(selectedPath)
                         ? "Slides"
-                        : selectedPath.startsWith("wiki/")
-                          ? "Wiki page"
-                          : selectedPath.startsWith("sources/")
-                            ? "Source"
-                          : "Workspace file"}
+                        : TEXT_EXT_REGEX.test(selectedPath)
+                          ? "Text"
+                          : selectedPath.startsWith("wiki/")
+                            ? "Wiki page"
+                            : selectedPath.startsWith("sources/")
+                              ? "Source"
+                              : "Workspace file"}
                 </span>
               ) : null}
               <div className="view-toggle">
@@ -5341,6 +5344,10 @@ function App() {
               ) : (
                 <div className="pptx-status">Rendering slides…</div>
               )
+            ) : TEXT_EXT_REGEX.test(selectedPath) ? (
+              <PlainTextDocument
+                content={selectedDocument.content ?? `${selectedDocument.path} is not available.`}
+              />
             ) : (
               <MarkdownDocument
                 content={selectedDocument.content ?? `${selectedDocument.path} is not available.`}
@@ -7618,6 +7625,14 @@ function MarkdownDocument({
       >
         {renderedContent}
       </ReactMarkdown>
+    </article>
+  );
+}
+
+function PlainTextDocument({ content }: { content: string }) {
+  return (
+    <article className="plain-text-document">
+      <pre>{content}</pre>
     </article>
   );
 }

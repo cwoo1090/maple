@@ -4120,19 +4120,10 @@ async fn read_workspace_file(
     let normalized_path = normalize_workspace_relative_path(&relative_path)?;
     let normalized = normalized_path.to_string_lossy().replace('\\', "/");
 
-    let is_root_file = normalized_path.components().count() == 1;
-    let is_readable_root_markdown =
-        is_root_file && !should_hide_workspace_file(&normalized) && normalized.ends_with(".md");
-
-    if !is_readable_root_markdown
-        && !normalized.starts_with("wiki/")
-        && !normalized.starts_with("sources/")
-    {
-        return Err("Only workspace files can be read by the app preview".to_string());
-    }
-
-    if normalized_path.extension().and_then(|value| value.to_str()) != Some("md") {
-        return Err("Only markdown files can be read by the app preview".to_string());
+    if !is_readable_workspace_preview_path(&normalized_path, &normalized) {
+        return Err(
+            "Only markdown and source text files can be read by the app preview".to_string(),
+        );
     }
 
     let full_path = workspace.join(&normalized_path);
@@ -4154,6 +4145,22 @@ async fn read_workspace_file(
         path: normalized,
         content,
     })
+}
+
+fn is_readable_workspace_preview_path(normalized_path: &Path, normalized: &str) -> bool {
+    let extension = normalized_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let is_root_file = normalized_path.components().count() == 1;
+    let is_readable_root_markdown =
+        is_root_file && !should_hide_workspace_file(normalized) && extension == "md";
+    let is_markdown_workspace_file = extension == "md"
+        && (normalized.starts_with("wiki/") || normalized.starts_with("sources/"));
+    let is_source_text_file = extension == "txt" && normalized.starts_with("sources/");
+
+    is_readable_root_markdown || is_markdown_workspace_file || is_source_text_file
 }
 
 #[tauri::command]
@@ -7026,18 +7033,18 @@ mod tests {
         compose_maintain_operation_instruction, dedupe_node_path_candidates,
         default_workspace_schema, ensure_maintain_thread_task_matches,
         extract_partial_answer_from_events, finalize_provider_check_report,
-        initialize_workspace_files, load_state_at, login_command_for_settings,
-        maintain_operation_assistant_text, maintain_operation_user_text, make_chat_thread,
-        make_maintain_thread, node_version_supported, normalize_operation_events,
-        normalize_settings, parse_node_major, parse_provider_ready, provider_choice_required,
-        provider_ready_candidate_count, provider_simulation_value_matches,
-        read_requested_or_new_chat_thread, read_text_tail, read_thread_file,
-        refresh_maintain_operation_messages, refresh_streaming_messages, run_command_probe,
-        runner_path_env, schema_update_prompt_for_workspace, select_node_candidate,
-        shell_single_quote, terminal_command_script, thread_activity_context,
-        validate_provider_candidate, validate_provider_path, write_schema_update_marker,
-        AppSettings, ChatThreadMessage, NodeCandidate, NodePathCandidate, ProviderCandidate,
-        ProviderPathCandidate, ThreadFileKind,
+        initialize_workspace_files, is_readable_workspace_preview_path, load_state_at,
+        login_command_for_settings, maintain_operation_assistant_text,
+        maintain_operation_user_text, make_chat_thread, make_maintain_thread,
+        node_version_supported, normalize_operation_events, normalize_settings, parse_node_major,
+        parse_provider_ready, provider_choice_required, provider_ready_candidate_count,
+        provider_simulation_value_matches, read_requested_or_new_chat_thread, read_text_tail,
+        read_thread_file, refresh_maintain_operation_messages, refresh_streaming_messages,
+        run_command_probe, runner_path_env, schema_update_prompt_for_workspace,
+        select_node_candidate, shell_single_quote, terminal_command_script,
+        thread_activity_context, validate_provider_candidate, validate_provider_path,
+        write_schema_update_marker, AppSettings, ChatThreadMessage, NodeCandidate,
+        NodePathCandidate, ProviderCandidate, ProviderPathCandidate, ThreadFileKind,
     };
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -7098,6 +7105,35 @@ mod tests {
         }
 
         let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn workspace_preview_allows_source_text_files() {
+        assert!(is_readable_workspace_preview_path(
+            Path::new("sources/lecture.txt"),
+            "sources/lecture.txt"
+        ));
+        assert!(is_readable_workspace_preview_path(
+            Path::new("sources/lecture.md"),
+            "sources/lecture.md"
+        ));
+        assert!(is_readable_workspace_preview_path(
+            Path::new("wiki/concepts/page.md"),
+            "wiki/concepts/page.md"
+        ));
+        assert!(is_readable_workspace_preview_path(
+            Path::new("index.md"),
+            "index.md"
+        ));
+
+        assert!(!is_readable_workspace_preview_path(
+            Path::new("wiki/concepts/page.txt"),
+            "wiki/concepts/page.txt"
+        ));
+        assert!(!is_readable_workspace_preview_path(
+            Path::new("notes.txt"),
+            "notes.txt"
+        ));
     }
 
     #[test]

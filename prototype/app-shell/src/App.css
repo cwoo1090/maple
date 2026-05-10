@@ -1352,6 +1352,22 @@ button.tree-name-clickable {
   background: var(--bg-elevated);
 }
 
+.plain-text-document {
+  width: 100%;
+  max-width: 920px;
+  margin: 0 auto;
+  color: var(--text);
+  font-size: var(--reading-font-size, 15px);
+  line-height: 1.65;
+}
+
+.plain-text-document pre {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: inherit;
+}
+
 .center-connections {
   position: fixed;
   right: calc(var(--right-panel-width, 320px) + 18px);
