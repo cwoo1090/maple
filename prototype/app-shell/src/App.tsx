@@ -5077,7 +5077,13 @@ function App() {
               removeDisabledReason={sourceRemoveBlockedReason}
             />
             {sourceFiles.length === 0 ? (
-              <p className="sidebar-empty">No sources imported yet.</p>
+              <div className="sidebar-empty-guide">
+                <strong>Start with one topic.</strong>
+                <span>
+                  Import a small set of related sources, build the first wiki, then refine it
+                  before adding more.
+                </span>
+              </div>
             ) : null}
           </div>
           {hasPendingGeneratedChanges && unreviewedChangedFiles.length > 0 ? (
@@ -6169,6 +6175,22 @@ function App() {
                   <p>No pending source changes were detected.</p>
                 )}
               </div>
+
+              {buildDraft.requiresWorkspaceContext ? (
+                <section className="first-build-guide" aria-label="First build guide">
+                  <span className="first-build-guide-icon" aria-hidden="true">
+                    <Lightbulb size={16} strokeWidth={2.2} />
+                  </span>
+                  <div className="first-build-guide-copy">
+                    <strong>Build in layers</strong>
+                    <p>
+                      Use this first build for one topic or area. Review the wiki, refine{" "}
+                      <code>schema.md</code> or the structure in the Maintain tab, then add the
+                      next group of sources.
+                    </p>
+                  </div>
+                </section>
+              ) : null}
 
               {looksLikeExistingWikiImport && !buildDraft.force ? (
                 <section className="existing-wiki-choice" aria-label="Existing wiki import options">
