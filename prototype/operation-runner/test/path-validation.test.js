@@ -9,6 +9,7 @@ const {
   IMPROVE_WIKI_FORBIDDEN_PATHS,
   ORGANIZE_SOURCES_ALLOWED_PATHS,
   SOURCE_MANIFEST_PATH,
+  WIKI_MANIFEST_PATH,
   WIKI_HEALTHCHECK_ALLOWED_PATHS,
   WIKI_WRITE_ALLOWED_PATHS,
   UPDATE_RULES_ALLOWED_PATHS,
@@ -24,6 +25,8 @@ const {
   diffSnapshot,
   fallbackSelectPageNumbers,
   getSourceStatus,
+  getWikiStatus,
+  getOutsideWikiChanges,
   initializeWorkspace,
   isAllowedPath,
   isRunnerMetadataPath,
@@ -31,12 +34,16 @@ const {
   getReviewableChangedFiles,
   getUserVisibleChangedFiles,
   markSourcesIngested,
+  markWikiTrusted,
+  acceptOutsideWikiChanges,
+  undoOutsideWikiChanges,
   migrateLegacyWorkspace,
   normalizeLegacyWorkspaceReferences,
   normalizeOperationId,
   normalizeMarkdownMathDelimiters,
   normalizeRelativePath,
   parseExplorePageReferences,
+  parseSourcePathsJson,
   parseSlideSelectionJson,
   parseVisualInspectionPlanJson,
   readRenderedPdfResult,
@@ -48,6 +55,7 @@ const {
   validateAndRestoreChanges,
   workspaceAgentInstructions,
   writeSourceManifest,
+  writeWikiManifest,
   undoLastOperation,
   wikiSchemaTemplate,
 } = require("../src/operation-runner");
@@ -864,6 +872,122 @@ test("tracks source status from source manifest", async (t) => {
   assert.equal(status.files.find((file) => file.path === "sources/a.md")?.state, "removed");
 });
 
+test("tracks outside wiki changes from trusted wiki manifest", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "maple-wiki-status-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  await initializeWorkspace(workspace);
+  await fs.mkdir(path.join(workspace, "wiki", "concepts"), { recursive: true });
+  await fs.writeFile(path.join(workspace, "wiki", "concepts", "a.md"), "# A\n");
+
+  await writeWikiManifest(workspace, "wiki-base");
+  let status = await getWikiStatus(workspace);
+  assert.equal(status.manifestExists, true);
+  assert.equal(status.changedCount, 0);
+
+  await fs.writeFile(path.join(workspace, "wiki", "concepts", "a.md"), "# A changed\n");
+  await fs.writeFile(path.join(workspace, "wiki", "summaries", "b.md"), "# B\n");
+  await fs.rm(path.join(workspace, "schema.md"));
+
+  status = await getWikiStatus(workspace);
+  assert.equal(status.changedCount, 3);
+  assert.equal(status.changedFiles.find((file) => file.path === "wiki/concepts/a.md")?.state, "modified");
+  assert.equal(status.changedFiles.find((file) => file.path === "wiki/summaries/b.md")?.state, "added");
+  assert.equal(status.changedFiles.find((file) => file.path === "schema.md")?.state, "deleted");
+});
+
+test("accepting outside wiki changes does not clear pending sources", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "maple-wiki-accept-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  await initializeWorkspace(workspace);
+  await fs.writeFile(path.join(workspace, "sources", "a.md"), "alpha\n");
+  await fs.mkdir(path.join(workspace, "wiki", "concepts"), { recursive: true });
+  await fs.writeFile(path.join(workspace, "wiki", "concepts", "a.md"), "# A\n");
+  await writeWikiManifest(workspace, "wiki-base");
+
+  await fs.writeFile(path.join(workspace, "wiki", "concepts", "a.md"), "# A changed\n");
+  assert.equal((await getWikiStatus(workspace)).changedCount, 1);
+  assert.equal((await getSourceStatus(workspace)).pendingCount, 1);
+
+  const originalLog = console.log;
+  console.log = () => {};
+  t.after(() => {
+    console.log = originalLog;
+  });
+  await acceptOutsideWikiChanges(workspace);
+
+  assert.equal((await getWikiStatus(workspace)).changedCount, 0);
+  assert.equal((await getSourceStatus(workspace)).pendingCount, 1);
+});
+
+test("Maple-trusted wiki save clears outside wiki change status", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "maple-wiki-trusted-save-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  await initializeWorkspace(workspace);
+  await fs.mkdir(path.join(workspace, "wiki", "concepts"), { recursive: true });
+  await fs.writeFile(path.join(workspace, "wiki", "concepts", "a.md"), "# A\n");
+  await writeWikiManifest(workspace, "wiki-base");
+
+  await fs.writeFile(path.join(workspace, "wiki", "concepts", "a.md"), "# A saved in Maple\n");
+  assert.equal((await getWikiStatus(workspace)).changedCount, 1);
+
+  const originalLog = console.log;
+  console.log = () => {};
+  t.after(() => {
+    console.log = originalLog;
+  });
+  await markWikiTrusted(workspace, { source: "maple-manual-edit" });
+
+  assert.equal((await getWikiStatus(workspace)).changedCount, 0);
+});
+
+test("undoing outside wiki changes restores trusted baseline files", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "maple-wiki-undo-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  await initializeWorkspace(workspace);
+  await fs.mkdir(path.join(workspace, "wiki", "concepts"), { recursive: true });
+  await fs.writeFile(path.join(workspace, "wiki", "concepts", "a.md"), "# A\n");
+  await writeWikiManifest(workspace, "wiki-base");
+
+  await fs.writeFile(path.join(workspace, "wiki", "concepts", "a.md"), "# A changed\n");
+  await fs.writeFile(path.join(workspace, "wiki", "concepts", "b.md"), "# B\n");
+  await fs.rm(path.join(workspace, "schema.md"));
+
+  const originalLog = console.log;
+  console.log = () => {};
+  t.after(() => {
+    console.log = originalLog;
+  });
+  await undoOutsideWikiChanges(workspace);
+
+  assert.equal(await fs.readFile(path.join(workspace, "wiki", "concepts", "a.md"), "utf8"), "# A\n");
+  assert.equal(await pathExists(path.join(workspace, "wiki", "concepts", "b.md")), false);
+  assert.equal(await pathExists(path.join(workspace, "schema.md")), true);
+  assert.equal((await getWikiStatus(workspace)).changedCount, 0);
+});
+
+test("outside wiki changes are suppressed while Maple generated changes need review", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "maple-wiki-review-suppress-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  await initializeWorkspace(workspace);
+  await fs.mkdir(path.join(workspace, "wiki", "concepts"), { recursive: true });
+  await fs.writeFile(path.join(workspace, "wiki", "concepts", "a.md"), "# A\n");
+  await writeWikiManifest(workspace, "wiki-base");
+  await fs.writeFile(path.join(workspace, "wiki", "concepts", "a.md"), "# A changed\n");
+
+  const status = await getWikiStatus(workspace);
+  assert.equal(status.changedCount, 1);
+  assert.equal(getOutsideWikiChanges(status, null)?.changedCount, 1);
+  assert.equal(
+    getOutsideWikiChanges(status, {
+      operationId: "op-review",
+      changedFiles: [
+        { path: "wiki/concepts/a.md", status: "modified", allowed: true, restored: false },
+      ],
+    }),
+    null,
+  );
+});
+
 test("treats source renames with unchanged content as already ingested", async (t) => {
   const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "maple-source-rename-"));
   t.after(() => fs.rm(workspace, { recursive: true, force: true }));
@@ -1349,6 +1473,11 @@ test("new workspace schema scaffold documents wiki structure and durable rules",
   assert.match(schema, /## Cross-References/);
   assert.match(schema, /## Math Formatting/);
   assert.match(schema, /## Source Citations/);
+  assert.match(schema, /#Lstart-Lend/);
+  assert.match(schema, /lecture-03\.txt#L15-L17/);
+  assert.match(schema, /lecture-03-notes\.md#attention-mechanism/);
+  assert.match(schema, /include that locator in the visible link label/);
+  assert.match(schema, /Do not use `#L\.\.\.` line anchors on Markdown source files/);
   assert.match(schema, /Web references are external links used during Explore Chat/);
   assert.match(schema, /found via Explore web search/);
   assert.match(schema, /## Visuals And Assets/);
@@ -1364,6 +1493,9 @@ test("new workspace schema scaffold documents wiki structure and durable rules",
   assert.match(schema, /Contradictions between pages/);
   assert.match(schema, /Web URLs incorrectly listed in frontmatter `sources`/);
   assert.match(schema, /Web-derived claims that lack inline URL citations/);
+  assert.match(schema, /Source citations that are not clickable Markdown links/);
+  assert.match(schema, /known exact locator is missing from the visible link label/);
+  assert.match(schema, /generated preview\/cache files/);
 });
 
 test("initializes a blank workspace without sample sources", async (t) => {
@@ -1752,5 +1884,65 @@ test("Improve Wiki prompt has build-level permissions without build ingestion la
   assert.match(prompt, /CLAUDE\.md/);
   assert.match(prompt, /may be moved or renamed only when the user explicitly asks/);
   assert.doesNotMatch(prompt, /pending source changes/);
+  assert.doesNotMatch(prompt, /Source-grounded improvement context/);
   assert.doesNotMatch(prompt, /source-manifest\.json.*successful build/);
+});
+
+test("Improve Wiki source grounding is opt-in and does not allow source edits", async () => {
+  const prompt = await buildMaintenancePrompt("/tmp/workspace", {
+    operationType: "improve-wiki",
+    label: "Improve wiki",
+    instruction: "Deepen weak explanations using the original material.",
+    allowedPathRules: IMPROVE_WIKI_ALLOWED_PATHS,
+    forbiddenPathRules: ["sources/**"],
+    sourceMoveOnly: true,
+    sourceStatus: {
+      files: [
+        { path: "sources/lecture-01.md", state: "unchanged" },
+        { path: "sources/lecture-02.pdf", state: "new" },
+      ],
+    },
+    sourceGrounding: {
+      sourcePaths: ["sources/lecture-01.md", "sources/lecture-02.pdf"],
+      preparedSources: {
+        sources: [
+          {
+            sourcePath: "sources/lecture-02.pdf",
+            textPath: ".aiwiki/extracted/op/lecture-02/text.md",
+            pageImages: [],
+            promptPageImages: [],
+            selectedPromptImages: [],
+          },
+        ],
+      },
+    },
+  });
+
+  assert.match(prompt, /Source-grounded improvement context/);
+  assert.match(prompt, /relevant source files/i);
+  assert.match(prompt, /Do not rebuild the wiki from scratch/);
+  assert.match(prompt, /Selected source files for this run/);
+  assert.match(prompt, /Forbidden write paths:\n- sources\/\*\*/);
+  assert.match(prompt, /Do not edit, create, rename, move, or delete files under sources\/\*\*/);
+  assert.match(prompt, /sources\/lecture-01\.md \(unchanged\)/);
+  assert.match(prompt, /sources\/lecture-02\.pdf \(new\)/);
+  assert.match(prompt, /Extracted text: \.aiwiki\/extracted\/op\/lecture-02\/text\.md/);
+  assert.doesNotMatch(prompt, /runner updates it only after a successful build/);
+});
+
+test("source picker JSON parser accepts only source-relative paths", () => {
+  assert.deepEqual(
+    parseSourcePathsJson('["sources/b.md", "sources/a.md", "sources/a.md"]'),
+    ["sources/a.md", "sources/b.md"],
+  );
+
+  assert.equal(parseSourcePathsJson(undefined), null);
+  assert.throws(
+    () => parseSourcePathsJson('["wiki/page.md"]'),
+    /Invalid selected source path/,
+  );
+  assert.throws(
+    () => parseSourcePathsJson('{"path":"sources/a.md"}'),
+    /must be a JSON array/,
+  );
 });

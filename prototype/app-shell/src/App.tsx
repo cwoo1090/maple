@@ -70,6 +70,8 @@ type WorkspaceState = {
   workspacePath: string;
   status: unknown | null;
   sourceStatus: SourceStatus | null;
+  wikiStatus: WikiStatus | null;
+  outsideWikiChanges: OutsideWikiChanges | null;
   changedMarker: {
     operationId?: string;
     operationType?: string;
@@ -111,6 +113,33 @@ type SourceStatus = {
   files: SourceStatusFile[];
 };
 
+type WikiChangeState = "added" | "modified" | "deleted" | "unchanged";
+
+type WikiStatusFile = {
+  path: string;
+  state?: WikiChangeState;
+  size?: number;
+  mtimeMs?: number;
+  sha256?: string;
+};
+
+type WikiStatus = {
+  changedCount: number;
+  lastTrustedAt?: string | null;
+  manifestPath?: string;
+  baselinePath?: string;
+  manifestExists?: boolean;
+  files: WikiStatusFile[];
+  changedFiles: WikiStatusFile[];
+};
+
+type OutsideWikiChanges = {
+  changedCount: number;
+  files: WikiStatusFile[];
+  canAccept?: boolean;
+  canUndo?: boolean;
+};
+
 type RunnerOutput = {
   success: boolean;
   code: number | null;
@@ -132,6 +161,39 @@ type SchemaUpdatePrompt = {
   latestHash: string;
 };
 
+type SchemaUpdateAvailability =
+  | "unknown"
+  | "checking"
+  | "available"
+  | "reopenable"
+  | "unavailable";
+
+function canReopenSchemaUpdatePrompt(prompt: SchemaUpdatePrompt): boolean {
+  return (
+    !prompt.available &&
+    prompt.currentHash !== prompt.latestHash &&
+    prompt.reason !== "customized_current_schema"
+  );
+}
+
+function schemaUpdateAvailabilityFromPrompt(
+  prompt: SchemaUpdatePrompt,
+): SchemaUpdateAvailability {
+  if (prompt.available) return "available";
+  if (canReopenSchemaUpdatePrompt(prompt)) return "reopenable";
+  return "unavailable";
+}
+
+function schemaUpdateUnavailableMessage(prompt: SchemaUpdatePrompt): string {
+  if (prompt.currentHash === prompt.latestHash) {
+    return "schema.md already uses the latest standard workspace schema.";
+  }
+  if (prompt.reason === "customized_current_schema") {
+    return "schema.md already includes the latest standard workspace schema plus workspace-specific rules.";
+  }
+  return "No new schema.md update is available.";
+}
+
 type WorkspaceFile = {
   path: string;
   content: string;
@@ -140,6 +202,20 @@ type WorkspaceFile = {
 type SelectedDocument = {
   path: string;
   content: string | null;
+};
+
+type EditBuffer = {
+  path: string;
+  original: string;
+  draft: string;
+  saving: boolean;
+};
+
+type UnsavedChoice = "save" | "discard" | "cancel";
+
+type UnsavedPrompt = {
+  path: string;
+  targetLabel: string;
 };
 
 type ExpandedImage = {
@@ -407,12 +483,21 @@ const IMAGE_EXT_REGEX = /\.(apng|avif|gif|jpe?g|png|svg|webp)$/i;
 const PDF_EXT_REGEX = /\.pdf$/i;
 const PPTX_EXT_REGEX = /\.pptx?$/i;
 const TEXT_EXT_REGEX = /\.txt$/i;
+const MARKDOWN_EXT_REGEX = /\.md$/i;
 const CHAT_PROGRESS_ERROR_PREFIX = "Failed to read chat progress:";
 const MAINTAIN_DISCUSSION_PROGRESS_ERROR_PREFIX = "Failed to read maintain discussion progress:";
 const OPERATION_PROGRESS_ERROR_PREFIX = "Failed to read operation progress:";
 const BACKGROUND_BUILD_PROGRESS_ERROR_PREFIX = "Failed to read background build progress:";
 const PENDING_GENERATED_CHANGES_ERROR =
   "Finish reviewing or undo generated changes before starting another workspace-changing action.";
+
+function rendersAsLineAddressableText(path: string): boolean {
+  return (
+    TEXT_EXT_REGEX.test(path) ||
+    (path.startsWith("sources/") && MARKDOWN_EXT_REGEX.test(path))
+  );
+}
+
 const LEFT_PANEL_WIDTH_KEY = "maple.leftPanelWidth";
 const RIGHT_PANEL_WIDTH_KEY = "maple.rightPanelWidth";
 const LEFT_PANEL_COLLAPSED_KEY = "maple.leftPanelCollapsed";
@@ -434,11 +519,13 @@ const MAX_LEFT_PANEL_WIDTH = 480;
 const MIN_RIGHT_PANEL_WIDTH = 260;
 const MAX_RIGHT_PANEL_WIDTH = 560;
 const MIN_CENTER_PANEL_WIDTH = 420;
+const MIN_COMPACT_CENTER_PANEL_WIDTH = 300;
 const RESIZE_HANDLE_WIDTH = 1;
 const DEFAULT_READING_TEXT_SIZE = 15;
 const MIN_READING_TEXT_SIZE = 12;
 const MAX_READING_TEXT_SIZE = 20;
 const READING_TEXT_SIZE_STEP = 1;
+type CompactRevealPanel = "left" | "right" | null;
 
 const MAINTAIN_TASKS: MaintainTaskConfig[] = [
   {
@@ -810,6 +897,19 @@ function sourceStateLabel(state: SourceState): string {
   }
 }
 
+function wikiChangeStateLabel(state: WikiChangeState | undefined): string {
+  switch (state) {
+    case "added":
+      return "Added";
+    case "modified":
+      return "Modified";
+    case "deleted":
+      return "Deleted";
+    default:
+      return "Changed";
+  }
+}
+
 function clampNumber(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max);
 }
@@ -849,6 +949,25 @@ function isEditableKeyboardTarget(target: EventTarget | null): boolean {
   if (target.isContentEditable) return true;
   const tagName = target.tagName.toLowerCase();
   return tagName === "input" || tagName === "textarea" || tagName === "select";
+}
+
+function isDirectlyEditableWorkspaceFile(path: string): boolean {
+  if (!path || path.split("/").some((part) => part.startsWith("."))) return false;
+  if (path === "schema.md" || path === "AGENTS.md" || path === "CLAUDE.md") return true;
+  return path.endsWith(".md") && path.startsWith("wiki/") && !path.startsWith("wiki/assets/");
+}
+
+function workspaceFileKindLabel(path: string): string {
+  if (path === "schema.md") return "Wiki rules";
+  if (path === "AGENTS.md") return "Codex instructions";
+  if (path === "CLAUDE.md") return "Claude instructions";
+  if (IMAGE_EXT_REGEX.test(path)) return "Image";
+  if (PDF_EXT_REGEX.test(path)) return "PDF";
+  if (PPTX_EXT_REGEX.test(path)) return "Slides";
+  if (TEXT_EXT_REGEX.test(path)) return "Text";
+  if (path.startsWith("wiki/")) return "Wiki page";
+  if (path.startsWith("sources/")) return "Source";
+  return "Workspace file";
 }
 
 function mergeOperationProgress(
@@ -968,6 +1087,8 @@ type CommandName =
   | "update_wiki_rules"
   | "undo_last_operation"
   | "keep_generated_changes"
+  | "accept_outside_wiki_changes"
+  | "undo_outside_wiki_changes"
   | "cancel_build"
   | "discard_interrupted_operation";
 
@@ -986,6 +1107,8 @@ const emptyState: WorkspaceState = {
   workspacePath: "",
   status: null,
   sourceStatus: null,
+  wikiStatus: null,
+  outsideWikiChanges: null,
   changedMarker: null,
   indexMd: null,
   logMd: null,
@@ -1115,6 +1238,10 @@ function App() {
     path: "index.md",
     content: null,
   });
+  const [editBuffer, setEditBuffer] = useState<EditBuffer | null>(null);
+  const [unsavedPrompt, setUnsavedPrompt] = useState<UnsavedPrompt | null>(null);
+  const unsavedPromptResolverRef = useRef<((choice: UnsavedChoice) => void) | null>(null);
+  const [linkGraphRefreshKey, setLinkGraphRefreshKey] = useState(0);
   const [expandedImage, setExpandedImage] = useState<ExpandedImage | null>(null);
   const [sofficeStatus, setSofficeStatus] = useState<SofficeStatus | null>(null);
   const [sofficeInstalling, setSofficeInstalling] = useState(false);
@@ -1134,6 +1261,8 @@ function App() {
   const [applyDraft, setApplyDraft] = useState<ApplyDraft>(null);
   const [buildDraft, setBuildDraft] = useState<BuildDraft>(null);
   const [schemaUpdatePrompt, setSchemaUpdatePrompt] = useState<SchemaUpdatePrompt | null>(null);
+  const [schemaUpdateAvailability, setSchemaUpdateAvailability] =
+    useState<SchemaUpdateAvailability>("unknown");
   const [schemaUpdateContentOpen, setSchemaUpdateContentOpen] = useState(false);
   const [aiSetupPromptReason, setAiSetupPromptReason] = useState<AiSetupPromptReason>(null);
   const [aiSetupReadyNoticeReason, setAiSetupReadyNoticeReason] =
@@ -1143,6 +1272,13 @@ function App() {
   const [selectedMaintainTaskId, setSelectedMaintainTaskId] = useState<MaintainTaskId | null>(null);
   const [maintainInstruction, setMaintainInstruction] = useState("");
   const [maintainAskOnly, setMaintainAskOnly] = useState(false);
+  const [maintainUseSources, setMaintainUseSources] = useState(false);
+  const [maintainSelectedSourcePaths, setMaintainSelectedSourcePaths] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const [maintainSourcePickerExpanded, setMaintainSourcePickerExpanded] = useState<Set<string>>(
+    () => new Set(),
+  );
   const [buildStatusStep, setBuildStatusStep] = useState(0);
   const [maintainStatusStep, setMaintainStatusStep] = useState(0);
   const [maintainLastResult, setMaintainLastResult] = useState<{
@@ -1221,6 +1357,8 @@ function App() {
   const [rightPanelCollapsed, setRightPanelCollapsed] = useState(() =>
     readStoredPanelCollapsed(RIGHT_PANEL_COLLAPSED_KEY, LEGACY_RIGHT_PANEL_COLLAPSED_KEY),
   );
+  const [layoutWidth, setLayoutWidth] = useState(() => window.innerWidth);
+  const [compactRevealPanel, setCompactRevealPanel] = useState<CompactRevealPanel>(null);
   const [readingTextSize, setReadingTextSize] = useState(readStoredReadingTextSize);
   const [pptxRender, setPptxRender] = useState<{
     sourcePath: string;
@@ -1487,7 +1625,11 @@ function App() {
     ? "Maintain discussion is answering. Wait for it to finish before updating schema.md."
     : blockingUiBusy && activeOperationLabel
     ? `${activeOperationLabel} is running. Wait for it to finish before updating schema.md.`
+    : writeActionBlocked
+    ? "A workspace action is running. Wait for it to finish before updating schema.md."
     : null;
+  const schemaUpdateButtonTitle =
+    "Review the latest standard workspace schema before updating schema.md";
   const workspaceUpdateExploreNotice = activeWorkspaceWriteLabel
     ? "A workspace update is running. Chat can answer from the current saved files, but may not include changes still being generated."
     : null;
@@ -1556,13 +1698,42 @@ function App() {
     ? selectedMaintainTask.label
     : "New task";
   const sourceStatus = workspace.sourceStatus;
+  const outsideWikiChanges = workspace.outsideWikiChanges;
   const pendingSourceFiles = useMemo(
     () => (sourceStatus?.files ?? []).filter((file) => file.state !== "unchanged"),
     [sourceStatus?.files],
   );
   const pendingSourceCount = sourceStatus?.pendingCount ?? pendingSourceFiles.length;
+  const outsideWikiChangedFiles = outsideWikiChanges?.files ?? [];
+  const outsideWikiChangeCount = outsideWikiChanges?.changedCount ?? outsideWikiChangedFiles.length;
+  const hasOutsideWikiChanges = outsideWikiChangeCount > 0;
   const rootFiles = workspace.rootFiles ?? [];
   const sourceFiles = workspace.sourceFiles ?? [];
+  const maintainSelectedSourcePathList = useMemo(
+    () => sourceFiles.filter((path) => maintainSelectedSourcePaths.has(path)),
+    [maintainSelectedSourcePaths, sourceFiles],
+  );
+  const maintainSourceGroundingAvailable = selectedMaintainTask?.id === "improveWiki";
+  const maintainSourceGroundingDisabled = Boolean(
+    !maintainSourceGroundingAvailable || maintainAskOnly || sourceFiles.length === 0,
+  );
+  const maintainSourceSelectionRequired = Boolean(
+    maintainSourceGroundingAvailable &&
+      maintainUseSources &&
+      sourceFiles.length > 0 &&
+      maintainSelectedSourcePathList.length === 0,
+  );
+  useEffect(() => {
+    setMaintainSelectedSourcePaths((previous) => {
+      if (previous.size === 0) return previous;
+      const available = new Set(sourceFiles);
+      const next = new Set<string>();
+      for (const sourcePath of previous) {
+        if (available.has(sourcePath)) next.add(sourcePath);
+      }
+      return next.size === previous.size ? previous : next;
+    });
+  }, [sourceFiles]);
   const wikiPages = useMemo(
     () => workspace.wikiFiles.filter((file) => file.endsWith(".md")),
     [workspace.wikiFiles],
@@ -1631,6 +1802,38 @@ function App() {
   );
   const activeReportContent =
     activeCenterTab?.kind === "report" ? activeCenterTab.content : null;
+  const editDirty = Boolean(editBuffer && editBuffer.draft !== editBuffer.original);
+  const editActiveForSelectedPath = Boolean(
+    editBuffer && editBuffer.path === selectedPath && viewMode === "page" && !activeReportContent,
+  );
+  const selectedPathEditable = isDirectlyEditableWorkspaceFile(selectedPath);
+  const editBlockedReason =
+    !selectedPathEditable
+      ? "This file is read-only."
+      : hasPendingGeneratedChanges
+        ? PENDING_GENERATED_CHANGES_ERROR
+        : activeWorkspaceWriteLabel
+          ? `${activeWorkspaceWriteLabel} is running. Wait for it to finish before editing.`
+          : blockingUiBusy && activeOperationLabel
+            ? `${activeOperationLabel} is running. Wait for it to finish before editing.`
+            : null;
+  const canStartEditing = Boolean(
+    workspace.workspacePath &&
+      !activeReportContent &&
+      viewMode === "page" &&
+      selectedPathEditable &&
+      !editBlockedReason,
+  );
+  const editStatusLabel = editBuffer?.saving ? "Saving" : editDirty ? "Unsaved" : "Saved";
+  const schemaUpdateButtonVisible = Boolean(
+    selectedPath === "schema.md" &&
+      viewMode === "page" &&
+      !activeReportContent &&
+      !editActiveForSelectedPath &&
+      !editDirty &&
+      !schemaUpdateBlockedReason &&
+      (schemaUpdateAvailability === "available" || schemaUpdateAvailability === "reopenable"),
+  );
   const canUndo = hasPendingGeneratedChanges;
   const hasPendingSourceChanges = pendingSourceCount > 0;
   const looksLikeExistingWikiImport = Boolean(
@@ -1763,10 +1966,12 @@ function App() {
     ? maintainDiscussionBusy
       ? "Maintain discussion is already answering"
       : exploreBlockedReason ?? "Ask without creating wiki changes"
-    : maintainBlockedReason ?? selectedMaintainTask?.actionLabel;
+    : maintainSourceSelectionRequired
+      ? "Choose at least one source."
+      : maintainBlockedReason ?? selectedMaintainTask?.actionLabel;
   const maintainSubmitDisabled = maintainAskOnly
     ? !maintainCanAskOnly
-    : !maintainCanRun;
+    : !maintainCanRun || maintainSourceSelectionRequired;
   const activeModelId = activeProvider
     ? appSettings?.models[activeProvider.name] || activeProvider.defaultModel
     : "";
@@ -1905,18 +2110,106 @@ function App() {
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(
     () => new Set(["sources", "wiki"]),
   );
+  const userLeftFootprint = leftPanelCollapsed ? 0 : leftPanelWidth + RESIZE_HANDLE_WIDTH;
+  const userRightFootprint = rightPanelCollapsed ? 0 : rightPanelWidth + RESIZE_HANDLE_WIDTH;
+  const layoutUnderPressure =
+    layoutWidth > 0 &&
+    userLeftFootprint + MIN_CENTER_PANEL_WIDTH + userRightFootprint > layoutWidth;
+  const revealLeftUnderPressure =
+    layoutUnderPressure && compactRevealPanel === "left" && !leftPanelCollapsed;
+  const bodyCenterMinWidth = layoutUnderPressure
+    ? MIN_COMPACT_CENTER_PANEL_WIDTH
+    : MIN_CENTER_PANEL_WIDTH;
+  const topbarCenterMinWidth = layoutUnderPressure ? 0 : MIN_CENTER_PANEL_WIDTH;
+  const leftPanelEffectivelyCollapsed =
+    leftPanelCollapsed || (layoutUnderPressure && !revealLeftUnderPressure);
+  const rightPanelEffectivelyCollapsed =
+    rightPanelCollapsed || (layoutUnderPressure && revealLeftUnderPressure);
+  const leftPanelColumnWidth = leftPanelEffectivelyCollapsed
+    ? 0
+    : clampNumber(
+        leftPanelWidth,
+        MIN_LEFT_PANEL_WIDTH,
+        Math.max(
+          MIN_LEFT_PANEL_WIDTH,
+          Math.min(
+            MAX_LEFT_PANEL_WIDTH,
+            layoutWidth -
+              bodyCenterMinWidth -
+              (rightPanelEffectivelyCollapsed ? 0 : MIN_RIGHT_PANEL_WIDTH + RESIZE_HANDLE_WIDTH) -
+              RESIZE_HANDLE_WIDTH,
+          ),
+        ),
+      );
+  const rightPanelColumnWidth = rightPanelEffectivelyCollapsed
+    ? 0
+    : clampNumber(
+        rightPanelWidth,
+        MIN_RIGHT_PANEL_WIDTH,
+        Math.max(
+          MIN_RIGHT_PANEL_WIDTH,
+          Math.min(
+            MAX_RIGHT_PANEL_WIDTH,
+            layoutWidth -
+              bodyCenterMinWidth -
+              (leftPanelEffectivelyCollapsed ? 0 : leftPanelColumnWidth + RESIZE_HANDLE_WIDTH) -
+              RESIZE_HANDLE_WIDTH,
+          ),
+        ),
+      );
   const bodyGridTemplateColumns = `${
-    leftPanelCollapsed ? 0 : leftPanelWidth
-  }px ${leftPanelCollapsed ? 0 : RESIZE_HANDLE_WIDTH}px minmax(${MIN_CENTER_PANEL_WIDTH}px, 1fr) ${
-    rightPanelCollapsed ? 0 : RESIZE_HANDLE_WIDTH
-  }px ${rightPanelCollapsed ? 0 : rightPanelWidth}px`;
-  const topbarGridTemplateColumns = `${leftPanelCollapsed ? COLLAPSED_LEFT_HEADER_WIDTH : leftPanelWidth}px minmax(${MIN_CENTER_PANEL_WIDTH}px, 1fr) ${
-    rightPanelCollapsed
+    leftPanelEffectivelyCollapsed ? 0 : leftPanelColumnWidth
+  }px ${leftPanelEffectivelyCollapsed ? 0 : RESIZE_HANDLE_WIDTH}px minmax(${bodyCenterMinWidth}px, 1fr) ${
+    rightPanelEffectivelyCollapsed ? 0 : RESIZE_HANDLE_WIDTH
+  }px ${rightPanelEffectivelyCollapsed ? 0 : rightPanelColumnWidth}px`;
+  const topbarGridTemplateColumns = `${
+    leftPanelEffectivelyCollapsed ? COLLAPSED_LEFT_HEADER_WIDTH : leftPanelColumnWidth
+  }px minmax(${topbarCenterMinWidth}px, 1fr) ${
+    rightPanelEffectivelyCollapsed
       ? isRightTopbarBusy
         ? COLLAPSED_RIGHT_HEADER_BUSY_WIDTH
         : COLLAPSED_RIGHT_HEADER_WIDTH
-      : rightPanelWidth
+      : rightPanelColumnWidth
   }px`;
+  const appLayoutClass = layoutUnderPressure ? "layout-constrained" : "";
+
+  useEffect(() => {
+    function updateLayoutWidth() {
+      const nextWidth = Math.round(
+        appBodyRef.current?.getBoundingClientRect().width || window.innerWidth,
+      );
+      setLayoutWidth((currentWidth) => (currentWidth === nextWidth ? currentWidth : nextWidth));
+    }
+
+    updateLayoutWidth();
+    window.addEventListener("resize", updateLayoutWidth);
+
+    const observedBody = appBodyRef.current;
+    const observer =
+      typeof ResizeObserver === "undefined" || !observedBody
+        ? null
+        : new ResizeObserver(updateLayoutWidth);
+    if (observedBody) observer?.observe(observedBody);
+
+    return () => {
+      window.removeEventListener("resize", updateLayoutWidth);
+      observer?.disconnect();
+    };
+  }, [workspace.workspacePath]);
+
+  useEffect(() => {
+    if (!compactRevealPanel) return;
+    if (!layoutUnderPressure) {
+      setCompactRevealPanel(null);
+      return;
+    }
+    if (
+      (compactRevealPanel === "left" && leftPanelCollapsed) ||
+      (compactRevealPanel === "right" && rightPanelCollapsed)
+    ) {
+      setCompactRevealPanel(null);
+    }
+  }, [compactRevealPanel, layoutUnderPressure, leftPanelCollapsed, rightPanelCollapsed]);
 
   function startPanelResize(
     panel: "left" | "right",
@@ -1924,7 +2217,10 @@ function App() {
   ) {
     const body = appBodyRef.current;
     if (!body) return;
-    if ((panel === "left" && leftPanelCollapsed) || (panel === "right" && rightPanelCollapsed)) {
+    if (
+      (panel === "left" && leftPanelEffectivelyCollapsed) ||
+      (panel === "right" && rightPanelEffectivelyCollapsed)
+    ) {
       return;
     }
 
@@ -1935,12 +2231,19 @@ function App() {
     document.body.classList.add("panel-resizing");
 
     function resizePanel(moveEvent: PointerEvent) {
-      const leftFootprint = leftPanelCollapsed ? 0 : leftPanelWidth + RESIZE_HANDLE_WIDTH;
-      const rightFootprint = rightPanelCollapsed ? 0 : rightPanelWidth + RESIZE_HANDLE_WIDTH;
+      const centerMinWidth = layoutUnderPressure
+        ? MIN_COMPACT_CENTER_PANEL_WIDTH
+        : MIN_CENTER_PANEL_WIDTH;
+      const leftFootprint = leftPanelEffectivelyCollapsed
+        ? 0
+        : leftPanelColumnWidth + RESIZE_HANDLE_WIDTH;
+      const rightFootprint = rightPanelEffectivelyCollapsed
+        ? 0
+        : rightPanelColumnWidth + RESIZE_HANDLE_WIDTH;
       if (panel === "left") {
         const maxLeft = Math.min(
           MAX_LEFT_PANEL_WIDTH,
-          rect.width - MIN_CENTER_PANEL_WIDTH - RESIZE_HANDLE_WIDTH - rightFootprint,
+          rect.width - centerMinWidth - RESIZE_HANDLE_WIDTH - rightFootprint,
         );
         const nextLeft = clampNumber(
           moveEvent.clientX - rect.left,
@@ -1954,7 +2257,7 @@ function App() {
 
       const maxRight = Math.min(
         MAX_RIGHT_PANEL_WIDTH,
-        rect.width - MIN_CENTER_PANEL_WIDTH - RESIZE_HANDLE_WIDTH - leftFootprint,
+        rect.width - centerMinWidth - RESIZE_HANDLE_WIDTH - leftFootprint,
       );
       const nextRight = clampNumber(
         rect.right - moveEvent.clientX,
@@ -1978,19 +2281,29 @@ function App() {
   }
 
   function toggleLeftPanelCollapsed() {
-    setLeftPanelCollapsed((collapsed) => {
-      const next = !collapsed;
-      window.localStorage.setItem(LEFT_PANEL_COLLAPSED_KEY, String(next));
-      return next;
-    });
+    if (leftPanelEffectivelyCollapsed) {
+      setLeftPanelCollapsed(false);
+      window.localStorage.setItem(LEFT_PANEL_COLLAPSED_KEY, "false");
+      if (layoutUnderPressure) setCompactRevealPanel("left");
+      return;
+    }
+
+    setLeftPanelCollapsed(true);
+    window.localStorage.setItem(LEFT_PANEL_COLLAPSED_KEY, "true");
+    if (compactRevealPanel === "left") setCompactRevealPanel(null);
   }
 
   function toggleRightPanelCollapsed() {
-    setRightPanelCollapsed((collapsed) => {
-      const next = !collapsed;
-      window.localStorage.setItem(RIGHT_PANEL_COLLAPSED_KEY, String(next));
-      return next;
-    });
+    if (rightPanelEffectivelyCollapsed) {
+      setRightPanelCollapsed(false);
+      window.localStorage.setItem(RIGHT_PANEL_COLLAPSED_KEY, "false");
+      if (layoutUnderPressure) setCompactRevealPanel("right");
+      return;
+    }
+
+    setRightPanelCollapsed(true);
+    window.localStorage.setItem(RIGHT_PANEL_COLLAPSED_KEY, "true");
+    if (compactRevealPanel === "right") setCompactRevealPanel(null);
   }
 
   function changeRightPanelMode(mode: RightPanelMode) {
@@ -2023,7 +2336,97 @@ function App() {
     });
   }
 
-  function openWorkspaceFile(path: string, anchor: string | null = null) {
+  function resolveUnsavedPrompt(choice: UnsavedChoice) {
+    const resolver = unsavedPromptResolverRef.current;
+    unsavedPromptResolverRef.current = null;
+    setUnsavedPrompt(null);
+    resolver?.(choice);
+  }
+
+  function requestUnsavedChoice(targetLabel: string): Promise<UnsavedChoice> {
+    if (!editBuffer || !editDirty) return Promise.resolve("discard");
+    return new Promise((resolve) => {
+      unsavedPromptResolverRef.current = resolve;
+      setUnsavedPrompt({ path: editBuffer.path, targetLabel });
+    });
+  }
+
+  function discardEditBuffer() {
+    setEditBuffer(null);
+  }
+
+  function startEditingSelectedFile() {
+    if (!canStartEditing) {
+      if (editBlockedReason) setError(editBlockedReason);
+      return;
+    }
+    if (selectedDocument.path !== selectedPath || selectedDocument.content === null) {
+      setError(`Wait for ${selectedPath} to finish loading before editing.`);
+      return;
+    }
+    setError(null);
+    setEditBuffer({
+      path: selectedPath,
+      original: selectedDocument.content,
+      draft: selectedDocument.content,
+      saving: false,
+    });
+  }
+
+  async function saveEditBuffer(buffer = editBuffer): Promise<boolean> {
+    if (!buffer) return true;
+    if (!isDirectlyEditableWorkspaceFile(buffer.path)) {
+      setError("This file is read-only.");
+      return false;
+    }
+
+    setEditBuffer((current) =>
+      current && current.path === buffer.path ? { ...current, saving: true } : current,
+    );
+    setError(null);
+
+    try {
+      const result = await invoke<AppCommandResult>("save_workspace_file", {
+        relativePath: buffer.path,
+        content: buffer.draft,
+      });
+      setRunner(result.runner);
+      setWorkspace(result.state);
+      setSelectedDocument({ path: buffer.path, content: buffer.draft });
+      setEditBuffer((current) => (current && current.path === buffer.path ? null : current));
+      if (buffer.path.startsWith("wiki/")) {
+        setLinkGraphRefreshKey((value) => value + 1);
+      }
+      track("workspace file saved", {
+        path: buffer.path,
+        kind: workspaceFileKindLabel(buffer.path),
+      });
+      return true;
+    } catch (err) {
+      setError(String(err));
+      setEditBuffer((current) =>
+        current && current.path === buffer.path ? { ...current, saving: false } : current,
+      );
+      return false;
+    }
+  }
+
+  async function resolveDirtyEditBefore(targetLabel: string): Promise<boolean> {
+    if (!editBuffer) return true;
+    if (!editDirty) {
+      discardEditBuffer();
+      return true;
+    }
+    const choice = await requestUnsavedChoice(targetLabel);
+    if (choice === "cancel") return false;
+    if (choice === "discard") {
+      discardEditBuffer();
+      return true;
+    }
+    return saveEditBuffer(editBuffer);
+  }
+
+  function performOpenWorkspaceFile(path: string, anchor: string | null = null) {
     const tab = workspaceCenterTab(path);
     if (!wikiExploredTrackedRef.current && isWikiExplorationPath(path)) {
       wikiExploredTrackedRef.current = true;
@@ -2044,6 +2447,14 @@ function App() {
       next.add(path);
       return next;
     });
+  }
+
+  async function openWorkspaceFile(path: string, anchor: string | null = null) {
+    if (editBuffer && editBuffer.path !== path) {
+      const canLeave = await resolveDirtyEditBefore(`open ${displayFileName(path)}`);
+      if (!canLeave) return;
+    }
+    performOpenWorkspaceFile(path, anchor);
   }
 
   function canOpenDocumentReference(reference: string | null | undefined, currentPath = selectedPath) {
@@ -2067,15 +2478,17 @@ function App() {
       workspace.workspacePath,
     );
     if (!target) return false;
-    openWorkspaceFile(target.path, target.anchor);
+    void openWorkspaceFile(target.path, target.anchor);
     return true;
   }
 
   function openWorkspaceDocument(path: string, anchor: string | null = null) {
-    openWorkspaceFile(path, anchor);
+    void openWorkspaceFile(path, anchor);
   }
 
-  function openGraphTab() {
+  async function openGraphTab() {
+    const canLeave = await resolveDirtyEditBefore("open Graph");
+    if (!canLeave) return;
     const tab = graphCenterTab();
     setViewMode("graph");
     setActiveCenterTabId(tab.id);
@@ -2085,8 +2498,10 @@ function App() {
     });
   }
 
-  function openReportTab() {
+  async function openReportTab() {
     if (!workspace.reportMd) return;
+    const canLeave = await resolveDirtyEditBefore("open the operation report");
+    if (!canLeave) return;
     const operationId =
       maintainThread?.operationId ??
       workspace.changedMarker?.operationId ??
@@ -2132,7 +2547,14 @@ function App() {
     return summaries;
   }
 
-  function activateCenterTab(tab: CenterTab) {
+  async function activateCenterTab(tab: CenterTab) {
+    if (editBuffer) {
+      const targetPath = tab.kind === "workspace" ? tab.path : null;
+      if (targetPath !== editBuffer.path) {
+        const canLeave = await resolveDirtyEditBefore(`open ${tab.title}`);
+        if (!canLeave) return;
+      }
+    }
     setActiveCenterTabId(tab.id);
     if (tab.kind === "workspace") {
       setSelectedPath(tab.path);
@@ -2144,7 +2566,12 @@ function App() {
     }
   }
 
-  function closeCenterTab(tabId: string) {
+  async function closeCenterTab(tabId: string) {
+    const closingTab = centerTabs.find((tab) => tab.id === tabId);
+    if (closingTab?.kind === "workspace" && editBuffer?.path === closingTab.path) {
+      const canClose = await resolveDirtyEditBefore(`close ${closingTab.title}`);
+      if (!canClose) return;
+    }
     setCenterTabs((prev) => {
       const index = prev.findIndex((tab) => tab.id === tabId);
       if (index === -1) return prev;
@@ -2352,6 +2779,30 @@ function App() {
   }, [readingTextSize]);
 
   useEffect(() => {
+    if (!editDirty) return;
+    function handleBeforeUnload(event: BeforeUnloadEvent) {
+      event.preventDefault();
+      event.returnValue = "";
+    }
+    window.addEventListener("beforeunload", handleBeforeUnload);
+    return () => window.removeEventListener("beforeunload", handleBeforeUnload);
+  }, [editDirty]);
+
+  useEffect(() => {
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.defaultPrevented) return;
+      if (!(event.metaKey || event.ctrlKey)) return;
+      if (event.altKey || event.key.toLowerCase() !== "s") return;
+      if (!editBuffer || !editDirty || editBuffer.saving) return;
+      event.preventDefault();
+      void saveEditBuffer(editBuffer);
+    }
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [editBuffer, editDirty]);
+
+  useEffect(() => {
     function handleKeyDown(event: KeyboardEvent) {
       if (event.defaultPrevented) return;
       if (!(event.metaKey || event.ctrlKey)) return;
@@ -2381,6 +2832,10 @@ function App() {
 
   useEffect(() => {
     if (!workspace.workspacePath) {
+      setEditBuffer(null);
+      setUnsavedPrompt(null);
+      unsavedPromptResolverRef.current?.("cancel");
+      unsavedPromptResolverRef.current = null;
       setChatThread(null);
       setChatThreads([]);
       setSeenChatThreadUpdates({});
@@ -2435,6 +2890,9 @@ function App() {
         const maintainSummary = maintainSummaries.find((summary) => summary.id === maintainThread.id);
         const maintainStatus = normalizeThreadActivityStatus(maintainSummary?.activityStatus);
         setSelectedMaintainTaskId(taskId);
+        setMaintainUseSources(false);
+        setMaintainSelectedSourcePaths(new Set());
+        setMaintainSourcePickerExpanded(new Set());
         setMaintainStage(maintainStageFromThread(maintainThread, maintainStatus));
       } catch (err) {
         if (!cancelled) setError(`Failed to load chat history: ${String(err)}`);
@@ -2446,11 +2904,18 @@ function App() {
   }, [workspace.workspacePath]);
 
   useEffect(() => {
-    if (!workspace.workspacePath || writeActionBlocked) return;
+    if (!workspace.workspacePath) {
+      setSchemaUpdateAvailability("unknown");
+      return;
+    }
+    if (writeActionBlocked || hasPendingGeneratedChanges) return;
     let cancelled = false;
+    setSchemaUpdateAvailability("checking");
     invoke<SchemaUpdatePrompt>("check_schema_update_prompt")
       .then((prompt) => {
-        if (cancelled || !prompt.available) return;
+        if (cancelled) return;
+        setSchemaUpdateAvailability(schemaUpdateAvailabilityFromPrompt(prompt));
+        if (!prompt.available) return;
         setSchemaUpdatePrompt(prompt);
         setSchemaUpdateContentOpen(false);
         track("schema update prompt shown", {
@@ -2459,11 +2924,18 @@ function App() {
         });
         void invoke<void>("dismiss_schema_update_prompt").catch(() => {});
       })
-      .catch(() => {});
+      .catch(() => {
+        if (!cancelled) setSchemaUpdateAvailability("unknown");
+      });
     return () => {
       cancelled = true;
     };
-  }, [workspace.workspacePath, writeActionBlocked]);
+  }, [
+    hasPendingGeneratedChanges,
+    workspace.schemaMd,
+    workspace.workspacePath,
+    writeActionBlocked,
+  ]);
 
   useEffect(() => {
     if (!chatThread?.id || !isAskingWiki) return;
@@ -2672,7 +3144,7 @@ function App() {
         });
         const nextPath = chooseDocumentAfterCommand("build_wiki", state);
         if (nextPath) {
-          openWorkspaceFile(nextPath);
+          void openWorkspaceFile(nextPath);
         }
       } catch (err) {
         if (!cancelled) setError(`Failed to refresh completed build: ${String(err)}`);
@@ -2725,7 +3197,7 @@ function App() {
             });
             const nextPath = chooseDocumentAfterCommand("build_wiki", state);
             if (nextPath) {
-              openWorkspaceFile(nextPath);
+              void openWorkspaceFile(nextPath);
             }
           } else {
             track("wiki build completed", {
@@ -2988,13 +3460,16 @@ function App() {
 
   useEffect(() => {
     if (!availableDocuments.includes(selectedPath)) {
-      openWorkspaceFile("index.md");
+      void openWorkspaceFile("index.md");
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [availableDocuments, selectedPath]);
 
   useEffect(() => {
     if (!pendingAnchor) return;
+    if (selectedDocument.path !== selectedPath) return;
+    if (rendersAsLineAddressableText(selectedPath)) return;
+    if (!MARKDOWN_EXT_REGEX.test(selectedPath)) return;
     if (!selectedDocument.content) return;
     const id = pendingAnchor;
     const raf = requestAnimationFrame(() => {
@@ -3005,7 +3480,7 @@ function App() {
       setPendingAnchor(null);
     });
     return () => cancelAnimationFrame(raf);
-  }, [pendingAnchor, selectedDocument.content]);
+  }, [pendingAnchor, selectedDocument.content, selectedDocument.path, selectedPath]);
 
   useEffect(() => {
     let cancelled = false;
@@ -3061,6 +3536,7 @@ function App() {
     workspace.indexMd,
     workspace.logMd,
     workspace.changedMarker?.completedAt,
+    linkGraphRefreshKey,
   ]);
 
   useEffect(() => {
@@ -3222,7 +3698,7 @@ function App() {
       }
       const nextPath = chooseDocumentAfterCommand(command, result.state);
       if (nextPath) {
-        openWorkspaceFile(nextPath);
+        void openWorkspaceFile(nextPath);
       }
       if (command === "keep_generated_changes" || command === "undo_last_operation") {
         await refreshChatThreadSummaries();
@@ -3240,13 +3716,16 @@ function App() {
 
   async function openSchemaUpdatePrompt(manual = false) {
     if (!workspace.workspacePath) return;
+    setSchemaUpdateAvailability("checking");
+    if (manual) setError(null);
     try {
       const prompt = await invoke<SchemaUpdatePrompt>("check_schema_update_prompt");
-      if (prompt.currentHash === prompt.latestHash) {
-        if (manual) setError("schema.md already uses the latest standard workspace schema.");
+      setSchemaUpdateAvailability(schemaUpdateAvailabilityFromPrompt(prompt));
+      const canOpenDismissedUpdate = manual && canReopenSchemaUpdatePrompt(prompt);
+      if (!prompt.available && !canOpenDismissedUpdate) {
+        if (manual) setError(schemaUpdateUnavailableMessage(prompt));
         return;
       }
-      if (!manual && !prompt.available) return;
       setSchemaUpdatePrompt(prompt);
       setSchemaUpdateContentOpen(false);
       track("schema update prompt shown", {
@@ -3257,6 +3736,7 @@ function App() {
         void invoke<void>("dismiss_schema_update_prompt").catch(() => {});
       }
     } catch (err) {
+      setSchemaUpdateAvailability("unknown");
       if (manual) setError(String(err));
     }
   }
@@ -3284,7 +3764,7 @@ function App() {
       setWorkspace(result.state);
       setSchemaUpdatePrompt(null);
       setSchemaUpdateContentOpen(false);
-      openWorkspaceFile("schema.md");
+      void openWorkspaceFile("schema.md");
       await refreshWorkspaceOperationProgressOnce();
       track("schema update merge completed", {
         reason: schemaUpdatePrompt.reason,
@@ -3515,6 +3995,9 @@ function App() {
     setSelectedMaintainTaskId(taskId);
     setMaintainInstruction("");
     setMaintainAskOnly(false);
+    setMaintainUseSources(false);
+    setMaintainSelectedSourcePaths(new Set());
+    setMaintainSourcePickerExpanded(new Set());
     setMaintainLastResult(null);
     setMaintainStage("compose");
   }
@@ -3525,6 +4008,9 @@ function App() {
       setSelectedMaintainTaskId(null);
       setMaintainInstruction("");
       setMaintainAskOnly(false);
+      setMaintainUseSources(false);
+      setMaintainSelectedSourcePaths(new Set());
+      setMaintainSourcePickerExpanded(new Set());
       setMaintainLastResult(null);
       setMaintainStage("choose");
       setMaintainHistoryOpen(false);
@@ -3537,6 +4023,9 @@ function App() {
       setSelectedMaintainTaskId(null);
       setMaintainInstruction("");
       setMaintainAskOnly(false);
+      setMaintainUseSources(false);
+      setMaintainSelectedSourcePaths(new Set());
+      setMaintainSourcePickerExpanded(new Set());
       setMaintainLastResult(null);
       setMaintainStage("choose");
       setMaintainHistoryOpen(false);
@@ -3557,6 +4046,9 @@ function App() {
       setSelectedMaintainTaskId(taskId);
       setMaintainInstruction("");
       setMaintainAskOnly(false);
+      setMaintainUseSources(false);
+      setMaintainSelectedSourcePaths(new Set());
+      setMaintainSourcePickerExpanded(new Set());
       setMaintainLastResult(null);
       setMaintainStage(maintainStageFromThread(thread, status));
       setMaintainHistoryOpen(false);
@@ -3577,6 +4069,9 @@ function App() {
       setSelectedMaintainTaskId(taskId);
       setMaintainInstruction("");
       setMaintainAskOnly(false);
+      setMaintainUseSources(false);
+      setMaintainSelectedSourcePaths(new Set());
+      setMaintainSourcePickerExpanded(new Set());
       setMaintainLastResult(null);
       setMaintainStage(maintainStageFromThread(thread));
       await refreshMaintainHistorySummaries();
@@ -3589,6 +4084,9 @@ function App() {
     setSelectedMaintainTaskId(null);
     setMaintainInstruction("");
     setMaintainAskOnly(false);
+    setMaintainUseSources(false);
+    setMaintainSelectedSourcePaths(new Set());
+    setMaintainSourcePickerExpanded(new Set());
     setMaintainLastResult(null);
     setMaintainStage("choose");
   }
@@ -3599,6 +4097,64 @@ function App() {
       return;
     }
     resetMaintainFlow();
+  }
+
+  function defaultMaintainSourceSelection(): Set<string> {
+    if (selectedPath.startsWith("sources/") && sourceFiles.includes(selectedPath)) {
+      return new Set([selectedPath]);
+    }
+    return new Set(sourceFiles);
+  }
+
+  function setMaintainSourceGroundingEnabled(enabled: boolean) {
+    setMaintainUseSources(enabled);
+    if (!enabled) {
+      setMaintainSourcePickerExpanded(new Set());
+      return;
+    }
+    setMaintainSourcePickerExpanded(new Set());
+    setMaintainSelectedSourcePaths((previous) => {
+      const available = new Set(sourceFiles);
+      const next = new Set<string>();
+      for (const sourcePath of previous) {
+        if (available.has(sourcePath)) next.add(sourcePath);
+      }
+      return next.size > 0 ? next : defaultMaintainSourceSelection();
+    });
+  }
+
+  function toggleMaintainSourcePickerFolder(path: string) {
+    setMaintainSourcePickerExpanded((previous) => {
+      const next = new Set(previous);
+      if (next.has(path)) next.delete(path);
+      else next.add(path);
+      return next;
+    });
+  }
+
+  function toggleMaintainSourcePath(sourcePath: string) {
+    setMaintainSelectedSourcePaths((previous) => {
+      const next = new Set(previous);
+      if (next.has(sourcePath)) {
+        next.delete(sourcePath);
+      } else {
+        next.add(sourcePath);
+      }
+      return next;
+    });
+  }
+
+  function toggleMaintainSourceFolder(node: TreeNode) {
+    const paths = collectTreeLeafPaths(node);
+    const allSelected = paths.every((path) => maintainSelectedSourcePaths.has(path));
+    setMaintainSelectedSourcePaths((previous) => {
+      const next = new Set(previous);
+      for (const sourcePath of paths) {
+        if (allSelected) next.delete(sourcePath);
+        else next.add(sourcePath);
+      }
+      return next;
+    });
   }
 
   async function runMaintainCommand() {
@@ -3622,6 +4178,15 @@ function App() {
     }
     const launchedThreadId = maintainThread.id;
     const launchedTask = selectedMaintainTask;
+    const useSourcesForImproveWiki =
+      launchedTask.id === "improveWiki" && maintainUseSources && sourceFiles.length > 0;
+    const selectedSourcePathsForImproveWiki = useSourcesForImproveWiki
+      ? maintainSelectedSourcePathList
+      : [];
+    if (useSourcesForImproveWiki && selectedSourcePathsForImproveWiki.length === 0) {
+      setError("Choose at least one source for this wiki improvement.");
+      return;
+    }
     setBusy(selectedMaintainTask.busyLabel);
     setError(null);
     setWorkspaceOperationProgress(null);
@@ -3637,6 +4202,8 @@ function App() {
       command: launchedTask.command,
       has_instruction: Boolean(trimmedInstruction),
       instruction_length: trimmedInstruction.length,
+      use_sources: useSourcesForImproveWiki,
+      selected_source_count: selectedSourcePathsForImproveWiki.length,
     };
     track("maintain command started", maintainCommandProperties);
 
@@ -3645,6 +4212,8 @@ function App() {
         threadId: launchedThreadId,
         command: launchedTask.command,
         instruction: trimmedInstruction || null,
+        useSources: useSourcesForImproveWiki,
+        sourcePaths: selectedSourcePathsForImproveWiki,
       });
       const stillViewingLaunchedThread = currentMaintainThreadIdRef.current === launchedThreadId;
       setRunner(result.runner);
@@ -3653,6 +4222,9 @@ function App() {
         setMaintainThread(result.thread);
         markMaintainThreadSeen(result.thread);
         setMaintainInstruction("");
+        setMaintainUseSources(false);
+        setMaintainSelectedSourcePaths(new Set());
+        setMaintainSourcePickerExpanded(new Set());
         setMaintainLastResult({
           taskId: launchedTask.id,
           success: Boolean(result.runner?.success),
@@ -3663,7 +4235,7 @@ function App() {
       await refreshMaintainHistorySummaries();
       const nextPath = chooseDocumentAfterCommand(launchedTask.command, result.state);
       if (stillViewingLaunchedThread && nextPath) {
-        openWorkspaceFile(nextPath);
+        void openWorkspaceFile(nextPath);
       }
       if (result.error) {
         setError(result.error);
@@ -3991,7 +4563,7 @@ function App() {
       markChatThreadSeen(thread);
       const contextPath = latestChatContextPath(thread);
       if (contextPath && availableDocuments.includes(contextPath)) {
-        openWorkspaceFile(contextPath);
+        void openWorkspaceFile(contextPath);
       }
       setApplyDraft(null);
       setChatHistoryOpen(false);
@@ -4652,7 +5224,7 @@ function App() {
         />
         {canShowWikiUpdateReport ? (
           <div className="explore-chat-operation-actions">
-            <button type="button" onClick={openReportTab}>
+            <button type="button" onClick={() => void openReportTab()}>
               Show report
             </button>
           </div>
@@ -4733,14 +5305,14 @@ function App() {
 
   return (
     <main
-      className="app"
+      className={`app ${appLayoutClass}`}
       style={{ "--reading-font-size": `${readingTextSize}px` } as React.CSSProperties}
     >
       <header
         className="app-topbar"
         style={{ gridTemplateColumns: topbarGridTemplateColumns } as React.CSSProperties}
       >
-        <div className={`topbar-left ${leftPanelCollapsed ? "panel-collapsed" : ""}`}>
+        <div className={`topbar-left ${leftPanelEffectivelyCollapsed ? "panel-collapsed" : ""}`}>
           <div className="topbar-workspace-group">
             <details ref={topbarWorkspaceMenuRef} className="topbar-workspace-menu">
               <summary>
@@ -4794,13 +5366,13 @@ function App() {
             type="button"
             className="panel-toggle-btn"
             onClick={toggleLeftPanelCollapsed}
-            aria-expanded={!leftPanelCollapsed}
-            aria-label={leftPanelCollapsed ? "Show source panel" : "Hide source panel"}
-            title={leftPanelCollapsed ? "Show source panel" : "Hide source panel"}
+            aria-expanded={!leftPanelEffectivelyCollapsed}
+            aria-label={leftPanelEffectivelyCollapsed ? "Show source panel" : "Hide source panel"}
+            title={leftPanelEffectivelyCollapsed ? "Show source panel" : "Hide source panel"}
           >
             <span
               className={`panel-toggle-icon panel-toggle-icon-left ${
-                leftPanelCollapsed ? "collapsed" : ""
+                leftPanelEffectivelyCollapsed ? "collapsed" : ""
               }`}
               aria-hidden
             />
@@ -4815,10 +5387,15 @@ function App() {
                 role="tab"
                 aria-selected={activeCenterTabId === tab.id}
                 className={`center-tab ${activeCenterTabId === tab.id ? "active" : ""}`}
-                onClick={() => activateCenterTab(tab)}
+                onClick={() => void activateCenterTab(tab)}
                 title={tab.kind === "workspace" ? tab.path : tab.title}
               >
                 <span className="center-tab-title">{tab.title}</span>
+                {tab.kind === "workspace" && editBuffer?.path === tab.path && editDirty ? (
+                  <span className="center-tab-dirty" aria-label="Unsaved changes">
+                    *
+                  </span>
+                ) : null}
                 <span
                   role="button"
                   tabIndex={0}
@@ -4826,13 +5403,13 @@ function App() {
                   aria-label={`Close ${tab.title}`}
                   onClick={(event) => {
                     event.stopPropagation();
-                    closeCenterTab(tab.id);
+                    void closeCenterTab(tab.id);
                   }}
                   onKeyDown={(event) => {
                     if (event.key === "Enter" || event.key === " ") {
                       event.preventDefault();
                       event.stopPropagation();
-                      closeCenterTab(tab.id);
+                      void closeCenterTab(tab.id);
                     }
                   }}
                 >
@@ -4850,7 +5427,7 @@ function App() {
           />
         </div>
         <div
-          className={`topbar-right ${rightPanelCollapsed ? "panel-collapsed" : ""} ${
+          className={`topbar-right ${rightPanelEffectivelyCollapsed ? "panel-collapsed" : ""} ${
             isRightTopbarBusy ? "is-busy" : ""
           }`}
         >
@@ -4858,18 +5435,18 @@ function App() {
             type="button"
             className="panel-toggle-btn"
             onClick={toggleRightPanelCollapsed}
-            aria-expanded={!rightPanelCollapsed}
-            aria-label={rightPanelCollapsed ? "Show explore panel" : "Hide explore panel"}
-            title={rightPanelCollapsed ? "Show explore panel" : "Hide explore panel"}
+            aria-expanded={!rightPanelEffectivelyCollapsed}
+            aria-label={rightPanelEffectivelyCollapsed ? "Show explore panel" : "Hide explore panel"}
+            title={rightPanelEffectivelyCollapsed ? "Show explore panel" : "Hide explore panel"}
           >
             <span
               className={`panel-toggle-icon panel-toggle-icon-right ${
-                rightPanelCollapsed ? "collapsed" : ""
+                rightPanelEffectivelyCollapsed ? "collapsed" : ""
               }`}
               aria-hidden
             />
           </button>
-          {!rightPanelCollapsed ? (
+          {!rightPanelEffectivelyCollapsed ? (
             <div className="right-panel-tabs" role="tablist" aria-label="Right panel">
               <button
                 type="button"
@@ -4978,10 +5555,12 @@ function App() {
         className="app-body"
         style={{
           gridTemplateColumns: bodyGridTemplateColumns,
-          "--right-panel-width": `${rightPanelCollapsed ? 0 : rightPanelWidth}px`,
+          "--right-panel-width": `${
+            rightPanelEffectivelyCollapsed ? 0 : rightPanelColumnWidth
+          }px`,
         } as React.CSSProperties}
       >
-        <aside className={`app-left ${leftPanelCollapsed ? "collapsed" : ""}`}>
+        <aside className={`app-left ${leftPanelEffectivelyCollapsed ? "collapsed" : ""}`}>
           <div className="source-action-bar">
             <button
               type="button"
@@ -5064,6 +5643,61 @@ function App() {
               </div>
             </section>
           ) : null}
+          {hasOutsideWikiChanges ? (
+            <section className="outside-change-panel" aria-label="Outside wiki changes detected">
+              <div className="outside-change-header">
+                <strong>Outside wiki changes detected</strong>
+                <span>
+                  {outsideWikiChangeCount} file{outsideWikiChangeCount === 1 ? "" : "s"}
+                </span>
+              </div>
+              <p>
+                These wiki files changed outside Maple. Accept them as trusted, or restore the last
+                trusted Maple version.
+              </p>
+              {pendingSourceCount > 0 ? (
+                <p className="outside-change-note">
+                  There are also pending source changes. Accepting these wiki edits will not mark
+                  sources ingested.
+                </p>
+              ) : null}
+              <div className="outside-change-list">
+                {outsideWikiChangedFiles.slice(0, 8).map((file) => (
+                  <div key={`${file.state ?? "changed"}-${file.path}`} className="outside-change-file">
+                    <span className="outside-change-path">{file.path}</span>
+                    <span className={`outside-change-state ${file.state ?? "changed"}`}>
+                      {wikiChangeStateLabel(file.state)}
+                    </span>
+                  </div>
+                ))}
+                {outsideWikiChangedFiles.length > 8 ? (
+                  <div className="outside-change-more">
+                    {outsideWikiChangedFiles.length - 8} more file
+                    {outsideWikiChangedFiles.length - 8 === 1 ? "" : "s"}
+                  </div>
+                ) : null}
+              </div>
+              <div className="outside-change-actions">
+                <button
+                  type="button"
+                  disabled={anyOperationBusy}
+                  title={activeOperationLabel ? `${activeOperationLabel} is running.` : undefined}
+                  onClick={() => runCommand("accept_outside_wiki_changes", "Accepting outside changes")}
+                >
+                  Accept changes
+                </button>
+                <button
+                  type="button"
+                  className="danger"
+                  disabled={anyOperationBusy}
+                  title={activeOperationLabel ? `${activeOperationLabel} is running.` : undefined}
+                  onClick={() => runCommand("undo_outside_wiki_changes", "Undoing outside changes")}
+                >
+                  Undo changes
+                </button>
+              </div>
+            </section>
+          ) : null}
           <div className="sidebar-tree-scroll">
             <TreeView
               nodes={workspaceTree}
@@ -5105,7 +5739,7 @@ function App() {
                       track("review opened", {
                         changed_file_count: reviewableChangedFiles.length,
                       });
-                      openWorkspaceFile(file.path);
+                      void openWorkspaceFile(file.path);
                     }}
                     title={`${file.path} (${file.status})`}
                   >
@@ -5139,9 +5773,9 @@ function App() {
 
         <button
           type="button"
-          className={`panel-resize-handle ${leftPanelCollapsed ? "collapsed" : ""}`}
+          className={`panel-resize-handle ${leftPanelEffectivelyCollapsed ? "collapsed" : ""}`}
           aria-label="Resize left panel"
-          disabled={leftPanelCollapsed}
+          disabled={leftPanelEffectivelyCollapsed}
           onPointerDown={(event) => startPanelResize("left", event)}
         />
 
@@ -5166,51 +5800,66 @@ function App() {
               ))}
             </div>
             <div className="center-header-right">
-              {!activeReportContent && selectedPath === "schema.md" ? (
+              {schemaUpdateButtonVisible ? (
                 <button
                   type="button"
                   className="center-schema-update-btn"
-                  disabled={Boolean(schemaUpdateBlockedReason)}
-                  title={
-                    schemaUpdateBlockedReason ??
-                    "Review the latest standard workspace schema before updating schema.md"
-                  }
+                  title={schemaUpdateButtonTitle}
                   onClick={() => void openSchemaUpdatePrompt(true)}
                 >
                   Update schema.md
                 </button>
               ) : null}
+              {!activeReportContent && viewMode === "page" && selectedPathEditable ? (
+                editActiveForSelectedPath ? (
+                  <div className="center-edit-actions" aria-label="Editing actions">
+                    <span className={`center-edit-status ${editDirty ? "dirty" : ""}`}>
+                      {editStatusLabel}
+                    </span>
+                    <button
+                      type="button"
+                      className="center-edit-btn"
+                      disabled={!editDirty || editBuffer?.saving}
+                      onClick={() => void saveEditBuffer()}
+                    >
+                      Save
+                    </button>
+                    <button
+                      type="button"
+                      className="center-edit-btn secondary"
+                      disabled={editBuffer?.saving}
+                      onClick={discardEditBuffer}
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                ) : (
+                  <button
+                    type="button"
+                    className="center-edit-btn"
+                    disabled={!canStartEditing}
+                    title={editBlockedReason ?? `Edit ${displayFileName(selectedPath)}`}
+                    onClick={startEditingSelectedFile}
+                  >
+                    Edit
+                  </button>
+                )
+              ) : null}
               {activeReportContent ? (
                 <span className="center-subtitle">Read-only report</span>
-              ) : viewMode === "page" ? (
-                <span className="center-subtitle">
-                  {IMAGE_EXT_REGEX.test(selectedPath)
-                    ? "Image"
-                    : PDF_EXT_REGEX.test(selectedPath)
-                      ? "PDF"
-                      : PPTX_EXT_REGEX.test(selectedPath)
-                        ? "Slides"
-                        : TEXT_EXT_REGEX.test(selectedPath)
-                          ? "Text"
-                          : selectedPath.startsWith("wiki/")
-                            ? "Wiki page"
-                            : selectedPath.startsWith("sources/")
-                              ? "Source"
-                              : "Workspace file"}
-                </span>
               ) : null}
               <div className="view-toggle">
                 <button
                   type="button"
                   className={`view-toggle-btn ${viewMode === "page" ? "active" : ""}`}
-                  onClick={() => openWorkspaceFile(selectedPath)}
+                  onClick={() => void openWorkspaceFile(selectedPath)}
                 >
                   Page
                 </button>
                 <button
                   type="button"
                   className={`view-toggle-btn ${viewMode === "graph" ? "active" : ""}`}
-                  onClick={openGraphTab}
+                  onClick={() => void openGraphTab()}
                 >
                   Graph
                 </button>
@@ -5296,8 +5945,7 @@ function App() {
                 workspacePath={workspace.workspacePath}
                 availableDocuments={availableDocuments}
                 onOpenDocument={(path, anchor) => {
-                  openWorkspaceFile(path);
-                  setPendingAnchor(anchor ?? null);
+                  void openWorkspaceFile(path, anchor ?? null);
                 }}
                 onOpenImage={setExpandedImage}
               />
@@ -5306,7 +5954,7 @@ function App() {
                 linkGraph={linkGraph}
                 selectedPath={selectedPath}
                 onOpenNode={(path) => {
-                  openWorkspaceFile(path);
+                  void openWorkspaceFile(path);
                   setPendingAnchor(null);
                   setViewMode("page");
                 }}
@@ -5344,9 +5992,26 @@ function App() {
               ) : (
                 <div className="pptx-status">Rendering slides…</div>
               )
-            ) : TEXT_EXT_REGEX.test(selectedPath) ? (
+            ) : editActiveForSelectedPath && editBuffer ? (
+              <MarkdownEditor
+                path={editBuffer.path}
+                value={editBuffer.draft}
+                disabled={editBuffer.saving}
+                onChange={(draft) =>
+                  setEditBuffer((current) =>
+                    current && current.path === editBuffer.path ? { ...current, draft } : current,
+                  )
+                }
+              />
+            ) : rendersAsLineAddressableText(selectedPath) ? (
               <PlainTextDocument
-                content={selectedDocument.content ?? `${selectedDocument.path} is not available.`}
+                content={
+                  selectedDocument.path === selectedPath
+                    ? selectedDocument.content ?? `${selectedDocument.path} is not available.`
+                    : `Loading ${selectedPath}...`
+                }
+                anchor={selectedDocument.path === selectedPath ? pendingAnchor : null}
+                onAnchorConsumed={() => setPendingAnchor(null)}
               />
             ) : (
               <MarkdownDocument
@@ -5355,14 +6020,14 @@ function App() {
                 workspacePath={workspace.workspacePath}
                 availableDocuments={availableDocuments}
                 onOpenDocument={(path, anchor) => {
-                  openWorkspaceFile(path);
-                  setPendingAnchor(anchor ?? null);
+                  void openWorkspaceFile(path, anchor ?? null);
                 }}
                 onOpenImage={setExpandedImage}
               />
             )}
             {!activeReportContent &&
             viewMode === "page" &&
+            !editActiveForSelectedPath &&
             selectedPath.endsWith(".md") &&
             linkGraph[selectedPath] ? (
               <div
@@ -5400,7 +6065,7 @@ function App() {
                                     type="button"
                                     className="connection-link"
                                     onClick={() => {
-                                      openWorkspaceFile(path);
+                                      void openWorkspaceFile(path);
                                       setConnectionsOpen(false);
                                     }}
                                     title={path}
@@ -5424,7 +6089,7 @@ function App() {
                                     type="button"
                                     className="connection-link"
                                     onClick={() => {
-                                      openWorkspaceFile(path);
+                                      void openWorkspaceFile(path);
                                       setConnectionsOpen(false);
                                     }}
                                     title={path}
@@ -5447,13 +6112,13 @@ function App() {
 
         <button
           type="button"
-          className={`panel-resize-handle ${rightPanelCollapsed ? "collapsed" : ""}`}
+          className={`panel-resize-handle ${rightPanelEffectivelyCollapsed ? "collapsed" : ""}`}
           aria-label="Resize right panel"
-          disabled={rightPanelCollapsed}
+          disabled={rightPanelEffectivelyCollapsed}
           onPointerDown={(event) => startPanelResize("right", event)}
         />
 
-        <aside className={`app-right ${rightPanelCollapsed ? "collapsed" : ""}`}>
+        <aside className={`app-right ${rightPanelEffectivelyCollapsed ? "collapsed" : ""}`}>
           {rightPanelMode === "explore" ? (
             <div className="explore-chat-shell">
               <header className="explore-chat-header">
@@ -5945,7 +6610,7 @@ function App() {
                 <div className="maintain-result-bar" role="status">
                   <span>{maintainResultMessage}</span>
                   {workspace.reportMd && maintainOperationIsCurrent ? (
-                    <button type="button" onClick={openReportTab}>
+                    <button type="button" onClick={() => void openReportTab()}>
                       Show report
                     </button>
                   ) : null}
@@ -6010,7 +6675,7 @@ function App() {
                                 type="button"
                                 className="maintain-rule-file-action"
                                 disabled={!canOpenRuleFile}
-                                onClick={() => openWorkspaceFile(ruleFile.path)}
+                                onClick={() => void openWorkspaceFile(ruleFile.path)}
                               >
                                 {canOpenRuleFile ? "Open" : "Missing"}
                               </button>
@@ -6019,6 +6684,69 @@ function App() {
                         })}
                       </section>
                     </details>
+                  ) : null}
+                  {maintainSourceGroundingAvailable ? (
+                    <label
+                      className={`maintain-source-toggle${
+                        maintainUseSources ? " active" : ""
+                      }`}
+                      title={
+                        sourceFiles.length === 0
+                          ? "No sources found in this workspace."
+                          : maintainAskOnly
+                            ? "Source grounding applies when running a wiki improvement."
+                            : "Use sources for this Improve wiki run."
+                      }
+                    >
+                      <input
+                        type="checkbox"
+                        checked={maintainUseSources}
+                        disabled={maintainSourceGroundingDisabled}
+                        onChange={(event) =>
+                          setMaintainSourceGroundingEnabled(event.target.checked)
+                        }
+                      />
+                      <span className="maintain-source-toggle-copy">
+                        <span className="maintain-source-toggle-title">Use sources</span>
+                        <span className="maintain-source-toggle-hint">
+                          Re-read source files for this improvement.
+                        </span>
+                      </span>
+                    </label>
+                  ) : null}
+                  {maintainSourceGroundingAvailable && maintainUseSources ? (
+                    <section className="maintain-source-picker" aria-label="Source picker">
+                      <header className="maintain-source-picker-header">
+                        <span>
+                          {maintainSelectedSourcePathList.length} of {sourceFiles.length} selected
+                        </span>
+                        <span className="maintain-source-picker-actions">
+                          <button
+                            type="button"
+                            onClick={() => setMaintainSelectedSourcePaths(new Set(sourceFiles))}
+                            disabled={sourceFiles.length === 0}
+                          >
+                            All
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setMaintainSelectedSourcePaths(new Set())}
+                            disabled={maintainSelectedSourcePathList.length === 0}
+                          >
+                            Clear
+                          </button>
+                        </span>
+                      </header>
+                      <SourcePickerTree
+                        nodes={sourceTree}
+                        level={0}
+                        selected={maintainSelectedSourcePaths}
+                        expanded={maintainSourcePickerExpanded}
+                        onToggleFile={toggleMaintainSourcePath}
+                        onToggleFolder={toggleMaintainSourceFolder}
+                        onToggleExpanded={toggleMaintainSourcePickerFolder}
+                      />
+                    </section>
                   ) : null}
                   <textarea
                     className="maintain-input"
@@ -6104,6 +6832,46 @@ function App() {
           </button>
           <img src={expandedImage.src} alt={expandedImage.alt} />
             {expandedImage.alt ? <p>{expandedImage.alt}</p> : null}
+          </div>
+        ) : null}
+
+        {unsavedPrompt ? (
+          <div
+            className="apply-modal-overlay"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="unsaved-edit-title"
+          >
+            <div className="apply-modal unsaved-edit-modal">
+              <header className="apply-modal-header">
+                <div>
+                  <h2 id="unsaved-edit-title">Save changes?</h2>
+                  <p>
+                    {displayFileName(unsavedPrompt.path)} has unsaved edits before you{" "}
+                    {unsavedPrompt.targetLabel}.
+                  </p>
+                </div>
+              </header>
+              <div className="unsaved-edit-actions">
+                <button type="button" onClick={() => resolveUnsavedPrompt("save")}>
+                  Save
+                </button>
+                <button
+                  type="button"
+                  className="secondary"
+                  onClick={() => resolveUnsavedPrompt("discard")}
+                >
+                  Discard
+                </button>
+                <button
+                  type="button"
+                  className="secondary"
+                  onClick={() => resolveUnsavedPrompt("cancel")}
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
           </div>
         ) : null}
 
@@ -7109,6 +7877,116 @@ function buildTree(files: string[], rootPrefix: string): TreeNode[] {
   return root;
 }
 
+function collectTreeLeafPaths(node: TreeNode): string[] {
+  if (!node.isDir) return [node.path];
+  return node.children.flatMap(collectTreeLeafPaths);
+}
+
+type SourcePickerTreeProps = {
+  nodes: TreeNode[];
+  level: number;
+  selected: Set<string>;
+  expanded: Set<string>;
+  onToggleFile: (path: string) => void;
+  onToggleFolder: (node: TreeNode) => void;
+  onToggleExpanded: (path: string) => void;
+};
+
+function SourcePickerTree(props: SourcePickerTreeProps) {
+  return (
+    <ul className={`maintain-source-picker-tree ${props.level === 0 ? "root" : "nested"}`}>
+      {props.nodes.map((node) => (
+        <SourcePickerTreeItem key={node.path} node={node} {...props} />
+      ))}
+    </ul>
+  );
+}
+
+function SourcePickerTreeItem({
+  node,
+  level,
+  selected,
+  expanded,
+  onToggleFile,
+  onToggleFolder,
+  onToggleExpanded,
+}: SourcePickerTreeProps & { node: TreeNode }) {
+  const indent = level === 0 ? 0 : 14;
+
+  if (node.isDir) {
+    const leafPaths = collectTreeLeafPaths(node);
+    const selectedCount = leafPaths.filter((path) => selected.has(path)).length;
+    const allSelected = leafPaths.length > 0 && selectedCount === leafPaths.length;
+    const partiallySelected = selectedCount > 0 && !allSelected;
+    const isOpen = expanded.has(node.path);
+
+    return (
+      <li className="maintain-source-picker-item">
+        <div className="maintain-source-picker-folder" style={{ paddingLeft: indent }}>
+          <button
+            type="button"
+            className="maintain-source-picker-expander"
+            onClick={() => onToggleExpanded(node.path)}
+            aria-label={isOpen ? `Collapse ${node.path}` : `Expand ${node.path}`}
+          >
+            {isOpen ? "▾" : "▸"}
+          </button>
+          <input
+            type="checkbox"
+            checked={allSelected}
+            ref={(input) => {
+              if (input) input.indeterminate = partiallySelected;
+            }}
+            onChange={() => onToggleFolder(node)}
+            aria-label={`Select ${node.path}`}
+          />
+          <button
+            type="button"
+            className="maintain-source-picker-name"
+            onClick={() => onToggleExpanded(node.path)}
+            title={node.path}
+          >
+            <span>{node.name}</span>
+            <span className="maintain-source-picker-count">
+              {selectedCount}/{leafPaths.length}
+            </span>
+          </button>
+        </div>
+        {isOpen ? (
+          <SourcePickerTree
+            nodes={node.children}
+            level={level + 1}
+            selected={selected}
+            expanded={expanded}
+            onToggleFile={onToggleFile}
+            onToggleFolder={onToggleFolder}
+            onToggleExpanded={onToggleExpanded}
+          />
+        ) : null}
+      </li>
+    );
+  }
+
+  const fileDisplay = getFileDisplayParts(node.name);
+  return (
+    <li className="maintain-source-picker-item">
+      <label className="maintain-source-picker-file" style={{ paddingLeft: indent + 23 }}>
+        <input
+          type="checkbox"
+          checked={selected.has(node.path)}
+          onChange={() => onToggleFile(node.path)}
+        />
+        <span className="maintain-source-picker-file-name" title={node.path}>
+          <span className="tree-file-label">{fileDisplay.label}</span>
+          {fileDisplay.extension ? (
+            <span className="tree-file-ext">{fileDisplay.extension}</span>
+          ) : null}
+        </span>
+      </label>
+    </li>
+  );
+}
+
 type TreeViewProps = {
   nodes: TreeNode[];
   level: number;
@@ -7629,11 +8507,133 @@ function MarkdownDocument({
   );
 }
 
-function PlainTextDocument({ content }: { content: string }) {
+function PlainTextDocument({
+  content,
+  anchor,
+  onAnchorConsumed,
+}: {
+  content: string;
+  anchor?: string | null;
+  onAnchorConsumed?: () => void;
+}) {
+  const lineTarget = parsePlainTextLineTarget(anchor);
+  const headingTarget = lineTarget ? null : parsePlainTextHeadingTarget(anchor, content);
+  const onAnchorConsumedRef = useRef(onAnchorConsumed);
+
+  useEffect(() => {
+    onAnchorConsumedRef.current = onAnchorConsumed;
+  }, [onAnchorConsumed]);
+
+  useEffect(() => {
+    if (!anchor) return;
+    if (!lineTarget && !headingTarget) {
+      onAnchorConsumedRef.current?.();
+      return;
+    }
+    const raf = requestAnimationFrame(() => {
+      const line = lineTarget
+        ? document.querySelector<HTMLElement>(
+            `.plain-text-line[data-line-number="${lineTarget.start}"]`,
+          )
+        : Array.from(document.querySelectorAll<HTMLElement>(".plain-text-line")).find(
+            (element) => element.dataset.headingAnchor === headingTarget,
+          );
+      if (line) {
+        line.scrollIntoView({ behavior: "smooth", block: "center" });
+      }
+      onAnchorConsumedRef.current?.();
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [anchor, content, headingTarget, lineTarget?.start, lineTarget?.end]);
+
+  const lines = content.split(/\r?\n/);
   return (
     <article className="plain-text-document">
-      <pre>{content}</pre>
+      <ol className="plain-text-lines">
+        {lines.map((line, index) => {
+          const lineNumber = index + 1;
+          const headingAnchor = markdownLineHeadingAnchor(line);
+          const highlighted = Boolean(
+            (lineTarget && lineNumber >= lineTarget.start && lineNumber <= lineTarget.end) ||
+              (headingTarget && headingAnchor === headingTarget),
+          );
+          return (
+            <li
+              key={lineNumber}
+              className={`plain-text-line${highlighted ? " highlighted" : ""}`}
+              data-line-number={lineNumber}
+              data-heading-anchor={headingAnchor ?? undefined}
+            >
+              <span>{line || " "}</span>
+            </li>
+          );
+        })}
+      </ol>
     </article>
+  );
+}
+
+function parsePlainTextHeadingTarget(anchor: string | null | undefined, content: string) {
+  if (!anchor) return null;
+  const normalized = safeDecode(anchor).trim().replace(/^#/, "");
+  if (!normalized || parsePlainTextLineTarget(normalized)) return null;
+
+  for (const line of content.split(/\r?\n/)) {
+    const headingAnchor = markdownLineHeadingAnchor(line);
+    if (headingAnchor === normalized) return normalized;
+  }
+
+  return null;
+}
+
+function markdownLineHeadingAnchor(line: string) {
+  const match = line.match(/^\s{0,3}#{1,6}\s+(.+?)\s*$/);
+  if (!match) return null;
+  const title = match[1].replace(/\s+#+\s*$/g, "").trim();
+  return title ? slugifyMarkdownHeading(title) : null;
+}
+
+function parsePlainTextLineTarget(anchor: string | null | undefined) {
+  if (!anchor) return null;
+  const normalized = safeDecode(anchor).trim();
+  const match = normalized.match(
+    /^(?:L|line|lines)?\s*[:=_-]?\s*(\d+)(?:\s*(?:-|~|to)\s*(?:L)?\s*(\d+))?$/i,
+  );
+  if (!match) return null;
+
+  const start = Number(match[1]);
+  const rawEnd = Number(match[2] ?? match[1]);
+  if (!Number.isInteger(start) || !Number.isInteger(rawEnd) || start < 1 || rawEnd < 1) {
+    return null;
+  }
+
+  return {
+    start: Math.min(start, rawEnd),
+    end: Math.max(start, rawEnd),
+  };
+}
+
+function MarkdownEditor({
+  path,
+  value,
+  disabled,
+  onChange,
+}: {
+  path: string;
+  value: string;
+  disabled?: boolean;
+  onChange: (value: string) => void;
+}) {
+  return (
+    <section className="markdown-editor" aria-label={`Editing ${path}`}>
+      <textarea
+        value={value}
+        disabled={disabled}
+        spellCheck={false}
+        onChange={(event) => onChange(event.target.value)}
+        aria-label={`Markdown source for ${path}`}
+      />
+    </section>
   );
 }
 
@@ -7698,7 +8698,11 @@ function WikiPageMetadataLine({
 }
 
 function chooseDocumentAfterCommand(command: CommandName, state: WorkspaceState) {
-  if (command === "reset_sample_workspace" || command === "undo_last_operation") {
+  if (
+    command === "reset_sample_workspace" ||
+    command === "undo_last_operation" ||
+    command === "undo_outside_wiki_changes"
+  ) {
     return "index.md";
   }
 

@@ -35,7 +35,7 @@ const LEGACY_RUNNER_METADATA_PREFIXES = [
   ".studywiki/chat-threads/",
   ".studywiki/maintain-threads/",
 ];
-const DEFAULT_CODEX_TIMEOUT_MS = 15 * 60 * 1000;
+const DEFAULT_CODEX_TIMEOUT_MS = 30 * 60 * 1000;
 const RUNNING_MARKER_PATH = ".aiwiki/running/operation.json";
 const LEGACY_RUNNING_MARKER_PATH = ".studywiki/running/operation.json";
 const EXTRACTOR_VERSION = 3;
@@ -113,6 +113,9 @@ const UPDATE_RULES_ALLOWED_PATHS = [
 ];
 const SOURCE_MANIFEST_PATH = ".aiwiki/source-manifest.json";
 const LEGACY_SOURCE_MANIFEST_PATH = ".studywiki/source-manifest.json";
+const WIKI_MANIFEST_PATH = ".aiwiki/wiki-manifest.json";
+const WIKI_BASELINE_DIR = ".aiwiki/wiki-baseline";
+const WIKI_TRACKED_ROOT_FILES = ["index.md", "log.md", "schema.md"];
 const WORKSPACE_DIRECTORIES = [
   "sources",
   "wiki/concepts",
@@ -120,6 +123,7 @@ const WORKSPACE_DIRECTORIES = [
   "wiki/guides",
   "wiki/assets",
   ".aiwiki",
+  ".aiwiki/wiki-baseline",
   ".aiwiki/running",
   ".aiwiki/chat",
   ".aiwiki/chat-threads",
@@ -195,6 +199,18 @@ async function main(argv = process.argv.slice(2)) {
       case "mark-sources-ingested":
         await markSourcesIngested(resolveWorkspace(args[0]));
         break;
+      case "trust-wiki":
+      case "mark-wiki-trusted":
+        await markWikiTrusted(resolveWorkspace(args[0]), {
+          source: flags.source || "maple",
+        });
+        break;
+      case "accept-outside-wiki-changes":
+        await acceptOutsideWikiChanges(resolveWorkspace(args[0]));
+        break;
+      case "undo-outside-wiki-changes":
+        await undoOutsideWikiChanges(resolveWorkspace(args[0]));
+        break;
       case "wiki-healthcheck":
         await runMaintenanceOperation(resolveWorkspace(args[0]), {
           operationType: "wiki-healthcheck",
@@ -215,6 +231,8 @@ async function main(argv = process.argv.slice(2)) {
           extraInstruction: flags.instruction || "",
           operationId: flags["operation-id"] || "",
           timeoutMs: parsePositiveInteger(flags["timeout-ms"], 0),
+          useSources: Boolean(flags["use-sources"]),
+          sourcePaths: parseSourcePathsJson(flags["source-paths-json"]),
         });
         break;
       case "organize-sources":
@@ -312,8 +330,11 @@ Usage:
   node src/operation-runner.js check [--provider codex|claude]
   node src/operation-runner.js build [workspace] [--provider codex|claude] [--model <id>] [--reasoning-effort low|medium|high|xhigh|max] [--instruction "..."] [--workspace-context "..."] [--force] [--strict-validation] [--timeout-ms 600000] [--skip-provider-check]
   node src/operation-runner.js baseline-sources [workspace]
+  node src/operation-runner.js trust-wiki [workspace] [--source maple]
+  node src/operation-runner.js accept-outside-wiki-changes [workspace]
+  node src/operation-runner.js undo-outside-wiki-changes [workspace]
   node src/operation-runner.js wiki-healthcheck [workspace] [--provider codex|claude] [--model <id>] [--reasoning-effort <id>] [--instruction "..."] [--operation-id <id>]
-  node src/operation-runner.js improve-wiki [workspace] [--provider codex|claude] [--model <id>] [--reasoning-effort <id>] --instruction "..." [--operation-id <id>]
+  node src/operation-runner.js improve-wiki [workspace] [--provider codex|claude] [--model <id>] [--reasoning-effort <id>] --instruction "..." [--operation-id <id>] [--use-sources] [--source-paths-json '["sources/a.md"]']
   node src/operation-runner.js organize-sources [workspace] [--provider codex|claude] [--model <id>] [--reasoning-effort <id>] --instruction "..." [--operation-id <id>]
   node src/operation-runner.js update-rules [workspace] [--provider codex|claude] [--model <id>] [--reasoning-effort <id>] --instruction "..." [--operation-id <id>]
   node src/operation-runner.js ask [workspace] [--provider codex|claude] [--model <id>] [--reasoning-effort <id>] --question "..." [--selected-path wiki/page.md] [--history-json "[...]"] [--chat-id <id>] [--skip-provider-check]
@@ -335,6 +356,41 @@ function parsePositiveInteger(value, fallback) {
   if (value === undefined || value === null || value === true || value === "") return fallback;
   const parsed = Number.parseInt(String(value), 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function parseSourcePathsJson(value) {
+  if (value === undefined || value === null || value === false || value === "") return null;
+  if (value === true) {
+    throw new Error("--source-paths-json requires a JSON array of source paths.");
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(String(value));
+  } catch (error) {
+    throw new Error(`Invalid --source-paths-json: ${error.message}`);
+  }
+  if (!Array.isArray(parsed)) {
+    throw new Error("--source-paths-json must be a JSON array of source paths.");
+  }
+
+  const sourcePaths = [];
+  const seen = new Set();
+  for (const item of parsed) {
+    if (typeof item !== "string") {
+      throw new Error("--source-paths-json entries must be strings.");
+    }
+    const normalized = normalizeRelativePath(item.trim());
+    if (!normalized || !normalized.startsWith("sources/")) {
+      throw new Error(`Invalid selected source path: ${item}`);
+    }
+    if (!seen.has(normalized)) {
+      seen.add(normalized);
+      sourcePaths.push(normalized);
+    }
+  }
+  sourcePaths.sort();
+  return sourcePaths;
 }
 
 function parseArgs(argv) {
@@ -618,6 +674,9 @@ No generated wiki pages yet.
       2,
     )}\n`,
   );
+  await writeWikiManifest(workspace, `sample-${createOperationId()}`, {
+    source: "maple-sample-workspace",
+  });
 
   console.log(`Sample workspace ready: ${workspace}`);
 }
@@ -659,6 +718,9 @@ No generated wiki pages yet.
     path.join(workspace, "CLAUDE.md"),
     workspaceAgentInstructions("Claude Workspace Instructions"),
   );
+  await writeWikiManifest(workspace, `init-${createOperationId()}`, {
+    source: "maple-workspace-init",
+  });
 
   console.log(`Workspace ready: ${workspace}`);
 }
@@ -1024,6 +1086,11 @@ async function runBuildWiki(workspace, options = {}) {
 	  ) {
 	    await writeSourceManifest(workspace, operationId);
 	  }
+    if (!options.dryRun && shouldTrustWikiAfterOperationStatus(status)) {
+      await writeWikiManifest(workspace, operationId, {
+        source: "maple-build-wiki",
+      });
+    }
 	  await writeChangedMarkers(workspace, report, reportPath, reportMarkdownPath);
 	  timingsMs.reportWrite = Date.now() - reportWriteStarted;
 	  timingsMs.total = Date.now() - startedMs;
@@ -1395,6 +1462,11 @@ async function runApplyChat(workspace, options = {}) {
 
   await fsp.writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`);
   await fsp.writeFile(reportMarkdownPath, renderReportMarkdown(report));
+  if (shouldTrustWikiAfterOperationStatus(status)) {
+    await writeWikiManifest(workspace, operationId, {
+      source: report.type,
+    });
+  }
   await writeChangedMarkers(workspace, report, reportPath, reportMarkdownPath);
 
   console.log("\nOperation report:");
@@ -1440,15 +1512,26 @@ async function runMaintenanceOperation(workspace, options = {}) {
 
   const startedAt = new Date().toISOString();
   const snapshot = await createSnapshot(workspace, operationId);
-  const sourceStatus = config.includeSourceStatus ? await getSourceStatus(workspace) : null;
+  const sourceGroundingEnabled = Boolean(options.useSources && config.supportsSourceGrounding);
+  const sourceStatus =
+    config.includeSourceStatus || sourceGroundingEnabled ? await getSourceStatus(workspace) : null;
+  const sourceGrounding = sourceGroundingEnabled
+    ? await prepareMaintenanceSourceGrounding(workspace, operationId, sourceStatus, {
+        sourcePaths: options.sourcePaths,
+      })
+    : null;
+  const forbiddenPathRules = sourceGroundingEnabled
+    ? Array.from(new Set([...(config.forbiddenPathRules || []), "sources/**"]))
+    : config.forbiddenPathRules || [];
   const prompt = await buildMaintenancePrompt(workspace, {
     operationType: config.type,
     label: config.label,
     instruction,
     allowedPathRules: config.allowedPathRules,
-    forbiddenPathRules: config.forbiddenPathRules || [],
+    forbiddenPathRules,
     sourceMoveOnly: config.sourceMoveOnly,
     sourceStatus,
+    sourceGrounding,
   });
   const promptPath = path.join(operationDir, "prompt.md");
   const eventsPath = path.join(operationDir, "events.jsonl");
@@ -1464,7 +1547,10 @@ async function runMaintenanceOperation(workspace, options = {}) {
     model,
     reasoningEffort,
     lastMessagePath,
-    maxTurns: config.maxTurns,
+    imageAttachments: sourceGrounding?.preparedSources?.imageAttachments || [],
+    maxTurns: sourceGroundingEnabled
+      ? Math.max(config.maxTurns, (sourceGrounding?.preparedSources?.imageAttachments?.length || 0) + 20)
+      : config.maxTurns,
   });
 
   console.log(`Snapshot created: ${path.relative(workspace, snapshot.dir)}`);
@@ -1497,7 +1583,7 @@ async function runMaintenanceOperation(workspace, options = {}) {
     config.allowedPathRules,
     {
       sourceMoveOnly: config.sourceMoveOnly,
-      forbiddenPathRules: config.forbiddenPathRules || [],
+      forbiddenPathRules,
     },
   );
   const userVisibleChangedFiles = getUserVisibleChangedFiles(validatedChanges);
@@ -1534,11 +1620,22 @@ async function runMaintenanceOperation(workspace, options = {}) {
     startedAt,
     completedAt,
     allowedPathRules: config.allowedPathRules,
-    forbiddenPathRules: config.forbiddenPathRules || [],
+    forbiddenPathRules,
     request: {
       instruction,
+      useSources: sourceGroundingEnabled,
     },
     sourceStatus,
+    sourceGrounding: sourceGrounding
+      ? {
+          enabled: true,
+          sourcePaths: sourceGrounding.sourcePaths,
+          preparedSourcePaths: sourceGrounding.preparedSources.sources.map((source) => source.sourcePath),
+        }
+      : { enabled: false },
+    sourceExtractionCache: sourceGrounding
+      ? buildSourceExtractionCacheReport(sourceGrounding.preparedSources)
+      : null,
     snapshot: {
       id: snapshot.id,
       path: path.relative(workspace, snapshot.dir),
@@ -1560,6 +1657,11 @@ async function runMaintenanceOperation(workspace, options = {}) {
 
   await fsp.writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`);
   await fsp.writeFile(reportMarkdownPath, renderReportMarkdown(report));
+  if (shouldTrustWikiAfterOperationStatus(status)) {
+    await writeWikiManifest(workspace, operationId, {
+      source: report.type,
+    });
+  }
   await writeChangedMarkers(workspace, report, reportPath, reportMarkdownPath);
 
   console.log("\nOperation report:");
@@ -1593,6 +1695,7 @@ function maintenanceOperationConfig(operationType) {
       forbiddenPathRules: IMPROVE_WIKI_FORBIDDEN_PATHS,
       requiresInstruction: true,
       includeSourceStatus: false,
+      supportsSourceGrounding: true,
       sourceMoveOnly: true,
       maxTurns: 20,
     },
@@ -2568,6 +2671,88 @@ Use this as durable workspace context:
   return prompt;
 }
 
+async function prepareMaintenanceSourceGrounding(workspace, operationId, sourceStatus, options = {}) {
+  const availableSourcePaths = (sourceStatus?.files || [])
+    .filter((file) => file.state !== "removed")
+    .map((file) => file.path)
+    .sort();
+  const available = new Set(availableSourcePaths);
+  const requestedSourcePaths = Array.isArray(options.sourcePaths) ? options.sourcePaths : null;
+  const sourcePaths = requestedSourcePaths
+    ? Array.from(
+        new Set(
+          requestedSourcePaths
+            .map((sourcePath) => normalizeRelativePath(sourcePath))
+            .filter(Boolean),
+        ),
+      ).sort()
+    : availableSourcePaths;
+
+  if (requestedSourcePaths && sourcePaths.length === 0) {
+    throw new Error("Choose at least one source for source-grounded Improve Wiki.");
+  }
+  for (const sourcePath of sourcePaths) {
+    if (!available.has(sourcePath)) {
+      throw new Error(`Selected source is not available in the current workspace: ${sourcePath}`);
+    }
+  }
+
+  const hasPptx = sourcePaths.some((sourcePath) => {
+    const lower = sourcePath.toLowerCase();
+    return lower.endsWith(".pptx") || lower.endsWith(".ppt");
+  });
+  if (hasPptx) {
+    const soffice = checkSoffice();
+    if (!soffice.installed) {
+      throw new Error(
+        "LibreOffice (soffice) is required to prepare .pptx sources for source-grounded Improve Wiki but was not found.\n" +
+          `Install with: ${soffice.installCommand}\n` +
+          "Or convert your .pptx files to PDF and re-add them to sources/.",
+      );
+    }
+  }
+
+  return {
+    sourcePaths,
+    preparedSources: await prepareSourceArtifacts(workspace, operationId, sourcePaths),
+  };
+}
+
+function renderSourceGroundingForPrompt(sourceGrounding, sourceStatus) {
+  if (!sourceGrounding) return "";
+
+  const stateByPath = new Map(
+    (sourceStatus?.files || [])
+      .filter((file) => file.path)
+      .map((file) => [file.path, file.state || "unknown"]),
+  );
+  const lines = [
+    "",
+    "Source-grounded improvement context:",
+    "- The user explicitly asked this Improve Wiki operation to use sources.",
+    "- Re-read relevant source files and compare them against the current wiki before editing.",
+    "- Use source evidence to strengthen summaries, concept pages, guides, citations, and wikilinks.",
+    "- Do not rebuild the wiki from scratch; preserve useful existing structure and improve it in place.",
+    "- Do not modify, move, rename, create, or delete files under sources/**.",
+    "- Do not edit .aiwiki/source-manifest.json; this is not a Build Wiki ingestion operation.",
+    "",
+    "Selected source files for this run:",
+  ];
+
+  if (sourceGrounding.sourcePaths.length === 0) {
+    lines.push("- No source files were found under sources/.");
+  } else {
+    for (const sourcePath of sourceGrounding.sourcePaths) {
+      lines.push(`- ${sourcePath} (${stateByPath.get(sourcePath) || "current"})`);
+    }
+  }
+
+  const preparedBlock = renderPreparedSourcesForPrompt(sourceGrounding.preparedSources)
+    .replace(/Build Wiki prompt/g, "Improve Wiki prompt");
+  if (preparedBlock) lines.push(preparedBlock);
+  return lines.join("\n");
+}
+
 async function buildMaintenancePrompt(workspace, options) {
   const instruction = options.instruction
     ? options.instruction
@@ -2594,17 +2779,24 @@ ${forbiddenPaths}
   };
   const operationGoal = operationGoals[options.operationType] || "Run the requested Maple operation.";
   const allowsSources = options.allowedPathRules.includes("sources/**");
+  const forbidsSources = forbiddenPathRules.includes("sources/**");
   const allowsAgentFiles =
     options.allowedPathRules.includes("AGENTS.md") ||
     options.allowedPathRules.includes("CLAUDE.md");
   const sourceBoundary = allowsSources
-    ? options.operationType === "organize-sources"
+    ? forbidsSources
+      ? "- Do not edit, create, rename, move, or delete files under sources/**."
+      : options.operationType === "organize-sources"
       ? "- Source files under sources/** may be moved or renamed, but source file contents must not be edited."
       : "- Source files under sources/** may be moved or renamed only when the user explicitly asks; source file contents must not be edited."
     : "- Do not edit, create, rename, or delete files under sources/**.";
   const agentBoundary = allowsAgentFiles
     ? "- Update AGENTS.md or CLAUDE.md only when the user explicitly asks for agent, bootstrap, or operation-boundary changes."
     : "- Do not edit AGENTS.md or CLAUDE.md.";
+  const sourceGroundingBlock = renderSourceGroundingForPrompt(
+    options.sourceGrounding,
+    options.sourceStatus,
+  );
 
   return `You are running a ${options.label} operation for Maple.
 
@@ -2617,6 +2809,7 @@ Operation goal:
 User instruction:
 ${instruction}
 ${sourceStatusBlock}
+${sourceGroundingBlock}
 Permission boundary:
 Allowed write paths:
 ${allowedPaths}
@@ -4420,6 +4613,9 @@ async function markSourcesIngested(workspace) {
     source: "existing-wiki-baseline",
   });
   await appendBaselineLogEntry(workspace, manifest);
+  await writeWikiManifest(workspace, operationId, {
+    source: "existing-wiki-baseline",
+  });
 
   console.log(
     JSON.stringify(
@@ -4428,6 +4624,86 @@ async function markSourcesIngested(workspace) {
         operationId,
         sourceCount: manifest.files.length,
         manifestPath: SOURCE_MANIFEST_PATH,
+      },
+      null,
+      2,
+    ),
+  );
+}
+
+async function markWikiTrusted(workspace, metadata = {}) {
+  await ensureWorkspaceDirectories(workspace);
+  await assertNoPendingGeneratedChanges(workspace);
+
+  const operationId = `wiki-baseline-${createOperationId()}`;
+  const manifest = await writeWikiManifest(workspace, operationId, {
+    source: metadata.source || "maple",
+  });
+
+  console.log(
+    JSON.stringify(
+      {
+        type: "trust-wiki",
+        operationId,
+        fileCount: manifest.files.length,
+        manifestPath: WIKI_MANIFEST_PATH,
+        baselinePath: WIKI_BASELINE_DIR,
+      },
+      null,
+      2,
+    ),
+  );
+}
+
+async function acceptOutsideWikiChanges(workspace) {
+  await ensureWorkspaceDirectories(workspace);
+  await assertNoPendingGeneratedChanges(workspace);
+
+  const operationId = `accept-outside-wiki-${createOperationId()}`;
+  const before = await getWikiStatus(workspace);
+  const manifest = await writeWikiManifest(workspace, operationId, {
+    source: "outside-wiki-changes-accepted",
+  });
+
+  console.log(
+    JSON.stringify(
+      {
+        type: "accept-outside-wiki-changes",
+        operationId,
+        acceptedChangeCount: before.changedCount,
+        fileCount: manifest.files.length,
+        manifestPath: WIKI_MANIFEST_PATH,
+        baselinePath: WIKI_BASELINE_DIR,
+      },
+      null,
+      2,
+    ),
+  );
+}
+
+async function undoOutsideWikiChanges(workspace) {
+  await ensureWorkspaceDirectories(workspace);
+  await assertNoPendingGeneratedChanges(workspace);
+
+  const status = await getWikiStatus(workspace);
+  if (!status.manifestExists) {
+    throw new Error("No trusted wiki baseline exists yet.");
+  }
+
+  const baselineRoot = path.join(workspace, WIKI_BASELINE_DIR);
+  for (const change of status.changedFiles) {
+    await restorePathFromSnapshot(workspace, baselineRoot, change.path);
+  }
+  await ensureWorkspaceDirectories(workspace);
+
+  console.log(
+    JSON.stringify(
+      {
+        type: "undo-outside-wiki-changes",
+        restoredChangeCount: status.changedCount,
+        restoredPaths: status.changedFiles.map((change) => change.path),
+        manifestPath: WIKI_MANIFEST_PATH,
+        baselinePath: WIKI_BASELINE_DIR,
       },
       null,
       2,
@@ -4444,6 +4720,79 @@ async function writeSourceManifest(workspace, operationId, metadata = {}) {
     files: await buildSourceManifest(workspace),
   };
   const manifestPath = path.join(workspace, SOURCE_MANIFEST_PATH);
+  await ensureDir(path.dirname(manifestPath));
+  await fsp.writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+  return manifest;
+}
+
+async function buildWikiManifest(workspace) {
+  const files = [];
+
+  for (const relPath of WIKI_TRACKED_ROOT_FILES) {
+    const absolutePath = safeJoin(workspace, relPath);
+    if (!(await exists(absolutePath))) continue;
+    const stat = await fsp.lstat(absolutePath);
+    if (!stat.isFile() && !stat.isSymbolicLink()) continue;
+    files.push(await buildWorkspaceFileEntry(absolutePath, relPath, stat));
+  }
+
+  const wikiRoot = path.join(workspace, "wiki");
+  if (await exists(wikiRoot)) {
+    await walkFiles(workspace, wikiRoot, async (absolutePath, relPath, stat) => {
+      if (!stat.isFile() && !stat.isSymbolicLink()) return;
+      files.push(await buildWorkspaceFileEntry(absolutePath, relPath, stat));
+    });
+  }
+
+  files.sort((a, b) => a.path.localeCompare(b.path));
+  return files;
+}
+
+async function buildWorkspaceFileEntry(absolutePath, relPath, stat = null) {
+  const fileStat = stat || (await fsp.lstat(absolutePath));
+  if (fileStat.isSymbolicLink()) {
+    const linkTarget = await fsp.readlink(absolutePath);
+    return {
+      path: relPath,
+      kind: "symlink",
+      size: Buffer.byteLength(linkTarget),
+      mtimeMs: Math.trunc(fileStat.mtimeMs),
+      sha256: sha256(Buffer.from(linkTarget)),
+      linkTarget,
+    };
+  }
+
+  const buffer = await fsp.readFile(absolutePath);
+  return {
+    path: relPath,
+    kind: "file",
+    size: fileStat.size,
+    mtimeMs: Math.trunc(fileStat.mtimeMs),
+    sha256: sha256(buffer),
+  };
+}
+
+async function writeWikiManifest(workspace, operationId, metadata = {}) {
+  const files = await buildWikiManifest(workspace);
+  const baselineRoot = path.join(workspace, WIKI_BASELINE_DIR);
+  await fsp.rm(baselineRoot, { recursive: true, force: true });
+  await ensureDir(baselineRoot);
+
+  for (const file of files) {
+    const sourcePath = safeJoin(workspace, file.path);
+    const targetPath = safeJoin(baselineRoot, file.path);
+    await copyPath(sourcePath, targetPath);
+  }
+
+  const manifest = {
+    schemaVersion: 1,
+    operationId,
+    builtAt: new Date().toISOString(),
+    baselinePath: WIKI_BASELINE_DIR,
+    ...metadata,
+    files,
+  };
+  const manifestPath = path.join(workspace, WIKI_MANIFEST_PATH);
   await ensureDir(path.dirname(manifestPath));
   await fsp.writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
   return manifest;
@@ -4533,6 +4882,98 @@ async function getSourceStatus(workspace) {
     pendingCount,
     files,
   };
+}
+
+async function readWikiManifest(workspace) {
+  const manifestPath = path.join(workspace, WIKI_MANIFEST_PATH);
+  if (!(await exists(manifestPath))) return null;
+
+  try {
+    const manifest = JSON.parse(await fsp.readFile(manifestPath, "utf8"));
+    if (!manifest || !Array.isArray(manifest.files)) return null;
+    return {
+      ...manifest,
+      files: manifest.files
+        .map((file) => ({
+          ...file,
+          path: normalizeRelativePath(file.path) || file.path,
+        }))
+        .filter((file) => isTrackedWikiPath(file.path)),
+    };
+  } catch (_error) {
+    return null;
+  }
+}
+
+async function getWikiStatus(workspace) {
+  const current = await buildWikiManifest(workspace);
+  const manifestPath = path.join(workspace, WIKI_MANIFEST_PATH);
+  const manifestExists = await exists(manifestPath);
+  const previous = await readWikiManifest(workspace);
+  const previousFiles = Array.isArray(previous?.files) ? previous.files : [];
+  const previousByPath = new Map(previousFiles.map((file) => [file.path, file]));
+  const currentByPath = new Map(current.map((file) => [file.path, file]));
+  const changedFiles = [];
+
+  if (previous) {
+    for (const file of current) {
+      const before = previousByPath.get(file.path);
+      if (!before) {
+        changedFiles.push({ ...file, state: "added" });
+      } else if (!wikiContentMatches(before, file)) {
+        changedFiles.push({ ...file, state: "modified" });
+      }
+    }
+
+    for (const file of previousFiles) {
+      if (!currentByPath.has(file.path)) {
+        changedFiles.push({ ...file, state: "deleted" });
+      }
+    }
+  }
+
+  changedFiles.sort((a, b) => a.path.localeCompare(b.path));
+  return {
+    lastTrustedAt: previous?.builtAt || null,
+    manifestPath: WIKI_MANIFEST_PATH,
+    baselinePath: previous?.baselinePath || WIKI_BASELINE_DIR,
+    manifestExists,
+    changedCount: changedFiles.length,
+    files: current.map((file) => ({ ...file, state: "unchanged" })),
+    changedFiles,
+  };
+}
+
+function getOutsideWikiChanges(wikiStatus, marker) {
+  if (!wikiStatus || wikiStatus.changedCount === 0) return null;
+  if (!wikiStatus.manifestExists) return null;
+  if (changedMarkerHasPendingReview(marker)) return null;
+  return {
+    changedCount: wikiStatus.changedCount,
+    files: wikiStatus.changedFiles,
+    canAccept: true,
+    canUndo: true,
+  };
+}
+
+function shouldTrustWikiAfterOperationStatus(status) {
+  return [
+    "completed",
+    "completed_with_forbidden_edits_restored",
+    "completed_without_changes",
+    "completed_without_wiki_content",
+  ].includes(status);
+}
+
+function wikiContentMatches(a, b) {
+  return a?.sha256 === b?.sha256 && a?.size === b?.size && a?.kind === b?.kind;
+}
+
+function isTrackedWikiPath(relPath) {
+  const normalized = normalizeRelativePath(relPath);
+  if (!normalized) return false;
+  if (WIKI_TRACKED_ROOT_FILES.includes(normalized)) return true;
+  return normalized === "wiki" || normalized.startsWith("wiki/");
 }
 
 function sourceContentMatches(a, b) {
@@ -4727,7 +5168,13 @@ function isAllowedPath(relPath, allowedRules = BUILD_WIKI_ALLOWED_PATHS) {
 
 function isProviderControlledPath(relPath) {
   const normalized = normalizeRelativePath(relPath);
-  return normalized === SOURCE_MANIFEST_PATH || normalized === LEGACY_SOURCE_MANIFEST_PATH;
+  return (
+    normalized === SOURCE_MANIFEST_PATH ||
+    normalized === LEGACY_SOURCE_MANIFEST_PATH ||
+    normalized === WIKI_MANIFEST_PATH ||
+    normalized === WIKI_BASELINE_DIR ||
+    normalized?.startsWith(`${WIKI_BASELINE_DIR}/`)
+  );
 }
 
 function getUserVisibleChangedFiles(changes) {
@@ -4993,11 +5440,31 @@ async function undoLastOperation(workspace) {
   const sourceManifestWasRunnerWritten =
     report.type === "build-wiki" &&
     (report.status === "completed" || report.status === "completed_with_forbidden_edits_restored");
+  const wikiManifestMayHaveBeenRunnerWritten = [
+    "build-wiki",
+    "apply-chat",
+    "wiki-healthcheck",
+    "improve-wiki",
+    "organize-sources",
+    "update-rules",
+  ].includes(report.type);
   if (
     sourceManifestWasRunnerWritten &&
     !restoreChanges.some((change) => change.path === SOURCE_MANIFEST_PATH)
   ) {
     restoreChanges.push({ path: SOURCE_MANIFEST_PATH });
+  }
+  if (
+    wikiManifestMayHaveBeenRunnerWritten &&
+    !restoreChanges.some((change) => change.path === WIKI_MANIFEST_PATH)
+  ) {
+    restoreChanges.push({ path: WIKI_MANIFEST_PATH });
+  }
+  if (
+    wikiManifestMayHaveBeenRunnerWritten &&
+    !restoreChanges.some((change) => change.path === WIKI_BASELINE_DIR)
+  ) {
+    restoreChanges.push({ path: WIKI_BASELINE_DIR });
   }
 
   for (const change of restoreChanges) {
@@ -5270,6 +5737,8 @@ async function printStatus(workspace) {
     : null;
   const manifest = await buildManifest(workspace);
   const sourceStatus = await getSourceStatus(workspace);
+  const wikiStatus = await getWikiStatus(workspace);
+  const outsideWikiChanges = getOutsideWikiChanges(wikiStatus, marker);
 
   console.log(
     JSON.stringify(
@@ -5277,6 +5746,8 @@ async function printStatus(workspace) {
         workspace,
         fileCount: Object.keys(manifest).length,
         sourceStatus,
+        wikiStatus,
+        outsideWikiChanges,
         lastOperation: marker,
       },
       null,
@@ -5700,6 +6171,8 @@ module.exports = {
   ORGANIZE_SOURCES_ALLOWED_PATHS,
   UPDATE_RULES_ALLOWED_PATHS,
   SOURCE_MANIFEST_PATH,
+  WIKI_MANIFEST_PATH,
+  WIKI_BASELINE_DIR,
   normalizeLegacyWorkspaceReferences,
   normalizeRelativePath,
   normalizeOperationId,
@@ -5716,11 +6189,18 @@ module.exports = {
 	  parseSlideSelectionJson,
 	  parseVisualInspectionPlanJson,
 	  getSourceStatus,
+  getWikiStatus,
+  getOutsideWikiChanges,
   buildSourceManifest,
+  buildWikiManifest,
   migrateLegacyWorkspace,
   markSourcesIngested,
+  markWikiTrusted,
+  acceptOutsideWikiChanges,
+  undoOutsideWikiChanges,
   initializeWorkspace,
   writeSourceManifest,
+  writeWikiManifest,
   undoLastOperation,
   wikiSchemaTemplate,
   workspaceAgentInstructions,
@@ -5734,6 +6214,7 @@ module.exports = {
   collectExploreSourceVisualContext,
   parseExplorePageReferences,
   isExploreVisualQuestion,
+  parseSourcePathsJson,
   buildApplyChatPrompt,
   buildMaintenancePrompt,
   createSnapshot,

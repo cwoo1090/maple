@@ -32,6 +32,8 @@ struct WorkspaceState {
     workspace_path: String,
     status: Option<Value>,
     source_status: Option<Value>,
+    wiki_status: Option<Value>,
+    outside_wiki_changes: Option<Value>,
     changed_marker: Option<Value>,
     index_md: Option<String>,
     log_md: Option<String>,
@@ -49,6 +51,8 @@ impl WorkspaceState {
             workspace_path: String::new(),
             status: None,
             source_status: None,
+            wiki_status: None,
+            outside_wiki_changes: None,
             changed_marker: None,
             index_md: None,
             log_md: None,
@@ -3725,8 +3729,16 @@ Latest standard workspace schema:
 ```"#,
     );
 
-    let mut result =
-        run_maintenance_command(&app, &state, "update-rules", Some(instruction), true, None)?;
+    let mut result = run_maintenance_command(
+        &app,
+        &state,
+        "update-rules",
+        Some(instruction),
+        true,
+        None,
+        false,
+        None,
+    )?;
     if result.runner.as_ref().is_some_and(|runner| runner.success) {
         annotate_schema_merge_change_marker(&workspace, &latest_hash)?;
         result.state = load_state_at(&workspace)?;
@@ -4147,6 +4159,62 @@ async fn read_workspace_file(
     })
 }
 
+#[tauri::command]
+async fn save_workspace_file(
+    relative_path: String,
+    content: String,
+    state: State<'_, WorkspaceStore>,
+) -> Result<AppCommandResult, String> {
+    let workspace = current_workspace(&state)?;
+    ensure_no_pending_generated_changes(&workspace)?;
+    ensure_no_workspace_operation_running(&workspace)?;
+
+    let (file_path, normalized) = resolve_editable_workspace_file(&workspace, &relative_path)?;
+
+    fs::write(&file_path, content)
+        .map_err(|error| format!("Failed to save {normalized}: {error}"))?;
+
+    if is_trusted_wiki_baseline_path(&normalized) {
+        let runner = run_runner(&workspace, "trust-wiki", &["--source", "maple-manual-edit"])?;
+        ensure_runner_success(&runner, "Failed to update trusted wiki baseline")?;
+    }
+
+    Ok(AppCommandResult {
+        runner: None,
+        state: load_state_at(&workspace)?,
+    })
+}
+
+fn resolve_editable_workspace_file(
+    workspace: &Path,
+    relative_path: &str,
+) -> Result<(PathBuf, String), String> {
+    let normalized_path = normalize_workspace_relative_path(relative_path)?;
+    let normalized = normalized_path.to_string_lossy().replace('\\', "/");
+
+    if !is_editable_workspace_file_path(&normalized_path, &normalized) {
+        return Err("Only saved wiki pages and AI instruction files can be edited.".to_string());
+    }
+
+    let full_path = workspace.join(&normalized_path);
+    let workspace_root = workspace
+        .canonicalize()
+        .map_err(|error| format!("Failed to resolve workspace path: {error}"))?;
+    let file_path = full_path
+        .canonicalize()
+        .map_err(|error| format!("Failed to resolve {normalized}: {error}"))?;
+
+    if !file_path.starts_with(&workspace_root) {
+        return Err("Workspace file path escaped the workspace".to_string());
+    }
+
+    if !file_path.is_file() {
+        return Err("Only existing workspace files can be edited.".to_string());
+    }
+
+    Ok((file_path, normalized))
+}
+
 fn is_readable_workspace_preview_path(normalized_path: &Path, normalized: &str) -> bool {
     let extension = normalized_path
         .extension()
@@ -4161,6 +4229,35 @@ fn is_readable_workspace_preview_path(normalized_path: &Path, normalized: &str) 
     let is_source_text_file = extension == "txt" && normalized.starts_with("sources/");
 
     is_readable_root_markdown || is_markdown_workspace_file || is_source_text_file
+}
+
+fn is_editable_workspace_file_path(normalized_path: &Path, normalized: &str) -> bool {
+    let extension = normalized_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if extension != "md" || has_hidden_path_component(normalized_path) {
+        return false;
+    }
+
+    let is_root_file = normalized_path.components().count() == 1;
+    if is_root_file {
+        return matches!(normalized, "schema.md" | "AGENTS.md" | "CLAUDE.md");
+    }
+
+    normalized.starts_with("wiki/") && !normalized.starts_with("wiki/assets/")
+}
+
+fn is_trusted_wiki_baseline_path(normalized: &str) -> bool {
+    matches!(normalized, "index.md" | "log.md" | "schema.md") || normalized.starts_with("wiki/")
+}
+
+fn has_hidden_path_component(path: &Path) -> bool {
+    path.components().any(|component| match component {
+        Component::Normal(part) => part.to_string_lossy().starts_with('.'),
+        _ => false,
+    })
 }
 
 #[tauri::command]
@@ -4475,8 +4572,49 @@ async fn keep_generated_changes(
         record_schema_standard_baseline(&workspace, &schema_base_hash)?;
     }
 
+    let runner = run_runner(
+        &workspace,
+        "trust-wiki",
+        &["--source", "maple-generated-review"],
+    )?;
+    ensure_runner_success(&runner, "Failed to update trusted wiki baseline")?;
+
     Ok(AppCommandResult {
         runner: None,
+        state: load_state_at(&workspace)?,
+    })
+}
+
+#[tauri::command]
+async fn accept_outside_wiki_changes(
+    state: State<'_, WorkspaceStore>,
+) -> Result<AppCommandResult, String> {
+    let workspace = current_workspace(&state)?;
+    ensure_no_pending_generated_changes(&workspace)?;
+    ensure_no_workspace_operation_running(&workspace)?;
+
+    let runner = run_runner(&workspace, "accept-outside-wiki-changes", &[])?;
+    ensure_runner_success(&runner, "Failed to accept outside wiki changes")?;
+
+    Ok(AppCommandResult {
+        runner: Some(runner),
+        state: load_state_at(&workspace)?,
+    })
+}
+
+#[tauri::command]
+async fn undo_outside_wiki_changes(
+    state: State<'_, WorkspaceStore>,
+) -> Result<AppCommandResult, String> {
+    let workspace = current_workspace(&state)?;
+    ensure_no_pending_generated_changes(&workspace)?;
+    ensure_no_workspace_operation_running(&workspace)?;
+
+    let runner = run_runner(&workspace, "undo-outside-wiki-changes", &[])?;
+    ensure_runner_success(&runner, "Failed to undo outside wiki changes")?;
+
+    Ok(AppCommandResult {
+        runner: Some(runner),
         state: load_state_at(&workspace)?,
     })
 }
@@ -4598,16 +4736,36 @@ async fn wiki_healthcheck(
     instruction: Option<String>,
     state: State<'_, WorkspaceStore>,
 ) -> Result<AppCommandResult, String> {
-    run_maintenance_command(&app, &state, "wiki-healthcheck", instruction, false, None)
+    run_maintenance_command(
+        &app,
+        &state,
+        "wiki-healthcheck",
+        instruction,
+        false,
+        None,
+        false,
+        None,
+    )
 }
 
 #[tauri::command]
 async fn improve_wiki(
     app: AppHandle,
     instruction: String,
+    use_sources: Option<bool>,
+    source_paths: Option<Vec<String>>,
     state: State<'_, WorkspaceStore>,
 ) -> Result<AppCommandResult, String> {
-    run_maintenance_command(&app, &state, "improve-wiki", Some(instruction), true, None)
+    run_maintenance_command(
+        &app,
+        &state,
+        "improve-wiki",
+        Some(instruction),
+        true,
+        None,
+        use_sources.unwrap_or(false),
+        source_paths,
+    )
 }
 
 #[tauri::command]
@@ -4623,6 +4781,8 @@ async fn organize_sources(
         Some(instruction),
         true,
         None,
+        false,
+        None,
     )
 }
 
@@ -4632,7 +4792,16 @@ async fn update_wiki_rules(
     instruction: String,
     state: State<'_, WorkspaceStore>,
 ) -> Result<AppCommandResult, String> {
-    run_maintenance_command(&app, &state, "update-rules", Some(instruction), true, None)
+    run_maintenance_command(
+        &app,
+        &state,
+        "update-rules",
+        Some(instruction),
+        true,
+        None,
+        false,
+        None,
+    )
 }
 
 fn run_maintenance_command(
@@ -4642,6 +4811,8 @@ fn run_maintenance_command(
     instruction: Option<String>,
     require_instruction: bool,
     operation_id: Option<&str>,
+    use_sources: bool,
+    source_paths: Option<Vec<String>>,
 ) -> Result<AppCommandResult, String> {
     let workspace = current_workspace(state)?;
     ensure_no_pending_generated_changes(&workspace)?;
@@ -4670,6 +4841,16 @@ fn run_maintenance_command(
     if let Some(operation_id) = operation_id {
         args.push("--operation-id".to_string());
         args.push(operation_id.to_string());
+    }
+    if command == "improve-wiki" && use_sources {
+        args.push("--use-sources".to_string());
+        let selected_source_paths = normalize_selected_source_paths(&workspace, source_paths)?;
+        if !selected_source_paths.is_empty() {
+            let selected_source_paths_json = serde_json::to_string(&selected_source_paths)
+                .map_err(|error| format!("Failed to serialize selected source paths: {error}"))?;
+            args.push("--source-paths-json".to_string());
+            args.push(selected_source_paths_json);
+        }
     }
     let runner = run_runner_with_args(&args)?;
     Ok(AppCommandResult {
@@ -4762,6 +4943,8 @@ async fn run_maintain_thread_operation(
     thread_id: String,
     command: String,
     instruction: Option<String>,
+    use_sources: Option<bool>,
+    source_paths: Option<Vec<String>>,
     state: State<'_, WorkspaceStore>,
 ) -> Result<MaintainOperationResult, String> {
     let workspace = current_workspace(&state)?;
@@ -4772,6 +4955,7 @@ async fn run_maintain_thread_operation(
     let model = selected_model(&settings, &provider);
     let reasoning_effort = selected_reasoning_effort(&settings, &provider, &model);
     let trimmed_instruction = instruction.unwrap_or_default().trim().to_string();
+    let use_sources = use_sources.unwrap_or(false) && runner_command == "improve-wiki";
     if require_instruction && trimmed_instruction.is_empty() {
         return Err("Add an instruction first.".to_string());
     }
@@ -4819,6 +5003,8 @@ async fn run_maintain_thread_operation(
         Some(operation_instruction),
         require_instruction,
         Some(operation_id.as_str()),
+        use_sources,
+        source_paths,
     );
     let completed_at = now_string();
 
@@ -5913,6 +6099,27 @@ fn run_runner_with_args(args: &[String]) -> Result<RunnerOutput, String> {
     })
 }
 
+fn ensure_runner_success(runner: &RunnerOutput, action: &str) -> Result<(), String> {
+    if runner.success {
+        return Ok(());
+    }
+
+    let detail = if !runner.stderr.trim().is_empty() {
+        runner.stderr.trim()
+    } else {
+        runner.stdout.trim()
+    };
+    let code = runner
+        .code
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    if detail.is_empty() {
+        Err(format!("{action}: runner exited with code {code}."))
+    } else {
+        Err(format!("{action}: runner exited with code {code}. {detail}"))
+    }
+}
+
 fn node_executable() -> Result<PathBuf, String> {
     let runtime = resolve_node_runtime();
     if let Some(path) = runtime
@@ -6647,6 +6854,14 @@ fn load_state_at(workspace: &Path) -> Result<WorkspaceState, String> {
             .as_ref()
             .and_then(|value| value.get("sourceStatus"))
             .cloned(),
+        wiki_status: status
+            .as_ref()
+            .and_then(|value| value.get("wikiStatus"))
+            .cloned(),
+        outside_wiki_changes: status
+            .as_ref()
+            .and_then(|value| value.get("outsideWikiChanges"))
+            .cloned(),
         status,
         changed_marker,
         index_md: read_text_if_exists(&workspace.join("index.md")),
@@ -6861,6 +7076,20 @@ fn ensure_no_pending_generated_changes(workspace: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn ensure_no_workspace_operation_running(workspace: &Path) -> Result<(), String> {
+    if read_workspace_running_marker(workspace)
+        .as_ref()
+        .is_some_and(running_marker_process_is_running)
+    {
+        return Err(
+            "A workspace operation is running. Wait for it to finish before editing files."
+                .to_string(),
+        );
+    }
+
+    Ok(())
+}
+
 fn is_reviewable_generated_change(change: &Value) -> bool {
     if !change
         .get("allowed")
@@ -6918,6 +7147,37 @@ fn normalize_workspace_relative_path(input: &str) -> Result<PathBuf, String> {
     }
 
     Ok(normalized)
+}
+
+fn normalize_selected_source_paths(
+    workspace: &Path,
+    source_paths: Option<Vec<String>>,
+) -> Result<Vec<String>, String> {
+    let Some(source_paths) = source_paths else {
+        return Ok(Vec::new());
+    };
+
+    let available = list_source_files(workspace)?
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let mut selected = Vec::new();
+    let mut seen = HashSet::new();
+
+    for source_path in source_paths {
+        let normalized_path = normalize_workspace_relative_path(&source_path)?;
+        let normalized = normalized_path.to_string_lossy().replace('\\', "/");
+        if !available.contains(&normalized) {
+            return Err(format!(
+                "Selected source is not available in this workspace: {normalized}"
+            ));
+        }
+        if seen.insert(normalized.clone()) {
+            selected.push(normalized);
+        }
+    }
+
+    selected.sort();
+    Ok(selected)
 }
 
 fn list_source_files(workspace: &Path) -> Result<Vec<String>, String> {
@@ -7032,19 +7292,20 @@ mod tests {
         backup_schema_before_update, chat_thread_summary, chat_threads_dir,
         compose_maintain_operation_instruction, dedupe_node_path_candidates,
         default_workspace_schema, ensure_maintain_thread_task_matches,
-        extract_partial_answer_from_events, finalize_provider_check_report,
-        initialize_workspace_files, is_readable_workspace_preview_path, load_state_at,
-        login_command_for_settings, maintain_operation_assistant_text,
-        maintain_operation_user_text, make_chat_thread, make_maintain_thread,
-        node_version_supported, normalize_operation_events, normalize_settings, parse_node_major,
-        parse_provider_ready, provider_choice_required, provider_ready_candidate_count,
-        provider_simulation_value_matches, read_requested_or_new_chat_thread, read_text_tail,
-        read_thread_file, refresh_maintain_operation_messages, refresh_streaming_messages,
-        run_command_probe, runner_path_env, schema_update_prompt_for_workspace,
-        select_node_candidate, shell_single_quote, terminal_command_script,
-        thread_activity_context, validate_provider_candidate, validate_provider_path,
-        write_schema_update_marker, AppSettings, ChatThreadMessage, NodeCandidate,
-        NodePathCandidate, ProviderCandidate, ProviderPathCandidate, ThreadFileKind,
+        ensure_no_pending_generated_changes, extract_partial_answer_from_events,
+        finalize_provider_check_report, initialize_workspace_files,
+        is_readable_workspace_preview_path, load_state_at, login_command_for_settings,
+        maintain_operation_assistant_text, maintain_operation_user_text, make_chat_thread,
+        make_maintain_thread, node_version_supported, normalize_operation_events,
+        normalize_settings, parse_node_major, parse_provider_ready, provider_choice_required,
+        provider_ready_candidate_count, provider_simulation_value_matches,
+        read_requested_or_new_chat_thread, read_text_tail, read_thread_file,
+        refresh_maintain_operation_messages, refresh_streaming_messages,
+        resolve_editable_workspace_file, run_command_probe, runner_path_env,
+        schema_update_prompt_for_workspace, select_node_candidate, shell_single_quote,
+        terminal_command_script, thread_activity_context, validate_provider_candidate,
+        validate_provider_path, write_schema_update_marker, AppSettings, ChatThreadMessage,
+        NodeCandidate, NodePathCandidate, ProviderCandidate, ProviderPathCandidate, ThreadFileKind,
     };
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -7137,12 +7398,93 @@ mod tests {
     }
 
     #[test]
+    fn editable_workspace_file_resolution_enforces_allowlist() {
+        let workspace = unique_test_workspace("maple-editable-files");
+        fs::create_dir_all(workspace.join("wiki/concepts")).unwrap();
+        fs::create_dir_all(workspace.join("wiki/assets")).unwrap();
+        fs::create_dir_all(workspace.join("sources")).unwrap();
+        fs::create_dir_all(workspace.join(".aiwiki")).unwrap();
+
+        for file in [
+            "wiki/concepts/page.md",
+            "wiki/page.md",
+            "wiki/assets/image.md",
+            "sources/note.md",
+            "index.md",
+            "log.md",
+            "schema.md",
+            "AGENTS.md",
+            "CLAUDE.md",
+            ".aiwiki/state.md",
+        ] {
+            fs::write(workspace.join(file), "# Test\n").unwrap();
+        }
+
+        for file in [
+            "wiki/concepts/page.md",
+            "wiki/page.md",
+            "schema.md",
+            "AGENTS.md",
+            "CLAUDE.md",
+        ] {
+            let (_path, normalized) = resolve_editable_workspace_file(&workspace, file).unwrap();
+            assert_eq!(normalized, file);
+        }
+
+        for file in [
+            "sources/note.md",
+            "wiki/assets/image.md",
+            "index.md",
+            "log.md",
+            ".aiwiki/state.md",
+            "../outside.md",
+            "wiki/missing.md",
+        ] {
+            assert!(
+                resolve_editable_workspace_file(&workspace, file).is_err(),
+                "{file} should not be editable"
+            );
+        }
+
+        let absolute = workspace.join("schema.md");
+        assert!(resolve_editable_workspace_file(&workspace, absolute.to_str().unwrap()).is_err());
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn manual_editing_is_blocked_by_pending_generated_changes() {
+        let workspace = unique_test_workspace("maple-edit-pending-review");
+        fs::create_dir_all(&workspace).unwrap();
+        write_changed_marker(
+            &workspace,
+            "op-review",
+            serde_json::json!([
+                {
+                    "path": "wiki/concepts/page.md",
+                    "status": "modified",
+                    "allowed": true,
+                    "restored": false
+                }
+            ]),
+        );
+
+        assert!(ensure_no_pending_generated_changes(&workspace).is_err());
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
     fn default_workspace_schema_includes_wiki_operation_rules() {
         let schema = default_workspace_schema();
 
         assert!(schema.contains("persistent, compounding wiki"));
         assert!(schema.contains("## Build Wiki Rules"));
         assert!(schema.contains("## Explore And Apply Rules"));
+        assert!(schema.contains("#Lstart-Lend"));
+        assert!(schema.contains("lecture-03.txt#L15-L17"));
+        assert!(schema.contains("include that locator in the visible link label"));
+        assert!(schema.contains("known exact locator is missing from the visible link label"));
         assert!(schema.contains("## Wiki Healthcheck Rules"));
     }
 
@@ -8252,6 +8594,7 @@ pub fn run() {
             read_workspace_operation_progress,
             read_chat_run_progress,
             read_workspace_file,
+            save_workspace_file,
             check_soffice,
             install_libreoffice,
             convert_pptx_to_pdf,
@@ -8260,6 +8603,8 @@ pub fn run() {
             mark_sources_ingested,
             remove_source_file,
             keep_generated_changes,
+            accept_outside_wiki_changes,
+            undo_outside_wiki_changes,
             build_wiki,
             wiki_healthcheck,
             improve_wiki,

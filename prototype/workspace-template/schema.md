@@ -155,12 +155,19 @@ updated: 2026-05-03
 - Concept and guide pages should list all contributing source paths.
 - For high-risk claims, cite the exact source span near the claim when available.
 - High-risk claims include equations, derivations, numerical values, component specs, slide corrections, and convention-dependent definitions.
-- Use compact source notes with clickable Markdown links to local source files, for example: _Source: [sources/Lec3_HW.pptx](sources/Lec3_HW.pptx), slide 2._
-- If a source path contains spaces or punctuation, wrap the link destination in angle brackets, for example: _Source: [sources/taegu lecture_2.txt](<sources/taegu lecture_2.txt>), around 04:03-07:50._
-- When citing a specific PDF page or slide, include the location in the link anchor when known:
-  - PDF page example: _Source: [sources/Lec5.pdf](sources/Lec5.pdf#page=15), pages 15-17._
-  - PowerPoint slide example: _Source: [sources/Lec5.pptx](sources/Lec5.pptx#slide=15), slides 15-17._
-- For page or slide ranges, link to the first page or slide in the range and describe the full range in the visible note.
+- Use compact source notes with clickable Markdown links to local source files.
+- When an exact page, slide, line range, or section is known, include that locator in the visible link label and in the link target fragment when the wiki viewer supports it.
+- Do not write citations where the link label is only the source file and the exact locator is left outside the link, such as `[source.pdf](source.pdf#page=15), page 15`; prefer `[source.pdf, page 15](source.pdf#page=15)`.
+- If a source path contains spaces or punctuation, wrap the link destination in angle brackets, for example: _Source: [sources/taegu lecture_2.txt, lines 15-17](<sources/taegu lecture_2.txt#L15-L17>)._
+- Supported local source anchors:
+  - PDF pages: use `#page=N`, for example _Source: [sources/Lec5.pdf, page 15](sources/Lec5.pdf#page=15)._
+  - PowerPoint or slide-derived PDFs: use `#slide=N`, for example _Source: [sources/Lec5.pptx, slide 15](sources/Lec5.pptx#slide=15)._
+  - TXT line ranges: use `#Lstart-Lend`, for example _Source: [sources/lecture-03.txt, lines 15-17](sources/lecture-03.txt#L15-L17)._
+  - Markdown source sections: use heading anchors when the relevant passage sits under a stable heading, for example _Source: [sources/lecture-03-notes.md, attention mechanism section](sources/lecture-03-notes.md#attention-mechanism)._
+- For PDF page ranges or slide ranges, link to the first page or slide in the range and describe the full range in the visible link label.
+- For TXT source ranges, include the full line range in both the visible link label and the link anchor.
+- Do not use `#L...` line anchors on Markdown source files unless the wiki viewer explicitly supports line anchors for rendered Markdown sources; use a heading anchor or a visible locator instead.
+- If no reliable page, slide, line, or heading target exists, cite the source file and add a short visible locator such as section title, timestamp, paragraph, or surrounding phrase.
 - Prefer linking to the original imported source under `sources/`; do not cite generated preview/cache files such as `.pptx.pdf` unless that file is itself an imported source.
 - Do not use bare code-formatted source paths for inline source notes; they render as text and are not clickable.
 - Web references are external links used during Explore Chat; they are not curated source files and must not be added to frontmatter `sources`.
@@ -220,6 +227,9 @@ Wiki healthcheck should conservatively check and fix:
 - Stale `index.md` entries and missing important pages.
 - Summary pages that do not cite their source.
 - Concept pages that make source-specific claims without source citations.
+- Source citations that are not clickable Markdown links to local source files.
+- Source citations where a known exact locator is missing from the visible link label, left only as plain text after the link, or absent from a supported link fragment such as `#page=N`, `#slide=N`, `#Lstart-Lend`, or a Markdown heading anchor.
+- Broken local source links or source links that point to generated preview/cache files instead of imported files under `sources/`.
 - Web URLs incorrectly listed in frontmatter `sources`; remove them from frontmatter and cite them as web references instead.
 - Web-derived claims that lack inline URL citations or a `## Web References` entry with title, URL, access date, and `found via Explore web search`.
 - Duplicate concept pages only when they are clearly duplicative; otherwise add cross-links.
