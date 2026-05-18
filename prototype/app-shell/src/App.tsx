@@ -1909,14 +1909,14 @@ function App() {
     });
   }, [sourceFiles]);
   const wikiPages = useMemo(
-    () => workspace.wikiFiles.filter((file) => file.endsWith(".md")),
-    [workspace.wikiFiles],
-  );
-  const imageAssets = useMemo(
     () =>
       workspace.wikiFiles.filter(
-        (file) => IMAGE_EXT_REGEX.test(file) && shouldShowWikiFileInSidebar(file),
+        (file) => file.endsWith(".md") && shouldShowWikiFileInSidebar(file),
       ),
+    [workspace.wikiFiles],
+  );
+  const imagesAndFiles = useMemo(
+    () => workspace.wikiFiles.filter(shouldShowImagesAndFilesInSidebar),
     [workspace.wikiFiles],
   );
   const assetByDisplayPath = useMemo(() => {
@@ -2659,7 +2659,7 @@ function App() {
     const canEdit = await resolveDirtyEditBefore(`delete ${title}`);
     if (!canEdit) return;
 
-    setAssetAction({ assetId: asset.id, label: "Deleting asset" });
+    setAssetAction({ assetId: asset.id, label: "Deleting image" });
     try {
       const result = await invoke<AppCommandResult>("delete_wiki_image_asset", {
         assetId: asset.id,
@@ -3057,6 +3057,10 @@ function App() {
 
   const sourceTree = useMemo(() => buildTree(sourceFiles, "sources/"), [sourceFiles]);
   const wikiTree = useMemo(() => buildTree(sidebarWikiFiles, "wiki/"), [sidebarWikiFiles]);
+  const imagesAndFilesTree = useMemo(
+    () => buildTree(imagesAndFiles, "wiki/assets/"),
+    [imagesAndFiles],
+  );
   const rootFileNodes = useMemo(
     () =>
       rootFiles.map((file, index) => ({
@@ -3070,11 +3074,18 @@ function App() {
   );
   const workspaceTree = useMemo(
     () => [
-      { name: "sources", path: "sources", isDir: true, children: sourceTree },
-      { name: "wiki", path: "wiki", isDir: true, children: wikiTree, sectionStart: true },
+      { name: "Sources", path: "sources", isDir: true, children: sourceTree },
+      { name: "Wiki", path: "wiki", isDir: true, children: wikiTree, sectionStart: true },
+      {
+        name: "Images & Files",
+        path: "wiki/assets",
+        isDir: true,
+        children: imagesAndFilesTree,
+        sectionStart: true,
+      },
       ...rootFileNodes,
     ],
-    [sourceTree, rootFileNodes, wikiTree],
+    [sourceTree, rootFileNodes, wikiTree, imagesAndFilesTree],
   );
 
   useEffect(() => {
@@ -3953,7 +3964,9 @@ function App() {
         setImageUsageMap(new Map());
         return;
       }
-      const wikiPagePaths = workspace.wikiFiles.filter((p) => p.endsWith(".md"));
+      const wikiPagePaths = workspace.wikiFiles.filter(
+        (p) => p.endsWith(".md") && shouldShowWikiFileInSidebar(p),
+      );
       const allPaths = ["index.md", ...wikiPagePaths, "log.md"];
 
       const contents = await Promise.all(
@@ -7346,7 +7359,7 @@ function App() {
           </span>
         ) : null}
         <span className="statusbar-meta">
-          {wikiPages.length} pages · {imageAssets.length} assets
+          {wikiPages.length} pages · {imagesAndFiles.length} files
         </span>
         <span className="statusbar-path" title={workspace.workspacePath}>
           {workspace.workspacePath}
@@ -8530,7 +8543,11 @@ function buildTree(files: string[], rootPrefix: string): TreeNode[] {
 }
 
 function shouldShowWikiFileInSidebar(path: string) {
-  if (!path.startsWith("wiki/assets/")) return true;
+  return !path.startsWith("wiki/assets/");
+}
+
+function shouldShowImagesAndFilesInSidebar(path: string) {
+  if (!path.startsWith("wiki/assets/")) return false;
   if (path === "wiki/assets/assets.json") return false;
   if (path.startsWith("wiki/assets/masters/")) return false;
   const fileName = displayFileName(path).toLowerCase();
@@ -8869,7 +8886,7 @@ function WorkspaceImageViewer({
                 onClick={() => onDeleteAsset(asset)}
               >
                 <Trash2 size={15} aria-hidden="true" />
-                Delete asset
+                Delete image
               </button>
             ) : null}
             {busyLabel ? (
