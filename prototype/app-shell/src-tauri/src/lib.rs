@@ -1,3 +1,5 @@
+use base64::{engine::general_purpose, Engine as _};
+use image::GenericImageView;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 #[cfg(unix)]
@@ -40,6 +42,7 @@ struct WorkspaceState {
     schema_md: Option<String>,
     report_md: Option<String>,
     last_operation_message: Option<String>,
+    asset_registry: Option<Value>,
     root_files: Vec<String>,
     source_files: Vec<String>,
     wiki_files: Vec<String>,
@@ -59,6 +62,7 @@ impl WorkspaceState {
             schema_md: None,
             report_md: None,
             last_operation_message: None,
+            asset_registry: None,
             root_files: Vec::new(),
             source_files: Vec::new(),
             wiki_files: Vec::new(),
@@ -71,6 +75,66 @@ impl WorkspaceState {
 struct WorkspaceFile {
     path: String,
     content: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct WikiImageAssetRegistry {
+    schema_version: u32,
+    #[serde(default)]
+    assets: Vec<WikiImageAsset>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct WikiImageAsset {
+    id: String,
+    owner: String,
+    origin: String,
+    master_path: String,
+    display_path: String,
+    #[serde(default)]
+    alt: String,
+    #[serde(default)]
+    caption: String,
+    #[serde(default)]
+    user_notes: String,
+    #[serde(default)]
+    semantic_notes: String,
+    #[serde(default)]
+    source: Option<Value>,
+    #[serde(default)]
+    protected: bool,
+    #[serde(default)]
+    edits: Option<WikiImageAssetEdits>,
+    #[serde(default)]
+    created_at: String,
+    #[serde(default)]
+    updated_at: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct WikiImageAssetEdits {
+    crop: Option<WikiImageAssetCrop>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct WikiImageAssetCrop {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    basis: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WikiImageAssetCommandResult {
+    state: WorkspaceState,
+    asset: WikiImageAsset,
+    markdown: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -125,6 +189,7 @@ const RUNNER_ROOT_ENV: &str = "MAPLE_RUNNER_ROOT";
 const REQUIRED_NODE_MAJOR: u32 = 20;
 const PROVIDER_COMMAND_TIMEOUT_MS: u64 = 8_000;
 const SCHEMA_UPDATE_METADATA_FILE: &str = "schema-update.json";
+const ASSET_REGISTRY_PATH: &str = "wiki/assets/assets.json";
 
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -4253,6 +4318,868 @@ fn is_trusted_wiki_baseline_path(normalized: &str) -> bool {
     matches!(normalized, "index.md" | "log.md" | "schema.md") || normalized.starts_with("wiki/")
 }
 
+#[tauri::command]
+async fn create_wiki_image_asset(
+    page_path: String,
+    file_name: String,
+    data_base64: String,
+    alt: Option<String>,
+    caption: Option<String>,
+    state: State<'_, WorkspaceStore>,
+) -> Result<WikiImageAssetCommandResult, String> {
+    let workspace = current_workspace(&state)?;
+    ensure_no_pending_generated_changes(&workspace)?;
+    ensure_no_workspace_operation_running(&workspace)?;
+
+    let normalized_page = normalize_workspace_relative_path(&page_path)?;
+    let normalized_page_string = normalized_page.to_string_lossy().replace('\\', "/");
+    if !is_editable_workspace_file_path(&normalized_page, &normalized_page_string) {
+        return Err("Images can only be inserted into editable wiki pages.".to_string());
+    }
+
+    let bytes = decode_image_payload(&data_base64)?;
+    let image = image::load_from_memory(&bytes)
+        .map_err(|error| format!("Could not decode image: {error}"))?;
+    let extension = normalized_image_extension(&file_name);
+    let id = make_local_id("asset");
+    let original_rel = format!("wiki/assets/user/{id}.original.{extension}");
+    let display_rel = format!("wiki/assets/user/{id}.display.png");
+    let original_path = workspace.join(&original_rel);
+    let display_path = workspace.join(&display_rel);
+    fs::create_dir_all(original_path.parent().unwrap())
+        .map_err(|error| format!("Failed to create asset directory: {error}"))?;
+    fs::write(&original_path, &bytes)
+        .map_err(|error| format!("Failed to write original image: {error}"))?;
+    save_display_png(&image, &display_path)?;
+
+    let now = now_string();
+    let asset = WikiImageAsset {
+        id: id.clone(),
+        owner: "user".to_string(),
+        origin: "user-added".to_string(),
+        master_path: original_rel,
+        display_path: display_rel.clone(),
+        alt: sanitize_asset_text(alt.as_deref())
+            .unwrap_or_else(|| fallback_alt_from_filename(&file_name)),
+        caption: sanitize_asset_text(caption.as_deref()).unwrap_or_default(),
+        user_notes: String::new(),
+        semantic_notes: String::new(),
+        source: None,
+        protected: true,
+        edits: None,
+        created_at: now.clone(),
+        updated_at: now,
+    };
+
+    let mut registry = read_wiki_image_asset_registry(&workspace);
+    registry.assets.retain(|existing| existing.id != asset.id);
+    registry.assets.push(asset.clone());
+    write_wiki_image_asset_registry(&workspace, &registry)?;
+    trust_wiki_after_asset_edit(&workspace)?;
+
+    let markdown_target = markdown_relative_path(&normalized_page_string, &display_rel);
+    let markdown = image_asset_markdown(&asset, &markdown_target);
+    Ok(WikiImageAssetCommandResult {
+        state: load_state_at(&workspace)?,
+        asset,
+        markdown: Some(markdown),
+    })
+}
+
+#[tauri::command]
+async fn crop_wiki_image_asset(
+    asset_id: String,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    state: State<'_, WorkspaceStore>,
+) -> Result<WikiImageAssetCommandResult, String> {
+    let workspace = current_workspace(&state)?;
+    ensure_no_pending_generated_changes(&workspace)?;
+    ensure_no_workspace_operation_running(&workspace)?;
+
+    let mut registry = read_wiki_image_asset_registry(&workspace);
+    let index = find_asset_index(&registry, &asset_id)?;
+    let mut asset = registry.assets[index].clone();
+    let master_path = ensure_asset_master_file_for_edit(&workspace, &mut asset)?;
+    let display_path = resolve_writable_asset_path(&workspace, &asset.display_path)?;
+    let image = image::open(&master_path)
+        .map_err(|error| format!("Could not open master image: {error}"))?;
+    let (image_width, image_height) = image.dimensions();
+    if image_width == 0 || image_height == 0 {
+        return Err("Cannot crop an empty image.".to_string());
+    }
+    let crop_x = x.min(image_width.saturating_sub(1));
+    let crop_y = y.min(image_height.saturating_sub(1));
+    let crop_width = width.max(1).min(image_width - crop_x);
+    let crop_height = height.max(1).min(image_height - crop_y);
+    let cropped = image.crop_imm(crop_x, crop_y, crop_width, crop_height);
+    save_display_png(&cropped, &display_path)?;
+    asset.edits = Some(WikiImageAssetEdits {
+        crop: Some(WikiImageAssetCrop {
+            x: crop_x,
+            y: crop_y,
+            width: crop_width,
+            height: crop_height,
+            basis: "master-pixels".to_string(),
+        }),
+    });
+    asset.updated_at = now_string();
+    registry.assets[index] = asset.clone();
+    write_wiki_image_asset_registry(&workspace, &registry)?;
+    trust_wiki_after_asset_edit(&workspace)?;
+
+    Ok(WikiImageAssetCommandResult {
+        state: load_state_at(&workspace)?,
+        asset,
+        markdown: None,
+    })
+}
+
+#[tauri::command]
+async fn reset_wiki_image_crop(
+    asset_id: String,
+    state: State<'_, WorkspaceStore>,
+) -> Result<WikiImageAssetCommandResult, String> {
+    let workspace = current_workspace(&state)?;
+    ensure_no_pending_generated_changes(&workspace)?;
+    ensure_no_workspace_operation_running(&workspace)?;
+
+    let mut registry = read_wiki_image_asset_registry(&workspace);
+    let index = find_asset_index(&registry, &asset_id)?;
+    let mut asset = registry.assets[index].clone();
+    let master_path = resolve_existing_asset_file(&workspace, &asset.master_path)?;
+    let display_path = resolve_writable_asset_path(&workspace, &asset.display_path)?;
+    let image = image::open(&master_path)
+        .map_err(|error| format!("Could not open master image: {error}"))?;
+    save_display_png(&image, &display_path)?;
+    asset.edits = None;
+    asset.updated_at = now_string();
+    registry.assets[index] = asset.clone();
+    write_wiki_image_asset_registry(&workspace, &registry)?;
+    trust_wiki_after_asset_edit(&workspace)?;
+
+    Ok(WikiImageAssetCommandResult {
+        state: load_state_at(&workspace)?,
+        asset,
+        markdown: None,
+    })
+}
+
+#[tauri::command]
+async fn replace_wiki_image_asset(
+    asset_id: String,
+    file_name: String,
+    data_base64: String,
+    state: State<'_, WorkspaceStore>,
+) -> Result<WikiImageAssetCommandResult, String> {
+    let workspace = current_workspace(&state)?;
+    ensure_no_pending_generated_changes(&workspace)?;
+    ensure_no_workspace_operation_running(&workspace)?;
+
+    let bytes = decode_image_payload(&data_base64)?;
+    let image = image::load_from_memory(&bytes)
+        .map_err(|error| format!("Could not decode replacement image: {error}"))?;
+    let mut registry = read_wiki_image_asset_registry(&workspace);
+    let index = find_asset_index(&registry, &asset_id)?;
+    let mut asset = registry.assets[index].clone();
+    let extension = normalized_image_extension(&file_name);
+    let new_master_rel = format!("wiki/assets/user/{}.original.{extension}", asset.id);
+    let new_master_path = resolve_writable_asset_path(&workspace, &new_master_rel)?;
+    if asset.master_path != new_master_rel {
+        let old_master = workspace.join(&asset.master_path);
+        let _ = fs::remove_file(old_master);
+    }
+    fs::write(&new_master_path, &bytes)
+        .map_err(|error| format!("Failed to write replacement image: {error}"))?;
+    let display_path = resolve_writable_asset_path(&workspace, &asset.display_path)?;
+    save_display_png(&image, &display_path)?;
+
+    asset.owner = "user".to_string();
+    asset.origin = "user-replaced".to_string();
+    asset.master_path = new_master_rel;
+    asset.protected = true;
+    asset.edits = None;
+    asset.updated_at = now_string();
+    registry.assets[index] = asset.clone();
+    write_wiki_image_asset_registry(&workspace, &registry)?;
+    trust_wiki_after_asset_edit(&workspace)?;
+
+    Ok(WikiImageAssetCommandResult {
+        state: load_state_at(&workspace)?,
+        asset,
+        markdown: None,
+    })
+}
+
+#[tauri::command]
+async fn update_wiki_image_asset(
+    asset_id: String,
+    alt: Option<String>,
+    caption: Option<String>,
+    user_notes: Option<String>,
+    semantic_notes: Option<String>,
+    protected: Option<bool>,
+    state: State<'_, WorkspaceStore>,
+) -> Result<WikiImageAssetCommandResult, String> {
+    let workspace = current_workspace(&state)?;
+    ensure_no_pending_generated_changes(&workspace)?;
+    ensure_no_workspace_operation_running(&workspace)?;
+
+    let mut registry = read_wiki_image_asset_registry(&workspace);
+    let index = find_asset_index(&registry, &asset_id)?;
+    let mut asset = registry.assets[index].clone();
+    if let Some(value) = alt {
+        asset.alt = sanitize_asset_text(Some(&value)).unwrap_or_default();
+    }
+    if let Some(value) = caption {
+        asset.caption = sanitize_asset_text(Some(&value)).unwrap_or_default();
+    }
+    if let Some(value) = user_notes {
+        asset.user_notes = sanitize_asset_text(Some(&value)).unwrap_or_default();
+    }
+    if let Some(value) = semantic_notes {
+        asset.semantic_notes = sanitize_asset_text(Some(&value)).unwrap_or_default();
+    }
+    if let Some(value) = protected {
+        asset.protected = value;
+    }
+    asset.updated_at = now_string();
+    registry.assets[index] = asset.clone();
+    write_wiki_image_asset_registry(&workspace, &registry)?;
+    trust_wiki_after_asset_edit(&workspace)?;
+
+    Ok(WikiImageAssetCommandResult {
+        state: load_state_at(&workspace)?,
+        asset,
+        markdown: None,
+    })
+}
+
+#[tauri::command]
+async fn delete_wiki_image_asset(
+    asset_id: String,
+    state: State<'_, WorkspaceStore>,
+) -> Result<AppCommandResult, String> {
+    let workspace = current_workspace(&state)?;
+    ensure_no_pending_generated_changes(&workspace)?;
+    ensure_no_workspace_operation_running(&workspace)?;
+
+    delete_wiki_image_asset_from_workspace(&workspace, &asset_id)?;
+    trust_wiki_after_asset_edit(&workspace)?;
+
+    Ok(AppCommandResult {
+        runner: None,
+        state: load_state_at(&workspace)?,
+    })
+}
+
+fn read_wiki_image_asset_registry(workspace: &Path) -> WikiImageAssetRegistry {
+    let registry_path = workspace.join(ASSET_REGISTRY_PATH);
+    let Ok(text) = fs::read_to_string(registry_path) else {
+        return WikiImageAssetRegistry {
+            schema_version: 1,
+            assets: Vec::new(),
+        };
+    };
+    let mut registry: WikiImageAssetRegistry =
+        serde_json::from_str(&text).unwrap_or_else(|_| WikiImageAssetRegistry {
+            schema_version: 1,
+            assets: Vec::new(),
+        });
+    registry.schema_version = 1;
+    registry.assets = registry
+        .assets
+        .into_iter()
+        .filter(|asset| is_valid_asset_relative_path(&asset.display_path))
+        .collect();
+    registry
+}
+
+fn register_existing_wiki_asset_references(workspace: &Path) -> Result<bool, String> {
+    let mut registry = read_wiki_image_asset_registry(workspace);
+    let mut registered: HashSet<String> = registry
+        .assets
+        .iter()
+        .map(|asset| asset.display_path.clone())
+        .collect();
+    let mut changed = false;
+    let now = now_string();
+
+    for page_path in list_wiki_files(workspace)?
+        .into_iter()
+        .filter(|path| path.ends_with(".md") && !path.starts_with("wiki/assets/"))
+    {
+        let page_full_path = workspace.join(&page_path);
+        let Ok(content) = fs::read_to_string(&page_full_path) else {
+            continue;
+        };
+
+        for reference in collect_markdown_image_references(&content) {
+            let Some(display_path) = resolve_markdown_workspace_path(&page_path, &reference.src)
+            else {
+                continue;
+            };
+            if !is_valid_asset_relative_path(&display_path) || registered.contains(&display_path) {
+                continue;
+            }
+            if !workspace.join(&display_path).is_file() {
+                continue;
+            }
+
+            let owner = if display_path.starts_with("wiki/assets/user/") {
+                "user"
+            } else {
+                "ai"
+            };
+            let protected = owner == "user";
+            registry.assets.push(WikiImageAsset {
+                id: format!("asset-legacy-{}", stable_text_hash(&display_path)),
+                owner: owner.to_string(),
+                origin: "legacy".to_string(),
+                master_path: display_path.clone(),
+                display_path: display_path.clone(),
+                alt: reference
+                    .alt
+                    .trim()
+                    .to_string()
+                    .trim_matches('"')
+                    .trim()
+                    .to_string(),
+                caption: String::new(),
+                user_notes: String::new(),
+                semantic_notes: String::new(),
+                source: None,
+                protected,
+                edits: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            });
+            registered.insert(display_path);
+            changed = true;
+        }
+    }
+
+    if changed {
+        write_wiki_image_asset_registry(workspace, &registry)?;
+    }
+
+    Ok(changed)
+}
+
+#[derive(Clone)]
+struct MarkdownImageReference {
+    alt: String,
+    src: String,
+    start: usize,
+    end: usize,
+}
+
+fn collect_markdown_image_references(content: &str) -> Vec<MarkdownImageReference> {
+    let mut references = Vec::new();
+    let mut offset = 0;
+
+    while let Some(start_relative) = content[offset..].find("![") {
+        let start = offset + start_relative;
+        let alt_start = start + 2;
+        let Some(alt_end_relative) = content[alt_start..].find("](") else {
+            offset = alt_start;
+            continue;
+        };
+        let alt_end = alt_start + alt_end_relative;
+        let src_start = alt_end + 2;
+        let Some(src_end_relative) = content[src_start..].find(')') else {
+            offset = src_start;
+            continue;
+        };
+        let src_end = src_start + src_end_relative;
+        let src = content[src_start..src_end].trim();
+        if !src.is_empty() {
+            references.push(MarkdownImageReference {
+                alt: content[alt_start..alt_end].trim().to_string(),
+                src: src.to_string(),
+                start,
+                end: src_end + 1,
+            });
+        }
+        offset = src_end + 1;
+    }
+
+    references
+}
+
+fn resolve_markdown_workspace_path(current_path: &str, target: &str) -> Option<String> {
+    if is_external_reference(target) || target.starts_with('#') {
+        return None;
+    }
+
+    let path_only = target.split('#').next()?.split('?').next()?.trim();
+    if path_only.is_empty() {
+        return None;
+    }
+
+    let base_dir = current_path
+        .rsplit_once('/')
+        .map(|(dir, _)| dir)
+        .unwrap_or("");
+    let combined = if path_only.starts_with('/') {
+        path_only.trim_start_matches('/').to_string()
+    } else if base_dir.is_empty() {
+        path_only.to_string()
+    } else {
+        format!("{base_dir}/{path_only}")
+    };
+
+    normalize_workspace_path_allowing_parent(&combined)
+}
+
+fn normalize_workspace_path_allowing_parent(path: &str) -> Option<String> {
+    let normalized_input = path.replace('\\', "/");
+    let mut parts: Vec<&str> = Vec::new();
+    for part in normalized_input.split('/') {
+        let part = part.trim();
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        if part == ".." {
+            parts.pop()?;
+            continue;
+        }
+        parts.push(part);
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("/"))
+    }
+}
+
+fn is_external_reference(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_alphabetic() {
+        return false;
+    }
+
+    for ch in chars {
+        if ch == ':' {
+            return true;
+        }
+        if !(ch.is_ascii_alphanumeric() || ch == '+' || ch == '.' || ch == '-') {
+            return false;
+        }
+    }
+
+    false
+}
+
+fn delete_wiki_image_asset_from_workspace(
+    workspace: &Path,
+    asset_id: &str,
+) -> Result<usize, String> {
+    let mut registry = read_wiki_image_asset_registry(workspace);
+    let index = find_asset_index(&registry, asset_id)?;
+    let asset = registry.assets[index].clone();
+
+    if asset.owner != "user" && !asset.display_path.starts_with("wiki/assets/user/") {
+        return Err("Only user-added image assets can be deleted directly.".to_string());
+    }
+
+    registry.assets.remove(index);
+    let retained_paths = registry
+        .assets
+        .iter()
+        .flat_map(|asset| [asset.master_path.clone(), asset.display_path.clone()])
+        .collect::<HashSet<_>>();
+
+    let removed_references = remove_wiki_image_asset_references(workspace, &asset.display_path)?;
+    write_wiki_image_asset_registry(workspace, &registry)?;
+
+    let mut deleted_paths = HashSet::new();
+    delete_asset_file_if_unshared(
+        workspace,
+        &asset.display_path,
+        &retained_paths,
+        &mut deleted_paths,
+    )?;
+    delete_asset_file_if_unshared(
+        workspace,
+        &asset.master_path,
+        &retained_paths,
+        &mut deleted_paths,
+    )?;
+
+    Ok(removed_references)
+}
+
+fn delete_asset_file_if_unshared(
+    workspace: &Path,
+    relative_path: &str,
+    retained_paths: &HashSet<String>,
+    deleted_paths: &mut HashSet<String>,
+) -> Result<(), String> {
+    if relative_path.trim().is_empty()
+        || retained_paths.contains(relative_path)
+        || deleted_paths.contains(relative_path)
+        || !is_valid_asset_relative_path(relative_path)
+    {
+        return Ok(());
+    }
+
+    let normalized = normalize_workspace_relative_path(relative_path)?;
+    let full_path = workspace.join(normalized);
+    if !full_path.exists() {
+        return Ok(());
+    }
+
+    let workspace_root = workspace
+        .canonicalize()
+        .map_err(|error| format!("Failed to resolve workspace path: {error}"))?;
+    let file_path = full_path
+        .canonicalize()
+        .map_err(|error| format!("Failed to resolve image asset path: {error}"))?;
+    if !file_path.starts_with(&workspace_root) {
+        return Err("Image asset path escaped the workspace.".to_string());
+    }
+    if file_path.is_file() {
+        fs::remove_file(&file_path)
+            .map_err(|error| format!("Failed to delete image asset: {error}"))?;
+        deleted_paths.insert(relative_path.to_string());
+    }
+    Ok(())
+}
+
+fn remove_wiki_image_asset_references(
+    workspace: &Path,
+    display_path: &str,
+) -> Result<usize, String> {
+    let mut page_paths = Vec::new();
+    for root_file in ["index.md", "log.md"] {
+        if workspace.join(root_file).is_file() {
+            page_paths.push(root_file.to_string());
+        }
+    }
+    page_paths.extend(
+        list_wiki_files(workspace)?
+            .into_iter()
+            .filter(|path| path.ends_with(".md") && !path.starts_with("wiki/assets/")),
+    );
+    page_paths.sort();
+    page_paths.dedup();
+
+    let mut updates = Vec::new();
+    let mut removed_count = 0;
+    for page_path in page_paths {
+        let full_path = workspace.join(&page_path);
+        let Ok(content) = fs::read_to_string(&full_path) else {
+            continue;
+        };
+        let (next_content, removed) =
+            remove_asset_references_from_markdown(&content, &page_path, display_path);
+        if removed == 0 {
+            continue;
+        }
+        removed_count += removed;
+        updates.push((full_path, next_content));
+    }
+
+    for (full_path, next_content) in updates {
+        fs::write(&full_path, next_content)
+            .map_err(|error| format!("Failed to remove image references: {error}"))?;
+    }
+
+    Ok(removed_count)
+}
+
+fn remove_asset_references_from_markdown(
+    content: &str,
+    page_path: &str,
+    display_path: &str,
+) -> (String, usize) {
+    let mut ranges = Vec::new();
+    for reference in collect_markdown_image_references(content) {
+        if resolve_markdown_workspace_path(page_path, &reference.src).as_deref()
+            == Some(display_path)
+        {
+            ranges.push(expand_image_reference_deletion_range(
+                content,
+                reference.start,
+                reference.end,
+            ));
+        }
+    }
+
+    if ranges.is_empty() {
+        return (content.to_string(), 0);
+    }
+
+    ranges.sort_by_key(|range| range.0);
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in ranges {
+        if let Some(last) = merged.last_mut() {
+            if start <= last.1 {
+                last.1 = last.1.max(end);
+                continue;
+            }
+        }
+        merged.push((start, end));
+    }
+
+    let mut next = String::with_capacity(content.len());
+    let mut cursor = 0;
+    for (start, end) in &merged {
+        next.push_str(&content[cursor..*start]);
+        cursor = *end;
+    }
+    next.push_str(&content[cursor..]);
+
+    (next, merged.len())
+}
+
+fn expand_image_reference_deletion_range(
+    content: &str,
+    start: usize,
+    end: usize,
+) -> (usize, usize) {
+    let line_start = content[..start]
+        .rfind('\n')
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    let line_end = content[end..]
+        .find('\n')
+        .map(|index| end + index + 1)
+        .unwrap_or(content.len());
+    let prefix = &content[line_start..start];
+    let suffix = &content[end..line_end];
+    if !prefix.trim().is_empty() || !suffix.trim().is_empty() {
+        return (start, end);
+    }
+
+    let mut range_end = line_end;
+    let mut cursor = line_end;
+    while cursor < content.len() {
+        let next_line_end = content[cursor..]
+            .find('\n')
+            .map(|index| cursor + index + 1)
+            .unwrap_or(content.len());
+        let line = &content[cursor..next_line_end];
+        if line.trim().is_empty() {
+            cursor = next_line_end;
+            continue;
+        }
+
+        let trimmed = line.trim();
+        if (trimmed.starts_with("_Figure:") || trimmed.starts_with("_Caption:"))
+            && trimmed.ends_with('_')
+        {
+            range_end = next_line_end;
+        }
+        break;
+    }
+
+    (line_start, range_end)
+}
+
+fn write_wiki_image_asset_registry(
+    workspace: &Path,
+    registry: &WikiImageAssetRegistry,
+) -> Result<(), String> {
+    let mut normalized = registry.clone();
+    normalized.schema_version = 1;
+    normalized
+        .assets
+        .sort_by(|left, right| left.display_path.cmp(&right.display_path));
+    let registry_path = workspace.join(ASSET_REGISTRY_PATH);
+    fs::create_dir_all(registry_path.parent().unwrap())
+        .map_err(|error| format!("Failed to create asset registry directory: {error}"))?;
+    let json = serde_json::to_string_pretty(&normalized)
+        .map_err(|error| format!("Failed to serialize asset registry: {error}"))?;
+    fs::write(&registry_path, format!("{json}\n"))
+        .map_err(|error| format!("Failed to write asset registry: {error}"))
+}
+
+fn decode_image_payload(data_base64: &str) -> Result<Vec<u8>, String> {
+    let payload = data_base64
+        .split_once(',')
+        .map(|(_, payload)| payload)
+        .unwrap_or(data_base64)
+        .trim();
+    general_purpose::STANDARD
+        .decode(payload)
+        .map_err(|error| format!("Image data was not valid base64: {error}"))
+}
+
+fn normalized_image_extension(file_name: &str) -> String {
+    let extension = Path::new(file_name)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("png")
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        "jpg" | "jpeg" => "jpg".to_string(),
+        "gif" => "gif".to_string(),
+        "webp" => "webp".to_string(),
+        _ => "png".to_string(),
+    }
+}
+
+fn save_display_png(image: &image::DynamicImage, path: &Path) -> Result<(), String> {
+    fs::create_dir_all(path.parent().unwrap())
+        .map_err(|error| format!("Failed to create image directory: {error}"))?;
+    image
+        .save_with_format(path, image::ImageFormat::Png)
+        .map_err(|error| format!("Failed to write display image: {error}"))
+}
+
+fn fallback_alt_from_filename(file_name: &str) -> String {
+    Path::new(file_name)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("Image")
+        .replace(['-', '_'], " ")
+        .trim()
+        .to_string()
+}
+
+fn sanitize_asset_text(value: Option<&str>) -> Option<String> {
+    value
+        .map(|text| text.trim().chars().take(4000).collect())
+        .filter(|text: &String| !text.is_empty())
+}
+
+fn find_asset_index(registry: &WikiImageAssetRegistry, asset_id: &str) -> Result<usize, String> {
+    registry
+        .assets
+        .iter()
+        .position(|asset| asset.id == asset_id)
+        .ok_or_else(|| "Image asset was not found.".to_string())
+}
+
+fn resolve_existing_asset_file(workspace: &Path, relative_path: &str) -> Result<PathBuf, String> {
+    let path = resolve_writable_asset_path(workspace, relative_path)?;
+    if !path.is_file() {
+        return Err("Image asset file is missing.".to_string());
+    }
+    Ok(path)
+}
+
+fn ensure_asset_master_file_for_edit(
+    workspace: &Path,
+    asset: &mut WikiImageAsset,
+) -> Result<PathBuf, String> {
+    if asset.master_path != asset.display_path {
+        return resolve_existing_asset_file(workspace, &asset.master_path);
+    }
+
+    let display_path = resolve_existing_asset_file(workspace, &asset.display_path)?;
+    let extension = normalized_image_extension(&asset.display_path);
+    let master_rel = format!("wiki/assets/masters/{}.master.{extension}", asset.id);
+    let master_path = resolve_writable_asset_path(workspace, &master_rel)?;
+    if !master_path.is_file() {
+        fs::copy(&display_path, &master_path).map_err(|error| {
+            format!("Failed to preserve original image before cropping: {error}")
+        })?;
+    }
+    asset.master_path = master_rel;
+    Ok(master_path)
+}
+
+fn resolve_writable_asset_path(workspace: &Path, relative_path: &str) -> Result<PathBuf, String> {
+    if !is_valid_asset_relative_path(relative_path) {
+        return Err("Image asset path must stay under wiki/assets/.".to_string());
+    }
+    let normalized = normalize_workspace_relative_path(relative_path)?;
+    let full_path = workspace.join(normalized);
+    let workspace_root = workspace
+        .canonicalize()
+        .map_err(|error| format!("Failed to resolve workspace path: {error}"))?;
+    let parent = full_path
+        .parent()
+        .ok_or_else(|| "Invalid image asset path.".to_string())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("Failed to create image asset directory: {error}"))?;
+    let parent_canonical = parent
+        .canonicalize()
+        .map_err(|error| format!("Failed to resolve image asset directory: {error}"))?;
+    if !parent_canonical.starts_with(&workspace_root) {
+        return Err("Image asset path escaped the workspace.".to_string());
+    }
+    Ok(full_path)
+}
+
+fn is_valid_asset_relative_path(relative_path: &str) -> bool {
+    let Ok(path) = normalize_workspace_relative_path(relative_path) else {
+        return false;
+    };
+    if has_hidden_path_component(&path) {
+        return false;
+    }
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    if !normalized.starts_with("wiki/assets/") || normalized == ASSET_REGISTRY_PATH {
+        return false;
+    }
+    matches!(
+        path.extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "webp"
+    )
+}
+
+fn markdown_relative_path(from_page: &str, target: &str) -> String {
+    let from_dir = from_page.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
+    let from_parts: Vec<&str> = from_dir
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
+    let target_parts: Vec<&str> = target.split('/').filter(|part| !part.is_empty()).collect();
+    let mut common = 0;
+    while common < from_parts.len()
+        && common < target_parts.len()
+        && from_parts[common] == target_parts[common]
+    {
+        common += 1;
+    }
+    let mut parts = Vec::new();
+    for _ in common..from_parts.len() {
+        parts.push("..");
+    }
+    parts.extend(target_parts[common..].iter().copied());
+    if parts.is_empty() {
+        target.to_string()
+    } else {
+        parts.join("/")
+    }
+}
+
+fn image_asset_markdown(asset: &WikiImageAsset, target: &str) -> String {
+    let mut markdown = format!(
+        "![{}]({target})",
+        asset.alt.replace('\\', "\\\\").replace(']', "\\]")
+    );
+    if !asset.caption.trim().is_empty() {
+        markdown.push_str("\n\n_Figure: ");
+        markdown.push_str(&asset.caption.replace('\n', " "));
+        markdown.push('_');
+    }
+    markdown
+}
+
+fn trust_wiki_after_asset_edit(workspace: &Path) -> Result<(), String> {
+    let runner = run_runner(
+        workspace,
+        "trust-wiki",
+        &["--source", "maple-image-asset-edit"],
+    )?;
+    ensure_runner_success(&runner, "Failed to update trusted wiki baseline")
+}
+
 fn has_hidden_path_component(path: &Path) -> bool {
     path.components().any(|component| match component {
         Component::Normal(part) => part.to_string_lossy().starts_with('.'),
@@ -6116,7 +7043,9 @@ fn ensure_runner_success(runner: &RunnerOutput, action: &str) -> Result<(), Stri
     if detail.is_empty() {
         Err(format!("{action}: runner exited with code {code}."))
     } else {
-        Err(format!("{action}: runner exited with code {code}. {detail}"))
+        Err(format!(
+            "{action}: runner exited with code {code}. {detail}"
+        ))
     }
 }
 
@@ -6822,6 +7751,13 @@ fn login_shell_path() -> Option<String> {
 
 fn load_state_at(workspace: &Path) -> Result<WorkspaceState, String> {
     migrate_legacy_workspace(workspace)?;
+    if !has_pending_generated_changes(workspace)
+        && read_workspace_running_marker(workspace).is_none()
+    {
+        if let Err(error) = register_existing_wiki_asset_references(workspace) {
+            eprintln!("Failed to register existing wiki image assets: {error}");
+        }
+    }
     let status = run_runner(workspace, "status", &[])
         .ok()
         .and_then(|output| serde_json::from_str::<Value>(&output.stdout).ok());
@@ -6869,6 +7805,7 @@ fn load_state_at(workspace: &Path) -> Result<WorkspaceState, String> {
         schema_md: read_text_if_exists(&workspace.join("schema.md")),
         report_md,
         last_operation_message,
+        asset_registry: read_json_if_exists_normalized(&workspace.join(ASSET_REGISTRY_PATH)),
         root_files: list_root_markdown_files(workspace)?,
         source_files: list_source_files(workspace)?,
         wiki_files: list_wiki_files(workspace)?,
@@ -7291,21 +8228,24 @@ mod tests {
     use super::{
         backup_schema_before_update, chat_thread_summary, chat_threads_dir,
         compose_maintain_operation_instruction, dedupe_node_path_candidates,
-        default_workspace_schema, ensure_maintain_thread_task_matches,
+        default_workspace_schema, delete_wiki_image_asset_from_workspace,
+        ensure_asset_master_file_for_edit, ensure_maintain_thread_task_matches,
         ensure_no_pending_generated_changes, extract_partial_answer_from_events,
         finalize_provider_check_report, initialize_workspace_files,
-        is_readable_workspace_preview_path, load_state_at, login_command_for_settings,
-        maintain_operation_assistant_text, maintain_operation_user_text, make_chat_thread,
-        make_maintain_thread, node_version_supported, normalize_operation_events,
-        normalize_settings, parse_node_major, parse_provider_ready, provider_choice_required,
-        provider_ready_candidate_count, provider_simulation_value_matches,
-        read_requested_or_new_chat_thread, read_text_tail, read_thread_file,
-        refresh_maintain_operation_messages, refresh_streaming_messages,
+        is_readable_workspace_preview_path, is_valid_asset_relative_path, load_state_at,
+        login_command_for_settings, maintain_operation_assistant_text,
+        maintain_operation_user_text, make_chat_thread, make_maintain_thread,
+        node_version_supported, normalize_operation_events, normalize_settings, parse_node_major,
+        parse_provider_ready, provider_choice_required, provider_ready_candidate_count,
+        provider_simulation_value_matches, read_requested_or_new_chat_thread, read_text_tail,
+        read_thread_file, read_wiki_image_asset_registry, refresh_maintain_operation_messages,
+        refresh_streaming_messages, register_existing_wiki_asset_references,
         resolve_editable_workspace_file, run_command_probe, runner_path_env,
         schema_update_prompt_for_workspace, select_node_candidate, shell_single_quote,
         terminal_command_script, thread_activity_context, validate_provider_candidate,
-        validate_provider_path, write_schema_update_marker, AppSettings, ChatThreadMessage,
-        NodeCandidate, NodePathCandidate, ProviderCandidate, ProviderPathCandidate, ThreadFileKind,
+        validate_provider_path, write_schema_update_marker, write_wiki_image_asset_registry,
+        AppSettings, ChatThreadMessage, NodeCandidate, NodePathCandidate, ProviderCandidate,
+        ProviderPathCandidate, ThreadFileKind, WikiImageAsset, WikiImageAssetRegistry,
     };
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -7453,6 +8393,139 @@ mod tests {
     }
 
     #[test]
+    fn image_asset_registry_round_trips_metadata() {
+        let workspace = unique_test_workspace("maple-asset-registry");
+        fs::create_dir_all(workspace.join("wiki/assets/user")).unwrap();
+
+        let registry = WikiImageAssetRegistry {
+            schema_version: 1,
+            assets: vec![WikiImageAsset {
+                id: "asset-test".to_string(),
+                owner: "user".to_string(),
+                origin: "user-added".to_string(),
+                master_path: "wiki/assets/user/asset-test.original.png".to_string(),
+                display_path: "wiki/assets/user/asset-test.display.png".to_string(),
+                alt: "Diagram".to_string(),
+                caption: "A useful diagram".to_string(),
+                user_notes: "Keep this".to_string(),
+                semantic_notes: String::new(),
+                source: None,
+                protected: true,
+                edits: None,
+                created_at: "1".to_string(),
+                updated_at: "1".to_string(),
+            }],
+        };
+
+        write_wiki_image_asset_registry(&workspace, &registry).unwrap();
+        let read = read_wiki_image_asset_registry(&workspace);
+        assert_eq!(read.schema_version, 1);
+        assert_eq!(read.assets.len(), 1);
+        assert_eq!(
+            read.assets[0].display_path,
+            "wiki/assets/user/asset-test.display.png"
+        );
+        assert!(read.assets[0].protected);
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn image_asset_path_validation_blocks_escape_and_registry_file() {
+        assert!(is_valid_asset_relative_path(
+            "wiki/assets/user/asset.display.png"
+        ));
+        assert!(is_valid_asset_relative_path(
+            "wiki/assets/generated/chart.webp"
+        ));
+        assert!(!is_valid_asset_relative_path(
+            "../wiki/assets/user/asset.png"
+        ));
+        assert!(!is_valid_asset_relative_path("sources/asset.png"));
+        assert!(!is_valid_asset_relative_path("wiki/assets/assets.json"));
+        assert!(!is_valid_asset_relative_path(
+            "wiki/assets/.hidden/asset.png"
+        ));
+    }
+
+    #[test]
+    fn existing_referenced_wiki_assets_are_registered_on_load() {
+        let workspace = unique_test_workspace("maple-register-legacy-assets");
+        fs::create_dir_all(workspace.join("wiki/concepts/topic")).unwrap();
+        fs::create_dir_all(workspace.join("wiki/assets/source")).unwrap();
+        fs::write(
+            workspace.join("wiki/assets/source/diagram.png"),
+            b"not decoded",
+        )
+        .unwrap();
+        fs::write(
+            workspace.join("wiki/assets/source/loose.png"),
+            b"not decoded",
+        )
+        .unwrap();
+        fs::write(
+            workspace.join("wiki/concepts/topic/page.md"),
+            "![Diagram](../../assets/source/diagram.png)\n\n![Remote](https://example.com/a.png)\n",
+        )
+        .unwrap();
+
+        let changed = register_existing_wiki_asset_references(&workspace).unwrap();
+        let registry = read_wiki_image_asset_registry(&workspace);
+
+        assert!(changed);
+        assert_eq!(registry.assets.len(), 1);
+        assert_eq!(
+            registry.assets[0].display_path,
+            "wiki/assets/source/diagram.png"
+        );
+        assert_eq!(registry.assets[0].owner, "ai");
+        assert!(!registry.assets[0].protected);
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn legacy_asset_crop_preserves_master_before_overwriting_display() {
+        let workspace = unique_test_workspace("maple-legacy-master-copy");
+        fs::create_dir_all(workspace.join("wiki/assets/source")).unwrap();
+        fs::write(
+            workspace.join("wiki/assets/source/diagram.png"),
+            b"original",
+        )
+        .unwrap();
+        let mut asset = WikiImageAsset {
+            id: "asset-legacy-test".to_string(),
+            owner: "ai".to_string(),
+            origin: "legacy".to_string(),
+            master_path: "wiki/assets/source/diagram.png".to_string(),
+            display_path: "wiki/assets/source/diagram.png".to_string(),
+            alt: "Diagram".to_string(),
+            caption: String::new(),
+            user_notes: String::new(),
+            semantic_notes: String::new(),
+            source: None,
+            protected: false,
+            edits: None,
+            created_at: "1".to_string(),
+            updated_at: "1".to_string(),
+        };
+
+        let master_path = ensure_asset_master_file_for_edit(&workspace, &mut asset).unwrap();
+
+        assert_eq!(
+            asset.master_path,
+            "wiki/assets/masters/asset-legacy-test.master.png"
+        );
+        assert_eq!(fs::read(master_path).unwrap(), b"original");
+        assert_eq!(
+            fs::read(workspace.join("wiki/assets/source/diagram.png")).unwrap(),
+            b"original"
+        );
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
     fn manual_editing_is_blocked_by_pending_generated_changes() {
         let workspace = unique_test_workspace("maple-edit-pending-review");
         fs::create_dir_all(&workspace).unwrap();
@@ -7475,6 +8548,115 @@ mod tests {
     }
 
     #[test]
+    fn user_image_asset_delete_removes_files_registry_and_references() {
+        let workspace = unique_test_workspace("maple-delete-user-asset");
+        fs::create_dir_all(workspace.join("wiki/concepts")).unwrap();
+        fs::create_dir_all(workspace.join("wiki/guides")).unwrap();
+        fs::create_dir_all(workspace.join("wiki/assets/user")).unwrap();
+        fs::write(
+            workspace.join("wiki/assets/user/asset-1.original.png"),
+            b"original",
+        )
+        .unwrap();
+        fs::write(
+            workspace.join("wiki/assets/user/asset-1.display.png"),
+            b"display",
+        )
+        .unwrap();
+        fs::write(
+            workspace.join("wiki/concepts/page.md"),
+            "# Page\n\n![Diagram](../assets/user/asset-1.display.png)\n\n_Figure: remove me._\n\nKeep this.\n",
+        )
+        .unwrap();
+        fs::write(
+            workspace.join("wiki/guides/path.md"),
+            "# Guide\n\n![Diagram](../assets/user/asset-1.display.png)\n",
+        )
+        .unwrap();
+        write_wiki_image_asset_registry(
+            &workspace,
+            &WikiImageAssetRegistry {
+                schema_version: 1,
+                assets: vec![WikiImageAsset {
+                    id: "asset-1".to_string(),
+                    owner: "user".to_string(),
+                    origin: "user-added".to_string(),
+                    master_path: "wiki/assets/user/asset-1.original.png".to_string(),
+                    display_path: "wiki/assets/user/asset-1.display.png".to_string(),
+                    alt: "Diagram".to_string(),
+                    caption: "remove me".to_string(),
+                    user_notes: String::new(),
+                    semantic_notes: String::new(),
+                    source: None,
+                    protected: true,
+                    edits: None,
+                    created_at: "1".to_string(),
+                    updated_at: "1".to_string(),
+                }],
+            },
+        )
+        .unwrap();
+
+        let removed = delete_wiki_image_asset_from_workspace(&workspace, "asset-1").unwrap();
+
+        assert_eq!(removed, 2);
+        assert!(!workspace
+            .join("wiki/assets/user/asset-1.original.png")
+            .exists());
+        assert!(!workspace
+            .join("wiki/assets/user/asset-1.display.png")
+            .exists());
+        assert!(read_wiki_image_asset_registry(&workspace).assets.is_empty());
+        let page = fs::read_to_string(workspace.join("wiki/concepts/page.md")).unwrap();
+        assert!(!page.contains("asset-1.display.png"));
+        assert!(!page.contains("Figure: remove me"));
+        assert!(page.contains("Keep this."));
+        assert!(!fs::read_to_string(workspace.join("wiki/guides/path.md"))
+            .unwrap()
+            .contains("asset-1.display.png"));
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn image_asset_delete_rejects_ai_owned_assets() {
+        let workspace = unique_test_workspace("maple-delete-ai-asset");
+        fs::create_dir_all(workspace.join("wiki/assets/source")).unwrap();
+        fs::write(workspace.join("wiki/assets/source/diagram.png"), b"image").unwrap();
+        write_wiki_image_asset_registry(
+            &workspace,
+            &WikiImageAssetRegistry {
+                schema_version: 1,
+                assets: vec![WikiImageAsset {
+                    id: "asset-ai".to_string(),
+                    owner: "ai".to_string(),
+                    origin: "ai-generated".to_string(),
+                    master_path: "wiki/assets/source/diagram.png".to_string(),
+                    display_path: "wiki/assets/source/diagram.png".to_string(),
+                    alt: "Diagram".to_string(),
+                    caption: String::new(),
+                    user_notes: String::new(),
+                    semantic_notes: String::new(),
+                    source: None,
+                    protected: false,
+                    edits: None,
+                    created_at: "1".to_string(),
+                    updated_at: "1".to_string(),
+                }],
+            },
+        )
+        .unwrap();
+
+        let error = delete_wiki_image_asset_from_workspace(&workspace, "asset-ai").unwrap_err();
+
+        assert!(error.contains("Only user-added image assets"));
+        assert!(workspace.join("wiki/assets/source/diagram.png").exists());
+        assert_eq!(read_wiki_image_asset_registry(&workspace).assets.len(), 1);
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
     fn default_workspace_schema_includes_wiki_operation_rules() {
         let schema = default_workspace_schema();
 
@@ -7485,6 +8667,10 @@ mod tests {
         assert!(schema.contains("lecture-03.txt#L15-L17"));
         assert!(schema.contains("include that locator in the visible link label"));
         assert!(schema.contains("known exact locator is missing from the visible link label"));
+        assert!(schema.contains("wiki/assets/assets.json"));
+        assert!(schema.contains("Preserve user-owned protected image assets"));
+        assert!(schema.contains("Managed image deletion must keep asset files"));
+        assert!(!schema.contains("Maple updates it"));
         assert!(schema.contains("## Wiki Healthcheck Rules"));
     }
 
@@ -8595,6 +9781,12 @@ pub fn run() {
             read_chat_run_progress,
             read_workspace_file,
             save_workspace_file,
+            create_wiki_image_asset,
+            crop_wiki_image_asset,
+            reset_wiki_image_crop,
+            replace_wiki_image_asset,
+            update_wiki_image_asset,
+            delete_wiki_image_asset,
             check_soffice,
             install_libreoffice,
             convert_pptx_to_pdf,

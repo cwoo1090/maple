@@ -4,12 +4,18 @@ import {
   Fragment,
   isValidElement,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
+  type ClipboardEvent as ReactClipboardEvent,
+  type CSSProperties,
+  type DragEvent as ReactDragEvent,
   type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
+  type RefObject,
   type ReactNode,
+  type SyntheticEvent as ReactSyntheticEvent,
 } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
@@ -32,10 +38,18 @@ import { forceCollide } from "d3-force";
 import {
   AlertTriangle,
   CheckCircle2,
+  Crop,
   HelpCircle,
   Info,
+  Link as LinkIcon,
   Lightbulb,
+  Pencil,
+  Plus,
   Quote,
+  RotateCcw,
+  ShieldCheck,
+  Trash2,
+  Upload,
   X,
   XCircle,
   type LucideIcon,
@@ -89,9 +103,88 @@ type WorkspaceState = {
   schemaMd: string | null;
   reportMd: string | null;
   lastOperationMessage: string | null;
+  assetRegistry: WikiImageAssetRegistry | null;
   rootFiles: string[];
   sourceFiles: string[];
   wikiFiles: string[];
+};
+
+type WikiImageAssetRegistry = {
+  schemaVersion: number;
+  assets: WikiImageAsset[];
+};
+
+type WikiImageAsset = {
+  id: string;
+  owner: "user" | "ai" | string;
+  origin: string;
+  masterPath: string;
+  displayPath: string;
+  alt?: string;
+  caption?: string;
+  userNotes?: string;
+  semanticNotes?: string;
+  source?: {
+    path?: string;
+    page?: number;
+    slide?: number;
+    sourceHash?: string;
+  } | null;
+  protected?: boolean;
+  edits?: {
+    crop?: {
+      x: number;
+      y: number;
+      width: number;
+      height: number;
+      basis?: string;
+    };
+  } | null;
+  createdAt?: string;
+  updatedAt?: string;
+};
+
+type WikiImageAssetCommandResult = {
+  state: WorkspaceState;
+  asset: WikiImageAsset;
+  markdown?: string | null;
+};
+
+type AssetCropRect = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+
+type AssetCropResizeEdge = "n" | "e" | "s" | "w" | "ne" | "nw" | "se" | "sw";
+
+type AssetCropDrag = {
+  pointerId: number;
+  mode: "create" | "move" | "resize";
+  edge?: AssetCropResizeEdge;
+  origin: { x: number; y: number };
+  startCrop: AssetCropRect;
+};
+
+type AssetCropDraft = AssetCropRect & {
+  asset: WikiImageAsset;
+  imageWidth?: number;
+  imageHeight?: number;
+};
+
+type AssetDetailsDraft = {
+  asset: WikiImageAsset;
+  alt: string;
+  caption: string;
+  userNotes: string;
+  semanticNotes: string;
+  protected: boolean;
+};
+
+type AssetActionState = {
+  assetId: string;
+  label: string;
 };
 
 type SourceState = "new" | "modified" | "removed" | "unchanged";
@@ -488,6 +581,7 @@ const CHAT_PROGRESS_ERROR_PREFIX = "Failed to read chat progress:";
 const MAINTAIN_DISCUSSION_PROGRESS_ERROR_PREFIX = "Failed to read maintain discussion progress:";
 const OPERATION_PROGRESS_ERROR_PREFIX = "Failed to read operation progress:";
 const BACKGROUND_BUILD_PROGRESS_ERROR_PREFIX = "Failed to read background build progress:";
+const NEW_IMAGE_ASSET_ACTION_ID = "__new-image-asset__";
 const PENDING_GENERATED_CHANGES_ERROR =
   "Finish reviewing or undo generated changes before starting another workspace-changing action.";
 
@@ -617,6 +711,7 @@ const MAINTAIN_TASK_ID_BY_OPERATION: Record<string, MaintainTaskId> = {
 type LinkGraphEntry = { outbound: string[]; backlinks: string[] };
 type LinkGraph = Record<string, LinkGraphEntry>;
 type WorkspaceDocumentTarget = { path: string; anchor: string | null };
+type ImageAssetUsage = { pagePath: string; line: number; alt: string; src: string; anchor: string };
 
 function makeWorkspaceAssetUrl(workspacePath: string, relativePath: string): string {
   const absolute = `${workspacePath.replace(/\/$/, "")}/${relativePath}`;
@@ -681,7 +776,11 @@ function resolveWorkspaceDocumentReference(
 }
 
 function parseWorkspaceDocumentReference(reference: string, workspacePath: string) {
-  const trimmed = reference.trim().replace(/^`([^`]+)`$/, "$1").trim();
+  const trimmed = reference
+    .trim()
+    .replace(/^`([^`]+)`$/, "$1")
+    .replace(/^<([^>]+)>$/, "$1")
+    .trim();
   if (!trimmed || trimmed.startsWith("#")) {
     return null;
   }
@@ -914,6 +1013,70 @@ function clampNumber(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max);
 }
 
+function clampCropRect(rect: AssetCropRect, imageWidth: number, imageHeight: number): AssetCropRect {
+  const width = Math.max(1, Math.min(Math.round(rect.width), imageWidth));
+  const height = Math.max(1, Math.min(Math.round(rect.height), imageHeight));
+  return {
+    x: Math.round(clampNumber(rect.x, 0, imageWidth - width)),
+    y: Math.round(clampNumber(rect.y, 0, imageHeight - height)),
+    width,
+    height,
+  };
+}
+
+function cropRectForDrag(
+  drag: AssetCropDrag,
+  point: { x: number; y: number },
+  imageWidth: number,
+  imageHeight: number,
+): AssetCropRect {
+  if (drag.mode === "create") {
+    const x = Math.min(drag.origin.x, point.x);
+    const y = Math.min(drag.origin.y, point.y);
+    const width = Math.abs(point.x - drag.origin.x);
+    const height = Math.abs(point.y - drag.origin.y);
+    return clampCropRect({ x, y, width, height }, imageWidth, imageHeight);
+  }
+
+  if (drag.mode === "move") {
+    const dx = point.x - drag.origin.x;
+    const dy = point.y - drag.origin.y;
+    return clampCropRect(
+      { ...drag.startCrop, x: drag.startCrop.x + dx, y: drag.startCrop.y + dy },
+      imageWidth,
+      imageHeight,
+    );
+  }
+
+  const edge = drag.edge ?? "se";
+  let left = drag.startCrop.x;
+  let top = drag.startCrop.y;
+  let right = drag.startCrop.x + drag.startCrop.width;
+  let bottom = drag.startCrop.y + drag.startCrop.height;
+
+  if (edge.includes("w")) left = point.x;
+  if (edge.includes("e")) right = point.x;
+  if (edge.includes("n")) top = point.y;
+  if (edge.includes("s")) bottom = point.y;
+
+  const x = Math.min(left, right);
+  const y = Math.min(top, bottom);
+  const width = Math.abs(right - left);
+  const height = Math.abs(bottom - top);
+  return clampCropRect({ x, y, width, height }, imageWidth, imageHeight);
+}
+
+function cropSelectionStyle(draft: AssetCropDraft): CSSProperties {
+  const imageWidth = draft.imageWidth || draft.width || 1;
+  const imageHeight = draft.imageHeight || draft.height || 1;
+  return {
+    left: `${(draft.x / imageWidth) * 100}%`,
+    top: `${(draft.y / imageHeight) * 100}%`,
+    width: `${(draft.width / imageWidth) * 100}%`,
+    height: `${(draft.height / imageHeight) * 100}%`,
+  };
+}
+
 function readStoredPanelWidth(
   key: string,
   legacyKey: string,
@@ -1115,6 +1278,7 @@ const emptyState: WorkspaceState = {
   schemaMd: null,
   reportMd: null,
   lastOperationMessage: null,
+  assetRegistry: null,
   rootFiles: [],
   sourceFiles: [],
   wikiFiles: [],
@@ -1242,7 +1406,15 @@ function App() {
   const [unsavedPrompt, setUnsavedPrompt] = useState<UnsavedPrompt | null>(null);
   const unsavedPromptResolverRef = useRef<((choice: UnsavedChoice) => void) | null>(null);
   const [linkGraphRefreshKey, setLinkGraphRefreshKey] = useState(0);
+  const [imageUsageMap, setImageUsageMap] = useState<Map<string, ImageAssetUsage[]>>(new Map());
   const [expandedImage, setExpandedImage] = useState<ExpandedImage | null>(null);
+  const [assetRefreshNonce, setAssetRefreshNonce] = useState(0);
+  const [assetCropDraft, setAssetCropDraft] = useState<AssetCropDraft | null>(null);
+  const assetCropStageRef = useRef<HTMLDivElement | null>(null);
+  const assetCropImageRef = useRef<HTMLImageElement | null>(null);
+  const assetCropDragRef = useRef<AssetCropDrag | null>(null);
+  const [assetDetailsDraft, setAssetDetailsDraft] = useState<AssetDetailsDraft | null>(null);
+  const [assetAction, setAssetAction] = useState<AssetActionState | null>(null);
   const [sofficeStatus, setSofficeStatus] = useState<SofficeStatus | null>(null);
   const [sofficeInstalling, setSofficeInstalling] = useState(false);
   const [sofficeInstallStartedAt, setSofficeInstallStartedAt] = useState<number | null>(null);
@@ -1740,13 +1912,25 @@ function App() {
   );
   const imageAssets = useMemo(
     () =>
-      workspace.wikiFiles.filter((file) =>
-        /\.(apng|avif|gif|jpe?g|png|svg|webp)$/i.test(file),
+      workspace.wikiFiles.filter(
+        (file) => IMAGE_EXT_REGEX.test(file) && shouldShowWikiFileInSidebar(file),
       ),
     [workspace.wikiFiles],
   );
+  const assetByDisplayPath = useMemo(() => {
+    const map = new Map<string, WikiImageAsset>();
+    for (const asset of workspace.assetRegistry?.assets ?? []) {
+      if (asset.displayPath) map.set(normalizeWorkspacePath(asset.displayPath) ?? asset.displayPath, asset);
+    }
+    return map;
+  }, [workspace.assetRegistry]);
+  const newImageBusyLabel =
+    assetAction?.assetId === NEW_IMAGE_ASSET_ACTION_ID ? assetAction.label : null;
+  function assetBusyLabel(asset: WikiImageAsset | null | undefined) {
+    return asset && assetAction?.assetId === asset.id ? assetAction.label : null;
+  }
   const sidebarWikiFiles = useMemo(
-    () => workspace.wikiFiles.filter((file) => !file.startsWith("wiki/assets/")),
+    () => workspace.wikiFiles.filter(shouldShowWikiFileInSidebar),
     [workspace.wikiFiles],
   );
   const maintainChangedFiles =
@@ -2408,6 +2592,276 @@ function App() {
         current && current.path === buffer.path ? { ...current, saving: false } : current,
       );
       return false;
+    }
+  }
+
+  async function createImageAssetFromFile(file: File, pagePath: string): Promise<string | null> {
+    if (!isDirectlyEditableWorkspaceFile(pagePath)) {
+      setError("Images can only be inserted into editable wiki pages.");
+      return null;
+    }
+    setAssetAction({ assetId: NEW_IMAGE_ASSET_ACTION_ID, label: "Adding image" });
+    try {
+      const dataBase64 = await fileToDataUrl(file);
+      const result = await invoke<WikiImageAssetCommandResult>("create_wiki_image_asset", {
+        pagePath,
+        fileName: file.name || "image.png",
+        dataBase64,
+        alt: fallbackAltFromFileName(file.name),
+        caption: "",
+      });
+      setWorkspace(result.state);
+      setAssetRefreshNonce((value) => value + 1);
+      return result.markdown ?? null;
+    } catch (err) {
+      setError(String(err));
+      return null;
+    } finally {
+      setAssetAction((current) =>
+        current?.assetId === NEW_IMAGE_ASSET_ACTION_ID ? null : current,
+      );
+    }
+  }
+
+  async function replaceImageAssetFromFile(asset: WikiImageAsset, file: File) {
+    if (assetBusyLabel(asset)) return;
+    setAssetAction({ assetId: asset.id, label: "Replacing image" });
+    try {
+      const dataBase64 = await fileToDataUrl(file);
+      const result = await invoke<WikiImageAssetCommandResult>("replace_wiki_image_asset", {
+        assetId: asset.id,
+        fileName: file.name || "image.png",
+        dataBase64,
+      });
+      setWorkspace(result.state);
+      setAssetRefreshNonce((value) => value + 1);
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setAssetAction((current) => (current?.assetId === asset.id ? null : current));
+    }
+  }
+
+  async function deleteImageAsset(asset: WikiImageAsset, usageCount = 0) {
+    if (asset.owner !== "user" && !asset.displayPath.startsWith("wiki/assets/user/")) {
+      setError("Only user-added images can be deleted directly.");
+      return;
+    }
+    const title = imageAssetTitle(asset);
+    const usageText =
+      usageCount > 0
+        ? ` This will also remove ${usageCount} wiki reference${usageCount === 1 ? "" : "s"}.`
+        : "";
+    const confirmed = window.confirm(`Delete "${title}" from this workspace?${usageText}`);
+    if (!confirmed) return;
+    const canEdit = await resolveDirtyEditBefore(`delete ${title}`);
+    if (!canEdit) return;
+
+    setAssetAction({ assetId: asset.id, label: "Deleting asset" });
+    try {
+      const result = await invoke<AppCommandResult>("delete_wiki_image_asset", {
+        assetId: asset.id,
+      });
+      setWorkspace(result.state);
+      setAssetRefreshNonce((value) => value + 1);
+      setExpandedImage((current) =>
+        current?.src.includes(asset.displayPath) || current?.src.includes(asset.masterPath)
+          ? null
+          : current,
+      );
+      setAssetCropDraft((current) => (current?.asset.id === asset.id ? null : current));
+      setAssetDetailsDraft((current) => (current?.asset.id === asset.id ? null : current));
+      if (selectedPath === asset.displayPath || selectedPath === asset.masterPath) {
+        setSelectedPath("index.md");
+      }
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setAssetAction((current) => (current?.assetId === asset.id ? null : current));
+    }
+  }
+
+  async function saveImageAssetCrop() {
+    if (!assetCropDraft) return;
+    const assetId = assetCropDraft.asset.id;
+    if (assetBusyLabel(assetCropDraft.asset)) return;
+    setAssetAction({ assetId, label: "Saving crop" });
+    try {
+      const result = await invoke<WikiImageAssetCommandResult>("crop_wiki_image_asset", {
+        assetId,
+        x: assetCropDraft.x,
+        y: assetCropDraft.y,
+        width: assetCropDraft.width,
+        height: assetCropDraft.height,
+      });
+      setWorkspace(result.state);
+      setAssetCropDraft(null);
+      setAssetRefreshNonce((value) => value + 1);
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setAssetAction((current) => (current?.assetId === assetId ? null : current));
+    }
+  }
+
+  async function resetImageAssetCrop(asset: WikiImageAsset) {
+    if (assetBusyLabel(asset)) return;
+    setAssetAction({ assetId: asset.id, label: "Resetting crop" });
+    try {
+      const result = await invoke<WikiImageAssetCommandResult>("reset_wiki_image_crop", {
+        assetId: asset.id,
+      });
+      setWorkspace(result.state);
+      setAssetRefreshNonce((value) => value + 1);
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setAssetAction((current) => (current?.assetId === asset.id ? null : current));
+    }
+  }
+
+  function openImageAssetCrop(asset: WikiImageAsset) {
+    const crop = asset.edits?.crop;
+    setAssetCropDraft({
+      asset,
+      x: crop?.x ?? 0,
+      y: crop?.y ?? 0,
+      width: crop?.width ?? 0,
+      height: crop?.height ?? 0,
+    });
+  }
+
+  function handleCropImageLoaded(event: ReactSyntheticEvent<HTMLImageElement>) {
+    const image = event.currentTarget;
+    const imageWidth = image.naturalWidth;
+    const imageHeight = image.naturalHeight;
+    setAssetCropDraft((current) => {
+      if (!current) return current;
+      const hasSelection = current.width > 0 && current.height > 0;
+      const next = hasSelection
+        ? clampCropRect(current, imageWidth, imageHeight)
+        : { ...current, x: 0, y: 0, width: imageWidth, height: imageHeight };
+      return { ...current, ...next, imageWidth, imageHeight };
+    });
+  }
+
+  function cropPointerToImagePoint(event: ReactPointerEvent<HTMLElement>) {
+    const image = assetCropImageRef.current;
+    if (!image || !assetCropDraft?.imageWidth || !assetCropDraft.imageHeight) return null;
+    const rect = image.getBoundingClientRect();
+    const x = ((event.clientX - rect.left) / rect.width) * assetCropDraft.imageWidth;
+    const y = ((event.clientY - rect.top) / rect.height) * assetCropDraft.imageHeight;
+    return {
+      x: clampNumber(x, 0, assetCropDraft.imageWidth),
+      y: clampNumber(y, 0, assetCropDraft.imageHeight),
+    };
+  }
+
+  function beginCropDrag(
+    event: ReactPointerEvent<HTMLElement>,
+    mode: AssetCropDrag["mode"],
+    edge?: AssetCropResizeEdge,
+  ) {
+    if (assetBusyLabel(assetCropDraft?.asset)) return;
+    if (!assetCropDraft?.imageWidth || !assetCropDraft.imageHeight) return;
+    const point = cropPointerToImagePoint(event);
+    if (!point) return;
+    event.preventDefault();
+    event.stopPropagation();
+    try {
+      assetCropStageRef.current?.setPointerCapture(event.pointerId);
+    } catch {
+      // Pointer capture is a best-effort enhancement for drag continuity.
+    }
+    assetCropDragRef.current = {
+      pointerId: event.pointerId,
+      mode,
+      edge,
+      origin: point,
+      startCrop: {
+        x: assetCropDraft.x,
+        y: assetCropDraft.y,
+        width: assetCropDraft.width,
+        height: assetCropDraft.height,
+      },
+    };
+    if (mode === "create") {
+      setAssetCropDraft((current) =>
+        current ? { ...current, x: Math.round(point.x), y: Math.round(point.y), width: 1, height: 1 } : current,
+      );
+    }
+  }
+
+  function handleCropPointerMove(event: ReactPointerEvent<HTMLDivElement>) {
+    const drag = assetCropDragRef.current;
+    if (!drag || !assetCropDraft?.imageWidth || !assetCropDraft.imageHeight) return;
+    const point = cropPointerToImagePoint(event);
+    if (!point) return;
+    const next = cropRectForDrag(drag, point, assetCropDraft.imageWidth, assetCropDraft.imageHeight);
+    setAssetCropDraft((current) => (current ? { ...current, ...next } : current));
+  }
+
+  function endCropPointerDrag(event: ReactPointerEvent<HTMLDivElement>) {
+    if (assetCropDragRef.current?.pointerId === event.pointerId) {
+      assetCropDragRef.current = null;
+      try {
+        if (assetCropStageRef.current?.hasPointerCapture(event.pointerId)) {
+          assetCropStageRef.current.releasePointerCapture(event.pointerId);
+        }
+      } catch {
+        // No cleanup needed if capture was already released by the browser.
+      }
+    }
+  }
+
+  function updateCropDraftNumber(field: "x" | "y" | "width" | "height", value: number) {
+    setAssetCropDraft((current) => {
+      if (!current) return current;
+      if (assetBusyLabel(current.asset)) return current;
+      const next = {
+        ...current,
+        [field]: Math.max(field === "width" || field === "height" ? 1 : 0, Math.trunc(value || 0)),
+      };
+      const rect =
+        current.imageWidth && current.imageHeight
+          ? clampCropRect(next, current.imageWidth, current.imageHeight)
+          : next;
+      return { ...current, ...rect };
+    });
+  }
+
+  function openImageAssetDetails(asset: WikiImageAsset) {
+    setAssetDetailsDraft({
+      asset,
+      alt: asset.alt ?? "",
+      caption: asset.caption ?? "",
+      userNotes: asset.userNotes ?? "",
+      semanticNotes: asset.semanticNotes ?? "",
+      protected: Boolean(asset.protected),
+    });
+  }
+
+  async function saveImageAssetDetails() {
+    if (!assetDetailsDraft) return;
+    const assetId = assetDetailsDraft.asset.id;
+    if (assetBusyLabel(assetDetailsDraft.asset)) return;
+    setAssetAction({ assetId, label: "Saving metadata" });
+    try {
+      const result = await invoke<WikiImageAssetCommandResult>("update_wiki_image_asset", {
+        assetId,
+        alt: assetDetailsDraft.alt,
+        caption: assetDetailsDraft.caption,
+        userNotes: assetDetailsDraft.userNotes,
+        semanticNotes: assetDetailsDraft.semanticNotes,
+        protected: assetDetailsDraft.protected,
+      });
+      setWorkspace(result.state);
+      setAssetDetailsDraft(null);
+      setAssetRefreshNonce((value) => value + 1);
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setAssetAction((current) => (current?.assetId === assetId ? null : current));
     }
   }
 
@@ -3488,6 +3942,7 @@ function App() {
     async function build() {
       if (!workspace.workspacePath) {
         setLinkGraph({});
+        setImageUsageMap(new Map());
         return;
       }
       const wikiPagePaths = workspace.wikiFiles.filter((p) => p.endsWith(".md"));
@@ -3510,8 +3965,25 @@ function App() {
       if (cancelled) return;
 
       const outbound: Record<string, Set<string>> = {};
+      const imageUsage = new Map<string, ImageAssetUsage[]>();
       for (const [path, content] of contents) {
         outbound[path] = new Set(extractWikiLinkTargets(content, path, allPaths));
+        const pageImageCounts = new Map<string, number>();
+        for (const reference of extractMarkdownImageReferences(content)) {
+          const assetPath = resolveWorkspacePath(path, reference.src);
+          if (!assetPath?.startsWith("wiki/assets/")) continue;
+          const occurrence = (pageImageCounts.get(assetPath) ?? 0) + 1;
+          pageImageCounts.set(assetPath, occurrence);
+          const usages = imageUsage.get(assetPath) ?? [];
+          usages.push({
+            pagePath: path,
+            line: lineNumberAtOffset(content, reference.start),
+            alt: reference.alt,
+            src: reference.src,
+            anchor: markdownImageAnchorId(assetPath, occurrence),
+          });
+          imageUsage.set(assetPath, usages);
+        }
       }
 
       const graph: LinkGraph = {};
@@ -3523,7 +3995,10 @@ function App() {
           if (graph[target]) graph[target].backlinks.push(from);
         }
       }
-      if (!cancelled) setLinkGraph(graph);
+      if (!cancelled) {
+        setLinkGraph(graph);
+        setImageUsageMap(imageUsage);
+      }
     }
 
     build();
@@ -5706,6 +6181,7 @@ function App() {
               toggleFolder={toggleFolder}
               selectedPath={selectedPath}
               changedFileMap={changedFileMap}
+              imageUsageMap={imageUsageMap}
               onSelect={openWorkspaceFile}
               onRemove={removeSourceFile}
               removeDisabled={Boolean(sourceRemoveBlockedReason) || !canRemoveSourceFiles}
@@ -5944,6 +6420,10 @@ function App() {
                 currentPath="Operation report"
                 workspacePath={workspace.workspacePath}
                 availableDocuments={availableDocuments}
+                assetByDisplayPath={assetByDisplayPath}
+                assetRefreshNonce={assetRefreshNonce}
+                anchor={selectedDocument.path === selectedPath ? pendingAnchor : null}
+                onAnchorConsumed={() => setPendingAnchor(null)}
                 onOpenDocument={(path, anchor) => {
                   void openWorkspaceFile(path, anchor ?? null);
                 }}
@@ -5960,12 +6440,27 @@ function App() {
                 }}
               />
             ) : IMAGE_EXT_REGEX.test(selectedPath) && workspace.workspacePath ? (
-              <div className="image-viewer">
-                <img
-                  src={makeWorkspaceAssetUrl(workspace.workspacePath, selectedPath)}
-                  alt={selectedPath}
-                />
-              </div>
+              <WorkspaceImageViewer
+                path={selectedPath}
+                workspacePath={workspace.workspacePath}
+                asset={assetByDisplayPath.get(normalizeWorkspacePath(selectedPath) ?? selectedPath)}
+                usages={imageUsageMap.get(normalizeWorkspacePath(selectedPath) ?? selectedPath) ?? []}
+                busyLabel={assetBusyLabel(
+                  assetByDisplayPath.get(normalizeWorkspacePath(selectedPath) ?? selectedPath),
+                )}
+                onOpenPage={(path, anchor) => {
+                  void openWorkspaceFile(path, anchor);
+                }}
+                onCropAsset={openImageAssetCrop}
+                onEditAsset={openImageAssetDetails}
+                onDeleteAsset={(asset) =>
+                  void deleteImageAsset(
+                    asset,
+                    imageUsageMap.get(normalizeWorkspacePath(selectedPath) ?? selectedPath)?.length ??
+                      0,
+                  )
+                }
+              />
             ) : PDF_EXT_REGEX.test(selectedPath) && workspace.workspacePath ? (
               <PdfViewer
                 key={selectedPath}
@@ -5996,7 +6491,22 @@ function App() {
               <MarkdownEditor
                 path={editBuffer.path}
                 value={editBuffer.draft}
+                workspacePath={workspace.workspacePath}
+                availableDocuments={availableDocuments}
+                assetByDisplayPath={assetByDisplayPath}
+                assetRefreshNonce={assetRefreshNonce}
+                imageBusyLabel={newImageBusyLabel}
                 disabled={editBuffer.saving}
+                assetBusyLabelFor={assetBusyLabel}
+                onCreateImage={(file) => createImageAssetFromFile(file, editBuffer.path)}
+                onOpenDocument={(path, anchor) => {
+                  void openWorkspaceFile(path, anchor ?? null);
+                }}
+                onOpenImage={setExpandedImage}
+                onCropAsset={openImageAssetCrop}
+                onResetAssetCrop={(asset) => void resetImageAssetCrop(asset)}
+                onReplaceAsset={(asset, file) => void replaceImageAssetFromFile(asset, file)}
+                onEditAsset={openImageAssetDetails}
                 onChange={(draft) =>
                   setEditBuffer((current) =>
                     current && current.path === editBuffer.path ? { ...current, draft } : current,
@@ -6019,6 +6529,8 @@ function App() {
                 currentPath={selectedDocument.path}
                 workspacePath={workspace.workspacePath}
                 availableDocuments={availableDocuments}
+                assetByDisplayPath={assetByDisplayPath}
+                assetRefreshNonce={assetRefreshNonce}
                 onOpenDocument={(path, anchor) => {
                   void openWorkspaceFile(path, anchor ?? null);
                 }}
@@ -6833,6 +7345,130 @@ function App() {
           <img src={expandedImage.src} alt={expandedImage.alt} />
             {expandedImage.alt ? <p>{expandedImage.alt}</p> : null}
           </div>
+        ) : null}
+
+        {assetCropDraft ? (
+          <div className="apply-modal-overlay" role="dialog" aria-modal="true">
+            <div className="apply-modal asset-modal">
+              <header className="apply-modal-header">
+                <div>
+                  <h2>Crop image</h2>
+                  <p>Drag to choose the visible area. Values use original image pixels.</p>
+                </div>
+                <button
+                  type="button"
+                  className="modal-close-btn"
+                  disabled={Boolean(assetBusyLabel(assetCropDraft.asset))}
+                  onClick={() => setAssetCropDraft(null)}
+                >
+                  <X size={16} aria-hidden="true" />
+                </button>
+              </header>
+              <div
+                ref={assetCropStageRef}
+                className={`asset-crop-stage${assetBusyLabel(assetCropDraft.asset) ? " is-busy" : ""}`}
+                aria-busy={Boolean(assetBusyLabel(assetCropDraft.asset))}
+                onPointerDown={(event) => {
+                  if (assetBusyLabel(assetCropDraft.asset)) return;
+                  if (
+                    event.target instanceof HTMLElement &&
+                    event.target.closest(".asset-crop-selection")
+                  ) {
+                    return;
+                  }
+                  beginCropDrag(event, "create");
+                }}
+                onPointerMove={handleCropPointerMove}
+                onPointerUp={endCropPointerDrag}
+                onPointerCancel={endCropPointerDrag}
+              >
+                <img
+                  ref={assetCropImageRef}
+                  className="asset-modal-preview"
+                  src={appendAssetCacheBust(
+                    makeWorkspaceAssetUrl(workspace.workspacePath, assetCropDraft.asset.masterPath),
+                    assetRefreshNonce,
+                  )}
+                  alt={assetCropDraft.asset.alt || "Image master"}
+                  onLoad={handleCropImageLoaded}
+                  draggable={false}
+                />
+                {assetCropDraft.imageWidth && assetCropDraft.imageHeight ? (
+                  <div
+                    className="asset-crop-selection"
+                    style={cropSelectionStyle(assetCropDraft)}
+                    onPointerDown={(event) => beginCropDrag(event, "move")}
+                  >
+                    {(["nw", "n", "ne", "e", "se", "s", "sw", "w"] as const).map((edge) => (
+                      <button
+                        key={edge}
+                        type="button"
+                        className={`asset-crop-handle ${edge}`}
+                        aria-label={`Resize crop ${edge}`}
+                        onPointerDown={(event) => beginCropDrag(event, "resize", edge)}
+                      />
+                    ))}
+                  </div>
+                ) : null}
+              </div>
+              <div className="asset-crop-grid">
+                {(["x", "y", "width", "height"] as const).map((field) => (
+                  <label key={field}>
+                    <span>{field}</span>
+                    <input
+                      type="number"
+                      min={field === "width" || field === "height" ? 1 : 0}
+                      value={assetCropDraft[field]}
+                      disabled={Boolean(assetBusyLabel(assetCropDraft.asset))}
+                      onChange={(event) => updateCropDraftNumber(field, Number(event.target.value))}
+                    />
+                  </label>
+                ))}
+              </div>
+              {assetBusyLabel(assetCropDraft.asset) ? (
+                <p className="asset-action-status" role="status">
+                  {assetBusyLabel(assetCropDraft.asset)}
+                </p>
+              ) : null}
+              <div className="unsaved-edit-actions">
+                <button
+                  type="button"
+                  disabled={
+                    assetCropDraft.width <= 0 ||
+                    assetCropDraft.height <= 0 ||
+                    Boolean(assetBusyLabel(assetCropDraft.asset))
+                  }
+                  onClick={() => void saveImageAssetCrop()}
+                >
+                  {assetBusyLabel(assetCropDraft.asset) ?? "Save crop"}
+                </button>
+                <button
+                  type="button"
+                  className="secondary"
+                  disabled={Boolean(assetBusyLabel(assetCropDraft.asset))}
+                  onClick={() => setAssetCropDraft(null)}
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          </div>
+        ) : null}
+
+        {assetDetailsDraft ? (
+          <AssetDetailsModal
+            draft={assetDetailsDraft}
+            usages={
+              imageUsageMap.get(
+                normalizeWorkspacePath(assetDetailsDraft.asset.displayPath) ??
+                  assetDetailsDraft.asset.displayPath,
+              ) ?? []
+            }
+            busyLabel={assetBusyLabel(assetDetailsDraft.asset)}
+            onChange={setAssetDetailsDraft}
+            onClose={() => setAssetDetailsDraft(null)}
+            onSave={() => void saveImageAssetDetails()}
+          />
         ) : null}
 
         {unsavedPrompt ? (
@@ -7877,6 +8513,15 @@ function buildTree(files: string[], rootPrefix: string): TreeNode[] {
   return root;
 }
 
+function shouldShowWikiFileInSidebar(path: string) {
+  if (!path.startsWith("wiki/assets/")) return true;
+  if (path === "wiki/assets/assets.json") return false;
+  if (path.startsWith("wiki/assets/masters/")) return false;
+  const fileName = displayFileName(path).toLowerCase();
+  if (fileName.includes(".original.") || fileName.includes(".master.")) return false;
+  return true;
+}
+
 function collectTreeLeafPaths(node: TreeNode): string[] {
   if (!node.isDir) return [node.path];
   return node.children.flatMap(collectTreeLeafPaths);
@@ -7994,6 +8639,7 @@ type TreeViewProps = {
   toggleFolder: (path: string) => void;
   selectedPath: string;
   changedFileMap: Map<string, ChangedFile>;
+  imageUsageMap?: Map<string, ImageAssetUsage[]>;
   onSelect?: (path: string) => void;
   onRemove?: (path: string) => void;
   removeDisabled?: boolean;
@@ -8017,6 +8663,7 @@ function TreeItem({
   toggleFolder,
   selectedPath,
   changedFileMap,
+  imageUsageMap,
   onSelect,
   onRemove,
   removeDisabled,
@@ -8052,6 +8699,7 @@ function TreeItem({
             toggleFolder={toggleFolder}
             selectedPath={selectedPath}
             changedFileMap={changedFileMap}
+            imageUsageMap={imageUsageMap}
             onSelect={onSelect}
             onRemove={onRemove}
             removeDisabled={removeDisabled}
@@ -8068,6 +8716,9 @@ function TreeItem({
   const canRemove = Boolean(onRemove && node.path.startsWith("sources/"));
   const changedFile = changedFileMap.get(node.path);
   const changeStatus = changedFile?.status || "";
+  const imageUsageCount = IMAGE_EXT_REGEX.test(node.path)
+    ? (imageUsageMap?.get(normalizeWorkspacePath(node.path) ?? node.path)?.length ?? 0)
+    : 0;
 
   return (
     <li className={`tree-item${node.sectionStart ? " tree-section-start" : ""}`}>
@@ -8110,6 +8761,14 @@ function TreeItem({
             title={changedFile.status}
           />
         ) : null}
+        {imageUsageCount > 0 ? (
+          <span
+            className="tree-usage-count"
+            title={`Used in ${imageUsageCount} page${imageUsageCount === 1 ? "" : "s"}`}
+          >
+            {imageUsageCount}
+          </span>
+        ) : null}
         {canRemove ? (
           <button
             type="button"
@@ -8123,6 +8782,282 @@ function TreeItem({
         ) : null}
       </div>
     </li>
+  );
+}
+
+function WorkspaceImageViewer({
+  path,
+  workspacePath,
+  asset,
+  usages,
+  busyLabel,
+  onOpenPage,
+  onCropAsset,
+  onEditAsset,
+  onDeleteAsset,
+}: {
+  path: string;
+  workspacePath: string;
+  asset?: WikiImageAsset;
+  usages: ImageAssetUsage[];
+  busyLabel?: string | null;
+  onOpenPage: (path: string, anchor: string | null) => void;
+  onCropAsset: (asset: WikiImageAsset) => void;
+  onEditAsset: (asset: WikiImageAsset) => void;
+  onDeleteAsset: (asset: WikiImageAsset) => void;
+}) {
+  const title = asset ? imageAssetTitle(asset) : displayFileName(path);
+  const description = asset ? imageAssetMeta(asset) : path;
+  const canDeleteAsset = asset
+    ? asset.owner === "user" || asset.displayPath.startsWith("wiki/assets/user/")
+    : false;
+
+  return (
+    <div className="image-viewer image-detail-viewer">
+      <div className="image-viewer-stage">
+        <img src={makeWorkspaceAssetUrl(workspacePath, path)} alt={title} />
+      </div>
+      <aside className="image-detail-panel" aria-label="Image details">
+        <div className="image-detail-header">
+          <div>
+            <h2>{title}</h2>
+            <p title={description}>{description}</p>
+          </div>
+          {asset ? (
+            <div className="image-detail-pills">
+              <span>{imageAssetOwnerLabel(asset)}</span>
+              {asset.protected ? (
+                <span className="protected">
+                  <ShieldCheck size={13} aria-hidden="true" />
+                  Protected
+                </span>
+              ) : null}
+            </div>
+          ) : null}
+        </div>
+
+        {asset ? (
+          <div className="image-detail-actions">
+            <button type="button" disabled={Boolean(busyLabel)} onClick={() => onCropAsset(asset)}>
+              <Crop size={15} aria-hidden="true" />
+              Crop
+            </button>
+            <button type="button" disabled={Boolean(busyLabel)} onClick={() => onEditAsset(asset)}>
+              <Pencil size={15} aria-hidden="true" />
+              Info
+            </button>
+            {canDeleteAsset ? (
+              <button
+                type="button"
+                disabled={Boolean(busyLabel)}
+                onClick={() => onDeleteAsset(asset)}
+              >
+                <Trash2 size={15} aria-hidden="true" />
+                Delete asset
+              </button>
+            ) : null}
+            {busyLabel ? (
+              <span className="asset-action-status inline" role="status">
+                {busyLabel}
+              </span>
+            ) : null}
+          </div>
+        ) : null}
+
+        <section className="image-usage-section">
+          <h3>
+            Used in {usages.length} page{usages.length === 1 ? "" : "s"}
+          </h3>
+          {usages.length > 0 ? (
+            <div className="image-usage-list">
+              {usages.map((usage) => (
+                <button
+                  type="button"
+                  key={`${usage.pagePath}-${usage.line}-${usage.src}`}
+                  className="image-usage-item"
+                  onClick={() => onOpenPage(usage.pagePath, usage.anchor)}
+                  title={`${usage.pagePath}, line ${usage.line}`}
+                >
+                  <span className="image-usage-title">{imageUsagePageTitle(usage.pagePath)}</span>
+                  <span className="image-usage-meta">
+                    {imageUsagePageFolder(usage.pagePath)}
+                    {usage.line > 0 ? ` / line ${usage.line}` : ""}
+                  </span>
+                </button>
+              ))}
+            </div>
+          ) : (
+            <p className="image-usage-empty">No wiki page references this image yet.</p>
+          )}
+        </section>
+      </aside>
+    </div>
+  );
+}
+
+function imageAssetTitle(asset: WikiImageAsset) {
+  return (
+    asset.caption?.trim() ||
+    asset.alt?.trim() ||
+    displayFileName(asset.displayPath || asset.masterPath || asset.id)
+  );
+}
+
+function imageAssetMeta(asset: WikiImageAsset) {
+  const sourcePath = asset.source?.path ? displayFileName(asset.source.path) : "";
+  const location =
+    typeof asset.source?.page === "number"
+      ? `page ${asset.source.page}`
+      : typeof asset.source?.slide === "number"
+        ? `slide ${asset.source.slide}`
+        : "";
+  const pieces = [sourcePath, location].filter(Boolean);
+  if (pieces.length > 0) return pieces.join(" / ");
+  if (asset.owner === "user") return "added by user";
+  if (asset.origin) return asset.origin.replace(/-/g, " ");
+  return displayFileName(asset.displayPath || asset.masterPath || asset.id);
+}
+
+function imageAssetOwnerLabel(asset: WikiImageAsset) {
+  if (asset.owner === "user") return "User";
+  if (asset.source?.path) return "Source";
+  if (asset.origin === "legacy") return "Legacy";
+  return "AI";
+}
+
+function imageUsagePageTitle(path: string) {
+  return path === "index.md" || path === "log.md" ? path : displayFileName(path);
+}
+
+function imageUsagePageFolder(path: string) {
+  const parts = path.split("/");
+  if (parts.length <= 1) return "workspace root";
+  return parts.slice(0, -1).join("/");
+}
+
+function AssetDetailsModal({
+  draft,
+  usages,
+  busyLabel,
+  onChange,
+  onClose,
+  onSave,
+}: {
+  draft: AssetDetailsDraft;
+  usages: ImageAssetUsage[];
+  busyLabel?: string | null;
+  onChange: (draft: AssetDetailsDraft) => void;
+  onClose: () => void;
+  onSave: () => void;
+}) {
+  const asset = draft.asset;
+  const busy = Boolean(busyLabel);
+  const folder = asset.displayPath.includes("/")
+    ? asset.displayPath.split("/").slice(0, -1).join("/")
+    : "workspace root";
+
+  return (
+    <div className="apply-modal-overlay" role="dialog" aria-modal="true">
+      <div className="apply-modal asset-modal asset-info-modal">
+        <header className="apply-modal-header">
+          <div>
+            <h2>Image info</h2>
+            <p>{displayFileName(asset.displayPath)}</p>
+          </div>
+          <button type="button" className="modal-close-btn" disabled={busy} onClick={onClose}>
+            <X size={16} aria-hidden="true" />
+          </button>
+        </header>
+
+        <div className="asset-info-summary">
+          <div className="asset-info-row">
+            <span>Folder</span>
+            <strong title={folder}>{folder}</strong>
+          </div>
+          <div className="asset-info-row">
+            <span>Owner</span>
+            <strong>{imageAssetOwnerLabel(asset)}</strong>
+          </div>
+          <div className="asset-info-row">
+            <span>Origin</span>
+            <strong title={imageAssetMeta(asset)}>{imageAssetMeta(asset)}</strong>
+          </div>
+          <div className="asset-info-row">
+            <span>Used in</span>
+            <strong>
+              {usages.length} page{usages.length === 1 ? "" : "s"}
+            </strong>
+          </div>
+          {asset.protected ? (
+            <div className="asset-info-row">
+              <span>Protection</span>
+              <strong>Preserved during AI updates</strong>
+            </div>
+          ) : null}
+        </div>
+
+        <details className="asset-details-advanced">
+          <summary>Advanced metadata</summary>
+          <div className="asset-details-fields">
+            <label>
+              <span>Alt text</span>
+              <input
+                value={draft.alt}
+                disabled={busy}
+                onChange={(event) => onChange({ ...draft, alt: event.target.value })}
+              />
+            </label>
+            <label>
+              <span>Caption</span>
+              <textarea
+                value={draft.caption}
+                disabled={busy}
+                onChange={(event) => onChange({ ...draft, caption: event.target.value })}
+              />
+            </label>
+            <label>
+              <span>User notes</span>
+              <textarea
+                value={draft.userNotes}
+                disabled={busy}
+                onChange={(event) => onChange({ ...draft, userNotes: event.target.value })}
+              />
+            </label>
+            <label>
+              <span>AI notes</span>
+              <textarea
+                value={draft.semanticNotes}
+                disabled={busy}
+                onChange={(event) => onChange({ ...draft, semanticNotes: event.target.value })}
+              />
+            </label>
+            <label className="asset-protected-toggle">
+              <input
+                type="checkbox"
+                checked={draft.protected}
+                disabled={busy}
+                onChange={(event) => onChange({ ...draft, protected: event.target.checked })}
+              />
+              <span>Protect this image during AI updates</span>
+            </label>
+          </div>
+        </details>
+
+        {busyLabel ? (
+          <p className="asset-action-status" role="status">
+            {busyLabel}
+          </p>
+        ) : null}
+        <div className="unsaved-edit-actions">
+          <button type="button" disabled={busy} onClick={onSave}>
+            {busyLabel ?? "Save metadata"}
+          </button>
+          <button type="button" className="secondary" disabled={busy} onClick={onClose}>
+            Close
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -8287,18 +9222,29 @@ function humanizeMarkdownCalloutType(type: string) {
     .replace(/\b\w/g, (character) => character.toUpperCase());
 }
 
+function renderedLinkLabel(node: ReactNode): string {
+  if (typeof node === "string" || typeof node === "number") return String(node);
+  if (Array.isArray(node)) return node.map(renderedLinkLabel).join("");
+  if (isValidElement<{ children?: ReactNode }>(node)) return renderedLinkLabel(node.props.children);
+  return "";
+}
+
 function WorkspaceAwareMarkdown({
   content,
   currentPath,
   workspacePath,
   availableDocuments,
   onOpenDocument,
+  editLinks = false,
+  onEditLink,
 }: {
   content: string;
   currentPath: string;
   workspacePath: string;
   availableDocuments: string[];
   onOpenDocument: (path: string, anchor?: string | null) => void;
+  editLinks?: boolean;
+  onEditLink?: (link: RenderedMarkdownLink) => void;
 }) {
   const renderedContent = normalizeMarkdownForDisplay(content, currentPath, availableDocuments);
   const components: Components = {
@@ -8307,7 +9253,20 @@ function WorkspaceAwareMarkdown({
       if (href?.startsWith("aiwiki-broken://")) {
         const target = decodeURIComponent(href.slice("aiwiki-broken://".length));
         return (
-          <span className="broken-wikilink" title={`No page named "${target}" yet`}>
+          <span
+            role={editLinks ? "button" : undefined}
+            tabIndex={editLinks ? 0 : undefined}
+            className="broken-wikilink"
+            title={editLinks ? "Click to edit this link." : `No page named "${target}" yet`}
+            onClick={
+              editLinks
+                ? (event) => {
+                    event.stopPropagation();
+                    onEditLink?.({ href: href ?? "", label: renderedLinkLabel(children) });
+                  }
+                : undefined
+            }
+          >
             {children}
           </span>
         );
@@ -8321,8 +9280,15 @@ function WorkspaceAwareMarkdown({
           <a
             {...props}
             href={href}
+            className={editLinks ? "markdown-edit-link" : props.className}
+            title={editLinks ? "Click to edit this section. Cmd-click to open the page." : props.title}
             onClick={(event) => {
               event.preventDefault();
+              if (editLinks && !event.metaKey && !event.ctrlKey) {
+                event.stopPropagation();
+                onEditLink?.({ href: href ?? target.path, label: renderedLinkLabel(children) });
+                return;
+              }
               onOpenDocument(target.path, target.anchor);
             }}
           >
@@ -8336,8 +9302,15 @@ function WorkspaceAwareMarkdown({
           <a
             {...props}
             href={href}
+            className={editLinks ? "markdown-edit-link" : props.className}
+            title={editLinks ? "Click to edit this section. Cmd-click to open the link." : props.title}
             onClick={(event) => {
               event.preventDefault();
+              if (editLinks && !event.metaKey && !event.ctrlKey) {
+                event.stopPropagation();
+                onEditLink?.({ href, label: renderedLinkLabel(children) });
+                return;
+              }
               openUrl(href).catch(() => {});
             }}
           >
@@ -8348,7 +9321,34 @@ function WorkspaceAwareMarkdown({
 
       if (isUnresolvedLocalReference(href)) {
         return (
-          <span className="broken-wikilink" title={`Cannot open "${href}" in this workspace`}>
+          <span
+            role={editLinks ? "button" : undefined}
+            tabIndex={editLinks ? 0 : undefined}
+            className="broken-wikilink"
+            title={
+              editLinks
+                ? `Click to edit this unresolved link.`
+                : `Cannot open "${href}" in this workspace`
+            }
+            onClick={
+              editLinks
+                ? (event) => {
+                    event.stopPropagation();
+                    onEditLink?.({ href: href ?? "", label: renderedLinkLabel(children) });
+                  }
+                : undefined
+            }
+            onKeyDown={
+              editLinks
+                ? (event) => {
+                    if (event.key === "Enter" || event.key === " ") {
+                      event.preventDefault();
+                      onEditLink?.({ href: href ?? "", label: renderedLinkLabel(children) });
+                    }
+                  }
+                : undefined
+            }
+          >
             {children}
           </span>
         );
@@ -8379,6 +9379,10 @@ function MarkdownDocument({
   currentPath,
   workspacePath,
   availableDocuments,
+  assetByDisplayPath,
+  assetRefreshNonce,
+  anchor,
+  onAnchorConsumed,
   onOpenDocument,
   onOpenImage,
 }: {
@@ -8386,9 +9390,15 @@ function MarkdownDocument({
   currentPath: string;
   workspacePath: string;
   availableDocuments: string[];
+  assetByDisplayPath?: Map<string, WikiImageAsset>;
+  assetRefreshNonce?: number;
+  anchor?: string | null;
+  onAnchorConsumed?: () => void;
   onOpenDocument: (path: string, anchor?: string | null) => void;
   onOpenImage: (image: ExpandedImage) => void;
 }) {
+  const articleRef = useRef<HTMLElement | null>(null);
+  const onAnchorConsumedRef = useRef(onAnchorConsumed);
   const parsedDocument = parseMarkdownFrontmatter(content);
   const headerDocument = extractWikiPageHeaderMetadata(parsedDocument.body);
   const metadata = mergeWikiPageMetadata(parsedDocument.metadata, headerDocument.metadata);
@@ -8398,6 +9408,32 @@ function MarkdownDocument({
     currentPath,
     availableDocuments,
   );
+  const imageAnchorCounts = new Map<string, number>();
+
+  useEffect(() => {
+    onAnchorConsumedRef.current = onAnchorConsumed;
+  }, [onAnchorConsumed]);
+
+  useEffect(() => {
+    if (!anchor) return;
+    const normalizedAnchor = safeDecode(anchor).trim().replace(/^#/, "");
+    if (!normalizedAnchor) {
+      onAnchorConsumedRef.current?.();
+      return;
+    }
+    const raf = requestAnimationFrame(() => {
+      const root = articleRef.current;
+      const target = root
+        ? Array.from(root.querySelectorAll<HTMLElement>("[id]")).find(
+            (element) => element.id === normalizedAnchor,
+          )
+        : null;
+      target?.scrollIntoView({ behavior: "smooth", block: "start" });
+      onAnchorConsumedRef.current?.();
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [anchor, renderedContent]);
+
   const components: Components = {
     blockquote: MarkdownCalloutBlockquote,
     a({ href, children, ...props }) {
@@ -8464,27 +9500,39 @@ function MarkdownDocument({
       }
 
       const label = alt || "";
+      const workspaceTarget = src ? resolveWorkspacePath(currentPath, src) : null;
+      let imageAnchor: string | undefined;
+      if (workspaceTarget) {
+        const occurrence = (imageAnchorCounts.get(workspaceTarget) ?? 0) + 1;
+        imageAnchorCounts.set(workspaceTarget, occurrence);
+        imageAnchor = markdownImageAnchorId(workspaceTarget, occurrence);
+      }
+      const managedAsset = workspaceTarget ? assetByDisplayPath?.get(workspaceTarget) : null;
+      const displayUrl = managedAsset
+        ? appendAssetCacheBust(assetUrl, assetRefreshNonce)
+        : assetUrl;
       return (
         <span
+          id={imageAnchor}
           role="button"
           tabIndex={0}
           className="markdown-image-button"
-          onClick={() => onOpenImage({ src: assetUrl, alt: label })}
+          onClick={() => onOpenImage({ src: displayUrl, alt: label })}
           onKeyDown={(event) => {
             if (event.key === "Enter" || event.key === " ") {
               event.preventDefault();
-              onOpenImage({ src: assetUrl, alt: label });
+              onOpenImage({ src: displayUrl, alt: label });
             }
           }}
         >
-          <img src={assetUrl} alt={label} />
+          <img src={displayUrl} alt={label} />
         </span>
       );
     },
   };
 
   return (
-    <article className="wiki-document">
+    <article ref={articleRef} className="wiki-document">
       {titledDocument.title ? (
         <h1 id={slugifyMarkdownHeading(titledDocument.title)}>{titledDocument.title}</h1>
       ) : null}
@@ -8504,6 +9552,138 @@ function MarkdownDocument({
         {renderedContent}
       </ReactMarkdown>
     </article>
+  );
+}
+
+function AssetImageBlock({
+  asset,
+  imageUrl,
+  workspacePath,
+  label,
+  busyLabel,
+  onOpenImage,
+  onCrop,
+  onResetCrop,
+  onReplace,
+  onEdit,
+  onDelete,
+}: {
+  asset: WikiImageAsset;
+  imageUrl: string;
+  workspacePath: string;
+  label: string;
+  busyLabel?: string | null;
+  onOpenImage: (image: ExpandedImage) => void;
+  onCrop?: (asset: WikiImageAsset) => void;
+  onResetCrop?: (asset: WikiImageAsset) => void;
+  onReplace?: (asset: WikiImageAsset, file: File) => void;
+  onEdit?: (asset: WikiImageAsset) => void;
+  onDelete?: (asset: WikiImageAsset) => void;
+}) {
+  const replaceInputRef = useRef<HTMLInputElement | null>(null);
+  const displayLabel = asset.alt || label || displayFileName(asset.displayPath);
+  const sourceLabel = asset.source?.path
+    ? `${asset.source.path}${asset.source.page ? `, page ${asset.source.page}` : ""}${
+        asset.source.slide ? `, slide ${asset.source.slide}` : ""
+      }`
+    : asset.owner === "user"
+      ? "User image"
+      : "Managed image";
+  const masterUrl = asset.masterPath
+    ? makeWorkspaceAssetUrl(workspacePath, asset.masterPath)
+    : imageUrl;
+  const busy = Boolean(busyLabel);
+
+  return (
+    <figure className="asset-image-block">
+      <button
+        type="button"
+        className="asset-image-preview"
+        onClick={() => onOpenImage({ src: imageUrl, alt: displayLabel })}
+      >
+        <img src={imageUrl} alt={displayLabel} />
+      </button>
+      <figcaption>
+        <span className="asset-image-title">{asset.caption || displayLabel}</span>
+        <span className="asset-image-meta">
+          {asset.protected ? (
+            <span className="asset-image-pill">
+              <ShieldCheck size={12} aria-hidden="true" />
+              Protected
+            </span>
+          ) : null}
+          <span>{sourceLabel}</span>
+        </span>
+      </figcaption>
+      <div className="asset-image-actions" aria-label="Image actions">
+        <button type="button" title="Crop image" disabled={busy} onClick={() => onCrop?.(asset)}>
+          <Crop size={14} aria-hidden="true" />
+          Crop
+        </button>
+        <button
+          type="button"
+          title="Reset crop"
+          disabled={busy}
+          onClick={() => onResetCrop?.(asset)}
+        >
+          <RotateCcw size={14} aria-hidden="true" />
+          Reset
+        </button>
+        <button
+          type="button"
+          title="Replace image"
+          disabled={busy}
+          onClick={() => replaceInputRef.current?.click()}
+        >
+          <Upload size={14} aria-hidden="true" />
+          Replace
+        </button>
+        <button
+          type="button"
+          title="Image info and metadata"
+          disabled={busy}
+          onClick={() => onEdit?.(asset)}
+        >
+          <Pencil size={14} aria-hidden="true" />
+          Info
+        </button>
+        {onDelete ? (
+          <button
+            type="button"
+            title="Remove image from this page"
+            disabled={busy}
+            onClick={() => onDelete(asset)}
+          >
+            <Trash2 size={14} aria-hidden="true" />
+            Remove
+          </button>
+        ) : null}
+        <button
+          type="button"
+          title="Open original/master image"
+          onClick={() => onOpenImage({ src: masterUrl, alt: displayLabel })}
+        >
+          Open original
+        </button>
+        {busyLabel ? (
+          <span className="asset-action-status inline" role="status">
+            {busyLabel}
+          </span>
+        ) : null}
+        <input
+          ref={replaceInputRef}
+          type="file"
+          accept="image/png,image/jpeg,image/gif,image/webp"
+          disabled={busy}
+          hidden
+          onChange={(event) => {
+            const file = event.target.files?.[0];
+            event.currentTarget.value = "";
+            if (file) onReplace?.(asset, file);
+          }}
+        />
+      </div>
+    </figure>
   );
 }
 
@@ -8616,23 +9796,1399 @@ function parsePlainTextLineTarget(anchor: string | null | undefined) {
 function MarkdownEditor({
   path,
   value,
+  workspacePath,
+  availableDocuments,
+  assetByDisplayPath,
+  assetRefreshNonce,
+  imageBusyLabel,
   disabled,
+  assetBusyLabelFor,
   onChange,
+  onCreateImage,
+  onOpenDocument,
+  onOpenImage,
+  onCropAsset,
+  onResetAssetCrop,
+  onReplaceAsset,
+  onEditAsset,
 }: {
   path: string;
   value: string;
+  workspacePath: string;
+  availableDocuments: string[];
+  assetByDisplayPath?: Map<string, WikiImageAsset>;
+  assetRefreshNonce?: number;
+  imageBusyLabel?: string | null;
   disabled?: boolean;
+  assetBusyLabelFor?: (asset: WikiImageAsset) => string | null;
   onChange: (value: string) => void;
+  onCreateImage?: (file: File) => Promise<string | null>;
+  onOpenDocument: (path: string, anchor?: string | null) => void;
+  onOpenImage: (image: ExpandedImage) => void;
+  onCropAsset?: (asset: WikiImageAsset) => void;
+  onResetAssetCrop?: (asset: WikiImageAsset) => void;
+  onReplaceAsset?: (asset: WikiImageAsset, file: File) => void;
+  onEditAsset?: (asset: WikiImageAsset) => void;
 }) {
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const sourceTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const blockTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const pendingImageInsertOffsetRef = useRef<number | null>(null);
+  const [sourceMode, setSourceMode] = useState(false);
+  const [activeBlock, setActiveBlock] = useState<MarkdownEditBlockRange | null>(null);
+  const blocks = useMemo(() => splitMarkdownEditBlocks(value), [value]);
+  const imageInsertBusy = Boolean(imageBusyLabel);
+
+  async function insertImageFile(file: File, offset = pendingImageInsertOffsetRef.current) {
+    if (!onCreateImage || disabled || imageInsertBusy) return;
+    const markdown = await onCreateImage(file);
+    pendingImageInsertOffsetRef.current = null;
+    if (!markdown) return;
+    if (offset !== null && offset !== undefined) {
+      insertMarkdownAtOffset(markdown, offset);
+      return;
+    }
+    insertEditorText(markdown);
+  }
+
+  function openImagePickerAt(offset: number | null) {
+    if (imageInsertBusy) return;
+    pendingImageInsertOffsetRef.current = offset;
+    fileInputRef.current?.click();
+  }
+
+  function insertMarkdownAtOffset(markdown: string, offset: number) {
+    const insertion = blockInsertionText(value, markdown, offset);
+    replaceSourceRange(offset, offset, insertion);
+  }
+
+  function deleteImageBlock(block: MarkdownEditBlock) {
+    replaceSourceRange(block.start, block.end, "");
+  }
+
+  function insertEditorText(text: string) {
+    if (sourceMode) {
+      const textarea = sourceTextareaRef.current;
+      if (textarea) {
+        const start = textarea.selectionStart ?? value.length;
+        const end = textarea.selectionEnd ?? start;
+        replaceSourceRange(start, end, text);
+        requestAnimationFrame(() => {
+          const cursor = start + text.length;
+          textarea.focus();
+          textarea.setSelectionRange(cursor, cursor);
+        });
+        return;
+      }
+    }
+
+    const blockTextarea = blockTextareaRef.current;
+    if (activeBlock && blockTextarea) {
+      const selectionStart = blockTextarea.selectionStart ?? activeBlock.end - activeBlock.start;
+      const selectionEnd = blockTextarea.selectionEnd ?? selectionStart;
+      const start = activeBlock.start + selectionStart;
+      const end = activeBlock.start + selectionEnd;
+      replaceSourceRange(start, end, text);
+      const nextEnd = activeBlock.end + text.length - (selectionEnd - selectionStart);
+      setActiveBlock({ start: activeBlock.start, end: nextEnd, kind: activeBlock.kind });
+      requestAnimationFrame(() => {
+        const cursor = selectionStart + text.length;
+        blockTextarea.focus();
+        blockTextarea.setSelectionRange(cursor, cursor);
+      });
+      return;
+    }
+
+    const insertion = `${value.trimEnd()}${value.trim() ? "\n\n" : ""}${text}\n`;
+    onChange(insertion);
+  }
+
+  function replaceSourceRange(start: number, end: number, replacement: string) {
+    onChange(`${value.slice(0, start)}${replacement}${value.slice(end)}`);
+  }
+
+  function updateBlockSource(block: MarkdownEditBlock, source: string) {
+    replaceSourceRange(block.start, block.end, source);
+    setActiveBlock({ start: block.start, end: block.start + source.length, kind: block.kind });
+  }
+
+  function handleImagePaste(event: ReactClipboardEvent<HTMLElement>) {
+    const image = Array.from(event.clipboardData.files).find((file) =>
+      file.type.startsWith("image/"),
+    );
+    if (!image) return;
+    event.preventDefault();
+    void insertImageFile(image);
+  }
+
+  function handleImageDrop(event: ReactDragEvent<HTMLElement>) {
+    const image = Array.from(event.dataTransfer.files).find((file) =>
+      file.type.startsWith("image/"),
+    );
+    if (!image) return;
+    event.preventDefault();
+    void insertImageFile(image);
+  }
+
+  function handleImageDragOver(event: ReactDragEvent<HTMLElement>) {
+    if (Array.from(event.dataTransfer.items).some((item) => item.type.startsWith("image/"))) {
+      event.preventDefault();
+    }
+  }
+
   return (
     <section className="markdown-editor" aria-label={`Editing ${path}`}>
-      <textarea
-        value={value}
-        disabled={disabled}
-        spellCheck={false}
-        onChange={(event) => onChange(event.target.value)}
-        aria-label={`Markdown source for ${path}`}
-      />
+      <div className="markdown-editor-toolbar">
+        <div className="markdown-editor-mode" aria-label="Edit mode">
+          <button
+            type="button"
+            className={!sourceMode ? "active" : ""}
+            onClick={() => setSourceMode(false)}
+          >
+            Rendered
+          </button>
+          <button
+            type="button"
+            className={sourceMode ? "active" : ""}
+            onClick={() => setSourceMode(true)}
+          >
+            Source
+          </button>
+        </div>
+        {imageBusyLabel ? (
+          <span className="markdown-editor-busy" role="status">
+            {imageBusyLabel}
+          </span>
+        ) : null}
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept="image/png,image/jpeg,image/gif,image/webp"
+          disabled={imageInsertBusy}
+          hidden
+          onChange={(event) => {
+            const file = event.target.files?.[0];
+            event.currentTarget.value = "";
+            if (file) void insertImageFile(file);
+          }}
+        />
+      </div>
+      {sourceMode ? (
+        <textarea
+          ref={sourceTextareaRef}
+          className="markdown-editor-source"
+          value={value}
+          disabled={disabled}
+          spellCheck={false}
+          onChange={(event) => onChange(event.target.value)}
+          onPaste={handleImagePaste}
+          onDrop={handleImageDrop}
+          onDragOver={handleImageDragOver}
+          aria-label={`Markdown source for ${path}`}
+        />
+      ) : (
+        <article
+          className="wiki-document markdown-edit-document"
+          onPaste={handleImagePaste}
+          onDrop={handleImageDrop}
+          onDragOver={handleImageDragOver}
+        >
+          {blocks.map((block) => {
+            const active =
+              activeBlock?.start === block.start &&
+              activeBlock.end === block.end &&
+              activeBlock.kind === block.kind;
+
+            return (
+              <Fragment key={block.id}>
+                <MarkdownInsertSlot
+                  disabled={disabled || !onCreateImage || imageInsertBusy}
+                  onInsertImage={() => openImagePickerAt(block.start)}
+                />
+                {block.kind === "image" ? (
+                  active ? (
+                    <MarkdownEditTextBlock
+                      block={block}
+                      active={active}
+                      disabled={disabled}
+                      textareaRef={blockTextareaRef}
+                      currentPath={path}
+                      workspacePath={workspacePath}
+                      availableDocuments={availableDocuments}
+                      onOpenDocument={onOpenDocument}
+                      onBeginEdit={() => {}}
+                      onChange={(source) => updateBlockSource(block, source)}
+                      onDone={() => setActiveBlock(null)}
+                    />
+                  ) : (
+                    <MarkdownEditImageBlock
+                      block={block}
+                      path={path}
+                      workspacePath={workspacePath}
+                      assetByDisplayPath={assetByDisplayPath}
+                      assetRefreshNonce={assetRefreshNonce}
+                      assetBusyLabelFor={assetBusyLabelFor}
+                      onOpenImage={onOpenImage}
+                      onCropAsset={onCropAsset}
+                      onResetAssetCrop={onResetAssetCrop}
+                      onReplaceAsset={onReplaceAsset}
+                      onEditAsset={onEditAsset}
+                      onDelete={() => deleteImageBlock(block)}
+                      onEditSource={() =>
+                        setActiveBlock({ start: block.start, end: block.end, kind: block.kind })
+                      }
+                    />
+                  )
+                ) : (
+                  <MarkdownEditTextBlock
+                    block={block}
+                    active={active}
+                    disabled={disabled}
+                    textareaRef={active ? blockTextareaRef : undefined}
+                    currentPath={path}
+                    workspacePath={workspacePath}
+                    availableDocuments={availableDocuments}
+                    onOpenDocument={onOpenDocument}
+                    onBeginEdit={() =>
+                      setActiveBlock({ start: block.start, end: block.end, kind: block.kind })
+                    }
+                    onChange={(source) => updateBlockSource(block, source)}
+                    onDone={() => setActiveBlock(null)}
+                  />
+                )}
+              </Fragment>
+            );
+          })}
+          <MarkdownInsertSlot
+            disabled={disabled || !onCreateImage}
+            onInsertImage={() => openImagePickerAt(value.length)}
+          />
+        </article>
+      )}
+    </section>
+  );
+}
+
+type MarkdownEditBlockKind = "frontmatter" | "markdown" | "image";
+
+type MarkdownEditBlockRange = {
+  start: number;
+  end: number;
+  kind: MarkdownEditBlockKind;
+};
+
+type MarkdownEditBlock = MarkdownEditBlockRange & {
+  id: string;
+  source: string;
+  image?: MarkdownImageReference;
+};
+
+type MarkdownImageReference = {
+  alt: string;
+  src: string;
+  start: number;
+  end: number;
+};
+
+type MarkdownEditableLinkToken = {
+  id: string;
+  text: string;
+  target: string;
+  syntax: "markdown" | "wiki";
+};
+
+type RenderedMarkdownLink = {
+  href: string;
+  label: string;
+};
+
+type MarkdownLinkDraft = {
+  text: string;
+  target: string;
+  selectionStart?: number;
+  selectionEnd?: number;
+  sourceText?: string;
+  syntax?: "markdown" | "wiki";
+};
+
+type MarkdownSelectionToolbar = {
+  top: number;
+  left: number;
+  text: string;
+};
+
+type LinkLocationMode = "whole" | "heading" | "line" | "page" | "slide";
+type LinkLocationKind = "wiki" | "sourceText" | "pdf" | "slide" | "file";
+type LinkLineRange = { start: number; end: number };
+type LinkTargetContentState = {
+  path: string;
+  content: string | null;
+  loading: boolean;
+  error: string | null;
+};
+type MarkdownHeadingOption = {
+  level: number;
+  title: string;
+  anchor: string;
+  line: number;
+};
+
+function MarkdownInsertSlot({
+  disabled,
+  onInsertImage,
+}: {
+  disabled?: boolean;
+  onInsertImage: () => void;
+}) {
+  return (
+    <div className="markdown-insert-slot">
+      <button type="button" disabled={disabled} title="Insert image here" onClick={onInsertImage}>
+        <Plus size={13} aria-hidden="true" />
+      </button>
+    </div>
+  );
+}
+
+function MarkdownEditTextBlock({
+  block,
+  active,
+  disabled,
+  textareaRef: _textareaRef,
+  currentPath,
+  workspacePath,
+  availableDocuments,
+  onOpenDocument,
+  onBeginEdit,
+  onChange,
+  onDone,
+}: {
+  block: MarkdownEditBlock;
+  active: boolean;
+  disabled?: boolean;
+  textareaRef?: RefObject<HTMLTextAreaElement | null>;
+  currentPath: string;
+  workspacePath: string;
+  availableDocuments: string[];
+  onOpenDocument: (path: string, anchor?: string | null) => void;
+  onBeginEdit: () => void;
+  onChange: (source: string) => void;
+  onDone: () => void;
+}) {
+  const editableRef = useRef<HTMLDivElement | null>(null);
+  const inlineEditSectionRef = useRef<HTMLElement | null>(null);
+  const internalPointerDownRef = useRef(false);
+  const model = useMemo(() => markdownSourceToEditableModel(block.source), [block.source]);
+  const draftTextRef = useRef(model.text);
+  const [draftLinks, setDraftLinks] = useState<MarkdownEditableLinkToken[]>(model.links);
+  const [linkDraft, setLinkDraft] = useState<MarkdownLinkDraft | null>(null);
+  const [previewLinkDraft, setPreviewLinkDraft] = useState<MarkdownLinkDraft | null>(null);
+  const [selectionToolbar, setSelectionToolbar] = useState<MarkdownSelectionToolbar | null>(null);
+
+  useEffect(() => {
+    if (!active) {
+      draftTextRef.current = model.text;
+      setDraftLinks(model.links);
+      setLinkDraft(null);
+      setSelectionToolbar(null);
+    }
+  }, [active, model]);
+
+  useLayoutEffect(() => {
+    if (!active) return;
+    const element = editableRef.current;
+    if (!element) return;
+    draftTextRef.current = model.text;
+    element.textContent = draftTextRef.current;
+  }, [active, block.id]);
+
+  useEffect(() => {
+    if (!active) return;
+    const element = editableRef.current;
+    if (!element) return;
+    requestAnimationFrame(() => {
+      element.focus();
+      setContentEditableCursor(element, draftTextRef.current.length);
+    });
+  }, [active, block.id]);
+
+  useEffect(() => {
+    if (!active) return;
+
+    function handleDocumentPointerDown(event: PointerEvent) {
+      const container = inlineEditSectionRef.current;
+      if (!container) return;
+      if (event.target instanceof Node && container.contains(event.target)) return;
+      commitInlineEdit();
+    }
+
+    document.addEventListener("pointerdown", handleDocumentPointerDown, true);
+    return () => document.removeEventListener("pointerdown", handleDocumentPointerDown, true);
+  }, [active, block.source, draftLinks]);
+
+  if (!block.source.trim() && !active) {
+    return null;
+  }
+
+  function commitInlineEdit() {
+    onChange(markdownSourceFromEditableModel(block.source, readDraftText(), draftLinks));
+    onDone();
+  }
+
+  function readDraftText() {
+    const text = editableRef.current?.innerText ?? draftTextRef.current;
+    draftTextRef.current = text;
+    return text;
+  }
+
+  function writeDraftText(text: string) {
+    draftTextRef.current = text;
+    const element = editableRef.current;
+    if (element) {
+      element.textContent = text;
+    }
+  }
+
+  function markInternalPointerDown() {
+    internalPointerDownRef.current = true;
+    window.setTimeout(() => {
+      internalPointerDownRef.current = false;
+    }, 120);
+  }
+
+  function openLinkDraftForSelection() {
+    const range = contentEditableSelectionRange(editableRef.current);
+    if (!range || range.start === range.end) return;
+    const start = Math.min(range.start, range.end);
+    const end = Math.max(range.start, range.end);
+    const currentText = readDraftText();
+    const selectedText = currentText.slice(start, end);
+    setLinkDraft({
+      text: selectedText,
+      target: "",
+      selectionStart: start,
+      selectionEnd: end,
+    });
+    setSelectionToolbar(null);
+  }
+
+  function updateSelectionToolbar() {
+    const root = editableRef.current;
+    const selection = window.getSelection();
+    if (!root || !selection || selection.rangeCount === 0 || selection.isCollapsed) {
+      setSelectionToolbar(null);
+      return;
+    }
+    const range = selection.getRangeAt(0);
+    if (!root.contains(range.startContainer) || !root.contains(range.endContainer)) {
+      setSelectionToolbar(null);
+      return;
+    }
+    const rect = range.getBoundingClientRect();
+    const selectedText = selection.toString().trim();
+    if (!selectedText || rect.width === 0) {
+      setSelectionToolbar(null);
+      return;
+    }
+    setSelectionToolbar({
+      left: rect.left + rect.width / 2,
+      top: Math.max(8, rect.top - 42),
+      text: selectedText,
+    });
+  }
+
+  function applyActiveLinkDraft() {
+    if (!linkDraft) return;
+    const target = linkDraft.target.trim();
+    const text = linkDraft.text.trim();
+    if (!target || !text) {
+      setLinkDraft(null);
+      return;
+    }
+    const start = linkDraft.selectionStart ?? 0;
+    const end = linkDraft.selectionEnd ?? start;
+    const currentText = readDraftText();
+    const nextText = `${currentText.slice(0, start)}${text}${currentText.slice(end)}`;
+    const delta = text.length - (end - start);
+    const nextLinks = draftLinks
+      .filter((link) => link.text && !rangesOverlap(start, end, linkTextRange(nextText, link.text)))
+      .map((link) => link);
+    nextLinks.push({
+      id: `link-${Date.now()}`,
+      text,
+      target,
+      syntax: linkSyntaxForTarget(target, currentPath, availableDocuments),
+    });
+    writeDraftText(nextText);
+    setDraftLinks(nextLinks);
+    setLinkDraft(null);
+    requestAnimationFrame(() => {
+      const selection = window.getSelection();
+      const element = editableRef.current;
+      if (!selection || !element) return;
+      const position = Math.max(0, start + text.length + delta);
+      setContentEditableCursor(element, Math.min(position, nextText.length));
+    });
+  }
+
+  function applyPreviewLinkDraft() {
+    if (!previewLinkDraft) return;
+    const nextSource = updateMarkdownLinkInSource(
+      block.source,
+      previewLinkDraft.sourceText ?? previewLinkDraft.text,
+      previewLinkDraft.text,
+      previewLinkDraft.target,
+      currentPath,
+      availableDocuments,
+      previewLinkDraft.syntax,
+    );
+    onChange(nextSource);
+    setPreviewLinkDraft(null);
+  }
+
+  function removePreviewLink() {
+    if (!previewLinkDraft) return;
+    onChange(removeMarkdownLinkInSource(block.source, previewLinkDraft.sourceText ?? previewLinkDraft.text));
+    setPreviewLinkDraft(null);
+  }
+
+  if (active) {
+    return (
+      <section
+        ref={inlineEditSectionRef}
+        className="markdown-edit-block editing inline"
+        onPointerDownCapture={markInternalPointerDown}
+        onBlur={(event) => {
+          const container = event.currentTarget;
+          const nextTarget = event.relatedTarget;
+          if (internalPointerDownRef.current) return;
+          if (nextTarget instanceof Node && container.contains(nextTarget)) return;
+          window.setTimeout(() => {
+            if (internalPointerDownRef.current) return;
+            const activeElement = document.activeElement;
+            if (activeElement instanceof Node && container.contains(activeElement)) return;
+            commitInlineEdit();
+          }, 0);
+        }}
+      >
+        <div
+          ref={editableRef}
+          className={`markdown-inline-editor ${model.blockStyle}`}
+          contentEditable={!disabled}
+          suppressContentEditableWarning
+          spellCheck
+          onInput={(event) => {
+            draftTextRef.current = event.currentTarget.innerText;
+          }}
+          onMouseUp={updateSelectionToolbar}
+          onKeyUp={updateSelectionToolbar}
+          onKeyDown={(event) => {
+            if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+              event.preventDefault();
+              openLinkDraftForSelection();
+            }
+            if (event.key === "Escape") {
+              event.preventDefault();
+              onDone();
+            }
+          }}
+          aria-label="Editable wiki text"
+        />
+        <div className="markdown-edit-block-actions">
+          <button type="button" onClick={commitInlineEdit} disabled={disabled}>
+            Done
+          </button>
+        </div>
+        {selectionToolbar ? (
+          <button
+            type="button"
+            className="markdown-selection-toolbar"
+            style={{ top: selectionToolbar.top, left: selectionToolbar.left }}
+            onMouseDown={(event) => event.preventDefault()}
+            onClick={openLinkDraftForSelection}
+            title={`Link "${selectionToolbar.text}"`}
+          >
+            <LinkIcon size={14} aria-hidden="true" />
+            Link
+          </button>
+        ) : null}
+        {linkDraft ? (
+          <MarkdownLinkPopover
+            draft={linkDraft}
+            availableDocuments={availableDocuments}
+            currentPath={currentPath}
+            onChange={setLinkDraft}
+            onApply={applyActiveLinkDraft}
+            onRemove={() => setLinkDraft(null)}
+            onClose={() => setLinkDraft(null)}
+            removeLabel="Cancel"
+          />
+        ) : null}
+      </section>
+    );
+  }
+
+  if (block.kind === "frontmatter") {
+    return (
+      <section className="markdown-edit-block metadata">
+        <div className="markdown-edit-metadata">
+          <span>Page metadata</span>
+          <span>{summarizeFrontmatterBlock(block.source)}</span>
+        </div>
+        <div className="markdown-edit-block-actions">
+          <button type="button" onClick={onBeginEdit} disabled={disabled} title="Edit metadata">
+            <Pencil size={14} aria-hidden="true" />
+            Edit
+          </button>
+        </div>
+      </section>
+    );
+  }
+
+  return (
+    <section
+      className="markdown-edit-block editable"
+      onClick={() => !disabled && onBeginEdit()}
+      title="Click to edit"
+    >
+      <div className="markdown-edit-preview">
+        <WorkspaceAwareMarkdown
+          content={block.source}
+          currentPath={currentPath}
+          workspacePath={workspacePath}
+          availableDocuments={availableDocuments}
+          onOpenDocument={onOpenDocument}
+          editLinks
+          onEditLink={(link) => {
+            const sourceLink = findMarkdownLinkInSource(block.source, link);
+            setPreviewLinkDraft({
+              text: sourceLink?.text ?? link.label,
+              target: sourceLink?.target ?? link.href,
+              sourceText: sourceLink?.text ?? link.label,
+              syntax: sourceLink?.syntax,
+            });
+          }}
+        />
+      </div>
+      {previewLinkDraft ? (
+        <MarkdownLinkPopover
+          draft={previewLinkDraft}
+          availableDocuments={availableDocuments}
+          currentPath={currentPath}
+          onChange={setPreviewLinkDraft}
+          onApply={applyPreviewLinkDraft}
+          onRemove={removePreviewLink}
+          onClose={() => setPreviewLinkDraft(null)}
+          removeLabel="Remove link"
+        />
+      ) : null}
+    </section>
+  );
+}
+
+function MarkdownLinkPopover({
+  draft,
+  availableDocuments,
+  currentPath,
+  onChange,
+  onApply,
+  onRemove,
+  onClose,
+  removeLabel,
+}: {
+  draft: MarkdownLinkDraft;
+  availableDocuments: string[];
+  currentPath: string;
+  onChange: (draft: MarkdownLinkDraft) => void;
+  onApply: () => void;
+  onRemove: () => void;
+  onClose: () => void;
+  removeLabel: string;
+}) {
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [pickerQuery, setPickerQuery] = useState("");
+  const resolvedTarget = useMemo(
+    () => resolveWorkspaceDocumentReference(draft.target, currentPath, availableDocuments),
+    [availableDocuments, currentPath, draft.target],
+  );
+  const resolvedTargetPath = useMemo(
+    () =>
+      resolvedTarget?.path ?? normalizeWorkspacePath(draft.target) ?? draft.target,
+    [draft.target, resolvedTarget],
+  );
+  const targetTree = useMemo(
+    () => buildLinkTargetTree(availableDocuments, currentPath, pickerQuery),
+    [availableDocuments, currentPath, pickerQuery],
+  );
+  const [expandedTargets, setExpandedTargets] = useState<Set<string>>(
+    () => new Set(["sources", "wiki", "workspace-files"]),
+  );
+  const [selectedTargetPath, setSelectedTargetPath] = useState<string | null>(
+    () => (resolvedTarget?.path && availableDocuments.includes(resolvedTarget.path) ? resolvedTarget.path : null),
+  );
+  const [locationMode, setLocationMode] = useState<LinkLocationMode>("whole");
+  const [pageNumber, setPageNumber] = useState("1");
+  const [slideNumber, setSlideNumber] = useState("1");
+  const [lineRange, setLineRange] = useState<LinkLineRange | null>(null);
+  const [headingAnchor, setHeadingAnchor] = useState("");
+  const [targetContent, setTargetContent] = useState<LinkTargetContentState | null>(null);
+  const pickerWasOpenRef = useRef(false);
+  const selectedTargetKind = selectedTargetPath ? linkLocationKind(selectedTargetPath) : "file";
+  const headingOptions = useMemo(
+    () =>
+      selectedTargetKind === "wiki" && targetContent?.content
+        ? extractMarkdownHeadingOptions(targetContent.content)
+        : [],
+    [selectedTargetKind, targetContent?.content],
+  );
+  const lineOptions = useMemo(
+    () =>
+      selectedTargetKind === "sourceText" && targetContent?.content
+        ? targetContent.content.split(/\r?\n/)
+        : [],
+    [selectedTargetKind, targetContent?.content],
+  );
+  const targetPreview = selectedTargetPath
+    ? buildLinkLocationTarget(selectedTargetPath, {
+        mode: locationMode,
+        headingAnchor,
+        lineRange,
+        pageNumber,
+        slideNumber,
+      })
+    : "";
+
+  useEffect(() => {
+    if (!pickerOpen) return;
+    setExpandedTargets((previous) => {
+      const next = new Set(previous);
+      next.add("sources");
+      next.add("wiki");
+      next.add("workspace-files");
+      for (const ancestor of treeAncestorPaths(resolvedTargetPath)) {
+        next.add(ancestor);
+      }
+      return next;
+    });
+  }, [pickerOpen, resolvedTargetPath]);
+
+  useEffect(() => {
+    if (pickerOpen && !pickerWasOpenRef.current) {
+      const targetPath =
+        resolvedTarget?.path && availableDocuments.includes(resolvedTarget.path)
+          ? resolvedTarget.path
+          : null;
+      setSelectedTargetPath(targetPath);
+      applyAnchorToLocation(targetPath, resolvedTarget?.anchor ?? null);
+    }
+    pickerWasOpenRef.current = pickerOpen;
+  }, [availableDocuments, pickerOpen, resolvedTarget]);
+
+  useEffect(() => {
+    if (!selectedTargetPath || !linkTargetNeedsContent(selectedTargetPath)) {
+      setTargetContent(null);
+      return;
+    }
+
+    let cancelled = false;
+    setTargetContent({ path: selectedTargetPath, content: null, loading: true, error: null });
+    invoke<WorkspaceFile>("read_workspace_file", { relativePath: selectedTargetPath })
+      .then((file) => {
+        if (!cancelled) {
+          setTargetContent({ path: selectedTargetPath, content: file.content, loading: false, error: null });
+        }
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          setTargetContent({
+            path: selectedTargetPath,
+            content: null,
+            loading: false,
+            error: String(error),
+          });
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedTargetPath]);
+
+  useEffect(() => {
+    if (!pickerOpen || !pickerQuery.trim()) return;
+    setExpandedTargets((previous) => {
+      const next = new Set(previous);
+      addTreeDirectoryPaths(targetTree, next);
+      return next;
+    });
+  }, [pickerOpen, pickerQuery, targetTree]);
+
+  function togglePickerFolder(path: string) {
+    setExpandedTargets((previous) => {
+      const next = new Set(previous);
+      if (next.has(path)) {
+        next.delete(path);
+      } else {
+        next.add(path);
+      }
+      return next;
+    });
+  }
+
+  function applyAnchorToLocation(path: string | null, anchor: string | null) {
+    const kind = path ? linkLocationKind(path) : "file";
+    setPageNumber("1");
+    setSlideNumber("1");
+    setLineRange(null);
+    setHeadingAnchor("");
+
+    if (!anchor || !path) {
+      setLocationMode("whole");
+      return;
+    }
+
+    if (kind === "pdf") {
+      const page = parsePdfTargetPage(anchor);
+      setLocationMode(page ? "page" : "whole");
+      if (page) setPageNumber(String(page));
+      return;
+    }
+
+    if (kind === "slide") {
+      const slide = parsePdfTargetPage(anchor);
+      setLocationMode(slide ? "slide" : "whole");
+      if (slide) setSlideNumber(String(slide));
+      return;
+    }
+
+    if (kind === "sourceText") {
+      const range = parsePlainTextLineTarget(anchor);
+      setLocationMode(range ? "line" : "whole");
+      if (range) setLineRange(range);
+      return;
+    }
+
+    if (kind === "wiki") {
+      setLocationMode("heading");
+      setHeadingAnchor(safeDecode(anchor).replace(/^#/, ""));
+      return;
+    }
+
+    setLocationMode("whole");
+  }
+
+  function selectTargetPath(path: string) {
+    setSelectedTargetPath(path);
+    applyAnchorToLocation(path, null);
+  }
+
+  function useSelectedTarget() {
+    if (!selectedTargetPath) return;
+    onChange({
+      ...draft,
+      target: targetPreview,
+      syntax: linkSyntaxForTarget(targetPreview, currentPath, availableDocuments),
+    });
+    setPickerOpen(false);
+    setPickerQuery("");
+  }
+
+  return (
+    <div
+      className="markdown-link-popover"
+      onClick={(event) => event.stopPropagation()}
+      onPointerDown={(event) => event.stopPropagation()}
+    >
+      <div className="markdown-link-popover-header">
+        <strong>Edit link</strong>
+        <button type="button" onClick={onClose} aria-label="Close link editor">
+          <X size={14} aria-hidden="true" />
+        </button>
+      </div>
+      <label>
+        <span>Text</span>
+        <input
+          value={draft.text}
+          onChange={(event) => onChange({ ...draft, text: event.target.value })}
+        />
+      </label>
+      <label>
+        <span>Target</span>
+        <div className="markdown-link-target-row">
+          <input
+            value={draft.target}
+            onChange={(event) => onChange({ ...draft, target: event.target.value })}
+            placeholder="wiki/page.md or https://..."
+          />
+          <button type="button" onClick={() => setPickerOpen((open) => !open)}>
+            Choose target
+          </button>
+          </div>
+      </label>
+      {pickerOpen ? (
+        <div className="markdown-link-picker" aria-label="Choose target">
+          <div className="markdown-link-picker-header">
+            <div>
+              <div className="markdown-link-picker-title">Workspace pages and sources</div>
+              <p>Choose from the same local files Maple can open.</p>
+            </div>
+            <input
+              value={pickerQuery}
+              onChange={(event) => setPickerQuery(event.target.value)}
+              placeholder="Search files"
+              aria-label="Search workspace pages and sources"
+            />
+          </div>
+          <div className="markdown-link-picker-body">
+            {targetTree.length > 0 ? (
+              <MarkdownLinkTargetTree
+                nodes={targetTree}
+                level={0}
+                selectedPath={selectedTargetPath ?? resolvedTargetPath}
+                expanded={expandedTargets}
+                onToggleFolder={togglePickerFolder}
+                onSelect={selectTargetPath}
+              />
+            ) : (
+              <span className="markdown-link-picker-empty">No matching page or file</span>
+            )}
+            <MarkdownLinkLocationPanel
+              selectedPath={selectedTargetPath}
+              kind={selectedTargetKind}
+              locationMode={locationMode}
+              onLocationModeChange={setLocationMode}
+              pageNumber={pageNumber}
+              onPageNumberChange={setPageNumber}
+              slideNumber={slideNumber}
+              onSlideNumberChange={setSlideNumber}
+              lineRange={lineRange}
+              onLineRangeChange={setLineRange}
+              headingAnchor={headingAnchor}
+              onHeadingAnchorChange={setHeadingAnchor}
+              contentState={targetContent}
+              headings={headingOptions}
+              lines={lineOptions}
+            />
+          </div>
+          <div className="markdown-link-picker-footer">
+            <span title={targetPreview}>{targetPreview || "Choose a target file"}</span>
+            <button type="button" disabled={!selectedTargetPath} onClick={useSelectedTarget}>
+              Use this link
+            </button>
+          </div>
+        </div>
+      ) : null}
+      <div className="markdown-link-actions">
+        <button type="button" className="primary" onClick={onApply}>
+          Done
+        </button>
+        <button type="button" className="secondary" onClick={onRemove}>
+          {removeLabel}
+        </button>
+        <button type="button" className="secondary" onClick={onClose}>
+          Close
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function MarkdownLinkLocationPanel({
+  selectedPath,
+  kind,
+  locationMode,
+  onLocationModeChange,
+  pageNumber,
+  onPageNumberChange,
+  slideNumber,
+  onSlideNumberChange,
+  lineRange,
+  onLineRangeChange,
+  headingAnchor,
+  onHeadingAnchorChange,
+  contentState,
+  headings,
+  lines,
+}: {
+  selectedPath: string | null;
+  kind: LinkLocationKind;
+  locationMode: LinkLocationMode;
+  onLocationModeChange: (mode: LinkLocationMode) => void;
+  pageNumber: string;
+  onPageNumberChange: (value: string) => void;
+  slideNumber: string;
+  onSlideNumberChange: (value: string) => void;
+  lineRange: LinkLineRange | null;
+  onLineRangeChange: (range: LinkLineRange | null) => void;
+  headingAnchor: string;
+  onHeadingAnchorChange: (value: string) => void;
+  contentState: LinkTargetContentState | null;
+  headings: MarkdownHeadingOption[];
+  lines: string[];
+}) {
+  if (!selectedPath) {
+    return (
+      <div className="markdown-link-location-panel empty">
+        <strong>Location</strong>
+        <p>Choose a page or source file from the tree.</p>
+      </div>
+    );
+  }
+
+  const title = displayFileName(selectedPath);
+  const folder = selectedPath.includes("/") ? selectedPath.split("/").slice(0, -1).join("/") : "root";
+
+  function setSingleLine(lineNumber: number, extend = false) {
+    onLocationModeChange("line");
+    if (extend && lineRange) {
+      onLineRangeChange({
+        start: Math.min(lineRange.start, lineNumber),
+        end: Math.max(lineRange.end, lineNumber),
+      });
+      return;
+    }
+    onLineRangeChange({ start: lineNumber, end: lineNumber });
+  }
+
+  function setLineStart(value: string) {
+    const next = parsePositiveInteger(value);
+    if (!next) {
+      onLineRangeChange(null);
+      return;
+    }
+    onLocationModeChange("line");
+    const end = lineRange?.end ?? next;
+    onLineRangeChange({ start: Math.min(next, end), end: Math.max(next, end) });
+  }
+
+  function setLineEnd(value: string) {
+    const next = parsePositiveInteger(value);
+    if (!next) {
+      onLineRangeChange(null);
+      return;
+    }
+    onLocationModeChange("line");
+    const start = lineRange?.start ?? next;
+    onLineRangeChange({ start: Math.min(start, next), end: Math.max(start, next) });
+  }
+
+  return (
+    <div className="markdown-link-location-panel">
+      <div className="markdown-link-location-selected">
+        <strong>{title}</strong>
+        <small>{folder}</small>
+      </div>
+      <div className="markdown-link-location-modes">
+        <button
+          type="button"
+          className={locationMode === "whole" ? "active" : ""}
+          onClick={() => onLocationModeChange("whole")}
+        >
+          Whole file
+        </button>
+      </div>
+
+      {kind === "pdf" ? (
+        <div className="markdown-link-location-field">
+          <button
+            type="button"
+            className={locationMode === "page" ? "active" : ""}
+            onClick={() => onLocationModeChange("page")}
+          >
+            Page
+          </button>
+          <input
+            type="number"
+            min={1}
+            value={pageNumber}
+            onFocus={() => onLocationModeChange("page")}
+            onChange={(event) => onPageNumberChange(event.target.value)}
+            aria-label="PDF page number"
+          />
+        </div>
+      ) : null}
+
+      {kind === "slide" ? (
+        <div className="markdown-link-location-field">
+          <button
+            type="button"
+            className={locationMode === "slide" ? "active" : ""}
+            onClick={() => onLocationModeChange("slide")}
+          >
+            Slide
+          </button>
+          <input
+            type="number"
+            min={1}
+            value={slideNumber}
+            onFocus={() => onLocationModeChange("slide")}
+            onChange={(event) => onSlideNumberChange(event.target.value)}
+            aria-label="Slide number"
+          />
+        </div>
+      ) : null}
+
+      {kind === "wiki" ? (
+        <div className="markdown-link-location-section">
+          <div className="markdown-link-location-title">Headings</div>
+          {contentState?.loading ? (
+            <p>Loading headings...</p>
+          ) : contentState?.error ? (
+            <p>{contentState.error}</p>
+          ) : headings.length > 0 ? (
+            <div className="markdown-link-heading-list">
+              {headings.map((heading) => (
+                <button
+                  key={`${heading.anchor}-${heading.line}`}
+                  type="button"
+                  className={
+                    locationMode === "heading" && headingAnchor === heading.anchor ? "active" : ""
+                  }
+                  style={{ paddingLeft: 6 + Math.max(0, heading.level - 1) * 10 }}
+                  onClick={() => {
+                    onLocationModeChange("heading");
+                    onHeadingAnchorChange(heading.anchor);
+                  }}
+                >
+                  <span>{heading.title}</span>
+                  <small>line {heading.line}</small>
+                </button>
+              ))}
+            </div>
+          ) : (
+            <p>No headings found. Link to the whole page.</p>
+          )}
+        </div>
+      ) : null}
+
+      {kind === "sourceText" ? (
+        <div className="markdown-link-location-section">
+          <div className="markdown-link-location-title">Lines</div>
+          <div className="markdown-link-line-inputs">
+            <label>
+              <span>Start</span>
+              <input
+                type="number"
+                min={1}
+                value={lineRange?.start ?? ""}
+                onFocus={() => onLocationModeChange("line")}
+                onChange={(event) => setLineStart(event.target.value)}
+              />
+            </label>
+            <label>
+              <span>End</span>
+              <input
+                type="number"
+                min={1}
+                value={lineRange?.end ?? ""}
+                onFocus={() => onLocationModeChange("line")}
+                onChange={(event) => setLineEnd(event.target.value)}
+              />
+            </label>
+          </div>
+          {contentState?.loading ? (
+            <p>Loading lines...</p>
+          ) : contentState?.error ? (
+            <p>{contentState.error}</p>
+          ) : lines.length > 0 ? (
+            <div className="markdown-link-line-list">
+              {lines.map((line, index) => {
+                const lineNumber = index + 1;
+                const active = Boolean(
+                  locationMode === "line" &&
+                    lineRange &&
+                    lineNumber >= lineRange.start &&
+                    lineNumber <= lineRange.end,
+                );
+                return (
+                  <button
+                    key={lineNumber}
+                    type="button"
+                    className={active ? "active" : ""}
+                    onClick={(event) => setSingleLine(lineNumber, event.shiftKey)}
+                  >
+                    <span>{lineNumber}</span>
+                    <code>{line || " "}</code>
+                  </button>
+                );
+              })}
+            </div>
+          ) : (
+            <p>No lines found. Link to the whole file.</p>
+          )}
+        </div>
+      ) : null}
+
+      {kind === "file" ? (
+        <p className="markdown-link-location-note">This file type supports whole-file links.</p>
+      ) : null}
+    </div>
+  );
+}
+
+type MarkdownLinkTargetTreeProps = {
+  nodes: TreeNode[];
+  level: number;
+  selectedPath: string;
+  expanded: Set<string>;
+  onToggleFolder: (path: string) => void;
+  onSelect: (path: string) => void;
+};
+
+function MarkdownLinkTargetTree(props: MarkdownLinkTargetTreeProps) {
+  return (
+    <ul className={`markdown-link-target-tree ${props.level === 0 ? "root" : "nested"}`}>
+      {props.nodes.map((node) => (
+        <MarkdownLinkTargetTreeItem key={node.path} node={node} {...props} />
+      ))}
+    </ul>
+  );
+}
+
+function MarkdownLinkTargetTreeItem({
+  node,
+  level,
+  selectedPath,
+  expanded,
+  onToggleFolder,
+  onSelect,
+}: MarkdownLinkTargetTreeProps & { node: TreeNode }) {
+  const indent = Math.min(level * 10, 50);
+
+  if (node.isDir) {
+    const isOpen = expanded.has(node.path);
+    const leafCount = collectTreeLeafPaths(node).length;
+    return (
+      <li className="markdown-link-target-item">
+        <button
+          type="button"
+          className="markdown-link-target-row-button folder"
+          style={{ paddingLeft: indent }}
+          onClick={() => onToggleFolder(node.path)}
+          title={node.path}
+          aria-expanded={isOpen}
+        >
+          <span className="markdown-link-target-chevron">{isOpen ? "▾" : "▸"}</span>
+          <span className="markdown-link-target-name">{node.name}</span>
+          <span className="markdown-link-target-count">{leafCount}</span>
+        </button>
+        {isOpen ? (
+          <MarkdownLinkTargetTree
+            nodes={node.children}
+            level={level + 1}
+            selectedPath={selectedPath}
+            expanded={expanded}
+            onToggleFolder={onToggleFolder}
+            onSelect={onSelect}
+          />
+        ) : null}
+      </li>
+    );
+  }
+
+  const fileDisplay = getFileDisplayParts(node.name);
+  const isSelected = selectedPath === node.path;
+  const parentPath = node.path.includes("/") ? node.path.split("/").slice(0, -1).join("/") : "root";
+  return (
+    <li className="markdown-link-target-item">
+      <button
+        type="button"
+        className={`markdown-link-target-row-button file${isSelected ? " active" : ""}`}
+        style={{ paddingLeft: indent + 18 }}
+        onClick={() => onSelect(node.path)}
+        title={node.path}
+      >
+        <span className="markdown-link-target-file-main">
+          <span className="tree-file-label">{fileDisplay.label}</span>
+          {fileDisplay.extension ? <span className="tree-file-ext">{fileDisplay.extension}</span> : null}
+        </span>
+        <small>{parentPath}</small>
+      </button>
+    </li>
+  );
+}
+
+function MarkdownEditImageBlock({
+  block,
+  path,
+  workspacePath,
+  assetByDisplayPath,
+  assetRefreshNonce,
+  assetBusyLabelFor,
+  onOpenImage,
+  onCropAsset,
+  onResetAssetCrop,
+  onReplaceAsset,
+  onEditAsset,
+  onDelete,
+  onEditSource,
+}: {
+  block: MarkdownEditBlock;
+  path: string;
+  workspacePath: string;
+  assetByDisplayPath?: Map<string, WikiImageAsset>;
+  assetRefreshNonce?: number;
+  assetBusyLabelFor?: (asset: WikiImageAsset) => string | null;
+  onOpenImage: (image: ExpandedImage) => void;
+  onCropAsset?: (asset: WikiImageAsset) => void;
+  onResetAssetCrop?: (asset: WikiImageAsset) => void;
+  onReplaceAsset?: (asset: WikiImageAsset, file: File) => void;
+  onEditAsset?: (asset: WikiImageAsset) => void;
+  onDelete: () => void;
+  onEditSource: () => void;
+}) {
+  const reference = block.image;
+  const assetUrl = reference ? toAssetUrl(workspacePath, path, reference.src) : null;
+  const workspaceTarget = reference ? resolveWorkspacePath(path, reference.src) : null;
+  const asset = workspaceTarget ? assetByDisplayPath?.get(workspaceTarget) : null;
+  const busyLabel = asset ? assetBusyLabelFor?.(asset) ?? null : null;
+
+  if (reference && assetUrl && asset) {
+    return (
+      <div className="markdown-edit-image-block">
+        <AssetImageBlock
+          asset={asset}
+          imageUrl={appendAssetCacheBust(assetUrl, assetRefreshNonce)}
+          workspacePath={workspacePath}
+          label={reference.alt}
+          busyLabel={busyLabel}
+          onOpenImage={onOpenImage}
+          onCrop={onCropAsset}
+          onResetCrop={onResetAssetCrop}
+          onReplace={onReplaceAsset}
+          onEdit={onEditAsset}
+          onDelete={onDelete}
+        />
+        <div className="markdown-edit-image-source">
+          <button
+            type="button"
+            disabled={Boolean(busyLabel)}
+            onClick={onEditSource}
+            title="Edit image Markdown"
+          >
+            <Pencil size={14} aria-hidden="true" />
+            Markdown
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <section className="markdown-edit-block">
+      <div className="markdown-edit-block-actions">
+        <button type="button" onClick={onEditSource} title="Edit image Markdown">
+          <Pencil size={14} aria-hidden="true" />
+          Edit
+        </button>
+      </div>
+      <div className="markdown-edit-preview">
+        <WorkspaceAwareMarkdown
+          content={block.source}
+          currentPath={path}
+          workspacePath={workspacePath}
+          availableDocuments={[path]}
+          onOpenDocument={() => {}}
+        />
+      </div>
     </section>
   );
 }
@@ -9012,7 +11568,9 @@ function normalizeMarkdownForDisplay(
 ) {
   return transformMarkdownOutsideCode(content, (segment) =>
     convertWikiLinks(
-      convertEscapedMathDelimiters(convertMarkdownDirectiveCallouts(segment)),
+      normalizeLooseMarkdownLinkDestinations(
+        convertEscapedMathDelimiters(convertMarkdownDirectiveCallouts(segment)),
+      ),
       currentPath,
       availableDocuments,
     ),
@@ -9065,7 +11623,7 @@ function convertWikiLinks(
       return `[${escapeMarkdownLinkLabel(label || target)}](aiwiki-broken://${encodeURIComponent(target)})`;
     }
 
-    return `[${escapeMarkdownLinkLabel(label || resolvedPath)}](${resolvedPath})`;
+    return `[${escapeMarkdownLinkLabel(label || resolvedPath)}](${formatMarkdownLinkDestination(resolvedPath)})`;
   });
 }
 
@@ -9191,6 +11749,60 @@ function escapeMarkdownLinkLabel(label: string) {
   return label.replace(/\\/g, "\\\\").replace(/\]/g, "\\]");
 }
 
+function normalizeLooseMarkdownLinkDestinations(content: string) {
+  return content.replace(
+    /(\[[^\]\n]+\])\(([^)\n]*\s[^)\n]*)\)/g,
+    (_match, label: string, target: string) => {
+      const trimmedTarget = target.trim();
+      const repairedTarget = repairMalformedAngleDestination(trimmedTarget);
+      if (repairedTarget) {
+        return `${label}(${repairedTarget})`;
+      }
+      if (isAngleBracketMarkdownDestination(trimmedTarget)) {
+        return `${label}(${trimmedTarget})`;
+      }
+      return `${label}(${formatMarkdownLinkDestination(trimmedTarget)})`;
+    },
+  );
+}
+
+function formatMarkdownLinkDestination(target: string) {
+  const trimmedTarget = target.trim();
+  const repairedTarget = repairMalformedAngleDestination(trimmedTarget);
+  if (repairedTarget) {
+    return repairedTarget;
+  }
+
+  if (isAngleBracketMarkdownDestination(trimmedTarget)) {
+    return trimmedTarget;
+  }
+
+  if (!isExternalUrl(trimmedTarget) && /[\s()<>]/.test(trimmedTarget)) {
+    return `<${trimmedTarget.replace(/</g, "%3C").replace(/>/g, "%3E")}>`;
+  }
+
+  if (isExternalUrl(trimmedTarget)) {
+    try {
+      return encodeURI(trimmedTarget).replace(/\(/g, "%28").replace(/\)/g, "%29");
+    } catch {
+      return trimmedTarget.replace(/\s/g, "%20").replace(/\(/g, "%28").replace(/\)/g, "%29");
+    }
+  }
+
+  return trimmedTarget;
+}
+
+function isAngleBracketMarkdownDestination(target: string) {
+  return /^<[^<>\n]+>$/.test(target);
+}
+
+function repairMalformedAngleDestination(target: string) {
+  const malformed = target.match(/^<<(.+?)(?:%3E|>)>$/i);
+  if (!malformed) return null;
+  const repaired = safeDecode(malformed[1]).replace(/>$/g, "").trim();
+  return repaired ? `<${repaired.replace(/</g, "%3C").replace(/>/g, "%3E")}>` : null;
+}
+
 function toAssetUrl(workspacePath: string, currentPath: string, src: string) {
   if (!workspacePath || isExternalUrl(src) || src.startsWith("#")) {
     return src;
@@ -9210,12 +11822,579 @@ function toAssetUrl(workspacePath: string, currentPath: string, src: string) {
   return `file://${absolutePath}`;
 }
 
+function appendAssetCacheBust(url: string, nonce?: number) {
+  if (!nonce) return url;
+  const separator = url.includes("?") ? "&" : "?";
+  return `${url}${separator}v=${nonce}`;
+}
+
+function fileToDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result ?? ""));
+    reader.onerror = () => reject(reader.error ?? new Error("Could not read image file."));
+    reader.readAsDataURL(file);
+  });
+}
+
+function fallbackAltFromFileName(fileName: string) {
+  return (fileName || "Image")
+    .replace(/\.[^.]+$/g, "")
+    .replace(/[-_]+/g, " ")
+    .trim();
+}
+
+function blockInsertionText(content: string, markdown: string, offset: number) {
+  const before = content.slice(0, offset);
+  const after = content.slice(offset);
+  const prefix = before && !before.endsWith("\n\n") ? before.endsWith("\n") ? "\n" : "\n\n" : "";
+  const suffix = after && !after.startsWith("\n\n") ? after.startsWith("\n") ? "\n" : "\n\n" : "\n";
+  return `${prefix}${markdown.trim()}\n${suffix}`;
+}
+
+function buildLinkTargetTree(
+  availableDocuments: string[],
+  currentPath: string,
+  query: string,
+): TreeNode[] {
+  const candidatePaths = Array.from(
+    new Set(
+      availableDocuments
+        .map((path) => normalizeWorkspacePath(path) ?? path)
+        .filter((path) => path && path !== currentPath)
+        .filter(isLinkPickerTarget),
+    ),
+  );
+  const sourceTree = buildTree(
+    candidatePaths.filter((path) => path.startsWith("sources/")),
+    "sources/",
+  );
+  const wikiTree = buildTree(
+    candidatePaths.filter((path) => path.startsWith("wiki/")),
+    "wiki/",
+  );
+  const rootFiles = candidatePaths
+    .filter((path) => !path.startsWith("sources/") && !path.startsWith("wiki/"))
+    .sort((a, b) => a.localeCompare(b))
+    .map<TreeNode>((path) => ({ name: path, path, isDir: false, children: [] }));
+  const nodes: TreeNode[] = [];
+  if (sourceTree.length > 0) {
+    nodes.push({ name: "sources", path: "sources", isDir: true, children: sourceTree });
+  }
+  if (wikiTree.length > 0) {
+    nodes.push({ name: "wiki", path: "wiki", isDir: true, children: wikiTree });
+  }
+  if (rootFiles.length > 0) {
+    nodes.push({
+      name: "workspace files",
+      path: "workspace-files",
+      isDir: true,
+      children: rootFiles,
+    });
+  }
+
+  const normalizedQuery = query.trim().toLowerCase();
+  return normalizedQuery ? filterTreeByQuery(nodes, normalizedQuery) : nodes;
+}
+
+function isLinkPickerTarget(path: string) {
+  if (path.startsWith("wiki/assets/") || path.startsWith(".aiwiki/")) return false;
+  if (path.startsWith("wiki/")) return path.endsWith(".md");
+  if (path.startsWith("sources/")) return true;
+  return path.endsWith(".md");
+}
+
+function filterTreeByQuery(nodes: TreeNode[], query: string): TreeNode[] {
+  return nodes.flatMap((node) => {
+    const ownMatch =
+      node.name.toLowerCase().includes(query) ||
+      node.path.toLowerCase().includes(query) ||
+      displayFileName(node.path).toLowerCase().includes(query);
+
+    if (node.isDir) {
+      const children = ownMatch ? node.children : filterTreeByQuery(node.children, query);
+      return children.length > 0 || ownMatch ? [{ ...node, children }] : [];
+    }
+
+    return ownMatch ? [node] : [];
+  });
+}
+
+function treeAncestorPaths(path: string) {
+  const normalized = normalizeWorkspacePath(path) ?? path;
+  const parts = normalized.split("/").filter(Boolean);
+  const ancestors: string[] = [];
+  for (let i = 1; i < parts.length; i++) {
+    ancestors.push(parts.slice(0, i).join("/"));
+  }
+  return ancestors;
+}
+
+function addTreeDirectoryPaths(nodes: TreeNode[], target: Set<string>) {
+  for (const node of nodes) {
+    if (!node.isDir) continue;
+    target.add(node.path);
+    addTreeDirectoryPaths(node.children, target);
+  }
+}
+
+function linkLocationKind(path: string): LinkLocationKind {
+  if (PDF_EXT_REGEX.test(path)) return "pdf";
+  if (PPTX_EXT_REGEX.test(path)) return "slide";
+  if (path.startsWith("sources/") && (MARKDOWN_EXT_REGEX.test(path) || TEXT_EXT_REGEX.test(path))) {
+    return "sourceText";
+  }
+  if (MARKDOWN_EXT_REGEX.test(path)) return "wiki";
+  return "file";
+}
+
+function linkTargetNeedsContent(path: string) {
+  const kind = linkLocationKind(path);
+  return kind === "wiki" || kind === "sourceText";
+}
+
+function buildLinkLocationTarget(
+  path: string,
+  location: {
+    mode: LinkLocationMode;
+    headingAnchor: string;
+    lineRange: LinkLineRange | null;
+    pageNumber: string;
+    slideNumber: string;
+  },
+) {
+  if (location.mode === "page") {
+    const page = parsePositiveInteger(location.pageNumber) ?? 1;
+    return `${path}#page=${page}`;
+  }
+
+  if (location.mode === "slide") {
+    const slide = parsePositiveInteger(location.slideNumber) ?? 1;
+    return `${path}#slide=${slide}`;
+  }
+
+  if (location.mode === "line" && location.lineRange) {
+    const start = Math.min(location.lineRange.start, location.lineRange.end);
+    const end = Math.max(location.lineRange.start, location.lineRange.end);
+    return start === end ? `${path}#L${start}` : `${path}#L${start}-L${end}`;
+  }
+
+  if (location.mode === "heading" && location.headingAnchor.trim()) {
+    return `${path}#${location.headingAnchor.trim()}`;
+  }
+
+  return path;
+}
+
+function extractMarkdownHeadingOptions(content: string): MarkdownHeadingOption[] {
+  const counts = new Map<string, number>();
+  return content
+    .split(/\r?\n/)
+    .map((line, index) => {
+      const match = line.match(/^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$/);
+      if (!match) return null;
+      const title = match[2].trim();
+      const baseAnchor = slugifyMarkdownHeading(title);
+      if (!baseAnchor) return null;
+      const count = counts.get(baseAnchor) ?? 0;
+      counts.set(baseAnchor, count + 1);
+      return {
+        level: match[1].length,
+        title,
+        anchor: count === 0 ? baseAnchor : `${baseAnchor}-${count}`,
+        line: index + 1,
+      };
+    })
+    .filter((heading): heading is MarkdownHeadingOption => Boolean(heading));
+}
+
+function parsePositiveInteger(value: string) {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+}
+
+function markdownSourceToEditableModel(source: string): {
+  text: string;
+  links: MarkdownEditableLinkToken[];
+  blockStyle: string;
+} {
+  const wrapper = markdownTextWrapper(source);
+  const links: MarkdownEditableLinkToken[] = [];
+  let text = "";
+  let cursor = 0;
+  const pattern = /(\[([^\]]+)\]\(([^)]+)\)|\[\[([^\]\n]+?)\]\])/g;
+  for (const match of wrapper.body.matchAll(pattern)) {
+    const start = match.index ?? 0;
+    text += wrapper.body.slice(cursor, start);
+    if (match[2] !== undefined) {
+      const label = match[2];
+      const target = match[3];
+      links.push({
+        id: `link-${links.length}-${text.length}`,
+        text: label,
+        target,
+        syntax: "markdown",
+      });
+      text += label;
+    } else {
+      const body = match[4] ?? "";
+      const divider = body.indexOf("|");
+      const target = divider === -1 ? body.trim() : body.slice(0, divider).trim();
+      const label = divider === -1 ? humanizeWikiLinkLabel(target) : body.slice(divider + 1).trim();
+      links.push({
+        id: `link-${links.length}-${text.length}`,
+        text: label,
+        target,
+        syntax: "wiki",
+      });
+      text += label;
+    }
+    cursor = start + match[0].length;
+  }
+  text += wrapper.body.slice(cursor);
+
+  return {
+    text: text.trim(),
+    links,
+    blockStyle: wrapper.style,
+  };
+}
+
+function markdownSourceFromEditableModel(
+  originalSource: string,
+  text: string,
+  links: MarkdownEditableLinkToken[],
+) {
+  const wrapper = markdownTextWrapper(originalSource);
+  let body = text.trim();
+  for (const link of links) {
+    const label = link.text.trim();
+    const target = link.target.trim();
+    if (!label || !target) continue;
+    const index = body.indexOf(label);
+    if (index === -1) continue;
+    const markdown = formatMarkdownLink(label, target, link.syntax);
+    body = `${body.slice(0, index)}${markdown}${body.slice(index + label.length)}`;
+  }
+  return `${wrapper.leading}${wrapper.prefix}${body}${wrapper.suffix}${wrapper.trailing}`;
+}
+
+function markdownTextWrapper(source: string) {
+  const leading = source.match(/^\s*/)?.[0] ?? "";
+  const trailing = source.match(/\s*$/)?.[0] ?? "";
+  const trimmed = source.slice(leading.length, source.length - trailing.length);
+
+  const heading = trimmed.match(/^(#{1,6}\s+)([\s\S]*?)(\s*#*)$/);
+  if (heading) {
+    return { leading, trailing, prefix: heading[1], body: heading[2], suffix: heading[3], style: `heading h${heading[1].trim().length}` };
+  }
+
+  const unordered = trimmed.match(/^(\s*[-*+]\s+)([\s\S]*)$/);
+  if (unordered) {
+    return { leading, trailing, prefix: unordered[1], body: unordered[2], suffix: "", style: "paragraph" };
+  }
+
+  const ordered = trimmed.match(/^(\s*\d+\.\s+)([\s\S]*)$/);
+  if (ordered) {
+    return { leading, trailing, prefix: ordered[1], body: ordered[2], suffix: "", style: "paragraph" };
+  }
+
+  return { leading, trailing, prefix: "", body: trimmed, suffix: "", style: "paragraph" };
+}
+
+function findMarkdownLinkInSource(source: string, link: RenderedMarkdownLink) {
+  const markdownLinks = source.matchAll(/\[([^\]]+)\]\(([^)]+)\)/g);
+  for (const match of markdownLinks) {
+    if (match[1] === link.label || match[2] === link.href) {
+      return { text: match[1], target: match[2], syntax: "markdown" as const };
+    }
+  }
+  const wikiLinks = source.matchAll(/\[\[([^\]\n]+?)\]\]/g);
+  for (const match of wikiLinks) {
+    const body = match[1];
+    const divider = body.indexOf("|");
+    const target = divider === -1 ? body.trim() : body.slice(0, divider).trim();
+    const text = divider === -1 ? humanizeWikiLinkLabel(target) : body.slice(divider + 1).trim();
+    if (text === link.label || target === link.href) {
+      return { text, target, syntax: "wiki" as const };
+    }
+  }
+  return null;
+}
+
+function linkSyntaxForTarget(
+  target: string,
+  currentPath: string,
+  availableDocuments: string[],
+  preferredSyntax?: "markdown" | "wiki",
+): "markdown" | "wiki" {
+  if (isExternalUrl(target) || isWorkspaceFileTarget(target, currentPath, availableDocuments)) {
+    return "markdown";
+  }
+  return preferredSyntax ?? "wiki";
+}
+
+function isWorkspaceFileTarget(target: string, currentPath: string, availableDocuments: string[]) {
+  const normalizedTarget = normalizeWorkspacePath(target.split("#")[0].split("?")[0]);
+  if (normalizedTarget && availableDocuments.includes(normalizedTarget)) return true;
+  const resolvedTarget = resolveWorkspacePath(currentPath, target);
+  if (resolvedTarget && availableDocuments.includes(resolvedTarget)) return true;
+  return /^(sources|wiki)\//.test(target) || /^[^/]+\.md(?:[#?].*)?$/i.test(target);
+}
+
+function formatMarkdownLink(label: string, target: string, syntax: "markdown" | "wiki") {
+  if (syntax === "wiki" && !isExternalUrl(target)) {
+    return `[[${target}${label && label !== humanizeWikiLinkLabel(target) ? `|${label}` : ""}]]`;
+  }
+  return `[${escapeMarkdownLinkLabel(label)}](${formatMarkdownLinkDestination(target)})`;
+}
+
+function updateMarkdownLinkInSource(
+  source: string,
+  originalText: string,
+  nextText: string,
+  nextTarget: string,
+  currentPath: string,
+  availableDocuments: string[],
+  preferredSyntax?: "markdown" | "wiki",
+) {
+  const replacement = formatMarkdownLink(
+    nextText,
+    nextTarget,
+    linkSyntaxForTarget(nextTarget, currentPath, availableDocuments, preferredSyntax),
+  );
+  return replaceFirstMarkdownLinkByText(source, originalText, replacement);
+}
+
+function removeMarkdownLinkInSource(source: string, text: string) {
+  return replaceFirstMarkdownLinkByText(source, text, text);
+}
+
+function replaceFirstMarkdownLinkByText(source: string, text: string, replacement: string) {
+  const escaped = escapeRegExp(text);
+  const markdown = new RegExp(`\\[${escaped}\\]\\([^)]+\\)`);
+  if (markdown.test(source)) return source.replace(markdown, replacement);
+  const wiki = /\[\[([^\]\n]+?)\]\]/g;
+  return source.replace(wiki, (match, body: string) => {
+    const divider = body.indexOf("|");
+    const target = divider === -1 ? body.trim() : body.slice(0, divider).trim();
+    const label = divider === -1 ? humanizeWikiLinkLabel(target) : body.slice(divider + 1).trim();
+    return label === text ? replacement : match;
+  });
+}
+
+function contentEditableSelectionRange(root: HTMLElement | null) {
+  if (!root) return null;
+  const selection = window.getSelection();
+  if (!selection || selection.rangeCount === 0) return null;
+  const range = selection.getRangeAt(0);
+  if (!root.contains(range.startContainer) || !root.contains(range.endContainer)) return null;
+  return {
+    start: textOffsetWithin(root, range.startContainer, range.startOffset),
+    end: textOffsetWithin(root, range.endContainer, range.endOffset),
+  };
+}
+
+function textOffsetWithin(root: HTMLElement, node: Node, offset: number) {
+  const range = document.createRange();
+  range.selectNodeContents(root);
+  range.setEnd(node, offset);
+  return range.toString().length;
+}
+
+function setContentEditableCursor(root: HTMLElement, offset: number) {
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  let remaining = offset;
+  let current = walker.nextNode();
+  while (current) {
+    const textLength = current.textContent?.length ?? 0;
+    if (remaining <= textLength) {
+      const range = document.createRange();
+      range.setStart(current, remaining);
+      range.collapse(true);
+      const selection = window.getSelection();
+      selection?.removeAllRanges();
+      selection?.addRange(range);
+      return;
+    }
+    remaining -= textLength;
+    current = walker.nextNode();
+  }
+}
+
+function rangesOverlap(start: number, end: number, range: { start: number; end: number } | null) {
+  return Boolean(range && Math.max(start, range.start) < Math.min(end, range.end));
+}
+
+function linkTextRange(text: string, label: string) {
+  const start = text.indexOf(label);
+  return start === -1 ? null : { start, end: start + label.length };
+}
+
+function escapeRegExp(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function splitMarkdownEditBlocks(content: string): MarkdownEditBlock[] {
+  const blocks: MarkdownEditBlock[] = [];
+  let cursor = 0;
+
+  if (content.startsWith("---\n")) {
+    const closing = content.indexOf("\n---\n", 4);
+    if (closing !== -1) {
+      const end = closing + 5;
+      blocks.push({
+        id: `frontmatter-0-${end}`,
+        kind: "frontmatter",
+        start: 0,
+        end,
+        source: content.slice(0, end),
+      });
+      cursor = end;
+    }
+  }
+
+  for (const reference of extractMarkdownImageReferences(content)) {
+    if (reference.start < cursor) continue;
+    if (reference.start > cursor) {
+      pushMarkdownEditTextBlocks(blocks, cursor, reference.start, content);
+    }
+    blocks.push({
+      id: `image-${reference.start}-${reference.end}`,
+      kind: "image",
+      start: reference.start,
+      end: reference.end,
+      source: content.slice(reference.start, reference.end),
+      image: reference,
+    });
+    cursor = reference.end;
+  }
+
+  if (cursor < content.length) {
+    pushMarkdownEditTextBlocks(blocks, cursor, content.length, content);
+  }
+
+  if (blocks.length === 0) {
+    blocks.push(markdownEditBlock("markdown", 0, content.length, content));
+  }
+
+  return blocks;
+}
+
+function pushMarkdownEditTextBlocks(
+  blocks: MarkdownEditBlock[],
+  start: number,
+  end: number,
+  content: string,
+) {
+  let cursor = start;
+  const segment = content.slice(start, end);
+  const separators = segment.matchAll(/\n{2,}/g);
+  for (const match of separators) {
+    const separatorStart = start + (match.index ?? 0);
+    const separatorEnd = separatorStart + match[0].length;
+    if (separatorStart > cursor) {
+      blocks.push(markdownEditBlock("markdown", cursor, separatorEnd, content));
+    } else {
+      cursor = separatorEnd;
+      continue;
+    }
+    cursor = separatorEnd;
+  }
+  if (cursor < end) {
+    blocks.push(markdownEditBlock("markdown", cursor, end, content));
+  }
+}
+
+function markdownEditBlock(
+  kind: MarkdownEditBlockKind,
+  start: number,
+  end: number,
+  content: string,
+): MarkdownEditBlock {
+  return {
+    id: `${kind}-${start}-${end}`,
+    kind,
+    start,
+    end,
+    source: content.slice(start, end),
+  };
+}
+
+function summarizeFrontmatterBlock(source: string) {
+  const frontmatter = source.replace(/^---\s*/, "").replace(/\s*---\s*$/g, "").trim();
+  if (!frontmatter) return "Empty";
+  const title = frontmatter.match(/^title:\s*["']?(.+?)["']?\s*$/m)?.[1]?.trim();
+  const category = frontmatter.match(/^category:\s*["']?(.+?)["']?\s*$/m)?.[1]?.trim();
+  if (title && category) return `${title} · ${category}`;
+  return title || category || `${frontmatter.split(/\r?\n/).filter(Boolean).length} fields`;
+}
+
+function lineNumberAtOffset(content: string, offset: number) {
+  return content.slice(0, Math.max(0, offset)).split(/\r?\n/).length;
+}
+
+function markdownImageAnchorId(path: string, occurrence: number) {
+  return `image-${hashStringForDomId(path)}-${occurrence}`;
+}
+
+function hashStringForDomId(value: string) {
+  let hash = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    hash = (hash * 31 + value.charCodeAt(index)) >>> 0;
+  }
+  return hash.toString(36);
+}
+
+function extractMarkdownImageReferences(content: string): MarkdownImageReference[] {
+  const references: MarkdownImageReference[] = [];
+  let offset = 0;
+
+  while (offset < content.length) {
+    const start = content.indexOf("![", offset);
+    if (start === -1) break;
+    const altStart = start + 2;
+    const altEnd = content.indexOf("](", altStart);
+    if (altEnd === -1) {
+      offset = altStart;
+      continue;
+    }
+    const srcStart = altEnd + 2;
+    const srcEnd = content.indexOf(")", srcStart);
+    if (srcEnd === -1) {
+      offset = srcStart;
+      continue;
+    }
+    const src = content.slice(srcStart, srcEnd).trim();
+    if (src) {
+      references.push({
+        alt: content.slice(altStart, altEnd).trim(),
+        src,
+        start,
+        end: srcEnd + 1,
+      });
+    }
+    offset = srcEnd + 1;
+  }
+
+  return references;
+}
+
 function resolveWorkspacePath(currentPath: string, target: string) {
-  if (isExternalUrl(target) || target.startsWith("#")) {
+  let normalizedTarget = target.trim();
+  const repairedAngleDestination = repairMalformedAngleDestination(normalizedTarget);
+  if (repairedAngleDestination) {
+    normalizedTarget = repairedAngleDestination;
+  }
+  if (isAngleBracketMarkdownDestination(normalizedTarget)) {
+    normalizedTarget = normalizedTarget.slice(1, -1).trim();
+  }
+
+  if (isExternalUrl(normalizedTarget) || normalizedTarget.startsWith("#")) {
     return null;
   }
 
-  const pathOnly = safeDecode(target.split("#")[0].split("?")[0]);
+  const pathOnly = safeDecode(normalizedTarget.split("#")[0].split("?")[0]);
   if (!pathOnly) {
     return null;
   }
@@ -9256,11 +12435,18 @@ function normalizeWorkspacePath(path: string) {
 }
 
 function safeDecode(value: string) {
-  try {
-    return decodeURIComponent(value);
-  } catch {
-    return value;
+  let decoded = value;
+  for (let index = 0; index < 3; index += 1) {
+    if (!decoded.includes("%")) return decoded;
+    try {
+      const next = decodeURIComponent(decoded);
+      if (next === decoded) return decoded;
+      decoded = next;
+    } catch {
+      return decoded;
+    }
   }
+  return decoded;
 }
 
 function isExternalUrl(value: string | undefined) {

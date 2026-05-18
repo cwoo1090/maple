@@ -1,0 +1,318 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="Learn Maple's workspace model: sources, wiki pages, schema.md rules, Build wiki, Explore, Update wiki, Maintain, review, and undo."
+    />
+    <title>Maple Guide - Sources, rules, and Maintain</title>
+    <link rel="icon" href="assets/maple-icon.png" />
+    <link rel="apple-touch-icon" href="assets/maple-icon.png" />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="index.html#top" aria-label="Maple home">
+        <img src="assets/maple-icon.png" alt="" />
+        <span>Maple</span>
+      </a>
+      <nav class="site-nav" aria-label="Primary navigation">
+        <a href="download-macos.html">Download</a>
+        <a href="index.html#workflow">Workflow</a>
+        <a href="guide.html" aria-current="page">Guide</a>
+        <a href="index.html#privacy">Privacy</a>
+      </nav>
+    </header>
+
+    <main class="guide-page" id="top">
+      <section class="guide-doc-hero" aria-labelledby="guide-doc-title">
+        <p class="section-kicker">Maple guide</p>
+        <h1 id="guide-doc-title">Sources, rules, and Maintain</h1>
+        <p>
+          Maple turns source material into a local wiki. This guide explains
+          the words you will see in the app, what each action does, and how to
+          stay in control of AI-generated changes.
+        </p>
+      </section>
+
+      <nav class="guide-doc-toc" aria-label="Guide contents">
+        <a href="#workspace">Workspace</a>
+        <a href="#sources">Sources</a>
+        <a href="#build-wiki">Build wiki</a>
+        <a href="#rules">schema.md and rules</a>
+        <a href="#explore-update">Explore vs Update</a>
+        <a href="#maintain">Maintain</a>
+        <a href="#review-undo">Review and undo</a>
+      </nav>
+
+      <section class="guide-doc-section" id="workspace" aria-labelledby="workspace-title">
+        <p class="section-kicker">Workspace</p>
+        <h2 id="workspace-title">What is a Maple workspace?</h2>
+        <p>
+          A workspace is one local folder for one subject: a course, research
+          topic, project, archive, or skill path. Maple keeps the raw material
+          and the generated wiki in separate places so the wiki can improve
+          without rewriting your original files.
+        </p>
+        <div class="guide-layer-grid">
+          <article>
+            <h3>Sources</h3>
+            <p>The original files you import. They are the evidence Maple reads from.</p>
+          </article>
+          <article>
+            <h3>Wiki pages</h3>
+            <p>The readable layer Maple drafts: summaries, concepts, guides, links, and assets.</p>
+          </article>
+          <article>
+            <h3>Rules</h3>
+            <p>The workspace instructions that tell AI how this wiki should be written and maintained.</p>
+          </article>
+          <article>
+            <h3>Reviewable changes</h3>
+            <p>Generated edits are shown as changed files, so you can inspect them before trusting them.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="guide-doc-section" id="sources" aria-labelledby="sources-title">
+        <p class="section-kicker">Sources</p>
+        <h2 id="sources-title">What are sources?</h2>
+        <p>
+          Sources are the original material you want Maple to learn from. They
+          can be PDFs, slides, notes, transcripts, screenshots, Markdown files,
+          papers, or captured web links. Think of them as the reference shelf,
+          not the notebook.
+        </p>
+        <div class="guide-split">
+          <div>
+            <h3>Sources should stay original</h3>
+            <p>
+              Maple treats source contents as immutable. Build wiki and Maintain
+              may read sources, but they should not rewrite what a PDF, note, or
+              transcript originally said.
+            </p>
+          </div>
+          <div>
+            <h3>Pending source changes</h3>
+            <p>
+              When you add, remove, or replace files under Sources, Maple marks
+              them as pending. Build wiki processes those changes into the wiki.
+            </p>
+          </div>
+        </div>
+        <table class="guide-table">
+          <thead>
+            <tr>
+              <th>Source state</th>
+              <th>What it means</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>New</td>
+              <td>A file was added and has not been built into the wiki yet.</td>
+            </tr>
+            <tr>
+              <td>Modified</td>
+              <td>A source changed after the last build. Maple treats this carefully because sources are meant to be stable.</td>
+            </tr>
+            <tr>
+              <td>Removed</td>
+              <td>A file that existed during the last build is no longer in Sources.</td>
+            </tr>
+            <tr>
+              <td>Unchanged</td>
+              <td>The source already matches the last known built state.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="guide-doc-section" id="build-wiki" aria-labelledby="build-wiki-title">
+        <p class="section-kicker">Build wiki</p>
+        <h2 id="build-wiki-title">What does Build wiki do?</h2>
+        <p>
+          Build wiki asks AI to read pending source changes and integrate them
+          into the existing wiki. It should not simply dump one summary per file;
+          it should strengthen the knowledge base you will keep using.
+        </p>
+        <div class="guide-created-grid">
+          <article>
+            <h3>Summaries</h3>
+            <p>Digests for substantial sources, such as a lecture, paper, or long note.</p>
+          </article>
+          <article>
+            <h3>Concept pages</h3>
+            <p>Reusable explanations of durable ideas, formulas, entities, comparisons, or processes.</p>
+          </article>
+          <article>
+            <h3>Guides</h3>
+            <p>Learning paths, review paths, onboarding routes, and synthesis pages across multiple topics.</p>
+          </article>
+          <article>
+            <h3>Links and navigation</h3>
+            <p>Wikilinks, index updates, and graph connections that help you move through the material.</p>
+          </article>
+          <article>
+            <h3>Assets</h3>
+            <p>Useful derived visuals from source material, saved separately from the original files.</p>
+          </article>
+          <article>
+            <h3>Log entries</h3>
+            <p>A short history of what operation changed the wiki and why.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="guide-doc-section" id="rules" aria-labelledby="rules-title">
+        <p class="section-kicker">Rules</p>
+        <h2 id="rules-title">What is schema.md?</h2>
+        <p>
+          <code>schema.md</code> is the local rulebook for a workspace. It tells
+          AI what page types to use, how to cite sources, how links should work,
+          what the wiki is for, and what Maintain should check.
+        </p>
+        <div class="guide-callout">
+          <strong>You usually do not need to edit this file directly.</strong>
+          <p>
+            In the app, use Update rules when you want Maple to remember a
+            future preference, such as "make every guide beginner-friendly" or
+            "always include practice questions in study guides."
+          </p>
+        </div>
+        <div class="guide-split">
+          <div>
+            <h3>One-time instruction</h3>
+            <p>
+              "For this build, focus on exam review." Maple uses it for the
+              current operation and does not make it a permanent rule.
+            </p>
+          </div>
+          <div>
+            <h3>Durable rule</h3>
+            <p>
+              "From now on, add source citations to every formula." Maple should
+              save this as a workspace rule for future operations.
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <section class="guide-doc-section" id="explore-update" aria-labelledby="explore-update-title">
+        <p class="section-kicker">Explore and update</p>
+        <h2 id="explore-update-title">Explore Chat is different from Update wiki</h2>
+        <p>
+          Maple separates asking questions from changing the wiki. This keeps
+          normal chat safe and makes permanent edits intentional.
+        </p>
+        <table class="guide-table">
+          <thead>
+            <tr>
+              <th>Action</th>
+              <th>Use it when</th>
+              <th>What changes</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Explore Chat</td>
+              <td>You want to ask a question, understand a page, or compare ideas.</td>
+              <td>Nothing by default. It is read-only.</td>
+            </tr>
+            <tr>
+              <td>Update wiki</td>
+              <td>A chat answer is worth keeping for later.</td>
+              <td>Maple drafts reviewable edits to wiki pages, navigation, or logs.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="guide-doc-section" id="maintain" aria-labelledby="maintain-title">
+        <p class="section-kicker">Maintain</p>
+        <h2 id="maintain-title">What are the Maintain functions?</h2>
+        <p>
+          Maintain is where you improve an existing workspace after the first
+          build. Use it when the wiki needs cleanup, restructuring, better rules,
+          or source organization.
+        </p>
+        <div class="maintain-guide-grid">
+          <article>
+            <h3>Wiki healthcheck</h3>
+            <p>
+              A conservative check for broken links, stale index entries, weak
+              pages, missing citations, and similar quality issues.
+            </p>
+            <span>Use when the wiki feels messy or stale.</span>
+          </article>
+          <article>
+            <h3>Improve wiki</h3>
+            <p>
+              A user-directed improvement pass for creating guides, connecting
+              pages, reshaping structure, or improving explanations.
+            </p>
+            <span>Use when you know what quality improvement you want.</span>
+          </article>
+          <article>
+            <h3>Organize sources</h3>
+            <p>
+              Moves or renames source files and folders without changing source
+              contents. For example, group slides and transcripts by lecture.
+            </p>
+            <span>Use when the source tree is hard to navigate.</span>
+          </article>
+          <article>
+            <h3>Update rules</h3>
+            <p>
+              Saves durable preferences for future wiki work. This is the app
+              action behind updating the workspace rulebook.
+            </p>
+            <span>Use when you want Maple to remember a convention.</span>
+          </article>
+        </div>
+      </section>
+
+      <section class="guide-doc-section" id="review-undo" aria-labelledby="review-undo-title">
+        <p class="section-kicker">Review and undo</p>
+        <h2 id="review-undo-title">How do reviewable changes work?</h2>
+        <p>
+          AI output is treated as a draft. After Build wiki, Update wiki, or a
+          Maintain operation, Maple marks generated files so you can inspect
+          what changed before moving on.
+        </p>
+        <ol class="guide-step-list">
+          <li>
+            <span>1</span>
+            <div>
+              <h3>Open changed files</h3>
+              <p>Review the generated summaries, concepts, guides, index updates, or rule changes.</p>
+            </div>
+          </li>
+          <li>
+            <span>2</span>
+            <div>
+              <h3>Finish review</h3>
+              <p>Mark the generated changes as reviewed when they look useful enough to keep.</p>
+            </div>
+          </li>
+          <li>
+            <span>3</span>
+            <div>
+              <h3>Undo last operation</h3>
+              <p>If the operation went in the wrong direction, restore the previous workspace state.</p>
+            </div>
+          </li>
+        </ol>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <span>Maple</span>
+      <span>Copyright <span id="year">2026</span> chulwoo ahn.</span>
+    </footer>
+
+    <script src="script.js"></script>
+  </body>
+</html>

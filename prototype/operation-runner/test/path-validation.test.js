@@ -8,6 +8,7 @@ const {
   IMPROVE_WIKI_ALLOWED_PATHS,
   IMPROVE_WIKI_FORBIDDEN_PATHS,
   ORGANIZE_SOURCES_ALLOWED_PATHS,
+  ASSET_REGISTRY_PATH,
   SOURCE_MANIFEST_PATH,
   WIKI_MANIFEST_PATH,
   WIKI_HEALTHCHECK_ALLOWED_PATHS,
@@ -20,6 +21,7 @@ const {
   calculateFullSlideBudget,
   contactSheetRanges,
   collectExploreSourceVisualContext,
+  collectReferencedWikiAssetImages,
   collectWikiPageImageAttachments,
   createSnapshot,
   diffSnapshot,
@@ -46,12 +48,15 @@ const {
   parseSourcePathsJson,
   parseSlideSelectionJson,
   parseVisualInspectionPlanJson,
+  readAssetRegistry,
   readRenderedPdfResult,
   renderPreparedSourcesForPrompt,
   renderSourceStatusForPrompt,
   resolveOperationId,
   selectBuildWikiVisualInputs,
   sourcePathsForBuild,
+  autoRegisterReferencedWikiAssets,
+  validateAndRestoreProtectedAssets,
   validateAndRestoreChanges,
   workspaceAgentInstructions,
   writeSourceManifest,
@@ -1449,6 +1454,7 @@ test("new workspace schema scaffold documents wiki structure and durable rules",
   assert.match(schema, /wiki\/summaries\//);
   assert.match(schema, /wiki\/guides\//);
   assert.match(schema, /wiki\/assets\//);
+  assert.match(schema, /assets\.json/);
   assert.match(schema, /capture substantial source units/);
   assert.match(schema, /Do not create mechanical summaries/);
   assert.match(schema, /create useful routes across multiple wiki pages/);
@@ -1482,6 +1488,10 @@ test("new workspace schema scaffold documents wiki structure and durable rules",
   assert.match(schema, /found via Explore web search/);
   assert.match(schema, /## Visuals And Assets/);
   assert.match(schema, /smallest useful set/);
+  assert.match(schema, /Save user-added images under `wiki\/assets\/user\/`/);
+  assert.match(schema, /Preserve user-owned protected image assets/);
+  assert.match(schema, /Managed image deletion must keep asset files, metadata, and Markdown references in sync/);
+  assert.doesNotMatch(schema, /Maple updates it/);
   assert.match(schema, /\[!question\]/);
   assert.match(schema, /\[!warning\]/);
   assert.match(schema, /## Uncertainty, Conflicts, And Knowledge Gaps/);
@@ -1723,6 +1733,88 @@ test("Explore Chat attaches only selected wiki page asset images", async (t) => 
   assert.match(prompt, /wiki\/assets\/diagram\.webp/);
   const imageSection = prompt.slice(prompt.indexOf("Wiki images from the selected page"));
   assert.doesNotMatch(imageSection, /sources\/raw\.png/);
+});
+
+test("auto-registers referenced wiki image assets only", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "maple-assets-register-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  await fs.mkdir(path.join(workspace, "wiki", "concepts"), { recursive: true });
+  await fs.mkdir(path.join(workspace, "wiki", "assets", "lecture"), { recursive: true });
+  await fs.mkdir(path.join(workspace, ".aiwiki", "extracted"), { recursive: true });
+  await fs.writeFile(path.join(workspace, "wiki", "assets", "lecture", "slide-08.png"), "png");
+  await fs.writeFile(path.join(workspace, "wiki", "assets", "lecture", "unused.png"), "png");
+  await fs.writeFile(path.join(workspace, ".aiwiki", "extracted", "temp.png"), "png");
+  await fs.writeFile(
+    path.join(workspace, "wiki", "concepts", "motor.md"),
+    [
+      "# Motor",
+      "",
+      "![states](../assets/lecture/slide-08.png)",
+      "_Figure: Source: [sources/lecture-03.pdf, page 8](../../sources/lecture-03.pdf#page=8)._",
+      "![temp](../../.aiwiki/extracted/temp.png)",
+    ].join("\n"),
+  );
+
+  const references = await collectReferencedWikiAssetImages(workspace);
+  assert.deepEqual(references.map((item) => item.path), ["wiki/assets/lecture/slide-08.png"]);
+
+  const result = await autoRegisterReferencedWikiAssets(workspace, { origin: "ai-generated" });
+  assert.equal(result.added, 1);
+  const registry = await readAssetRegistry(workspace);
+  assert.equal(registry.assets.length, 1);
+  assert.equal(registry.assets[0].displayPath, "wiki/assets/lecture/slide-08.png");
+  assert.equal(registry.assets[0].protected, false);
+  assert.equal(registry.assets[0].source?.path, "sources/lecture-03.pdf");
+  assert.equal(registry.assets[0].source?.page, 8);
+  assert.equal(await pathExists(path.join(workspace, ASSET_REGISTRY_PATH)), true);
+});
+
+test("protected image validation restores asset files and orphaned references", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "maple-assets-protect-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  await fs.mkdir(path.join(workspace, "wiki", "concepts"), { recursive: true });
+  await fs.mkdir(path.join(workspace, "wiki", "assets", "user"), { recursive: true });
+  await fs.writeFile(path.join(workspace, "wiki", "assets", "user", "asset-1.display.png"), "original");
+  await fs.writeFile(path.join(workspace, "wiki", "assets", "user", "asset-1.original.png"), "master");
+  await fs.writeFile(
+    path.join(workspace, ASSET_REGISTRY_PATH),
+    JSON.stringify({
+      schemaVersion: 1,
+      assets: [
+        {
+          id: "asset-1",
+          owner: "user",
+          origin: "user-added",
+          masterPath: "wiki/assets/user/asset-1.original.png",
+          displayPath: "wiki/assets/user/asset-1.display.png",
+          protected: true,
+        },
+      ],
+    }),
+  );
+  await fs.writeFile(
+    path.join(workspace, "wiki", "concepts", "rag.md"),
+    "# RAG\n\n![flow](../assets/user/asset-1.display.png)\n",
+  );
+
+  const snapshot = await createSnapshot(workspace, "op-assets");
+  await fs.writeFile(path.join(workspace, "wiki", "assets", "user", "asset-1.display.png"), "changed");
+  await fs.writeFile(path.join(workspace, "wiki", "concepts", "rag.md"), "# RAG\n\nImage removed.\n");
+  const changes = await diffSnapshot(workspace, snapshot);
+  const validated = changes.map((change) => ({ ...change, allowed: true, restored: false }));
+
+  await validateAndRestoreProtectedAssets(workspace, snapshot, validated);
+
+  assert.equal(
+    await fs.readFile(path.join(workspace, "wiki", "assets", "user", "asset-1.display.png"), "utf8"),
+    "original",
+  );
+  assert.match(
+    await fs.readFile(path.join(workspace, "wiki", "concepts", "rag.md"), "utf8"),
+    /asset-1\.display\.png/,
+  );
+  assert.equal(validated.find((change) => change.path.endsWith("asset-1.display.png"))?.allowed, false);
+  assert.equal(validated.find((change) => change.path === "wiki/concepts/rag.md")?.allowed, false);
 });
 
 test("Explore Chat source-only prompt asks for local answers", async (t) => {

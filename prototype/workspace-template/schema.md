@@ -20,7 +20,8 @@ workspace/
     concepts/             # Canonical concept pages, one durable idea per file
     summaries/            # Source digests for substantial source units
     guides/               # Useful routes across multiple wiki pages
-    assets/               # Derived figures extracted or generated for wiki pages
+    assets/               # Managed wiki images, display copies, and image metadata
+      assets.json         # App-managed image metadata; do not edit directly
   index.md                # Reader-facing catalog and navigation map
   log.md                  # Append-only history of wiki operations
   schema.md               # This file; durable wiki conventions
@@ -176,9 +177,14 @@ updated: 2026-05-03
 ## Visuals And Assets
 
 - Use visuals when they materially clarify a concept, equation, architecture, plot, or comparison.
-- Keep `sources/` immutable. Save extracted or cropped derived images under `wiki/assets/<source-slug>/`.
+- Keep `sources/` immutable. Save source-derived images under `wiki/assets/<source-slug>/`.
+- Save user-added images under `wiki/assets/user/` and preserve their managed display files.
 - Place visuals near the explanation they support and include a short caption with source path/page when possible.
 - Do not add decorative images or dump every source or inspected image into the wiki; embed only the smallest useful set.
+- `wiki/assets/assets.json` is durable wiki metadata for managed images. Do not edit it directly; the app updates it.
+- Preserve user-owned protected image assets, crops, metadata, and Markdown references unless the user explicitly asks to change or remove them.
+- Managed image deletion must keep asset files, metadata, and Markdown references in sync; do not leave orphaned metadata or broken image links.
+- For source-derived visuals, keep captions grounded in the original source path plus page or slide when known.
 
 ## Uncertainty, Conflicts, And Knowledge Gaps
 

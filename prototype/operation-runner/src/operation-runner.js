@@ -115,6 +115,7 @@ const SOURCE_MANIFEST_PATH = ".aiwiki/source-manifest.json";
 const LEGACY_SOURCE_MANIFEST_PATH = ".studywiki/source-manifest.json";
 const WIKI_MANIFEST_PATH = ".aiwiki/wiki-manifest.json";
 const WIKI_BASELINE_DIR = ".aiwiki/wiki-baseline";
+const ASSET_REGISTRY_PATH = "wiki/assets/assets.json";
 const WIKI_TRACKED_ROOT_FILES = ["index.md", "log.md", "schema.md"];
 const WORKSPACE_DIRECTORIES = [
   "sources",
@@ -965,6 +966,12 @@ async function runBuildWiki(workspace, options = {}) {
 
   const finalize = await measure("finalize", async () => {
     await normalizeGeneratedMarkdownFiles(workspace);
+    await restoreAssetRegistryFromSnapshotIfChanged(workspace, snapshot);
+    await autoRegisterReferencedWikiAssets(workspace, {
+      operationId,
+      origin: "ai-generated",
+      owner: "ai",
+    });
 
     return provider.finalizeLastMessage({
       eventsPath,
@@ -981,6 +988,7 @@ async function runBuildWiki(workspace, options = {}) {
       BUILD_WIKI_ALLOWED_PATHS,
       { sourceMoveOnly: true },
     );
+    await validateAndRestoreProtectedAssets(workspace, snapshot, validatedChanges);
     return { changedFiles, validatedChanges };
   });
   annotateFinalWikiAssetCounts(preparedSources, validatedChanges);
@@ -1387,6 +1395,12 @@ async function runApplyChat(workspace, options = {}) {
   });
 
   await normalizeGeneratedMarkdownFiles(workspace);
+  await restoreAssetRegistryFromSnapshotIfChanged(workspace, snapshot);
+  await autoRegisterReferencedWikiAssets(workspace, {
+    operationId,
+    origin: "ai-generated",
+    owner: "ai",
+  });
 
   const finalize = await provider.finalizeLastMessage({
     eventsPath,
@@ -1400,6 +1414,7 @@ async function runApplyChat(workspace, options = {}) {
     changedFiles,
     WIKI_WRITE_ALLOWED_PATHS,
   );
+  await validateAndRestoreProtectedAssets(workspace, snapshot, validatedChanges);
   const userVisibleChangedFiles = getUserVisibleChangedFiles(validatedChanges);
   const reviewableChangedFiles = getReviewableChangedFiles(userVisibleChangedFiles);
   const completedAt = new Date().toISOString();
@@ -1569,6 +1584,12 @@ async function runMaintenanceOperation(workspace, options = {}) {
   });
 
   await normalizeGeneratedMarkdownFiles(workspace);
+  await restoreAssetRegistryFromSnapshotIfChanged(workspace, snapshot);
+  await autoRegisterReferencedWikiAssets(workspace, {
+    operationId,
+    origin: "ai-generated",
+    owner: "ai",
+  });
 
   const finalize = await provider.finalizeLastMessage({
     eventsPath,
@@ -1586,6 +1607,7 @@ async function runMaintenanceOperation(workspace, options = {}) {
       forbiddenPathRules,
     },
   );
+  await validateAndRestoreProtectedAssets(workspace, snapshot, validatedChanges);
   const userVisibleChangedFiles = getUserVisibleChangedFiles(validatedChanges);
   const reviewableChangedFiles = getReviewableChangedFiles(userVisibleChangedFiles);
   const completedAt = new Date().toISOString();
@@ -2611,6 +2633,7 @@ async function buildWikiPrompt(workspace, options, preparedSources = { sources: 
     force: Boolean(options.force),
   });
   const preparedSourceList = renderPreparedSourcesForPrompt(preparedSources);
+  const protectedAssetContext = await renderProtectedAssetsForPrompt(workspace);
   let prompt = `You are running a Build Wiki operation for Maple.
 
 Follow AGENTS.md or CLAUDE.md for workspace bootstrap instructions.
@@ -2633,9 +2656,11 @@ ${renderAllowedPathRulesForPrompt(BUILD_WIKI_ALLOWED_PATHS)}
 
 - Source files under sources/** may be moved or renamed, but source file contents must not be edited.
 - Do not edit .aiwiki/source-manifest.json; the runner updates it only after a successful build.
+- Do not edit ${ASSET_REGISTRY_PATH}; Maple updates image asset metadata after the operation.
 - When copying a visual into wiki/assets, copy from the listed full-resolution PNG path, not the prompt JPEG path.
 - Update schema.md only when the user explicitly asks for a durable rule or workspace preference.
 - Update AGENTS.md or CLAUDE.md only when the user explicitly asks for agent, bootstrap, or operation-boundary changes.
+${protectedAssetContext}
 
 Finish protocol:
 - The Maple runner validates paths, changed files, and report state after you exit.
@@ -2797,6 +2822,7 @@ ${forbiddenPaths}
     options.sourceGrounding,
     options.sourceStatus,
   );
+  const protectedAssetContext = await renderProtectedAssetsForPrompt(workspace);
 
   return `You are running a ${options.label} operation for Maple.
 
@@ -2817,9 +2843,11 @@ ${forbiddenPathBlock}
 
 ${sourceBoundary}
 - Do not edit .aiwiki/source-manifest.json; the runner owns source ingestion state.
+- Do not edit ${ASSET_REGISTRY_PATH}; Maple owns image asset metadata.
 - Update schema.md only when the user explicitly asks for a durable rule or workspace preference, except when running Update Rules.
 ${agentBoundary}
 - The Maple runner validates paths, changed files, and report state after you exit.
+${protectedAssetContext}
 
 Workspace path: ${workspace}
 
@@ -4965,6 +4993,348 @@ function shouldTrustWikiAfterOperationStatus(status) {
   ].includes(status);
 }
 
+function emptyAssetRegistry() {
+  return {
+    schemaVersion: 1,
+    assets: [],
+  };
+}
+
+async function readAssetRegistry(root) {
+  const registryPath = path.join(root, ASSET_REGISTRY_PATH);
+  if (!(await exists(registryPath))) return emptyAssetRegistry();
+
+  try {
+    const parsed = JSON.parse(await fsp.readFile(registryPath, "utf8"));
+    const assets = Array.isArray(parsed?.assets)
+      ? parsed.assets.map(normalizeAssetRecord).filter(Boolean)
+      : [];
+    return {
+      schemaVersion: 1,
+      assets,
+    };
+  } catch (_error) {
+    return emptyAssetRegistry();
+  }
+}
+
+function normalizeAssetRecord(record) {
+  if (!record || typeof record !== "object") return null;
+  const displayPath = normalizeRelativePath(record.displayPath || "");
+  if (!isWikiAssetImagePath(displayPath)) return null;
+  const masterPath = normalizeRelativePath(record.masterPath || "") || displayPath;
+  const id = cleanAssetId(record.id) || stableAssetId(displayPath);
+  return {
+    id,
+    owner: record.owner === "user" ? "user" : "ai",
+    origin: cleanAssetText(record.origin || (record.owner === "user" ? "user-added" : "ai-generated")),
+    masterPath: isWikiAssetImagePath(masterPath) ? masterPath : displayPath,
+    displayPath,
+    alt: cleanAssetText(record.alt || ""),
+    caption: cleanAssetText(record.caption || ""),
+    userNotes: cleanAssetText(record.userNotes || ""),
+    semanticNotes: cleanAssetText(record.semanticNotes || ""),
+    source: normalizeAssetSource(record.source),
+    protected: Boolean(record.protected),
+    edits: normalizeAssetEdits(record.edits),
+    createdAt: cleanAssetText(record.createdAt || ""),
+    updatedAt: cleanAssetText(record.updatedAt || ""),
+  };
+}
+
+function normalizeAssetSource(source) {
+  if (!source || typeof source !== "object") return null;
+  const sourcePath = normalizeRelativePath(source.path || "");
+  if (!sourcePath || !sourcePath.startsWith("sources/")) return null;
+  const normalized = { path: sourcePath };
+  const page = Number(source.page);
+  const slide = Number(source.slide);
+  if (Number.isInteger(page) && page > 0) normalized.page = page;
+  if (Number.isInteger(slide) && slide > 0) normalized.slide = slide;
+  if (typeof source.sourceHash === "string" && source.sourceHash.trim()) {
+    normalized.sourceHash = source.sourceHash.trim();
+  }
+  return normalized;
+}
+
+function normalizeAssetEdits(edits) {
+  if (!edits || typeof edits !== "object") return null;
+  const crop = edits.crop && typeof edits.crop === "object" ? edits.crop : null;
+  if (!crop) return null;
+  const x = Math.max(0, Math.trunc(Number(crop.x) || 0));
+  const y = Math.max(0, Math.trunc(Number(crop.y) || 0));
+  const width = Math.max(1, Math.trunc(Number(crop.width) || 0));
+  const height = Math.max(1, Math.trunc(Number(crop.height) || 0));
+  return {
+    crop: {
+      x,
+      y,
+      width,
+      height,
+      basis: cleanAssetText(crop.basis || "master-pixels") || "master-pixels",
+    },
+  };
+}
+
+function cleanAssetText(value) {
+  return typeof value === "string" ? value.trim().slice(0, 4000) : "";
+}
+
+function cleanAssetId(value) {
+  const cleaned = String(value || "").trim();
+  return /^[A-Za-z0-9._-]+$/.test(cleaned) ? cleaned : "";
+}
+
+function stableAssetId(displayPath) {
+  return `asset-${sha256(Buffer.from(displayPath)).slice(0, 12)}`;
+}
+
+function isWikiAssetImagePath(relPath) {
+  const normalized = normalizeRelativePath(relPath);
+  return Boolean(
+    normalized &&
+      normalized.startsWith("wiki/assets/") &&
+      normalized !== ASSET_REGISTRY_PATH &&
+      isPromptImageSource(normalized),
+  );
+}
+
+async function writeAssetRegistry(workspace, registry) {
+  const normalized = {
+    schemaVersion: 1,
+    assets: (registry.assets || [])
+      .map(normalizeAssetRecord)
+      .filter(Boolean)
+      .sort((a, b) => a.displayPath.localeCompare(b.displayPath)),
+  };
+  const registryPath = path.join(workspace, ASSET_REGISTRY_PATH);
+  await ensureDir(path.dirname(registryPath));
+  await fsp.writeFile(registryPath, `${JSON.stringify(normalized, null, 2)}\n`);
+  return normalized;
+}
+
+async function restoreAssetRegistryFromSnapshotIfChanged(workspace, snapshot) {
+  const beforePath = path.join(snapshot.treeDir, ASSET_REGISTRY_PATH);
+  const afterPath = path.join(workspace, ASSET_REGISTRY_PATH);
+  const before = (await exists(beforePath)) ? await fsp.readFile(beforePath, "utf8") : "";
+  const after = (await exists(afterPath)) ? await fsp.readFile(afterPath, "utf8") : "";
+  if (before !== after) {
+    await restorePathFromSnapshot(workspace, snapshot.treeDir, ASSET_REGISTRY_PATH);
+  }
+}
+
+async function autoRegisterReferencedWikiAssets(workspace, options = {}) {
+  const references = await collectReferencedWikiAssetImages(workspace);
+  if (references.length === 0) return { added: 0 };
+
+  const registry = await readAssetRegistry(workspace);
+  const knownDisplayPaths = new Set(registry.assets.map((asset) => asset.displayPath));
+  const knownIds = new Set(registry.assets.map((asset) => asset.id));
+  let added = 0;
+
+  for (const reference of references) {
+    if (knownDisplayPaths.has(reference.path)) continue;
+    if (!(await exists(path.join(workspace, reference.path)))) continue;
+
+    let id = stableAssetId(reference.path);
+    for (let index = 2; knownIds.has(id); index += 1) {
+      id = `${stableAssetId(reference.path)}-${index}`;
+    }
+    knownIds.add(id);
+    knownDisplayPaths.add(reference.path);
+    const now = new Date().toISOString();
+    registry.assets.push({
+      id,
+      owner: options.owner || "ai",
+      origin: options.origin || "ai-generated",
+      masterPath: reference.path,
+      displayPath: reference.path,
+      alt: reference.alt || "",
+      caption: reference.caption || "",
+      userNotes: "",
+      semanticNotes: "",
+      source: reference.source || null,
+      protected: false,
+      edits: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+    added += 1;
+  }
+
+  if (added > 0) await writeAssetRegistry(workspace, registry);
+  return { added };
+}
+
+async function collectReferencedWikiAssetImages(root) {
+  const markdownFiles = await listWikiMarkdownFiles(root);
+  const references = [];
+  const seen = new Set();
+  for (const relPath of markdownFiles) {
+    const absolutePath = path.join(root, relPath);
+    let markdown = "";
+    try {
+      markdown = await fsp.readFile(absolutePath, "utf8");
+    } catch (_error) {
+      continue;
+    }
+    const pageDir = relPath.includes("/") ? relPath.split("/").slice(0, -1).join("/") : "";
+    for (const target of extractMarkdownImageTargets(markdown)) {
+      const imagePath = normalizeWikiAssetImageTarget(pageDir, target);
+      if (!imagePath || !isWikiAssetImagePath(imagePath)) continue;
+      const key = `${relPath}\0${imagePath}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      references.push({
+        path: imagePath,
+        pagePath: relPath,
+        alt: "",
+        caption: inferImageCaption(markdown, target),
+        source: inferImageSourceMetadata(markdown, target),
+      });
+    }
+  }
+  references.sort((a, b) => a.path.localeCompare(b.path) || a.pagePath.localeCompare(b.pagePath));
+  return references;
+}
+
+async function listWikiMarkdownFiles(root) {
+  const files = [];
+  for (const relPath of WIKI_TRACKED_ROOT_FILES) {
+    const absolutePath = path.join(root, relPath);
+    if (relPath.endsWith(".md") && await exists(absolutePath)) files.push(relPath);
+  }
+  const wikiRoot = path.join(root, "wiki");
+  if (await exists(wikiRoot)) {
+    await walkFiles(root, wikiRoot, async (_absolutePath, relPath, stat) => {
+      if (!stat.isFile() || !relPath.endsWith(".md")) return;
+      if (relPath.startsWith("wiki/assets/")) return;
+      files.push(relPath);
+    });
+  }
+  return Array.from(new Set(files)).sort();
+}
+
+function inferImageCaption(markdown, target) {
+  const index = markdown.indexOf(target);
+  if (index < 0) return "";
+  const tail = markdown.slice(index).split(/\r?\n/).slice(1, 3).join(" ").trim();
+  const caption = tail.match(/^_([^_]{1,400})_/);
+  return caption ? caption[1].trim() : "";
+}
+
+function inferImageSourceMetadata(markdown, target) {
+  const index = markdown.indexOf(target);
+  const context = index < 0
+    ? markdown.slice(0, 1000)
+    : markdown.slice(Math.max(0, index - 500), Math.min(markdown.length, index + 900));
+  const sourceMatch = context.match(/sources\/[^\]\)\s`<>]+/);
+  if (!sourceMatch) return null;
+  const source = { path: sourceMatch[0].replace(/[.,;:]+$/, "") };
+  const pageMatch = context.match(/\bpage\s+(\d+)\b/i);
+  const slideMatch = context.match(/\bslide\s+(\d+)\b/i);
+  if (pageMatch) source.page = Number(pageMatch[1]);
+  if (slideMatch) source.slide = Number(slideMatch[1]);
+  return normalizeAssetSource(source);
+}
+
+async function renderProtectedAssetsForPrompt(workspace) {
+  const registry = await readAssetRegistry(workspace);
+  const protectedAssets = registry.assets.filter((asset) => asset.protected);
+  if (protectedAssets.length === 0) return "";
+  const references = await collectReferencedWikiAssetImages(workspace);
+  const pagesByAsset = new Map();
+  for (const reference of references) {
+    if (!pagesByAsset.has(reference.path)) pagesByAsset.set(reference.path, new Set());
+    pagesByAsset.get(reference.path).add(reference.pagePath);
+  }
+
+  const lines = [
+    "",
+    "Protected user image assets:",
+    "- Preserve these user-owned images and their Markdown references unless the user explicitly asks to change them.",
+    "- Do not overwrite, delete, recrop, or orphan protected assets.",
+  ];
+  for (const asset of protectedAssets.slice(0, 30)) {
+    const pages = Array.from(pagesByAsset.get(asset.displayPath) || []).slice(0, 5);
+    lines.push(`- ${asset.id}: ${asset.displayPath}`);
+    if (pages.length) lines.push(`  - referenced in: ${pages.join(", ")}`);
+    if (asset.caption) lines.push(`  - caption: ${asset.caption}`);
+    if (asset.userNotes) lines.push(`  - user notes: ${asset.userNotes}`);
+    if (asset.semanticNotes) lines.push(`  - semantic notes: ${asset.semanticNotes}`);
+  }
+  if (protectedAssets.length > 30) {
+    lines.push(`- ${protectedAssets.length - 30} more protected assets omitted from prompt context.`);
+  }
+  return `\n${lines.join("\n")}\n`;
+}
+
+async function validateAndRestoreProtectedAssets(workspace, snapshot, changes) {
+  const registry = await readAssetRegistry(snapshot.treeDir);
+  const protectedAssets = registry.assets.filter((asset) => asset.protected);
+  if (protectedAssets.length === 0) return changes;
+
+  const protectedPaths = new Set();
+  const protectedDisplayPaths = new Set();
+  for (const asset of protectedAssets) {
+    if (isWikiAssetImagePath(asset.masterPath)) protectedPaths.add(asset.masterPath);
+    if (isWikiAssetImagePath(asset.displayPath)) {
+      protectedPaths.add(asset.displayPath);
+      protectedDisplayPaths.add(asset.displayPath);
+    }
+  }
+
+  for (const change of changes) {
+    if (!protectedPaths.has(change.path)) continue;
+    await restorePathFromSnapshot(workspace, snapshot.treeDir, change.path);
+    markProtectedRestored(change);
+  }
+
+  const beforeRefs = await collectAssetReferencesByDisplayPath(snapshot.treeDir, protectedDisplayPaths);
+  const afterRefs = await collectAssetReferencesByDisplayPath(workspace, protectedDisplayPaths);
+  for (const asset of protectedAssets) {
+    const beforePages = beforeRefs.get(asset.displayPath) || new Set();
+    const afterPages = afterRefs.get(asset.displayPath) || new Set();
+    if (beforePages.size === 0 || afterPages.size > 0) continue;
+    for (const pagePath of beforePages) {
+      await restorePathFromSnapshot(workspace, snapshot.treeDir, pagePath);
+      const existing = changes.find((change) => change.path === pagePath);
+      if (existing) {
+        markProtectedRestored(existing);
+      } else {
+        changes.push({
+          path: pagePath,
+          status: "modified",
+          before: snapshot.manifest?.[pagePath] || null,
+          after: null,
+          allowed: false,
+          restored: true,
+          restorationReason: "protected_asset_reference_removed",
+        });
+      }
+    }
+  }
+
+  return changes;
+}
+
+function markProtectedRestored(change) {
+  change.allowed = false;
+  change.restored = true;
+  change.restorationReason = "protected_asset";
+}
+
+async function collectAssetReferencesByDisplayPath(root, displayPaths) {
+  const references = await collectReferencedWikiAssetImages(root);
+  const result = new Map();
+  for (const reference of references) {
+    if (!displayPaths.has(reference.path)) continue;
+    if (!result.has(reference.path)) result.set(reference.path, new Set());
+    result.get(reference.path).add(reference.pagePath);
+  }
+  return result;
+}
+
 function wikiContentMatches(a, b) {
   return a?.sha256 === b?.sha256 && a?.size === b?.size && a?.kind === b?.kind;
 }
@@ -6173,6 +6543,7 @@ module.exports = {
   SOURCE_MANIFEST_PATH,
   WIKI_MANIFEST_PATH,
   WIKI_BASELINE_DIR,
+  ASSET_REGISTRY_PATH,
   normalizeLegacyWorkspaceReferences,
   normalizeRelativePath,
   normalizeOperationId,
@@ -6193,6 +6564,11 @@ module.exports = {
   getOutsideWikiChanges,
   buildSourceManifest,
   buildWikiManifest,
+  readAssetRegistry,
+  writeAssetRegistry,
+  autoRegisterReferencedWikiAssets,
+  collectReferencedWikiAssetImages,
+  validateAndRestoreProtectedAssets,
   migrateLegacyWorkspace,
   markSourcesIngested,
   markWikiTrusted,
