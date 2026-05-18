@@ -582,6 +582,7 @@ const MAINTAIN_DISCUSSION_PROGRESS_ERROR_PREFIX = "Failed to read maintain discu
 const OPERATION_PROGRESS_ERROR_PREFIX = "Failed to read operation progress:";
 const BACKGROUND_BUILD_PROGRESS_ERROR_PREFIX = "Failed to read background build progress:";
 const NEW_IMAGE_ASSET_ACTION_ID = "__new-image-asset__";
+const APP_UPDATE_AUTO_CHECK_DELAY_MS = 2500;
 const PENDING_GENERATED_CHANGES_ERROR =
   "Finish reviewing or undo generated changes before starting another workspace-changing action.";
 
@@ -1473,6 +1474,7 @@ function App() {
   const handledBuildOperationIdRef = useRef<string | null>(null);
   const autoFinishedReviewOperationIdRef = useRef<string | null>(null);
   const appOpenedTrackedRef = useRef(false);
+  const appUpdateAutoCheckStartedRef = useRef(false);
   const wikiExploredTrackedRef = useRef(false);
   const onboardingStepTrackedRef = useRef<Set<string>>(new Set());
   const providerSetupTrackedRef = useRef<Set<string>>(new Set());
@@ -3156,19 +3158,25 @@ function App() {
 	    };
 	  }, []);
 
-		  useEffect(() => {
-		    if (!appVersion) return;
-		    if (appOpenedTrackedRef.current) return;
-		    appOpenedTrackedRef.current = true;
-		    track("app opened");
-		  }, [appVersion]);
+  useEffect(() => {
+    if (!appVersion) return;
+    if (appOpenedTrackedRef.current) return;
+    appOpenedTrackedRef.current = true;
+    track("app opened");
+  }, [appVersion]);
 
   useEffect(() => {
-    const timerId = window.setTimeout(() => {
+    if (!appVersion || appVersion === "unknown") return;
+    if (appUpdateAutoCheckStartedRef.current) return;
+
+    const timeoutId = window.setTimeout(() => {
+      if (appUpdateAutoCheckStartedRef.current) return;
+      appUpdateAutoCheckStartedRef.current = true;
       void checkForAppUpdate({ silent: true });
-    }, 4000);
-    return () => window.clearTimeout(timerId);
-  }, []);
+    }, APP_UPDATE_AUTO_CHECK_DELAY_MS);
+
+    return () => window.clearTimeout(timeoutId);
+  }, [appVersion]);
 
   useEffect(() => {
     function targetIsInside(target: EventTarget | null, elements: Array<HTMLElement | null>) {
@@ -5483,6 +5491,11 @@ function App() {
       if (update) {
         setAppUpdate(update);
         setAppUpdateStatus("available");
+        track("app update available", {
+          version: update.version,
+          current_version: appVersion,
+          automatic: silent,
+        });
         return;
       }
 
@@ -5503,6 +5516,7 @@ function App() {
       }
       setAppUpdateStatus("error");
       setError(`Failed to check for updates: ${String(err)}`);
+      track("app update check failed", { automatic: silent });
     }
   }
 
@@ -5560,17 +5574,19 @@ function App() {
       ? "Checking…"
       : appUpdateStatus === "up-to-date"
         ? "Up to date"
-        : appUpdateStatus === "downloading"
-          ? appUpdatePercent === null
-            ? "Downloading…"
-            : `Updating ${appUpdatePercent}%`
-          : appUpdateStatus === "installing"
-            ? "Installing…"
-            : appUpdateStatus === "restarting"
-              ? "Restarting…"
-              : appUpdateStatus === "error"
-                ? "Retry update"
-                : "Update";
+        : appUpdateStatus === "available"
+          ? "Update available"
+          : appUpdateStatus === "downloading"
+            ? appUpdatePercent === null
+              ? "Downloading…"
+              : `Updating ${appUpdatePercent}%`
+            : appUpdateStatus === "installing"
+              ? "Installing…"
+              : appUpdateStatus === "restarting"
+                ? "Restarting…"
+                : appUpdateStatus === "error"
+                  ? "Retry update"
+                  : "Update";
   const appUpdateTitle =
     appUpdateStatus === "available" && appUpdate
       ? `Install Maple ${appUpdate.version}`

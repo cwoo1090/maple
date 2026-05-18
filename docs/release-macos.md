@@ -78,14 +78,16 @@ prototype/app-shell/src-tauri/target/release/bundle/macos/latest.json
 Upload all of these to the GitHub Release for the same version:
 
 ```bash
-gh release create v0.1.1 \
-  prototype/app-shell/src-tauri/target/release/bundle/dmg/Maple_0.1.1_aarch64.dmg \
+MAPLE_VERSION="$(node -p "JSON.parse(require('fs').readFileSync('prototype/app-shell/package.json', 'utf8')).version")"
+
+gh release create "v${MAPLE_VERSION}" \
+  "prototype/app-shell/src-tauri/target/release/bundle/dmg/Maple_${MAPLE_VERSION}_aarch64.dmg" \
   prototype/app-shell/src-tauri/target/release/bundle/macos/Maple.app.tar.gz \
   prototype/app-shell/src-tauri/target/release/bundle/macos/Maple.app.tar.gz.sig \
   prototype/app-shell/src-tauri/target/release/bundle/macos/latest.json \
   --repo cwoo1090/maple \
-  --title "Maple 0.1.1" \
-  --notes "Updater-enabled Maple beta."
+  --title "Maple ${MAPLE_VERSION}" \
+  --notes "Maple ${MAPLE_VERSION}."
 ```
 
 The first updater-enabled build is `0.1.1`. Users on `0.1.0` still need to install `0.1.1` manually once. After that, newer releases can appear inside Maple.
