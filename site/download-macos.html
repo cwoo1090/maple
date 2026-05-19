@@ -3,13 +3,25 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="Download Maple for Apple silicon Macs and build local AI wikis with your own ChatGPT/Codex or Claude subscription."
+    />
     <meta name="robots" content="noindex" />
     <title>Downloading Maple for macOS</title>
     <link rel="icon" href="assets/maple-icon.png" />
-    <link rel="stylesheet" href="styles.css" />
+    <link rel="stylesheet" href="styles.css?v=20260520-copy-2" />
   </head>
   <body class="download-page">
     <main class="download-redirect" aria-labelledby="download-title">
+      <button
+        class="language-toggle download-language-toggle"
+        type="button"
+        data-language-toggle
+        aria-label="Switch language to Korean"
+      >
+        한국어
+      </button>
       <img src="assets/maple-icon.png" alt="" />
       <p class="section-kicker">Direct download</p>
       <h1 id="download-title">Downloading Maple for macOS</h1>
@@ -20,6 +32,7 @@
         Open latest release
       </a>
     </main>
+    <script src="script.js?v=20260520-copy-2"></script>
     <script src="download-macos.js"></script>
   </body>
 </html>

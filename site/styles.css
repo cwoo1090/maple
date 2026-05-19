@@ -7,7 +7,7 @@
   --faint: #837b6a;
   --line: #e5e0d2;
   --line-strong: #d4cdb9;
-  --maple: #e04e1a;
+  --maple: #cc4214;
   --maple-dark: #b93e17;
   --forest: #20483a;
   --forest-soft: #e5f0ea;
@@ -54,6 +54,11 @@ body.download-page {
 a {
   color: inherit;
   text-decoration: none;
+}
+
+:where(a, button, video):focus-visible {
+  outline: 3px solid rgba(32, 91, 145, 0.52);
+  outline-offset: 3px;
 }
 
 button {
@@ -132,6 +137,26 @@ code {
   font-weight: 700;
 }
 
+.language-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 36px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  padding: 0 12px;
+  background: rgba(255, 255, 255, 0.72);
+  color: var(--muted);
+  font-size: 0.88rem;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.language-toggle:hover {
+  border-color: var(--forest);
+  color: var(--ink);
+}
+
 .hero {
   overflow: hidden;
   border-bottom: 1px solid var(--line);
@@ -147,7 +172,7 @@ code {
   align-items: center;
   width: min(1560px, calc(100% - 96px));
   margin: 0 auto;
-  padding: 92px 0 88px;
+  padding: 68px 0 72px;
 }
 
 .hero-copy-block {
@@ -162,6 +187,11 @@ code {
   font-weight: 800;
   letter-spacing: 0;
   text-transform: uppercase;
+}
+
+body[data-language="ko"] .eyebrow,
+body[data-language="ko"] .section-kicker {
+  text-transform: none;
 }
 
 .hero h1 {
@@ -238,6 +268,7 @@ code {
 }
 
 .hero-product-shot {
+  scroll-margin-top: 84px;
   width: 100%;
   margin: 0;
   overflow: hidden;
@@ -247,12 +278,14 @@ code {
   box-shadow: var(--shadow);
 }
 
-.hero-product-shot img {
+.hero-demo-video {
+  display: block;
   width: 100%;
   height: auto;
 }
 
 .guide-section,
+.launch-section,
 .privacy-section,
 .workflow-section {
   scroll-margin-top: 84px;
@@ -261,6 +294,7 @@ code {
 }
 
 .guide-section h2,
+.launch-section h2,
 .workflow-section h2,
 .privacy-copy h2 {
   margin: 0;
@@ -287,6 +321,11 @@ code {
   padding: 72px 0;
 }
 
+.launch-section {
+  padding: 72px 0;
+  border-bottom: 1px solid var(--line);
+}
+
 .section-heading {
   max-width: 700px;
 }
@@ -311,6 +350,44 @@ code {
   grid-template-columns: repeat(6, minmax(0, 1fr));
   gap: 12px;
   margin-top: 30px;
+}
+
+.launch-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 30px;
+}
+
+.launch-grid article {
+  min-width: 0;
+  min-height: 164px;
+  padding: 18px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--paper-strong);
+}
+
+.launch-grid article:nth-child(2) {
+  background: var(--forest-soft);
+}
+
+.launch-grid article:nth-child(3) {
+  background: var(--blue-soft);
+}
+
+.launch-grid h3 {
+  margin: 0 0 8px;
+  color: var(--ink);
+  font-size: 1.02rem;
+  line-height: 1.25;
+  letter-spacing: 0;
+}
+
+.launch-grid p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.92rem;
 }
 
 .workflow-grid article {
@@ -745,12 +822,19 @@ code {
 }
 
 .download-redirect {
+  position: relative;
   width: min(520px, 100%);
   border: 1px solid var(--line);
   border-radius: 8px;
   padding: 32px;
   background: var(--paper-strong);
   box-shadow: 0 16px 48px rgba(31, 26, 18, 0.1);
+}
+
+.download-language-toggle {
+  position: absolute;
+  top: 22px;
+  right: 22px;
 }
 
 .download-redirect img {
@@ -802,6 +886,7 @@ code {
   .workflow-grid,
   .guide-created-grid,
   .guide-layer-grid,
+  .launch-grid,
   .principles {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -823,16 +908,23 @@ code {
 
   .site-nav {
     width: 100%;
-    justify-content: space-between;
+    flex-wrap: wrap;
+    justify-content: flex-start;
+    row-gap: 4px;
   }
 
   .site-nav a {
     padding: 0 8px;
   }
 
+  .language-toggle {
+    min-height: 34px;
+  }
+
   .hero-inner,
   .guide-page,
   .guide-section,
+  .launch-section,
   .privacy-section,
   .workflow-section {
     scroll-margin-top: 126px;
@@ -869,6 +961,7 @@ code {
   .workflow-section,
   .guide-page,
   .guide-section,
+  .launch-section,
   .privacy-section {
     padding: 48px 0;
   }
@@ -904,6 +997,7 @@ code {
   }
 
   .guide-section h2,
+  .launch-section h2,
   .workflow-section h2,
   .privacy-copy h2 {
     font-size: 1.85rem;
@@ -912,6 +1006,7 @@ code {
   .workflow-grid,
   .guide-created-grid,
   .guide-layer-grid,
+  .launch-grid,
   .guide-split,
   .maintain-guide-grid,
   .guide-primer ol,

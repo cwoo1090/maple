@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://maple-taupe.vercel.app/sitemap.xml
