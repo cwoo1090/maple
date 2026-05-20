@@ -851,6 +851,71 @@ test("keeps escaped math delimiter examples inside inline code", () => {
   );
 });
 
+test("preserves list indentation when normalizing escaped display math", () => {
+  const markdown = [
+    "- 뒤쪽의 normalized view는 대략",
+    "  \\[",
+    "  C \\approx \\frac{\\tau}{\\sqrt{P_{heat}}\\sqrt{J_{out}}}",
+    "  \\]",
+    "  형태로 정리합니다.",
+  ].join("\n");
+
+  assert.equal(
+    normalizeMarkdownMathDelimiters(markdown),
+    [
+      "- 뒤쪽의 normalized view는 대략",
+      "  $$",
+      "  C \\approx \\frac{\\tau}{\\sqrt{P_{heat}}\\sqrt{J_{out}}}",
+      "  $$",
+      "  형태로 정리합니다.",
+    ].join("\n"),
+  );
+});
+
+test("wraps standalone bare LaTeX formula blocks", () => {
+  const markdown = [
+    "The normalized view is approximately:",
+    "",
+    "C \\approx \\frac{\\tau}",
+    "{\\sqrt{P_{heat}}\\sqrt{J_{out}}}",
+    "",
+    "This means output inertia is small.",
+  ].join("\n");
+
+  assert.equal(
+    normalizeMarkdownMathDelimiters(markdown),
+    [
+      "The normalized view is approximately:",
+      "",
+      "$$",
+      "C \\approx \\frac{\\tau}",
+      "{\\sqrt{P_{heat}}\\sqrt{J_{out}}}",
+      "$$",
+      "",
+      "This means output inertia is small.",
+    ].join("\n"),
+  );
+});
+
+test("does not wrap prose that mentions LaTeX commands", () => {
+  const markdown = [
+    "Use \\tau for torque in the equation.",
+    "Then compare the result with the prior section.",
+  ].join("\n");
+
+  assert.equal(normalizeMarkdownMathDelimiters(markdown), markdown);
+});
+
+test("wraps a bare LaTeX prefix without swallowing Korean prose", () => {
+  const markdown =
+    "C \\approx \\frac{\\tau}{\\sqrt{P_{heat}}\\sqrt{J_{out}}} 형태로 정리합니다.";
+
+  assert.equal(
+    normalizeMarkdownMathDelimiters(markdown),
+    "$C \\approx \\frac{\\tau}{\\sqrt{P_{heat}}\\sqrt{J_{out}}}$ 형태로 정리합니다.",
+  );
+});
+
 test("tracks source status from source manifest", async (t) => {
   const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "maple-source-status-"));
   t.after(() => fs.rm(workspace, { recursive: true, force: true }));

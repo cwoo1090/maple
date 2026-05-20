@@ -5706,7 +5706,13 @@ function App() {
   const wikiUpdateRunBlock = currentWikiUpdateRun ? (
     <Fragment key={`wiki-update-${currentWikiUpdateRun.id}`}>
       <div className="explore-chat-msg explore-chat-msg-user explore-chat-update-request">
-        {wikiUpdateUserMessage}
+        <WorkspaceAwareMarkdown
+          content={wikiUpdateUserMessage}
+          currentPath={selectedPath}
+          workspacePath={workspace.workspacePath}
+          availableDocuments={availableDocuments}
+          onOpenDocument={openWorkspaceDocument}
+        />
       </div>
       <div className="explore-chat-msg explore-chat-msg-assistant explore-chat-update-intro">
         <p>{wikiUpdateAssistantIntro}</p>
@@ -6818,7 +6824,13 @@ function App() {
                             onOpenDocument={openWorkspaceDocument}
                           />
                         ) : (
-                          message.text
+                          <WorkspaceAwareMarkdown
+                            content={message.text}
+                            currentPath={message.contextPath ?? selectedPath}
+                            workspacePath={workspace.workspacePath}
+                            availableDocuments={availableDocuments}
+                            onOpenDocument={openWorkspaceDocument}
+                          />
                         )}
                       </div>
                     </Fragment>
@@ -7072,7 +7084,13 @@ function App() {
                         />
                       </>
                     ) : message.role === "user" ? (
-                      <MaintainUserMessage text={message.text} />
+                      <MaintainUserMessage
+                        text={message.text}
+                        currentPath={message.contextPath ?? selectedPath}
+                        workspacePath={workspace.workspacePath}
+                        availableDocuments={availableDocuments}
+                        onOpenDocument={openWorkspaceDocument}
+                      />
                     ) : (
                       message.text
                     )}
@@ -8171,7 +8189,19 @@ function OperationFeedPanel({
   );
 }
 
-function MaintainUserMessage({ text }: { text: string }) {
+function MaintainUserMessage({
+  text,
+  currentPath,
+  workspacePath,
+  availableDocuments,
+  onOpenDocument,
+}: {
+  text: string;
+  currentPath: string;
+  workspacePath: string;
+  availableDocuments: string[];
+  onOpenDocument: (path: string, anchor?: string | null) => void;
+}) {
   const parts = text
     .split(/\n+/)
     .map((part) => part.trim())
@@ -8186,7 +8216,15 @@ function MaintainUserMessage({ text }: { text: string }) {
           {context}
         </div>
       ) : null}
-      <div className="maintain-message-body">{body}</div>
+      <div className="maintain-message-body">
+        <WorkspaceAwareMarkdown
+          content={body}
+          currentPath={currentPath}
+          workspacePath={workspacePath}
+          availableDocuments={availableDocuments}
+          onOpenDocument={onOpenDocument}
+        />
+      </div>
     </>
   );
 }
@@ -9397,7 +9435,7 @@ function WorkspaceAwareMarkdown({
 
   return (
     <ReactMarkdown
-      remarkPlugins={[remarkGfm, remarkMath]}
+      remarkPlugins={[remarkGfm, [remarkMath, { singleDollarTextMath: true }]]}
       rehypePlugins={[rehypeKatex]}
       components={components}
       urlTransform={(url) => url}
@@ -11636,9 +11674,135 @@ function normalizeDirectiveCalloutTitle(rawTitle: string) {
 }
 
 function convertEscapedMathDelimiters(content: string) {
-  return content
-    .replace(/\\\[([\s\S]*?)\\\]/g, (_match, expression) => `$$\n${expression.trim()}\n$$`)
+  const normalized = convertEscapedDisplayMathDelimiters(content)
+    .replace(/\\\[([^\n]*?)\\\]/g, (_match, expression) => `$${expression.trim()}$`)
     .replace(/\\\(([\s\S]*?)\\\)/g, (_match, expression) => `$${expression.trim()}$`);
+
+  return normalizeBareLatexMathBlocks(normalized);
+}
+
+function convertEscapedDisplayMathDelimiters(content: string) {
+  const lines = content.split("\n");
+  const output: string[] = [];
+  let index = 0;
+
+  while (index < lines.length) {
+    const open = lines[index].match(/^(\s*)\\\[\s*$/);
+    if (!open) {
+      output.push(lines[index]);
+      index += 1;
+      continue;
+    }
+
+    const indent = open[1] ?? "";
+    const mathLines: string[] = [];
+    index += 1;
+    let closed = false;
+
+    while (index < lines.length) {
+      if (/^\s*\\\]\s*$/.test(lines[index])) {
+        closed = true;
+        index += 1;
+        break;
+      }
+
+      const rawLine = lines[index];
+      mathLines.push(rawLine.startsWith(indent) ? rawLine.slice(indent.length) : rawLine.trim());
+      index += 1;
+    }
+
+    if (!closed) {
+      output.push(`${indent}\\[`, ...mathLines.map((line) => `${indent}${line}`));
+      continue;
+    }
+
+    const expression = mathLines.join("\n").trim();
+    output.push(
+      `${indent}$$`,
+      ...expression.split("\n").map((line) => `${indent}${line.trimEnd()}`),
+      `${indent}$$`,
+    );
+  }
+
+  return output.join("\n");
+}
+
+function normalizeBareLatexMathBlocks(content: string) {
+  const lines = content.split("\n");
+  const output: string[] = [];
+  let index = 0;
+  let insideDollarBlock = false;
+
+  while (index < lines.length) {
+    const line = lines[index];
+    const trimmed = line.trim();
+
+    if (trimmed === "$$") {
+      insideDollarBlock = !insideDollarBlock;
+      output.push(line);
+      index += 1;
+      continue;
+    }
+
+    if (insideDollarBlock) {
+      output.push(line);
+      index += 1;
+      continue;
+    }
+
+    const latexPrefix = splitBareLatexPrefixFromTrailingProse(line);
+    if (latexPrefix) {
+      output.push(`${latexPrefix.leading}$${latexPrefix.math}$${latexPrefix.trailing}`);
+      index += 1;
+      continue;
+    }
+
+    if (!isBareLatexMathLine(line)) {
+      output.push(line);
+      index += 1;
+      continue;
+    }
+
+    const indent = line.match(/^\s*/)?.[0] ?? "";
+    const mathLines: string[] = [];
+    while (index < lines.length && isBareLatexMathLine(lines[index])) {
+      mathLines.push(lines[index].trim());
+      index += 1;
+    }
+
+    output.push(`${indent}$$`, ...mathLines.map((mathLine) => `${indent}${mathLine}`), `${indent}$$`);
+  }
+
+  return output.join("\n");
+}
+
+function isBareLatexMathLine(line: string) {
+  const trimmed = line.trim();
+  if (!trimmed || trimmed.includes("$")) return false;
+  if (/^(?:#{1,6}\s|>\s?|[-*+]\s|\d+[.)]\s|\|)/.test(trimmed)) return false;
+  if (!/\\(?:frac|sqrt|sum|int|prod|lim|approx|sim|simeq|cdot|times|leq|geq|neq|equiv|propto|infty|alpha|beta|gamma|delta|epsilon|theta|lambda|mu|pi|rho|sigma|tau|omega|Omega|Delta|partial|nabla|sin|cos|tan|log|ln|exp|text|mathrm|mathbf|left|right|begin|end)\b/.test(trimmed)) {
+    return false;
+  }
+
+  return /^(?:\\[A-Za-z]+|[{}()[\]+\-*/=<>]|[A-Za-z](?:_\{?[^}\s]+\}?|\^\{?[^}\s]+\}?)*\s*(?:[=≈<>+\-*/]|\\(?:approx|sim|simeq|equiv|propto|leq|geq|neq|to|rightarrow|leftarrow|frac|sqrt)))/.test(
+    trimmed,
+  );
+}
+
+function splitBareLatexPrefixFromTrailingProse(line: string) {
+  const leading = line.match(/^\s*/)?.[0] ?? "";
+  const body = line.slice(leading.length);
+  const proseMatch = /[가-힣]/.exec(body);
+  if (!proseMatch || proseMatch.index === 0) return null;
+
+  const math = body.slice(0, proseMatch.index).trimEnd();
+  if (!isBareLatexMathLine(math)) return null;
+
+  return {
+    leading,
+    math: math.trim(),
+    trailing: body.slice(math.length),
+  };
 }
 
 function convertWikiLinks(

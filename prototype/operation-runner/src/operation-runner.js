@@ -2924,6 +2924,10 @@ Visual grounding rules:
 - Do not claim you inspected slides or images that were not attached or present in extracted text.
 - Do not unzip or dump the full PPTX/PDF unless the attached visuals and extracted text are insufficient; if they are insufficient, say what is missing.
 
+Math formatting rules:
+- Wrap block equations in $$...$$ and inline formulas in $...$.
+- Do not leave raw LaTeX commands such as \\frac, \\sqrt, \\tau, or \\approx outside math delimiters.
+
 Current selected context:
 ${selectedBlock}
 
@@ -6188,10 +6192,136 @@ async function normalizeGeneratedMarkdownFiles(workspace) {
 
 function normalizeMarkdownMathDelimiters(markdown) {
   return transformMarkdownOutsideCode(markdown, (segment) =>
-    segment
-      .replace(/\\\[([\s\S]*?)\\\]/g, (_match, expression) => `$$\n${expression.trim()}\n$$`)
-      .replace(/\\\(([\s\S]*?)\\\)/g, (_match, expression) => `$${expression.trim()}$`),
+    normalizeBareLatexMathBlocks(
+      convertEscapedDisplayMathDelimiters(segment)
+        .replace(/\\\[([^\n]*?)\\\]/g, (_match, expression) => `$${expression.trim()}$`)
+        .replace(/\\\(([\s\S]*?)\\\)/g, (_match, expression) => `$${expression.trim()}$`),
+    ),
   );
+}
+
+function convertEscapedDisplayMathDelimiters(markdown) {
+  const lines = markdown.split("\n");
+  const output = [];
+  let index = 0;
+
+  while (index < lines.length) {
+    const open = lines[index].match(/^(\s*)\\\[\s*$/);
+    if (!open) {
+      output.push(lines[index]);
+      index += 1;
+      continue;
+    }
+
+    const indent = open[1] ?? "";
+    const mathLines = [];
+    index += 1;
+    let closed = false;
+
+    while (index < lines.length) {
+      if (/^\s*\\\]\s*$/.test(lines[index])) {
+        closed = true;
+        index += 1;
+        break;
+      }
+
+      const rawLine = lines[index];
+      mathLines.push(rawLine.startsWith(indent) ? rawLine.slice(indent.length) : rawLine.trim());
+      index += 1;
+    }
+
+    if (!closed) {
+      output.push(`${indent}\\[`, ...mathLines.map((line) => `${indent}${line}`));
+      continue;
+    }
+
+    const expression = mathLines.join("\n").trim();
+    output.push(
+      `${indent}$$`,
+      ...expression.split("\n").map((line) => `${indent}${line.trimEnd()}`),
+      `${indent}$$`,
+    );
+  }
+
+  return output.join("\n");
+}
+
+function normalizeBareLatexMathBlocks(markdown) {
+  const lines = markdown.split("\n");
+  const output = [];
+  let index = 0;
+  let insideDollarBlock = false;
+
+  while (index < lines.length) {
+    const line = lines[index];
+    const trimmed = line.trim();
+
+    if (trimmed === "$$") {
+      insideDollarBlock = !insideDollarBlock;
+      output.push(line);
+      index += 1;
+      continue;
+    }
+
+    if (insideDollarBlock) {
+      output.push(line);
+      index += 1;
+      continue;
+    }
+
+    const latexPrefix = splitBareLatexPrefixFromTrailingProse(line);
+    if (latexPrefix) {
+      output.push(`${latexPrefix.leading}$${latexPrefix.math}$${latexPrefix.trailing}`);
+      index += 1;
+      continue;
+    }
+
+    if (!isBareLatexMathLine(line)) {
+      output.push(line);
+      index += 1;
+      continue;
+    }
+
+    const indent = line.match(/^\s*/)?.[0] ?? "";
+    const mathLines = [];
+    while (index < lines.length && isBareLatexMathLine(lines[index])) {
+      mathLines.push(lines[index].trim());
+      index += 1;
+    }
+
+    output.push(`${indent}$$`, ...mathLines.map((mathLine) => `${indent}${mathLine}`), `${indent}$$`);
+  }
+
+  return output.join("\n");
+}
+
+function isBareLatexMathLine(line) {
+  const trimmed = line.trim();
+  if (!trimmed || trimmed.includes("$")) return false;
+  if (/^(?:#{1,6}\s|>\s?|[-*+]\s|\d+[.)]\s|\|)/.test(trimmed)) return false;
+  if (!/\\(?:frac|sqrt|sum|int|prod|lim|approx|sim|simeq|cdot|times|leq|geq|neq|equiv|propto|infty|alpha|beta|gamma|delta|epsilon|theta|lambda|mu|pi|rho|sigma|tau|omega|Omega|Delta|partial|nabla|sin|cos|tan|log|ln|exp|text|mathrm|mathbf|left|right|begin|end)\b/.test(trimmed)) {
+    return false;
+  }
+
+  return /^(?:\\[A-Za-z]+|[{}()[\]+\-*/=<>]|[A-Za-z](?:_\{?[^}\s]+\}?|\^\{?[^}\s]+\}?)*\s*(?:[=≈<>+\-*/]|\\(?:approx|sim|simeq|equiv|propto|leq|geq|neq|to|rightarrow|leftarrow|frac|sqrt)))/.test(
+    trimmed,
+  );
+}
+
+function splitBareLatexPrefixFromTrailingProse(line) {
+  const leading = line.match(/^\s*/)?.[0] ?? "";
+  const body = line.slice(leading.length);
+  const proseMatch = /[가-힣]/.exec(body);
+  if (!proseMatch || proseMatch.index === 0) return null;
+
+  const math = body.slice(0, proseMatch.index).trimEnd();
+  if (!isBareLatexMathLine(math)) return null;
+
+  return {
+    leading,
+    math: math.trim(),
+    trailing: body.slice(math.length),
+  };
 }
 
 function transformMarkdownOutsideCode(markdown, transform) {
