@@ -4199,7 +4199,8 @@ async fn read_workspace_file(
 
     if !is_readable_workspace_preview_path(&normalized_path, &normalized) {
         return Err(
-            "Only markdown and source text files can be read by the app preview".to_string(),
+            "Only markdown and supported source text files can be read by the app preview"
+                .to_string(),
         );
     }
 
@@ -4217,6 +4218,16 @@ async fn read_workspace_file(
 
     let content = fs::read_to_string(&file_path)
         .map_err(|error| format!("Failed to read {normalized}: {error}"))?;
+    let content = if normalized.starts_with("sources/")
+        && normalized_path
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(is_html_source_extension)
+    {
+        html_to_text_preview(&normalized, &content)
+    } else {
+        content
+    };
 
     Ok(WorkspaceFile {
         path: normalized,
@@ -4291,9 +4302,258 @@ fn is_readable_workspace_preview_path(normalized_path: &Path, normalized: &str) 
         is_root_file && !should_hide_workspace_file(normalized) && extension == "md";
     let is_markdown_workspace_file = extension == "md"
         && (normalized.starts_with("wiki/") || normalized.starts_with("sources/"));
-    let is_source_text_file = extension == "txt" && normalized.starts_with("sources/");
+    let is_source_text_file =
+        is_supported_source_text_extension(&extension) && normalized.starts_with("sources/");
 
     is_readable_root_markdown || is_markdown_workspace_file || is_source_text_file
+}
+
+fn is_supported_source_text_extension(extension: &str) -> bool {
+    matches!(
+        extension.to_ascii_lowercase().as_str(),
+        "txt" | "json" | "jsonl" | "csv" | "tsv" | "html" | "htm"
+    )
+}
+
+fn is_html_source_extension(extension: &str) -> bool {
+    matches!(extension.to_ascii_lowercase().as_str(), "html" | "htm")
+}
+
+fn html_to_text_preview(path: &str, html: &str) -> String {
+    let title = extract_html_title(html).unwrap_or_else(|| display_file_name(path));
+    let text = html_to_plain_text(html);
+    format!(
+        "HTML preview\nSource: {path}\nTitle: {title}\n\n{}",
+        text.trim()
+    )
+}
+
+fn display_file_name(path: &str) -> String {
+    path.rsplit('/')
+        .next()
+        .filter(|value| !value.is_empty())
+        .unwrap_or(path)
+        .to_string()
+}
+
+fn extract_html_title(html: &str) -> Option<String> {
+    let lower = html.to_ascii_lowercase();
+    let title_start = lower.find("<title")?;
+    let content_start = lower[title_start..].find('>')? + title_start + 1;
+    let content_end = lower[content_start..].find("</title>")? + content_start;
+    let title = html_to_plain_text(&html[content_start..content_end]);
+    let title = title.trim();
+    if title.is_empty() {
+        None
+    } else {
+        Some(title.to_string())
+    }
+}
+
+fn html_to_plain_text(html: &str) -> String {
+    let without_comments = remove_html_comments(html);
+    let without_scripts = remove_html_element_content(&without_comments, "script");
+    let without_styles = remove_html_element_content(&without_scripts, "style");
+    let mut text = String::new();
+    let mut chars = without_styles.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '<' {
+            let mut tag = String::new();
+            for tag_ch in chars.by_ref() {
+                if tag_ch == '>' {
+                    break;
+                }
+                tag.push(tag_ch);
+            }
+            if html_tag_starts_block(&tag) {
+                text.push('\n');
+            } else if html_tag_is_table_cell(&tag) {
+                text.push('\t');
+            }
+            continue;
+        }
+        text.push(ch);
+    }
+
+    collapse_preview_whitespace(&decode_html_entities(&text))
+}
+
+fn html_tag_starts_block(tag: &str) -> bool {
+    let normalized = tag
+        .trim_start_matches('/')
+        .trim()
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "address"
+            | "article"
+            | "aside"
+            | "blockquote"
+            | "br"
+            | "dd"
+            | "div"
+            | "dl"
+            | "dt"
+            | "figcaption"
+            | "figure"
+            | "footer"
+            | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
+            | "header"
+            | "hr"
+            | "li"
+            | "main"
+            | "nav"
+            | "ol"
+            | "p"
+            | "pre"
+            | "section"
+            | "table"
+            | "tbody"
+            | "tfoot"
+            | "thead"
+            | "tr"
+            | "ul"
+    )
+}
+
+fn html_tag_is_table_cell(tag: &str) -> bool {
+    let normalized = tag
+        .trim_start_matches('/')
+        .trim()
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(normalized.as_str(), "td" | "th")
+}
+
+fn remove_html_comments(input: &str) -> String {
+    let mut output = String::new();
+    let mut index = 0;
+    while let Some(start_rel) = input[index..].find("<!--") {
+        let start = index + start_rel;
+        output.push_str(&input[index..start]);
+        if let Some(end_rel) = input[start + 4..].find("-->") {
+            index = start + 4 + end_rel + 3;
+        } else {
+            index = input.len();
+            break;
+        }
+    }
+    output.push_str(&input[index..]);
+    output
+}
+
+fn remove_html_element_content(input: &str, tag: &str) -> String {
+    let lower = input.to_ascii_lowercase();
+    let open_pattern = format!("<{tag}");
+    let close_pattern = format!("</{tag}");
+    let mut output = String::new();
+    let mut index = 0;
+
+    while let Some(open_rel) = lower[index..].find(&open_pattern) {
+        let open = index + open_rel;
+        output.push_str(&input[index..open]);
+        if let Some(close_rel) = lower[open..].find(&close_pattern) {
+            let close = open + close_rel;
+            if let Some(end_rel) = lower[close..].find('>') {
+                index = close + end_rel + 1;
+                continue;
+            }
+        }
+        index = input.len();
+        break;
+    }
+
+    output.push_str(&input[index..]);
+    output
+}
+
+fn decode_html_entities(input: &str) -> String {
+    let mut output = String::new();
+    let mut chars = input.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch != '&' {
+            output.push(ch);
+            continue;
+        }
+
+        let mut entity = String::new();
+        while let Some(&next) = chars.peek() {
+            if next == ';' {
+                chars.next();
+                break;
+            }
+            if entity.len() > 12 || next.is_whitespace() {
+                break;
+            }
+            entity.push(next);
+            chars.next();
+        }
+
+        let decoded = match entity.as_str() {
+            "amp" => Some('&'),
+            "lt" => Some('<'),
+            "gt" => Some('>'),
+            "quot" => Some('"'),
+            "apos" => Some('\''),
+            "nbsp" => Some(' '),
+            _ => decode_numeric_html_entity(&entity),
+        };
+
+        if let Some(decoded) = decoded {
+            output.push(decoded);
+        } else {
+            output.push('&');
+            output.push_str(&entity);
+            if !entity.is_empty() {
+                output.push(';');
+            }
+        }
+    }
+
+    output
+}
+
+fn decode_numeric_html_entity(entity: &str) -> Option<char> {
+    if let Some(hex) = entity
+        .strip_prefix("#x")
+        .or_else(|| entity.strip_prefix("#X"))
+    {
+        u32::from_str_radix(hex, 16).ok().and_then(char::from_u32)
+    } else if let Some(decimal) = entity.strip_prefix('#') {
+        decimal.parse::<u32>().ok().and_then(char::from_u32)
+    } else {
+        None
+    }
+}
+
+fn collapse_preview_whitespace(input: &str) -> String {
+    let mut lines = Vec::new();
+    let mut previous_blank = false;
+    for raw_line in input.lines() {
+        let line = raw_line.split_whitespace().collect::<Vec<_>>().join(" ");
+        if line.is_empty() {
+            if !previous_blank {
+                lines.push(String::new());
+            }
+            previous_blank = true;
+        } else {
+            lines.push(line);
+            previous_blank = false;
+        }
+    }
+    lines.join("\n").trim().to_string()
 }
 
 fn is_editable_workspace_file_path(normalized_path: &Path, normalized: &str) -> bool {
@@ -5231,17 +5491,37 @@ fn find_soffice_bin() -> Option<PathBuf> {
 }
 
 #[tauri::command]
+async fn convert_source_to_pdf(
+    relative_path: String,
+    state: State<'_, WorkspaceStore>,
+) -> Result<String, String> {
+    let workspace = current_workspace(&state)?;
+    convert_source_to_pdf_in_workspace(&workspace, &relative_path)
+}
+
+#[tauri::command]
 async fn convert_pptx_to_pdf(
     relative_path: String,
     state: State<'_, WorkspaceStore>,
 ) -> Result<String, String> {
     let workspace = current_workspace(&state)?;
+    convert_source_to_pdf_in_workspace(&workspace, &relative_path)
+}
+
+fn convert_source_to_pdf_in_workspace(
+    workspace: &Path,
+    relative_path: &str,
+) -> Result<String, String> {
     let normalized_path = normalize_workspace_relative_path(&relative_path)?;
     let normalized = normalized_path.to_string_lossy().replace('\\', "/");
 
-    let lower = normalized.to_lowercase();
-    if !(lower.ends_with(".pptx") || lower.ends_with(".ppt")) {
-        return Err("Only .pptx/.ppt files can be converted".to_string());
+    let extension = normalized_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !is_pdf_convertible_source_extension(&extension) {
+        return Err("Only PowerPoint, Word, and Excel source files can be converted".to_string());
     }
     if !normalized.starts_with(&format!("{SOURCE_DIR}/")) {
         return Err("Only sources can be converted".to_string());
@@ -5268,7 +5548,7 @@ async fn convert_pptx_to_pdf(
     let source_stem = source_canonical
         .file_stem()
         .and_then(|s| s.to_str())
-        .unwrap_or("slide")
+        .unwrap_or("source")
         .to_string();
     let safe_stem: String = source_stem
         .chars()
@@ -5281,11 +5561,15 @@ async fn convert_pptx_to_pdf(
         })
         .collect();
 
-    let cache_dir = workspace.join(METADATA_DIR).join("cache").join("pptx");
+    let cache_dir = workspace
+        .join(METADATA_DIR)
+        .join("cache")
+        .join("source-pdf");
     fs::create_dir_all(&cache_dir)
         .map_err(|error| format!("Failed to create cache directory: {error}"))?;
-    let cached_pdf = cache_dir.join(format!("{safe_stem}-{mtime_secs}.pdf"));
-    let cached_relative = format!("{METADATA_DIR}/cache/pptx/{safe_stem}-{mtime_secs}.pdf");
+    let cache_name = format!("{safe_stem}-{extension}-{mtime_secs}");
+    let cached_pdf = cache_dir.join(format!("{cache_name}.pdf"));
+    let cached_relative = format!("{METADATA_DIR}/cache/source-pdf/{cache_name}.pdf");
 
     if cached_pdf.exists() {
         return Ok(cached_relative);
@@ -5295,13 +5579,25 @@ async fn convert_pptx_to_pdf(
         "LibreOffice (soffice) not found. Install it from the right panel first.".to_string()
     })?;
 
+    let convert_dir = cache_dir.join(format!("{cache_name}-work"));
+    if convert_dir.exists() {
+        fs::remove_dir_all(&convert_dir)
+            .map_err(|error| format!("Failed to reset conversion cache: {error}"))?;
+    }
+    fs::create_dir_all(&convert_dir)
+        .map_err(|error| format!("Failed to create conversion directory: {error}"))?;
+    let staged_input = convert_dir.join(format!("source.{extension}"));
+    let expected_pdf = convert_dir.join("source.pdf");
+    fs::copy(&source_canonical, &staged_input)
+        .map_err(|error| format!("Failed to stage source for conversion: {error}"))?;
+
     let output = Command::new(&soffice_bin)
         .arg("--headless")
         .arg("--convert-to")
         .arg("pdf")
         .arg("--outdir")
-        .arg(&cache_dir)
-        .arg(&source_canonical)
+        .arg(&convert_dir)
+        .arg(&staged_input)
         .output()
         .map_err(|error| format!("Failed to run soffice: {error}"))?;
 
@@ -5310,7 +5606,29 @@ async fn convert_pptx_to_pdf(
         return Err(format!("soffice failed: {stderr}"));
     }
 
-    let produced = cache_dir.join(format!("{source_stem}.pdf"));
+    let produced = if expected_pdf.exists() {
+        expected_pdf
+    } else {
+        let pdfs = fs::read_dir(&convert_dir)
+            .map_err(|error| format!("Failed to read conversion output: {error}"))?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| {
+                path.extension()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"))
+            })
+            .collect::<Vec<_>>();
+        if pdfs.len() == 1 {
+            pdfs[0].clone()
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            return Err(format!(
+                "Expected converted PDF not found at {}.\n{stdout}\n{stderr}",
+                expected_pdf.display()
+            ));
+        }
+    };
     if !produced.exists() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -5320,12 +5638,19 @@ async fn convert_pptx_to_pdf(
         ));
     }
 
-    if produced != cached_pdf {
-        fs::rename(&produced, &cached_pdf)
-            .map_err(|error| format!("Failed to move converted PDF: {error}"))?;
-    }
+    fs::rename(&produced, &cached_pdf)
+        .map_err(|error| format!("Failed to move converted PDF: {error}"))?;
+    fs::remove_dir_all(&convert_dir)
+        .map_err(|error| format!("Failed to clean conversion directory: {error}"))?;
 
     Ok(cached_relative)
+}
+
+fn is_pdf_convertible_source_extension(extension: &str) -> bool {
+    matches!(
+        extension.to_ascii_lowercase().as_str(),
+        "ppt" | "pptx" | "doc" | "docx" | "xls" | "xlsx"
+    )
 }
 
 #[tauri::command]
@@ -7909,7 +8234,7 @@ fn import_source_file(source_dir: &Path, source_path: &str) -> Result<(), String
 
     if !is_supported_source_extension(&extension) {
         return Err(format!(
-            "Unsupported source type for {}. Use PDF, PPTX, Markdown, text, or image files.",
+            "Unsupported source type for {}. Use PDF, PPTX, DOCX, XLSX, Markdown, text, JSON/JSONL, CSV/TSV, HTML, or image files.",
             source.display()
         ));
     }
@@ -7942,7 +8267,26 @@ fn import_source_file(source_dir: &Path, source_path: &str) -> Result<(), String
 fn is_supported_source_extension(extension: &str) -> bool {
     matches!(
         extension,
-        "pdf" | "pptx" | "ppt" | "md" | "txt" | "png" | "jpg" | "jpeg" | "webp" | "gif"
+        "pdf"
+            | "pptx"
+            | "ppt"
+            | "doc"
+            | "docx"
+            | "xls"
+            | "xlsx"
+            | "md"
+            | "txt"
+            | "json"
+            | "jsonl"
+            | "csv"
+            | "tsv"
+            | "html"
+            | "htm"
+            | "png"
+            | "jpg"
+            | "jpeg"
+            | "webp"
+            | "gif"
     )
 }
 
@@ -8231,14 +8575,15 @@ mod tests {
         default_workspace_schema, delete_wiki_image_asset_from_workspace,
         ensure_asset_master_file_for_edit, ensure_maintain_thread_task_matches,
         ensure_no_pending_generated_changes, extract_partial_answer_from_events,
-        finalize_provider_check_report, initialize_workspace_files,
-        is_readable_workspace_preview_path, is_valid_asset_relative_path, load_state_at,
-        login_command_for_settings, maintain_operation_assistant_text,
-        maintain_operation_user_text, make_chat_thread, make_maintain_thread,
-        node_version_supported, normalize_operation_events, normalize_settings, parse_node_major,
-        parse_provider_ready, provider_choice_required, provider_ready_candidate_count,
-        provider_simulation_value_matches, read_requested_or_new_chat_thread, read_text_tail,
-        read_thread_file, read_wiki_image_asset_registry, refresh_maintain_operation_messages,
+        finalize_provider_check_report, html_to_text_preview, initialize_workspace_files,
+        is_readable_workspace_preview_path, is_supported_source_extension,
+        is_valid_asset_relative_path, load_state_at, login_command_for_settings,
+        maintain_operation_assistant_text, maintain_operation_user_text, make_chat_thread,
+        make_maintain_thread, node_version_supported, normalize_operation_events,
+        normalize_settings, parse_node_major, parse_provider_ready, provider_choice_required,
+        provider_ready_candidate_count, provider_simulation_value_matches,
+        read_requested_or_new_chat_thread, read_text_tail, read_thread_file,
+        read_wiki_image_asset_registry, refresh_maintain_operation_messages,
         refresh_streaming_messages, register_existing_wiki_asset_references,
         resolve_editable_workspace_file, run_command_probe, runner_path_env,
         schema_update_prompt_for_workspace, select_node_candidate, shell_single_quote,
@@ -8315,6 +8660,30 @@ mod tests {
             "sources/lecture.txt"
         ));
         assert!(is_readable_workspace_preview_path(
+            Path::new("sources/export.json"),
+            "sources/export.json"
+        ));
+        assert!(is_readable_workspace_preview_path(
+            Path::new("sources/events.jsonl"),
+            "sources/events.jsonl"
+        ));
+        assert!(is_readable_workspace_preview_path(
+            Path::new("sources/table.csv"),
+            "sources/table.csv"
+        ));
+        assert!(is_readable_workspace_preview_path(
+            Path::new("sources/table.tsv"),
+            "sources/table.tsv"
+        ));
+        assert!(is_readable_workspace_preview_path(
+            Path::new("sources/article.html"),
+            "sources/article.html"
+        ));
+        assert!(is_readable_workspace_preview_path(
+            Path::new("sources/article.htm"),
+            "sources/article.htm"
+        ));
+        assert!(is_readable_workspace_preview_path(
             Path::new("sources/lecture.md"),
             "sources/lecture.md"
         ));
@@ -8332,9 +8701,48 @@ mod tests {
             "wiki/concepts/page.txt"
         ));
         assert!(!is_readable_workspace_preview_path(
+            Path::new("wiki/concepts/data.json"),
+            "wiki/concepts/data.json"
+        ));
+        assert!(!is_readable_workspace_preview_path(
             Path::new("notes.txt"),
             "notes.txt"
         ));
+    }
+
+    #[test]
+    fn source_import_allows_text_data_files() {
+        for extension in [
+            "txt", "json", "jsonl", "csv", "tsv", "html", "htm", "doc", "docx", "xls", "xlsx",
+        ] {
+            assert!(
+                is_supported_source_extension(extension),
+                "{extension} should be importable"
+            );
+        }
+    }
+
+    #[test]
+    fn html_preview_extracts_readable_text() {
+        let html = r#"<!doctype html>
+<html>
+<head>
+  <title>Research &amp; Notes</title>
+  <style>.hidden { display: none; }</style>
+  <script>alert("ignore");</script>
+</head>
+<body>
+  <h1>Research &amp; Notes</h1>
+  <p>First paragraph&nbsp;with spacing.</p>
+  <table><tr><th>Name</th><th>Score</th></tr><tr><td>Ada</td><td>98</td></tr></table>
+</body>
+</html>"#;
+        let preview = html_to_text_preview("sources/research.html", html);
+        assert!(preview.contains("Title: Research & Notes"));
+        assert!(preview.contains("First paragraph with spacing."));
+        assert!(preview.contains("Name Score"));
+        assert!(!preview.contains("alert"));
+        assert!(!preview.contains("display: none"));
     }
 
     #[test]
@@ -9789,6 +10197,7 @@ pub fn run() {
             delete_wiki_image_asset,
             check_soffice,
             install_libreoffice,
+            convert_source_to_pdf,
             convert_pptx_to_pdf,
             reset_sample_workspace,
             import_sources,

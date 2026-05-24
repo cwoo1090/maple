@@ -1702,7 +1702,7 @@ test("Explore Chat source visuals attach explicitly referenced slide images", as
 
   assert.match(prompt, /Source visual context for the selected source/);
   assert.match(prompt, /Page 12: \.aiwiki\/extracted\/20260504120000\/deck\/prompt-images\/page-12\.jpg/);
-  assert.match(prompt, /Do not unzip or dump the full PPTX\/PDF/);
+  assert.match(prompt, /Do not unzip or dump the full Office\/PDF source/);
 });
 
 test("Explore Chat source visuals attach contact sheet for visual questions without page numbers", async (t) => {

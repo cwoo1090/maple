@@ -575,7 +575,14 @@ function parseRunnerJson<T>(runner: RunnerOutput | null): T | null {
 const IMAGE_EXT_REGEX = /\.(apng|avif|gif|jpe?g|png|svg|webp)$/i;
 const PDF_EXT_REGEX = /\.pdf$/i;
 const PPTX_EXT_REGEX = /\.pptx?$/i;
+const DOC_EXT_REGEX = /\.docx?$/i;
+const SPREADSHEET_EXT_REGEX = /\.xlsx?$/i;
+const OFFICE_PDF_PREVIEW_EXT_REGEX = /\.(pptx?|docx?|xlsx?)$/i;
 const TEXT_EXT_REGEX = /\.txt$/i;
+const JSON_EXT_REGEX = /\.jsonl?$/i;
+const TABULAR_TEXT_EXT_REGEX = /\.(csv|tsv)$/i;
+const HTML_EXT_REGEX = /\.html?$/i;
+const SOURCE_TEXT_EXT_REGEX = /\.(txt|jsonl?|csv|tsv|html?)$/i;
 const MARKDOWN_EXT_REGEX = /\.md$/i;
 const CHAT_PROGRESS_ERROR_PREFIX = "Failed to read chat progress:";
 const MAINTAIN_DISCUSSION_PROGRESS_ERROR_PREFIX = "Failed to read maintain discussion progress:";
@@ -588,8 +595,15 @@ const PENDING_GENERATED_CHANGES_ERROR =
 
 function rendersAsLineAddressableText(path: string): boolean {
   return (
-    TEXT_EXT_REGEX.test(path) ||
-    (path.startsWith("sources/") && MARKDOWN_EXT_REGEX.test(path))
+    path.startsWith("sources/") &&
+    (MARKDOWN_EXT_REGEX.test(path) || SOURCE_TEXT_EXT_REGEX.test(path))
+  );
+}
+
+function isReadableWorkspaceTextPreview(path: string): boolean {
+  return (
+    MARKDOWN_EXT_REGEX.test(path) ||
+    (path.startsWith("sources/") && SOURCE_TEXT_EXT_REGEX.test(path))
   );
 }
 
@@ -1128,6 +1142,11 @@ function workspaceFileKindLabel(path: string): string {
   if (IMAGE_EXT_REGEX.test(path)) return "Image";
   if (PDF_EXT_REGEX.test(path)) return "PDF";
   if (PPTX_EXT_REGEX.test(path)) return "Slides";
+  if (DOC_EXT_REGEX.test(path)) return "Document";
+  if (SPREADSHEET_EXT_REGEX.test(path)) return "Spreadsheet";
+  if (JSON_EXT_REGEX.test(path)) return "JSON";
+  if (HTML_EXT_REGEX.test(path)) return "HTML";
+  if (TABULAR_TEXT_EXT_REGEX.test(path)) return "Table";
   if (TEXT_EXT_REGEX.test(path)) return "Text";
   if (path.startsWith("wiki/")) return "Wiki page";
   if (path.startsWith("sources/")) return "Source";
@@ -1534,7 +1553,7 @@ function App() {
   const [layoutWidth, setLayoutWidth] = useState(() => window.innerWidth);
   const [compactRevealPanel, setCompactRevealPanel] = useState<CompactRevealPanel>(null);
   const [readingTextSize, setReadingTextSize] = useState(readStoredReadingTextSize);
-  const [pptxRender, setPptxRender] = useState<{
+  const [sourcePdfRender, setSourcePdfRender] = useState<{
     sourcePath: string;
     status: "pending" | "ready" | "error";
     pdfPath?: string;
@@ -3892,13 +3911,13 @@ function App() {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [applyDraft, wikiUpdateBusy]);
 
-  const hasPptxInSources = useMemo(
-    () => sourceFiles.some((s) => s.toLowerCase().endsWith(".pptx")),
+  const hasOfficePdfPreviewSources = useMemo(
+    () => sourceFiles.some((s) => OFFICE_PDF_PREVIEW_EXT_REGEX.test(s)),
     [sourceFiles],
   );
 
   useEffect(() => {
-    if (!hasPptxInSources) return;
+    if (!hasOfficePdfPreviewSources) return;
     if (sofficeStatus) return;
     invoke<AppCommandResult>("check_soffice")
       .then((result) => {
@@ -3906,7 +3925,7 @@ function App() {
         if (status) setSofficeStatus(status);
       })
       .catch(() => {});
-  }, [hasPptxInSources, sofficeStatus]);
+  }, [hasOfficePdfPreviewSources, sofficeStatus]);
 
   useEffect(() => {
     if (!sofficeInstalling) return;
@@ -4081,7 +4100,7 @@ function App() {
         return;
       }
 
-      if (!selectedPath.endsWith(".md") && !TEXT_EXT_REGEX.test(selectedPath)) {
+      if (!isReadableWorkspaceTextPreview(selectedPath)) {
         setSelectedDocument({ path: selectedPath, content: null });
         return;
       }
@@ -4110,31 +4129,31 @@ function App() {
   }, [selectedPath, workspace.indexMd, workspace.logMd, workspace.workspacePath]);
 
   useEffect(() => {
-    if (!PPTX_EXT_REGEX.test(selectedPath)) {
-      setPptxRender(null);
+    if (!OFFICE_PDF_PREVIEW_EXT_REGEX.test(selectedPath)) {
+      setSourcePdfRender(null);
       return;
     }
     if (!workspace.workspacePath) return;
     if (sofficeStatus && !sofficeStatus.installed) {
-      setPptxRender({
+      setSourcePdfRender({
         sourcePath: selectedPath,
         status: "error",
-        error: "LibreOffice is required to render PowerPoint files.",
+        error: "LibreOffice is required to render Office files.",
       });
       return;
     }
     let active = true;
-    setPptxRender({ sourcePath: selectedPath, status: "pending" });
+    setSourcePdfRender({ sourcePath: selectedPath, status: "pending" });
     (async () => {
       try {
-        const pdfPath = await invoke<string>("convert_pptx_to_pdf", {
+        const pdfPath = await invoke<string>("convert_source_to_pdf", {
           relativePath: selectedPath,
         });
         if (!active) return;
-        setPptxRender({ sourcePath: selectedPath, status: "ready", pdfPath });
+        setSourcePdfRender({ sourcePath: selectedPath, status: "ready", pdfPath });
       } catch (err) {
         if (!active) return;
-        setPptxRender({
+        setSourcePdfRender({
           sourcePath: selectedPath,
           status: "error",
           error: String(err),
@@ -5333,10 +5352,12 @@ function App() {
       return;
     }
     const supported = paths.filter((p) =>
-      /\.(pdf|pptx|ppt|md|txt|png|jpe?g|webp|gif)$/i.test(p),
+      /\.(pdf|pptx?|docx?|xlsx?|md|txt|jsonl?|csv|tsv|html?|png|jpe?g|webp|gif)$/i.test(p),
     );
     if (supported.length === 0) {
-      setError("No supported files in drop. Use PDF, PPTX, MD, TXT, or images.");
+      setError(
+        "No supported files in drop. Use PDF, PPTX, DOCX, XLSX, MD, TXT, JSON, CSV, TSV, HTML, or images.",
+      );
       return;
     }
     setBusy("Importing sources");
@@ -5375,7 +5396,28 @@ function App() {
         filters: [
           {
             name: "Sources",
-            extensions: ["pdf", "pptx", "ppt", "md", "txt", "png", "jpg", "jpeg", "webp", "gif"],
+            extensions: [
+              "pdf",
+              "pptx",
+              "ppt",
+              "docx",
+              "doc",
+              "xlsx",
+              "xls",
+              "md",
+              "txt",
+              "json",
+              "jsonl",
+              "csv",
+              "tsv",
+              "html",
+              "htm",
+              "png",
+              "jpg",
+              "jpeg",
+              "webp",
+              "gif",
+            ],
           },
         ],
       });
@@ -6379,8 +6421,8 @@ function App() {
           </div>
           {error ||
           interruptedOp?.interrupted ||
-          (hasPptxInSources && sofficeInstalling) ||
-          (hasPptxInSources && sofficeStatus && !sofficeStatus.installed) ? (
+          (hasOfficePdfPreviewSources && sofficeInstalling) ||
+          (hasOfficePdfPreviewSources && sofficeStatus && !sofficeStatus.installed) ? (
             <div className="center-notices">
               {error ? (
                 <div className="banner banner-error banner-dismissible" role="alert">
@@ -6420,7 +6462,7 @@ function App() {
                 </div>
               ) : null}
 
-              {hasPptxInSources && sofficeInstalling ? (
+              {hasOfficePdfPreviewSources && sofficeInstalling ? (
                 <div className="banner banner-info">
                   <strong>Watching for LibreOffice install…</strong>
                   <p>
@@ -6430,9 +6472,9 @@ function App() {
                       : ""}
                   </p>
                 </div>
-              ) : hasPptxInSources && sofficeStatus && !sofficeStatus.installed ? (
+              ) : hasOfficePdfPreviewSources && sofficeStatus && !sofficeStatus.installed ? (
                 <div className="banner banner-warn">
-                  <strong>LibreOffice needed for .pptx files.</strong>
+                  <strong>LibreOffice needed for Office files.</strong>
                   <p>One-time install. Opens Terminal.</p>
                   <button
                     type="button"
@@ -6503,18 +6545,21 @@ function App() {
                 anchor={pendingAnchor}
                 onAnchorConsumed={() => setPendingAnchor(null)}
               />
-            ) : PPTX_EXT_REGEX.test(selectedPath) && workspace.workspacePath ? (
-              pptxRender?.sourcePath === selectedPath && pptxRender.status === "ready" && pptxRender.pdfPath ? (
+            ) : OFFICE_PDF_PREVIEW_EXT_REGEX.test(selectedPath) && workspace.workspacePath ? (
+              sourcePdfRender?.sourcePath === selectedPath &&
+              sourcePdfRender.status === "ready" &&
+              sourcePdfRender.pdfPath ? (
                 <PdfViewer
-                  key={pptxRender.pdfPath}
-                  src={makeWorkspaceAssetUrl(workspace.workspacePath, pptxRender.pdfPath)}
+                  key={sourcePdfRender.pdfPath}
+                  src={makeWorkspaceAssetUrl(workspace.workspacePath, sourcePdfRender.pdfPath)}
                   anchor={pendingAnchor}
                   onAnchorConsumed={() => setPendingAnchor(null)}
                 />
-              ) : pptxRender?.sourcePath === selectedPath && pptxRender.status === "error" ? (
+              ) : sourcePdfRender?.sourcePath === selectedPath &&
+                sourcePdfRender.status === "error" ? (
                 <div className="pptx-status pptx-status-error">
                   <strong>Couldn't render slides.</strong>
-                  <p>{pptxRender.error}</p>
+                  <p>{sourcePdfRender.error}</p>
                   {sofficeStatus && !sofficeStatus.installed ? (
                     <p>Install LibreOffice, then reopen this file.</p>
                   ) : null}
@@ -7993,7 +8038,7 @@ function App() {
           <div className="drop-overlay" aria-hidden>
             <div className="drop-overlay-card">
               <strong>Drop to import</strong>
-              <p>PDF, PPTX, MD, TXT, or images</p>
+              <p>PDF, Office, MD, TXT, JSON, CSV, HTML, or images</p>
             </div>
           </div>
         ) : null}
@@ -12138,7 +12183,10 @@ function addTreeDirectoryPaths(nodes: TreeNode[], target: Set<string>) {
 function linkLocationKind(path: string): LinkLocationKind {
   if (PDF_EXT_REGEX.test(path)) return "pdf";
   if (PPTX_EXT_REGEX.test(path)) return "slide";
-  if (path.startsWith("sources/") && (MARKDOWN_EXT_REGEX.test(path) || TEXT_EXT_REGEX.test(path))) {
+  if (
+    path.startsWith("sources/") &&
+    (MARKDOWN_EXT_REGEX.test(path) || SOURCE_TEXT_EXT_REGEX.test(path))
+  ) {
     return "sourceText";
   }
   if (MARKDOWN_EXT_REGEX.test(path)) return "wiki";

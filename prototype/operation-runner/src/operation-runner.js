@@ -531,7 +531,7 @@ async function collectRewritableFiles(current, files) {
     const entryPath = path.join(current, entry.name);
     if (entry.isDirectory()) {
       await collectRewritableFiles(entryPath, files);
-    } else if (entry.isFile() && /\.(md|txt|json|jsonl)$/i.test(entry.name)) {
+    } else if (entry.isFile() && /\.(md|txt|json|jsonl|csv|tsv|html?)$/i.test(entry.name)) {
       files.push(entryPath);
     }
   }
@@ -755,7 +755,7 @@ async function printSofficeCheck() {
   console.log(JSON.stringify(check, null, 2));
 
   if (!check.installed) {
-    console.log("\nLibreOffice (soffice) is not installed. Required to process .pptx files.");
+    console.log("\nLibreOffice (soffice) is not installed. Required to process Office source files.");
     console.log(`  ${check.installCommand}`);
   }
 }
@@ -800,7 +800,7 @@ function checkSoffice() {
     installed,
     path: installed ? pathCommand.stdout.trim().split(/\r?\n/)[0] : null,
     installCommand: "brew install --cask libreoffice",
-    purpose: "Converts .pptx sources to PDF before the existing PDF extraction pipeline runs.",
+    purpose: "Converts presentation, Word, and spreadsheet sources to PDF before the existing PDF extraction pipeline runs.",
   };
 }
 
@@ -883,14 +883,14 @@ async function runBuildWiki(workspace, options = {}) {
     const sourcePreview = options.force
       ? sourceStatus.files.filter((file) => file.state !== "removed").map((file) => file.path)
       : buildSourcePaths;
-    const hasPptx = sourcePreview.some((s) => s.toLowerCase().endsWith(".pptx"));
-    if (hasPptx) {
+    const hasLibreOfficeSources = sourcePreview.some(requiresLibreOfficeExtraction);
+    if (hasLibreOfficeSources) {
       const soffice = checkSoffice();
       if (!soffice.installed) {
         throw new Error(
-          "LibreOffice (soffice) is required to process .pptx files but was not found.\n" +
+          "LibreOffice (soffice) is required to process Office source files but was not found.\n" +
             `Install with: ${soffice.installCommand}\n` +
-            "Or convert your .pptx files to PDF and re-add them to sources/.",
+            "Or convert your Office files to PDF and re-add them to sources/.",
         );
       }
     }
@@ -2722,17 +2722,14 @@ async function prepareMaintenanceSourceGrounding(workspace, operationId, sourceS
     }
   }
 
-  const hasPptx = sourcePaths.some((sourcePath) => {
-    const lower = sourcePath.toLowerCase();
-    return lower.endsWith(".pptx") || lower.endsWith(".ppt");
-  });
-  if (hasPptx) {
+  const hasLibreOfficeSources = sourcePaths.some(requiresLibreOfficeExtraction);
+  if (hasLibreOfficeSources) {
     const soffice = checkSoffice();
     if (!soffice.installed) {
       throw new Error(
-        "LibreOffice (soffice) is required to prepare .pptx sources for source-grounded Improve Wiki but was not found.\n" +
+        "LibreOffice (soffice) is required to prepare Office sources for source-grounded Improve Wiki but was not found.\n" +
           `Install with: ${soffice.installCommand}\n` +
-          "Or convert your .pptx files to PDF and re-add them to sources/.",
+          "Or convert your Office files to PDF and re-add them to sources/.",
       );
     }
   }
@@ -2919,10 +2916,10 @@ async function buildExploreChatPrompt(workspace, options) {
 ${webModeBlock}
 
 Visual grounding rules:
-- Use attached wiki images and attached source slide images as the visual context for this answer.
-- Source slide images from .aiwiki/extracted are temporary Explore context, not wiki assets.
-- Do not claim you inspected slides or images that were not attached or present in extracted text.
-- Do not unzip or dump the full PPTX/PDF unless the attached visuals and extracted text are insufficient; if they are insufficient, say what is missing.
+- Use attached wiki images and attached source page/slide images as the visual context for this answer.
+- Source page/slide images from .aiwiki/extracted are temporary Explore context, not wiki assets.
+- Do not claim you inspected pages, slides, or images that were not attached or present in extracted text.
+- Do not unzip or dump the full Office/PDF source unless the attached visuals and extracted text are insufficient; if they are insufficient, say what is missing.
 
 Math formatting rules:
 - Wrap block equations in $$...$$ and inline formulas in $...$.
@@ -3145,7 +3142,7 @@ async function readChatContextFile(workspace, relPath, maxChars) {
   ) {
     return null;
   }
-  if (!/\.(md|txt)$/i.test(normalized)) {
+  if (!/\.(md|txt|json|jsonl|csv|tsv)$/i.test(normalized)) {
     return null;
   }
 
@@ -3851,7 +3848,19 @@ function renderExploreSourceVisualContextForPrompt(context) {
 }
 
 function isExtractableSource(sourcePath) {
-  return /\.(pdf|pptx?)$/i.test(sourcePath);
+  return isPdfSource(sourcePath) || isHtmlSource(sourcePath) || requiresLibreOfficeExtraction(sourcePath);
+}
+
+function isPdfSource(sourcePath) {
+  return /\.pdf$/i.test(sourcePath);
+}
+
+function isHtmlSource(sourcePath) {
+  return /\.html?$/i.test(sourcePath);
+}
+
+function requiresLibreOfficeExtraction(sourcePath) {
+  return /\.(pptx?|docx?|xlsx?)$/i.test(sourcePath);
 }
 
 async function prepareSelectedSourceTextForChat(workspace, sourcePath, operationId, maxChars) {
@@ -4008,33 +4017,38 @@ async function prepareSourceArtifacts(workspace, operationId, sourcePaths = null
       const imagePath = safeJoin(workspace, sourceFile);
       prepared.sources.push({
         sourcePath: sourceFile,
-	        sourceSlug: slugFromSourcePath(sourceFile),
-	        textPath: "",
-	        manifestPath: "",
-	        sourceImage: sourceFile,
-	        pageImages: [],
-	        promptPageImages: [],
-	        selectedPromptImages: [],
-	      });
-	      prepared.imageAttachments.push(imagePath);
-	      continue;
+        sourceSlug: slugFromSourcePath(sourceFile),
+        textPath: "",
+        manifestPath: "",
+        sourceImage: sourceFile,
+        pageImages: [],
+        promptPageImages: [],
+        selectedPromptImages: [],
+      });
+      prepared.imageAttachments.push(imagePath);
+      continue;
     }
 
-    const lower = sourceFile.toLowerCase();
-    const isPdf = lower.endsWith(".pdf");
-    const isPresentation = lower.endsWith(".pptx") || lower.endsWith(".ppt");
-    if (!isPdf && !isPresentation) continue;
+    const isPdf = isPdfSource(sourceFile);
+    const isHtml = isHtmlSource(sourceFile);
+    const isLibreOfficeSource = requiresLibreOfficeExtraction(sourceFile);
+    if (!isPdf && !isHtml && !isLibreOfficeSource) continue;
 
     const sourceSlug = slugFromSourcePath(sourceFile);
     const outputDir = path.join(workspace, ".aiwiki", "extracted", operationId, sourceSlug);
     await ensureDir(outputDir);
 
-    const extraction = await extractSourceArtifactsWithCache(workspace, {
-      sourceFile,
-      outputDir,
-      isPdf,
-      isPresentation,
-    });
+    const extraction = isHtml
+      ? await extractHtmlSourceArtifactsWithCache(workspace, {
+          sourceFile,
+          outputDir,
+        })
+      : await extractSourceArtifactsWithCache(workspace, {
+          sourceFile,
+          outputDir,
+          isPdf,
+          isLibreOfficeSource,
+        });
     const result = extraction.result;
     const pageImages = result.pageImages.map((imagePath) => toPosixRelative(workspace, imagePath));
     const promptPageImages = result.promptPageImages.map((imagePath) =>
@@ -4068,6 +4082,7 @@ async function prepareSourceArtifacts(workspace, operationId, sourcePaths = null
       pageCount: result.pageCount,
       pages: result.pages,
       convertedFromPptx: extraction.convertedFromPptx,
+      convertedFromOffice: extraction.convertedFromOffice,
       extractionCache: cacheEntry,
     });
     prepared.sourceExtractionCache.entries.push(cacheEntry);
@@ -4101,6 +4116,7 @@ async function extractSourceArtifactsWithCache(workspace, options) {
     return {
       result: await readRenderedPdfResult(options.outputDir),
       convertedFromPptx: !options.isPdf,
+      convertedFromOffice: !options.isPdf,
       cache: {
         hit: true,
         cacheKey,
@@ -4117,7 +4133,7 @@ async function extractSourceArtifactsWithCache(workspace, options) {
     pdfPath = sourceAbsolutePath;
   } else {
     const convertDir = path.join(options.outputDir, "converted");
-    pdfPath = await convertPptxToPdf(sourceAbsolutePath, convertDir);
+    pdfPath = await convertOfficeSourceToPdf(sourceAbsolutePath, convertDir);
     convertedFromPptx = true;
   }
 
@@ -4129,6 +4145,7 @@ async function extractSourceArtifactsWithCache(workspace, options) {
   return {
     result,
     convertedFromPptx,
+    convertedFromOffice: convertedFromPptx,
     cache: {
       hit: false,
       cacheKey,
@@ -4139,25 +4156,174 @@ async function extractSourceArtifactsWithCache(workspace, options) {
   };
 }
 
-async function convertPptxToPdf(pptxPath, outputDir) {
+async function extractHtmlSourceArtifactsWithCache(workspace, options) {
+  const sourceAbsolutePath = safeJoin(workspace, options.sourceFile);
+  const sourceBuffer = await fsp.readFile(sourceAbsolutePath);
+  const sourceSha256 = sha256(sourceBuffer);
+  const sourceExtension = path.extname(options.sourceFile).toLowerCase();
+  const cacheSettings = {
+    extractorVersion: EXTRACTOR_VERSION,
+    kind: "html-text",
+  };
+  const cacheKey = sha256(JSON.stringify({ sourceSha256, sourceExtension, cacheSettings }));
+  const cacheDir = path.join(workspace, ".aiwiki", "cache", "extracted", cacheKey);
+  const manifestPath = path.join(cacheDir, "manifest.json");
+
+  if (await exists(manifestPath)) {
+    await fsp.rm(options.outputDir, { recursive: true, force: true });
+    await copyPath(cacheDir, options.outputDir);
+    return {
+      result: await readTextSourceExtractionResult(options.outputDir),
+      convertedFromPptx: false,
+      convertedFromOffice: false,
+      cache: {
+        hit: true,
+        cacheKey,
+        cacheDir,
+        sourceSha256,
+        extractorVersion: EXTRACTOR_VERSION,
+        kind: "html-text",
+      },
+    };
+  }
+
+  const result = await extractHtmlSourceArtifacts(sourceAbsolutePath, options.outputDir, {
+    sourceFile: options.sourceFile,
+  });
+  await fsp.rm(cacheDir, { recursive: true, force: true });
+  await ensureDir(path.dirname(cacheDir));
+  await copyPath(options.outputDir, cacheDir);
+
+  return {
+    result,
+    convertedFromPptx: false,
+    convertedFromOffice: false,
+    cache: {
+      hit: false,
+      cacheKey,
+      cacheDir,
+      sourceSha256,
+      extractorVersion: EXTRACTOR_VERSION,
+      kind: "html-text",
+    },
+  };
+}
+
+async function extractHtmlSourceArtifacts(sourceAbsolutePath, outputDir, options = {}) {
+  await ensureDir(outputDir);
+  const html = await fsp.readFile(sourceAbsolutePath, "utf8");
+  const title = extractHtmlTitle(html) || path.basename(options.sourceFile || sourceAbsolutePath);
+  const text = htmlToPlainText(html);
+  const textPath = path.join(outputDir, "text.md");
+  const manifestPath = path.join(outputDir, "manifest.json");
+  const markdown = [
+    "# Extracted HTML Text",
+    "",
+    `Source: ${options.sourceFile || sourceAbsolutePath}`,
+    `Title: ${title}`,
+    "",
+    text || "(No readable text extracted.)",
+    "",
+  ].join("\n");
+  await fsp.writeFile(textPath, markdown);
+  await fsp.writeFile(
+    manifestPath,
+    `${JSON.stringify(
+      {
+        source: sourceAbsolutePath,
+        sourceType: "html",
+        pageCount: 0,
+        textPath: "text.md",
+        contactSheets: [],
+        pages: [],
+      },
+      null,
+      2,
+    )}\n`,
+  );
+  return readTextSourceExtractionResult(outputDir);
+}
+
+async function readTextSourceExtractionResult(outputDir) {
+  const manifestPath = path.join(outputDir, "manifest.json");
+  const manifest = JSON.parse(await fsp.readFile(manifestPath, "utf8"));
+  return {
+    textPath: path.join(outputDir, manifest.textPath || "text.md"),
+    manifestPath,
+    pageImages: [],
+    promptPageImages: [],
+    contactSheetPath: "",
+    contactSheets: [],
+    pageCount: 0,
+    pages: [],
+  };
+}
+
+function extractHtmlTitle(html) {
+  const match = String(html || "").match(/<title\b[^>]*>([\s\S]*?)<\/title>/i);
+  if (!match) return "";
+  return htmlToPlainText(match[1]).trim();
+}
+
+function htmlToPlainText(html) {
+  return decodeHtmlEntities(
+    String(html || "")
+      .replace(/<!--[\s\S]*?-->/g, " ")
+      .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, " ")
+      .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, " ")
+      .replace(/<\/?(?:address|article|aside|blockquote|br|dd|div|dl|dt|figcaption|figure|footer|h[1-6]|header|hr|li|main|nav|ol|p|pre|section|table|tbody|tfoot|thead|tr|ul)\b[^>]*>/gi, "\n")
+      .replace(/<\/?(?:td|th)\b[^>]*>/gi, "\t")
+      .replace(/<[^>]+>/g, " "),
+  )
+    .split(/\r?\n/)
+    .map((line) => line.replace(/\s+/g, " ").trim())
+    .filter((line, index, lines) => line || (index > 0 && lines[index - 1]))
+    .join("\n")
+    .trim();
+}
+
+function decodeHtmlEntities(text) {
+  return String(text || "").replace(/&(#x?[0-9a-f]+|amp|lt|gt|quot|apos|nbsp);/gi, (match, entity) => {
+    const normalized = String(entity).toLowerCase();
+    if (normalized === "amp") return "&";
+    if (normalized === "lt") return "<";
+    if (normalized === "gt") return ">";
+    if (normalized === "quot") return '"';
+    if (normalized === "apos") return "'";
+    if (normalized === "nbsp") return " ";
+    if (normalized.startsWith("#x")) {
+      const value = Number.parseInt(normalized.slice(2), 16);
+      return isValidCodePoint(value) ? String.fromCodePoint(value) : match;
+    }
+    if (normalized.startsWith("#")) {
+      const value = Number.parseInt(normalized.slice(1), 10);
+      return isValidCodePoint(value) ? String.fromCodePoint(value) : match;
+    }
+    return match;
+  });
+}
+
+function isValidCodePoint(value) {
+  return Number.isInteger(value) && value >= 0 && value <= 0x10ffff;
+}
+
+async function convertOfficeSourceToPdf(sourcePath, outputDir) {
   const sofficeCheck = checkSoffice();
   if (!sofficeCheck.installed) {
     throw new Error(
-      `LibreOffice (soffice) is required to process .pptx files but was not found.\n` +
+      `LibreOffice (soffice) is required to process Office source files but was not found.\n` +
         `Install with: ${sofficeCheck.installCommand}\n` +
-        `Or convert ${path.basename(pptxPath)} to PDF and re-add it to sources/.`,
+        `Or convert ${path.basename(sourcePath)} to PDF and re-add it to sources/.`,
     );
   }
 
   await ensureDir(outputDir);
-  const extension = path.extname(pptxPath).toLowerCase() === ".ppt"
-    ? ".ppt"
-    : ".pptx";
+  const extension = path.extname(sourcePath).toLowerCase() || ".source";
   const stagedInputPath = path.join(outputDir, `source${extension}`);
   const expectedPdfPath = path.join(outputDir, "source.pdf");
   await fsp.rm(stagedInputPath, { force: true }).catch(() => {});
   await fsp.rm(expectedPdfPath, { force: true }).catch(() => {});
-  await fsp.copyFile(pptxPath, stagedInputPath);
+  await fsp.copyFile(sourcePath, stagedInputPath);
 
   const result = spawnSync(
     "soffice",
@@ -4177,7 +4343,7 @@ async function convertPptxToPdf(pptxPath, outputDir) {
   }
   if (result.status !== 0) {
     throw new Error(
-      `soffice failed for ${pptxPath}\n${cleanCommandText(result.stderr || result.stdout)}`,
+      `soffice failed for ${sourcePath}\n${cleanCommandText(result.stderr || result.stdout)}`,
     );
   }
 
@@ -4199,6 +4365,10 @@ async function convertPptxToPdf(pptxPath, outputDir) {
 
   await fsp.rm(stagedInputPath, { force: true }).catch(() => {});
   return convertedPdfPath;
+}
+
+async function convertPptxToPdf(pptxPath, outputDir) {
+  return convertOfficeSourceToPdf(pptxPath, outputDir);
 }
 
 function isPromptImageSource(sourcePath) {
