@@ -190,6 +190,7 @@ const REQUIRED_NODE_MAJOR: u32 = 20;
 const PROVIDER_COMMAND_TIMEOUT_MS: u64 = 8_000;
 const SCHEMA_UPDATE_METADATA_FILE: &str = "schema-update.json";
 const ASSET_REGISTRY_PATH: &str = "wiki/assets/assets.json";
+const MAPLE_GUIDE_KNOWLEDGE: &str = include_str!("../../src/help/maple-guide.md");
 
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -297,6 +298,28 @@ struct ExploreChatRunnerReport {
     completed_at: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MapleGuideRunnerReport {
+    status: String,
+    provider: String,
+    model: String,
+    #[serde(default)]
+    reasoning_effort: String,
+    answer: String,
+    completed_at: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MapleGuideAnswer {
+    answer: String,
+    provider: String,
+    model: String,
+    reasoning_effort: String,
+    completed_at: String,
+}
+
 #[derive(Deserialize, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct ApplyChatMessagePayload {
@@ -372,6 +395,14 @@ fn default_model_for_provider(provider: &str) -> &'static str {
     match provider {
         "claude" => "claude-sonnet-4-6",
         _ => "gpt-5.5",
+    }
+}
+
+fn default_maple_guide_model_for_provider(provider: &str) -> &'static str {
+    match provider {
+        "codex" => "gpt-5.4-mini",
+        "claude" => "claude-haiku-4-5-20251001",
+        _ => default_model_for_provider(provider),
     }
 }
 
@@ -886,7 +917,9 @@ async fn discover_provider_helpers(
     provider_binary_name(&name)?;
     let settings = read_settings(&app);
     apply_provider_path_env(&settings);
-    let report = build_provider_check_report(&name, &settings);
+    let saved_path = settings.provider_paths.get(&name).cloned();
+    let report = simulated_provider_check(&name, saved_path)?
+        .unwrap_or_else(|| build_provider_check_report(&name, &settings));
     cache_provider_status(&cache, &name, &report);
     Ok(report)
 }
@@ -932,22 +965,28 @@ async fn install_provider(
     name: String,
     cache: State<'_, ProviderStatusCache>,
 ) -> Result<RunnerOutput, String> {
+    provider_binary_name(&name)?;
+    if simulated_provider_check(&name, None)?.is_some() {
+        invalidate_provider_status(&cache, &name);
+        return Ok(simulated_terminal_output(&name, "install"));
+    }
+
     let runtime = node_runtime_status();
     if !runtime.node_installed {
         return Err(
-            "Node.js is required before installing an AI provider. Install Node.js first, then recheck."
+            "Node.js is required before setting up this connection. Install Node.js first, then check connection status."
                 .to_string(),
         );
     }
     if !runtime.node_version_supported {
         return Err(format!(
-            "Maple needs Node.js {} or newer before installing an AI provider. Update Node.js first, then recheck.",
+            "Maple needs Node.js {} or newer before setting up this connection. Update Node.js first, then check connection status.",
             runtime.required_node_major
         ));
     }
     if !runtime.npm_installed {
         return Err(
-            "npm is required before installing this AI provider with Maple's current installer. Install Node.js with npm first, then recheck."
+            "One required part of the Node.js setup is missing before setting up this connection. Install Node.js from the official page, then check connection status."
                 .to_string(),
         );
     }
@@ -967,9 +1006,25 @@ async fn login_provider(
     name: String,
     cache: State<'_, ProviderStatusCache>,
 ) -> Result<RunnerOutput, String> {
-    let cmd = login_command_for_settings(&read_settings(&app), &name)?;
+    let settings = read_settings(&app);
+    let saved_path = settings.provider_paths.get(&name).cloned();
+    if simulated_provider_check(&name, saved_path)?.is_some() {
+        invalidate_provider_status(&cache, &name);
+        return Ok(simulated_terminal_output(&name, "sign-in"));
+    }
+
+    let cmd = login_command_for_settings(&settings, &name)?;
     invalidate_provider_status(&cache, &name);
     open_terminal_with(&cmd)
+}
+
+fn simulated_terminal_output(name: &str, action: &str) -> RunnerOutput {
+    RunnerOutput {
+        success: true,
+        code: Some(0),
+        stdout: format!("Simulated {action} for {name}. No real command was run."),
+        stderr: String::new(),
+    }
 }
 
 fn open_terminal_with(command: &str) -> Result<RunnerOutput, String> {
@@ -1023,10 +1078,11 @@ fn terminal_command_script(command: &str) -> Result<String, String> {
         r#"#!/bin/zsh -l
 rm -f "$0"
 export PATH={path_env}
-printf '\nMaple is running:\n  %s\n\n' {display_command}
+printf '\nMaple opened this setup window to finish AI connection setup.\n'
+printf 'Technical command:\n  %s\n\n' {display_command}
 {command}
-status=$?
-printf '\nMaple command finished with exit code %s.\n' "$status"
+exit_code=$?
+printf '\nMaple setup command finished with exit code %s.\n' "$exit_code"
 printf 'You can close this Terminal window after you review the output.\n'
 exec "${{SHELL:-/bin/zsh}}" -l
 "#,
@@ -1081,10 +1137,8 @@ fn run_provider_check(app: &AppHandle, name: &str) -> Result<ProviderCheckReport
     let settings = read_settings(app);
     apply_provider_path_env(&settings);
     let saved_path = settings.provider_paths.get(name).cloned();
-    if saved_path.is_none() {
-        if let Some(report) = simulated_provider_check(name, saved_path)? {
-            return Ok(report);
-        }
+    if let Some(report) = simulated_provider_check(name, saved_path.clone())? {
+        return Ok(report);
     }
     Ok(build_provider_check_report(name, &settings))
 }
@@ -6531,6 +6585,85 @@ async fn start_explore_chat(
 }
 
 #[tauri::command]
+async fn ask_maple_guide(
+    app: AppHandle,
+    question: String,
+    history_json: Option<String>,
+    app_state: Option<String>,
+    state: State<'_, WorkspaceStore>,
+    provider_cache: State<'_, ProviderStatusCache>,
+) -> Result<MapleGuideAnswer, String> {
+    let question = question.trim().to_string();
+    if question.is_empty() {
+        return Err("Ask Maple Guide a question first.".to_string());
+    }
+
+    let settings = read_settings(&app);
+    let provider = settings.provider.clone();
+    ensure_provider_ready(&app, &provider_cache, &provider)?;
+    let model = default_maple_guide_model_for_provider(&provider).to_string();
+    let reasoning_effort = default_reasoning_effort_for_model(&provider, &model).to_string();
+
+    let mut runner_args = vec!["maple-guide-chat".to_string()];
+    if let Some(workspace) = current_workspace_optional(&state) {
+        runner_args.push(workspace.to_string_lossy().to_string());
+    } else {
+        runner_args.push("--no-workspace".to_string());
+    }
+    runner_args.extend([
+        "--provider".to_string(),
+        provider,
+        "--model".to_string(),
+        model,
+        "--reasoning-effort".to_string(),
+        reasoning_effort,
+        "--question".to_string(),
+        question,
+        "--history-json".to_string(),
+        history_json.unwrap_or_default(),
+        "--app-state".to_string(),
+        app_state.unwrap_or_default(),
+        "--guide-json".to_string(),
+        serde_json::to_string(MAPLE_GUIDE_KNOWLEDGE)
+            .map_err(|error| format!("Failed to serialize Maple Guide knowledge: {error}"))?,
+        "--chat-id".to_string(),
+        make_local_id("guide"),
+        "--skip-provider-check".to_string(),
+    ]);
+
+    runner_root()?;
+    node_executable()?;
+    let runner = run_runner_with_args(&runner_args)?;
+    let report = extract_json_from_runner_stdout::<MapleGuideRunnerReport>(&runner.stdout)
+        .map_err(|parse_error| {
+            if runner.stderr.trim().is_empty() {
+                parse_error
+            } else {
+                runner.stderr.trim().to_string()
+            }
+        })?;
+
+    if !runner.success || report.status != "completed" {
+        let detail = if !runner.stderr.trim().is_empty() {
+            runner.stderr.trim().to_string()
+        } else if !report.answer.trim().is_empty() {
+            report.answer.trim().to_string()
+        } else {
+            format!("Maple Guide failed with status: {}.", report.status)
+        };
+        return Err(detail);
+    }
+
+    Ok(MapleGuideAnswer {
+        answer: report.answer,
+        provider: report.provider,
+        model: report.model,
+        reasoning_effort: report.reasoning_effort,
+        completed_at: report.completed_at,
+    })
+}
+
+#[tauri::command]
 async fn start_maintain_discussion(
     app: AppHandle,
     thread_id: String,
@@ -9747,8 +9880,11 @@ not-json
     fn terminal_command_script_runs_exact_provider_command() {
         let script = terminal_command_script("npm i -g @openai/codex").unwrap();
         assert!(
-            script.contains("printf '\\nMaple is running:\\n  %s\\n\\n' 'npm i -g @openai/codex'")
+            script.contains(
+                "printf '\\nMaple opened this setup window to finish AI connection setup.\\n'"
+            )
         );
+        assert!(script.contains("printf 'Technical command:\\n  %s\\n\\n' 'npm i -g @openai/codex'"));
         assert!(script.contains("\nnpm i -g @openai/codex\n"));
         assert!(script.contains("exec \"${SHELL:-/bin/zsh}\" -l"));
     }
@@ -10213,6 +10349,7 @@ pub fn run() {
             update_wiki_rules,
             ask_wiki,
             start_explore_chat,
+            ask_maple_guide,
             start_maintain_discussion,
             apply_chat_to_wiki,
             run_maintain_thread_operation,

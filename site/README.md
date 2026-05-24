@@ -33,3 +33,22 @@ LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8 \
 
 The site download link does not need to change when a new release is published
 with the same DMG naming pattern.
+
+## Launch Demo Video
+
+The homepage uses:
+
+```text
+assets/maple-launch-demo.mp4
+assets/maple-launch-demo-poster.jpg
+```
+
+Regenerate the current screenshot-based launch demo with:
+
+```bash
+node create-launch-demo-video.mjs
+```
+
+This is a lightweight site video built from the checked-in Maple screenshots.
+Replace the MP4 and poster with a ScreenStudio export when a live capture is
+ready.

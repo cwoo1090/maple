@@ -8,6 +8,8 @@ const posthogHost = import.meta.env.VITE_POSTHOG_HOST || "https://us.i.posthog.c
 const posthogReplayEnabled = import.meta.env.VITE_POSTHOG_REPLAY_ENABLED !== "false";
 const posthogFullReplay = import.meta.env.VITE_POSTHOG_FULL_REPLAY !== "false";
 const posthogReplaySampleRate = readSampleRate(import.meta.env.VITE_POSTHOG_REPLAY_SAMPLE_RATE);
+const posthogExcludedHosts = readList(import.meta.env.VITE_POSTHOG_EXCLUDED_HOSTS || "localhost:1420");
+const posthogExcludedDistinctIds = readList(import.meta.env.VITE_POSTHOG_EXCLUDED_DISTINCT_IDS);
 const redactedPropertyNames = new Set([
   "$city_name",
   "$current_url",
@@ -45,8 +47,56 @@ function readSampleRate(value: string | undefined): number {
   return Math.min(Math.max(parsed, 0), 1);
 }
 
+function readList(value: string | undefined): string[] {
+  if (!value) return [];
+  return value
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
 function hasAnalyticsConfig() {
   return Boolean(posthogKey && posthogHost);
+}
+
+function isExcludedHost() {
+  if (typeof window === "undefined") return false;
+  const currentHost = window.location.host.toLowerCase();
+  return posthogExcludedHosts.some((host) => host.toLowerCase() === currentHost);
+}
+
+function readStoredPostHogDistinctIds(): string[] {
+  if (typeof window === "undefined") return [];
+
+  try {
+    const ids = new Set<string>();
+    for (let index = 0; index < window.localStorage.length; index += 1) {
+      const key = window.localStorage.key(index);
+      if (!key?.startsWith("ph_") || !key.includes("posthog")) continue;
+
+      const value = window.localStorage.getItem(key);
+      if (!value) continue;
+
+      const properties = JSON.parse(value) as Record<string, unknown>;
+      for (const propertyName of ["distinct_id", "$user_id"]) {
+        const id = properties[propertyName];
+        if (typeof id === "string" && id) ids.add(id);
+      }
+    }
+    return Array.from(ids);
+  } catch {
+    return [];
+  }
+}
+
+function isExcludedDistinctId() {
+  if (posthogExcludedDistinctIds.length === 0) return false;
+  const excludedIds = new Set(posthogExcludedDistinctIds);
+  return readStoredPostHogDistinctIds().some((id) => excludedIds.has(id));
+}
+
+function shouldDisablePostHog() {
+  return isExcludedHost() || isExcludedDistinctId();
 }
 
 function redactProperties(properties: Properties | undefined): Properties {
@@ -84,7 +134,7 @@ function clientDeviceProperties(): AnalyticsProperties {
 }
 
 function initializePostHog() {
-  if (initialized || !hasAnalyticsConfig()) return;
+  if (initialized || !hasAnalyticsConfig() || shouldDisablePostHog()) return;
 
   posthog.init(posthogKey, {
     api_host: posthogHost,
@@ -133,6 +183,11 @@ function initializePostHog() {
   });
 
   initialized = true;
+  if (posthogExcludedDistinctIds.includes(posthog.get_distinct_id())) {
+    posthog.opt_out_capturing();
+    return;
+  }
+
   posthog.opt_in_capturing();
   if (posthogReplayEnabled) {
     posthog.startSessionRecording(true);

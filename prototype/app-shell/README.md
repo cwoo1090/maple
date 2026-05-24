@@ -22,6 +22,30 @@ npm run tauri build
 npm run tauri dev
 ```
 
+## Analytics
+
+PostHog is disabled by default on `localhost:1420` so local Tauri dev sessions
+are not collected or recorded. To exclude specific PostHog distinct IDs in
+other environments, set:
+
+```bash
+VITE_POSTHOG_EXCLUDED_DISTINCT_IDS=uuid-1,uuid-2
+```
+
+The AI connection funnel is intentionally granular for Codex/ChatGPT and Claude
+setup:
+
+- `ai connection runtime check started|completed|failed`
+- `ai connection check started|completed|failed`
+- `ai connection action started|blocked|launched|failed`
+- `ai connection poll started|attempt|completed|timed out|failed`
+- `ai connection helper save started|saved|failed`
+- `ai setup provider selected|selection saved|selection failed`
+
+These events use booleans and counts for local state, such as Node/npm readiness,
+provider installed/logged-in status, candidate counts, warning counts, and
+whether a saved path exists. They do not send local binary paths.
+
 ## Setup UX Simulation
 
 Use these dev-only environment flags to test first-run setup states without

@@ -3,12 +3,15 @@
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const fsp = require("node:fs/promises");
+const os = require("node:os");
 const path = require("node:path");
 const { spawn, spawnSync } = require("node:child_process");
 
 const { selectProvider } = require("./providers");
 
 const PROTOTYPE_ROOT = path.resolve(__dirname, "..");
+const APP_SHELL_ROOT = path.resolve(PROTOTYPE_ROOT, "..", "app-shell");
+const MAPLE_GUIDE_KNOWLEDGE_PATH = path.join(APP_SHELL_ROOT, "src", "help", "maple-guide.md");
 const WORKSPACE_TEMPLATE_DIR = path.resolve(PROTOTYPE_ROOT, "..", "workspace-template");
 const WORKSPACE_SCHEMA_TEMPLATE_PATH = path.join(WORKSPACE_TEMPLATE_DIR, "schema.md");
 const DEFAULT_WORKSPACE = path.join(PROTOTYPE_ROOT, "sample-workspace");
@@ -55,6 +58,9 @@ const MAX_FULL_SLIDE_ATTACHMENTS_TOTAL = 20;
 const SLIDE_SELECTION_TIMEOUT_MS = 2 * 60 * 1000;
 const EXPLORE_CHAT_HISTORY_LIMIT = 6;
 const EXPLORE_CHAT_HISTORY_TEXT_LIMIT = 2000;
+const MAPLE_GUIDE_HISTORY_LIMIT = 8;
+const MAPLE_GUIDE_HISTORY_TEXT_LIMIT = 1600;
+const MAPLE_GUIDE_APP_STATE_LIMIT = 6000;
 const EXPLORE_CHAT_IMAGE_ATTACHMENT_LIMIT = 5;
 const EXPLORE_SOURCE_VISUAL_PAGE_LIMIT = 3;
 const EXPLORE_SOURCE_VISUAL_EXPLICIT_PAGE_LIMIT = 5;
@@ -274,6 +280,21 @@ async function main(argv = process.argv.slice(2)) {
           timeoutMs: parsePositiveInteger(flags["timeout-ms"], 0),
         });
         break;
+      case "maple-guide-chat":
+      case "guide-chat":
+        await runMapleGuideChat(flags["no-workspace"] ? "" : resolveWorkspace(args[0]), {
+          provider: flags.provider || "codex",
+          model: flags.model || "",
+          reasoningEffort: flags["reasoning-effort"] || "",
+          chatId: flags["chat-id"] || "",
+          question: flags.question || "",
+          historyJson: flags["history-json"] || "",
+          appState: flags["app-state"] || "",
+          guideJson: flags["guide-json"] || "",
+          skipProviderCheck: Boolean(flags["skip-provider-check"]),
+          timeoutMs: parsePositiveInteger(flags["timeout-ms"], 0),
+        });
+        break;
       case "apply-chat":
         await runApplyChat(resolveWorkspace(args[0]), {
           provider: flags.provider || "codex",
@@ -340,6 +361,8 @@ Usage:
   node src/operation-runner.js update-rules [workspace] [--provider codex|claude] [--model <id>] [--reasoning-effort <id>] --instruction "..." [--operation-id <id>]
   node src/operation-runner.js ask [workspace] [--provider codex|claude] [--model <id>] [--reasoning-effort <id>] --question "..." [--selected-path wiki/page.md] [--history-json "[...]"] [--chat-id <id>] [--skip-provider-check]
   node src/operation-runner.js explore-chat [workspace] [--provider codex|claude] [--model <id>] [--reasoning-effort <id>] --question "..." [--selected-path wiki/page.md] [--history-json "[...]"] [--chat-id <id>] [--skip-provider-check]
+  node src/operation-runner.js maple-guide-chat [workspace] [--no-workspace] [--provider codex|claude] [--model <id>] [--reasoning-effort <id>] --question "..." [--history-json "[...]"] [--app-state "..."] [--guide-json "..."] [--chat-id <id>] [--skip-provider-check]
+    Defaults to a lightweight guide model: gpt-5.4-mini for Codex, Claude Haiku for Claude.
   node src/operation-runner.js apply-chat [workspace] [--provider codex|claude] [--model <id>] [--reasoning-effort <id>] --payload-file .aiwiki/chat-threads/apply-payload.json [--operation-id <id>] [--skip-provider-check]
   node src/operation-runner.js status [workspace]
   node src/operation-runner.js undo [workspace]
@@ -1332,6 +1355,228 @@ async function runExploreChat(workspace, options = {}) {
   if (providerResult.exitCode !== 0) {
     process.exitCode = providerResult.exitCode || 1;
   }
+}
+
+async function runMapleGuideChat(workspace, options = {}) {
+  const question = String(options.question || "").trim();
+  if (!question) {
+    throw new Error("Maple Guide requires a non-empty question.");
+  }
+
+  const provider = selectProvider(options.provider || "codex");
+  if (!options.skipProviderCheck) {
+    const installed = provider.checkInstalled();
+    if (!installed.installed) {
+      throw new Error(`${provider.name} CLI is not installed. Run: ${provider.installCommand}`);
+    }
+    const auth = provider.checkLoggedIn();
+    if (!auth.loggedIn) {
+      throw new Error(`${provider.name} login was not confirmed. Run: ${provider.loginCommand}`);
+    }
+  }
+
+  const chatId = normalizeOperationId(options.chatId) || createOperationId();
+  const model = options.model || defaultMapleGuideModel(provider);
+  const reasoningEffort = selectedReasoningEffort(provider, model, options);
+  const hasWorkspace = Boolean(workspace && (await exists(workspace)));
+  const runCwd = hasWorkspace ? workspace : PROTOTYPE_ROOT;
+  const chatDir = hasWorkspace
+    ? path.join(workspace, ".aiwiki", "guide-chat", chatId)
+    : path.join(os.tmpdir(), "maple-guide-chat", chatId);
+  await ensureDir(chatDir);
+
+  const guide = await readMapleGuideKnowledge(options);
+  const history = parseMapleGuideHistory(options.historyJson);
+  const appState = clipText(String(options.appState || "").trim(), MAPLE_GUIDE_APP_STATE_LIMIT);
+  const startedAt = new Date().toISOString();
+  const prompt = buildMapleGuidePrompt({
+    guide,
+    history,
+    appState,
+    question,
+    workspace: hasWorkspace ? workspace : "",
+  });
+
+  const promptPath = path.join(chatDir, "prompt.md");
+  const eventsPath = path.join(chatDir, "events.jsonl");
+  const stderrPath = path.join(chatDir, "stderr.log");
+  const lastMessagePath = path.join(chatDir, "answer.md");
+  const reportPath = path.join(chatDir, "report.json");
+  await fsp.writeFile(promptPath, prompt);
+
+  const args = provider.askExecArgs({
+    workspace: runCwd,
+    model,
+    reasoningEffort,
+    lastMessagePath,
+    maxTurns: 6,
+  });
+
+  const providerResult = await runProviderExec(provider, args, prompt, {
+    cwd: runCwd,
+    eventsPath,
+    stderrPath,
+    lastMessagePath,
+    runningMarkerPath: path.join(chatDir, "running.json"),
+    timeoutMs: options.timeoutMs || 3 * 60 * 1000,
+    operationId: chatId,
+    operationType: "maple-guide-chat",
+    mirrorStdout: false,
+    mirrorStderr: false,
+  });
+
+  const finalize = await provider.finalizeLastMessage({
+    eventsPath,
+    lastMessagePath,
+  });
+  const answer = await fsp.readFile(lastMessagePath, "utf8").catch(() => "");
+  const completedAt = new Date().toISOString();
+  const status =
+    providerResult.timedOut
+      ? "timed_out"
+      : providerResult.cancelled
+        ? "cancelled"
+        : finalize.subtype === "error_during_execution" || providerResult.exitCode !== 0
+          ? "provider_failed"
+          : answer.trim()
+            ? "completed"
+            : "empty_answer";
+
+  const report = {
+    id: chatId,
+    type: "maple-guide-chat",
+    provider: provider.name,
+    model,
+    reasoningEffort,
+    status,
+    workspace: hasWorkspace ? workspace : "",
+    selectedPath: "",
+    question,
+    historyCount: history.length,
+    webSearchEnabled: false,
+    answer,
+    startedAt,
+    completedAt,
+    promptPath: hasWorkspace ? path.relative(workspace, promptPath) : promptPath,
+    eventsPath: hasWorkspace ? path.relative(workspace, eventsPath) : eventsPath,
+    stderrPath: hasWorkspace ? path.relative(workspace, stderrPath) : stderrPath,
+  };
+
+  await fsp.writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`);
+  console.log(JSON.stringify(report, null, 2));
+
+  if (providerResult.exitCode !== 0) {
+    process.exitCode = providerResult.exitCode || 1;
+  }
+}
+
+function defaultMapleGuideModel(provider) {
+  const supported = new Set((provider.supportedModels || []).map((model) => model.id));
+  if (provider.name === "codex" && supported.has("gpt-5.4-mini")) {
+    return "gpt-5.4-mini";
+  }
+  if (provider.name === "claude" && supported.has("claude-haiku-4-5-20251001")) {
+    return "claude-haiku-4-5-20251001";
+  }
+  return provider.defaultModel;
+}
+
+async function readMapleGuideKnowledge(options = {}) {
+  if (options.guideJson) {
+    try {
+      const parsed = JSON.parse(options.guideJson);
+      if (typeof parsed === "string" && parsed.trim()) {
+        return parsed;
+      }
+    } catch (_error) {
+      throw new Error("Maple Guide knowledge must be valid JSON string content.");
+    }
+  }
+
+  try {
+    return await fsp.readFile(MAPLE_GUIDE_KNOWLEDGE_PATH, "utf8");
+  } catch (error) {
+    throw new Error(`Failed to read Maple Guide knowledge base: ${error.message}`);
+  }
+}
+
+function parseMapleGuideHistory(historyJson) {
+  if (!historyJson) return [];
+
+  let parsed;
+  try {
+    parsed = JSON.parse(historyJson);
+  } catch (_error) {
+    throw new Error("Maple Guide history must be valid JSON.");
+  }
+
+  if (!Array.isArray(parsed)) {
+    throw new Error("Maple Guide history must be a JSON array.");
+  }
+
+  return parsed
+    .filter((message) =>
+      message &&
+      (message.role === "user" || message.role === "assistant") &&
+      typeof message.text === "string" &&
+      message.text.trim(),
+    )
+    .slice(-MAPLE_GUIDE_HISTORY_LIMIT)
+    .map((message) => ({
+      role: message.role,
+      text: clipText(message.text, MAPLE_GUIDE_HISTORY_TEXT_LIMIT),
+    }));
+}
+
+function renderMapleGuideHistory(history) {
+  if (!history.length) return "No previous Maple Guide conversation.";
+  return history
+    .map((message) => {
+      const label = message.role === "user" ? "User" : "Assistant";
+      return `${label}: ${message.text}`;
+    })
+    .join("\n\n");
+}
+
+function buildMapleGuidePrompt(options) {
+  const workspaceLine = options.workspace
+    ? `Open workspace path: ${options.workspace}`
+    : "Open workspace path: none";
+  const appState = options.appState || "No live app state was provided.";
+
+  return `You are Maple Guide, the in-app help assistant for Maple.
+
+Use the built-in Maple Guide Knowledge Base below as your primary source of truth.
+
+Hard rules:
+- Do not write, edit, rename, delete, or create files.
+- Do not run shell commands.
+- Do not answer as if you are Explore Chat. Explore Chat answers questions about wiki content; Maple Guide explains how to use the Maple app.
+- Use the current app state when it helps, but do not invent app state that was not provided.
+- Give short, concrete UI steps.
+- Answer in the same language as the user.
+
+${workspaceLine}
+
+Current app state:
+${appState}
+
+Recent Maple Guide conversation:
+${renderMapleGuideHistory(options.history || [])}
+
+Maple Guide Knowledge Base:
+${options.guide}
+
+User question:
+${String(options.question || "").trim()}
+
+Answer now as Maple Guide.`;
+}
+
+function clipText(text, limit) {
+  const value = String(text || "");
+  if (value.length <= limit) return value;
+  return `${value.slice(0, limit)}\n\n[truncated]`;
 }
 
 async function runApplyChat(workspace, options = {}) {

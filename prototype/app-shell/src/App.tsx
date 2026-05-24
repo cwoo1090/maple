@@ -11,6 +11,7 @@ import {
   type ClipboardEvent as ReactClipboardEvent,
   type CSSProperties,
   type DragEvent as ReactDragEvent,
+  type FormEvent as ReactFormEvent,
   type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
   type RefObject,
@@ -70,6 +71,7 @@ import {
 } from "./ModelReasoningPicker";
 import { Settings } from "./Settings";
 import { setAnalyticsContext, track } from "./analytics";
+import { translate, useI18n, type UiLanguage } from "./i18n";
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
@@ -351,6 +353,26 @@ type ExploreChatMessage = {
   completedAt?: string;
 };
 
+type MapleGuideMessage = {
+  id: string;
+  role: "user" | "assistant";
+  text: string;
+  status: "completed" | "streaming" | "failed";
+  provider?: string;
+  model?: string;
+  reasoningEffort?: string;
+  createdAt: string;
+  completedAt?: string;
+};
+
+type MapleGuideAnswer = {
+  answer: string;
+  provider: string;
+  model: string;
+  reasoningEffort: string;
+  completedAt: string;
+};
+
 type ChatThread = {
   schemaVersion: number;
   id: string;
@@ -446,7 +468,7 @@ type BuildDraft = {
 } | null;
 
 type RightPanelMode = "explore" | "maintain";
-type AiSetupPromptReason = "build" | "chat" | "maintain" | null;
+type AiSetupPromptReason = "onboarding" | "build" | "chat" | "maintain" | null;
 type AiSetupReason = Exclude<AiSetupPromptReason, null>;
 type AppUpdateStatus =
   | "idle"
@@ -523,11 +545,6 @@ type CenterTab =
       kind: "graph";
       title: string;
     };
-
-const APPLY_SCOPE_OPTIONS: Array<{ value: ApplyScope; label: string }> = [
-  { value: "question-and-answer", label: "Current Q&A" },
-  { value: "selected-messages", label: "Choose messages" },
-];
 
 const WIKI_UPDATE_STEPS = [
   "Collecting selected chat",
@@ -715,6 +732,58 @@ const MAINTAIN_TASKS: MaintainTaskConfig[] = [
 const MAINTAIN_TASK_BY_ID = Object.fromEntries(
   MAINTAIN_TASKS.map((task) => [task.id, task]),
 ) as Record<MaintainTaskId, MaintainTaskConfig>;
+
+type MaintainTaskUiCopy = Pick<
+  MaintainTaskConfig,
+  "label" | "summary" | "guidanceLabel" | "busyLabel" | "actionLabel" | "placeholder"
+> & {
+  contextHint: string;
+};
+
+function maintainTaskUiCopy(id: MaintainTaskId, language: UiLanguage): MaintainTaskUiCopy {
+  switch (id) {
+    case "healthcheck":
+      return {
+        label: translate(language, "maintain.healthcheck.label"),
+        summary: translate(language, "maintain.healthcheck.summary"),
+        guidanceLabel: translate(language, "maintain.healthcheck.guidance"),
+        busyLabel: translate(language, "maintain.healthcheck.busy"),
+        actionLabel: translate(language, "maintain.healthcheck.action"),
+        placeholder: translate(language, "maintain.healthcheck.placeholder"),
+        contextHint: translate(language, "maintain.healthcheck.context"),
+      };
+    case "improveWiki":
+      return {
+        label: translate(language, "maintain.improve.label"),
+        summary: translate(language, "maintain.improve.summary"),
+        guidanceLabel: translate(language, "maintain.improve.guidance"),
+        busyLabel: translate(language, "maintain.improve.busy"),
+        actionLabel: translate(language, "maintain.improve.action"),
+        placeholder: translate(language, "maintain.improve.placeholder"),
+        contextHint: translate(language, "maintain.improve.context"),
+      };
+    case "organizeSources":
+      return {
+        label: translate(language, "maintain.organize.label"),
+        summary: translate(language, "maintain.organize.summary"),
+        guidanceLabel: translate(language, "maintain.organize.guidance"),
+        busyLabel: translate(language, "maintain.organize.busy"),
+        actionLabel: translate(language, "maintain.organize.action"),
+        placeholder: translate(language, "maintain.organize.placeholder"),
+        contextHint: translate(language, "maintain.organize.context"),
+      };
+    case "updateRules":
+      return {
+        label: translate(language, "maintain.rules.label"),
+        summary: translate(language, "maintain.rules.summary"),
+        guidanceLabel: translate(language, "maintain.rules.guidance"),
+        busyLabel: translate(language, "maintain.rules.busy"),
+        actionLabel: translate(language, "maintain.rules.action"),
+        placeholder: translate(language, "maintain.rules.placeholder"),
+        contextHint: translate(language, "maintain.rules.context"),
+      };
+  }
+}
 
 const MAINTAIN_TASK_ID_BY_OPERATION: Record<string, MaintainTaskId> = {
   "wiki-healthcheck": "healthcheck",
@@ -998,29 +1067,35 @@ function displayProviderName(provider: ProviderInfo): string {
   return provider.label;
 }
 
-function sourceStateLabel(state: SourceState): string {
+function aiProviderHint(provider: ProviderInfo, language: UiLanguage = "en"): string {
+  if (provider.name === "codex") return translate(language, "app.ai.chatgptHint");
+  if (provider.name === "claude") return translate(language, "app.ai.claudeHint");
+  return translate(language, "app.ai.otherProviderHint");
+}
+
+function sourceStateLabel(state: SourceState, language: UiLanguage = "en"): string {
   switch (state) {
     case "new":
-      return "New";
+      return translate(language, "app.common.new");
     case "modified":
-      return "Modified";
+      return language === "ko" ? "수정됨" : "Modified";
     case "removed":
-      return "Removed";
+      return language === "ko" ? "삭제됨" : "Removed";
     default:
-      return "Unchanged";
+      return language === "ko" ? "변경 없음" : "Unchanged";
   }
 }
 
-function wikiChangeStateLabel(state: WikiChangeState | undefined): string {
+function wikiChangeStateLabel(state: WikiChangeState | undefined, language: UiLanguage = "en"): string {
   switch (state) {
     case "added":
-      return "Added";
+      return language === "ko" ? "추가됨" : "Added";
     case "modified":
-      return "Modified";
+      return language === "ko" ? "수정됨" : "Modified";
     case "deleted":
-      return "Deleted";
+      return language === "ko" ? "삭제됨" : "Deleted";
     default:
-      return "Changed";
+      return language === "ko" ? "변경됨" : "Changed";
   }
 }
 
@@ -1398,9 +1473,11 @@ function wikiTitleProperties(state: WorkspaceState) {
 }
 
 function App() {
+  const { t, language, setLanguage } = useI18n();
   const appBodyRef = useRef<HTMLDivElement | null>(null);
   const exploreChatMessagesRef = useRef<HTMLDivElement | null>(null);
   const maintainChatMessagesRef = useRef<HTMLDivElement | null>(null);
+  const mapleGuideMessagesRef = useRef<HTMLDivElement | null>(null);
   const topbarWorkspaceMenuRef = useRef<HTMLDetailsElement | null>(null);
   const topbarMenuRef = useRef<HTMLDetailsElement | null>(null);
   const chatHistoryButtonRef = useRef<HTMLButtonElement | null>(null);
@@ -1497,6 +1574,8 @@ function App() {
   const wikiExploredTrackedRef = useRef(false);
   const onboardingStepTrackedRef = useRef<Set<string>>(new Set());
   const providerSetupTrackedRef = useRef<Set<string>>(new Set());
+  const aiSetupWizardTrackedRef = useRef<Set<string>>(new Set());
+  const aiSetupCompletedTrackedRef = useRef<Set<string>>(new Set());
   const [chatRunProgressById, setChatRunProgressById] = useState<Record<string, OperationProgress>>(
     {},
   );
@@ -1526,6 +1605,10 @@ function App() {
   ]);
   const [activeCenterTabId, setActiveCenterTabId] = useState("workspace:index.md");
   const [showSettings, setShowSettings] = useState(false);
+  const [mapleGuideOpen, setMapleGuideOpen] = useState(false);
+  const [mapleGuideQuestion, setMapleGuideQuestion] = useState("");
+  const [mapleGuideMessages, setMapleGuideMessages] = useState<MapleGuideMessage[]>([]);
+  const [mapleGuideBusy, setMapleGuideBusy] = useState(false);
   const [leftPanelWidth, setLeftPanelWidth] = useState(() =>
     readStoredPanelWidth(
       LEFT_PANEL_WIDTH_KEY,
@@ -1822,7 +1905,9 @@ function App() {
     ? "A workspace action is running. Wait for it to finish before updating schema.md."
     : null;
   const schemaUpdateButtonTitle =
-    "Review the latest standard workspace schema before updating schema.md";
+    language === "ko"
+      ? "schema.md를 업데이트하기 전에 최신 표준 워크스페이스 스키마를 검토합니다"
+      : "Review the latest standard workspace schema before updating schema.md";
   const workspaceUpdateExploreNotice = activeWorkspaceWriteLabel
     ? "A workspace update is running. Chat can answer from the current saved files, but may not include changes still being generated."
     : null;
@@ -1888,8 +1973,8 @@ function App() {
   const maintainContextLabel = maintainThread?.operationType
     ? operationTypeLabel(maintainThread.operationType)
     : selectedMaintainTask
-    ? selectedMaintainTask.label
-    : "New task";
+    ? maintainTaskUiCopy(selectedMaintainTask.id, language).label
+    : t("app.common.new");
   const sourceStatus = workspace.sourceStatus;
   const outsideWikiChanges = workspace.outsideWikiChanges;
   const pendingSourceFiles = useMemo(
@@ -2030,7 +2115,7 @@ function App() {
       !editBlockedReason,
   );
   const editStatusLabel = editBuffer?.saving ? "Saving" : editDirty ? "Unsaved" : "Saved";
-  const schemaUpdateButtonVisible = Boolean(
+  const schemaUpdateButtonAvailable = Boolean(
     selectedPath === "schema.md" &&
       viewMode === "page" &&
       !activeReportContent &&
@@ -2073,11 +2158,27 @@ function App() {
   );
   const providerSetup = useProviderSetup(
     activeProvider?.name ?? null,
-    Boolean(activeProvider && aiSetupPromptReason),
+    Boolean(activeProvider && workspace.workspacePath),
+    `workspace_${aiSetupPromptReason ?? "background"}`,
   );
   const activeProviderReady = providerSetup.ready;
+  const schemaUpdateButtonVisible = schemaUpdateButtonAvailable && activeProviderReady;
+  const aiSetupStatusKnown =
+    providerSetup.statusKind !== "not_checked" && providerSetup.statusKind !== "checking";
+  const aiSetupGateActive = Boolean(
+    workspace.workspacePath && activeProvider && aiSetupStatusKnown && !activeProviderReady,
+  );
   const visibleAiSetupReason = aiSetupPromptReason ?? aiSetupReadyNoticeReason;
   const showAiSetupReadyNotice = Boolean(aiSetupReadyNoticeReason);
+  const showGlobalAiSetupWizard = Boolean(
+    aiSetupPromptReason === "onboarding",
+  );
+  const aiSetupWizardContext =
+    aiSetupPromptReason === "build" ||
+    aiSetupPromptReason === "chat" ||
+    aiSetupPromptReason === "maintain"
+      ? aiSetupPromptReason
+      : "settings";
 
   function showAiSetupPrompt(reason: AiSetupReason) {
     setAiSetupReadyNoticeReason(null);
@@ -2089,10 +2190,106 @@ function App() {
     setAiSetupReadyNoticeReason((current) => (current === reason ? null : current));
   }
 
+  function aiConnectionRequiredMessage(
+    key: Parameters<typeof t>[0],
+    provider: ProviderInfo | null | undefined = activeProvider,
+  ) {
+    return t(key, { product: provider ? displayProviderName(provider) : t("app.common.ai") });
+  }
+
   function completeAiSetupPrompt(reason: AiSetupReason) {
-    setAiSetupReadyNoticeReason(reason);
+    setAiSetupReadyNoticeReason(reason === "onboarding" ? null : reason);
     setAiSetupPromptReason(null);
-    setError((current) => (current?.includes("setup is needed before") ? null : current));
+    setError((current) =>
+      current?.startsWith(t("app.ai.connectRequiredPrefix")) ||
+      current?.includes("setup is needed before")
+        ? null
+        : current,
+    );
+    const completeKey = `${workspace.workspacePath}:${activeProvider?.name ?? "unknown"}:${reason}`;
+    if (!aiSetupCompletedTrackedRef.current.has(completeKey)) {
+      aiSetupCompletedTrackedRef.current.add(completeKey);
+      track("ai setup completed", {
+        reason,
+        provider: activeProvider?.name ?? null,
+        setup_status: providerSetup.statusKind,
+        source_count: sourceFiles.length,
+        pending_source_count: pendingSourceCount,
+        wiki_page_count: wikiPages.length,
+      });
+    }
+  }
+
+  function skipAiSetupForNow() {
+    setAiSetupPromptReason(null);
+    setAiSetupReadyNoticeReason(null);
+    setSchemaUpdatePrompt(null);
+    track("ai setup skipped", {
+      reason: aiSetupPromptReason ?? "onboarding",
+      provider: activeProvider?.name ?? null,
+      source_count: sourceFiles.length,
+      wiki_page_count: wikiPages.length,
+    });
+  }
+
+  function openAiSetupFromGate(reason: AiSetupReason, action: string) {
+    setError(null);
+    showAiSetupPrompt(reason);
+    track("ai gated action clicked", {
+      action,
+      reason,
+      provider: activeProvider?.name ?? null,
+      ai_status: activeProviderReady ? "ready" : providerSetup.statusKind,
+    });
+    void providerSetup.refresh("gate");
+  }
+
+  function trackAiSetupAction(
+    action: string,
+    setupStatus: string,
+    provider: ProviderInfo | null | undefined = activeProvider,
+  ) {
+    track("ai setup action clicked", {
+      action,
+      provider: provider?.name ?? null,
+      status_before: setupStatus,
+      reason: aiSetupPromptReason ?? visibleAiSetupReason ?? "unknown",
+      surface: showGlobalAiSetupWizard ? "global_wizard" : "inline_card",
+      source_count: sourceFiles.length,
+      pending_source_count: pendingSourceCount,
+      wiki_page_count: wikiPages.length,
+    });
+  }
+
+  async function selectAiSetupProvider(providerName: string) {
+    const provider = providers.find((item) => item.name === providerName);
+    if (!provider) return;
+    track("ai setup provider selected", {
+      provider: provider.name,
+      previous_provider: activeProvider?.name ?? null,
+      reason: aiSetupPromptReason ?? "onboarding",
+      surface: showGlobalAiSetupWizard ? "global_wizard" : "inline_card",
+    });
+    try {
+      const updated = await invoke<AppSettings>("set_provider", { name: providerName });
+      applySettingsUpdate(updated);
+      setError(null);
+      track("ai setup provider selection saved", {
+        provider: provider.name,
+        previous_provider: activeProvider?.name ?? null,
+        reason: aiSetupPromptReason ?? "onboarding",
+        surface: showGlobalAiSetupWizard ? "global_wizard" : "inline_card",
+      });
+    } catch (err) {
+      setError(`Failed to switch provider: ${String(err)}`);
+      track("ai setup provider selection failed", {
+        provider: provider.name,
+        previous_provider: activeProvider?.name ?? null,
+        reason: aiSetupPromptReason ?? "onboarding",
+        surface: showGlobalAiSetupWizard ? "global_wizard" : "inline_card",
+        error_kind: errorKindFromText(String(err)),
+      });
+    }
   }
 	  function trackOnboardingStepOnce(
 	    step: string,
@@ -2112,6 +2309,28 @@ function App() {
     if (!aiSetupPromptReason || aiSetupPromptReason === "build" || !activeProviderReady) return;
     completeAiSetupPrompt(aiSetupPromptReason);
   }, [activeProviderReady, aiSetupPromptReason]);
+
+  useEffect(() => {
+    if (!showGlobalAiSetupWizard || !workspace.workspacePath) return;
+    const key = `${workspace.workspacePath}:${aiSetupPromptReason ?? "unknown"}:${
+      activeProvider?.name ?? "unknown"
+    }`;
+    if (aiSetupWizardTrackedRef.current.has(key)) return;
+    aiSetupWizardTrackedRef.current.add(key);
+    track("ai setup wizard shown", {
+      reason: aiSetupPromptReason ?? "onboarding",
+      provider: activeProvider?.name ?? null,
+      source_count: sourceFiles.length,
+      wiki_page_count: wikiPages.length,
+    });
+  }, [
+    activeProvider?.name,
+    aiSetupPromptReason,
+    showGlobalAiSetupWizard,
+    sourceFiles.length,
+    wikiPages.length,
+    workspace.workspacePath,
+  ]);
 
   useEffect(() => {
     if (!aiSetupReadyNoticeReason) return;
@@ -2147,15 +2366,27 @@ function App() {
 	    if (!activeProvider || !aiSetupPromptReason) return;
 	    const statusKind = providerSetup.statusKind;
 	    if (!statusKind || statusKind === "checking" || statusKind === "not_checked") return;
-	    const key = `${activeProvider.name}:${statusKind}`;
+	    const key = `${aiSetupPromptReason}:${activeProvider.name}:${statusKind}`;
 	    if (providerSetupTrackedRef.current.has(key)) return;
 	    providerSetupTrackedRef.current.add(key);
 	    track(statusKind === "provider_ready" ? "provider setup completed" : "provider setup needed", {
 	      provider: activeProvider.name,
 	      setup_status: statusKind,
 	      reason: aiSetupPromptReason,
+	      surface: showGlobalAiSetupWizard ? "global_wizard" : "inline_card",
+	      source_count: sourceFiles.length,
+	      pending_source_count: pendingSourceCount,
+	      wiki_page_count: wikiPages.length,
 	    });
-	  }, [activeProvider?.name, aiSetupPromptReason, providerSetup.statusKind]);
+	  }, [
+	    activeProvider?.name,
+	    aiSetupPromptReason,
+	    pendingSourceCount,
+	    providerSetup.statusKind,
+	    showGlobalAiSetupWizard,
+	    sourceFiles.length,
+	    wikiPages.length,
+	  ]);
   const maintainCanAskOnly = Boolean(
     workspace.workspacePath &&
       maintainThread &&
@@ -2164,17 +2395,26 @@ function App() {
       !maintainDiscussionBusy &&
       maintainInstruction.trim(),
   );
-  const maintainSubmitLabel = maintainAskOnly
-    ? "Ask in read-only Maintain discussion"
-    : selectedMaintainTask?.actionLabel ?? "Submit";
-  const maintainSubmitTitle = maintainAskOnly
+  const selectedMaintainTaskCopy = selectedMaintainTask
+    ? maintainTaskUiCopy(selectedMaintainTask.id, language)
+    : null;
+  const maintainSubmitLabel = aiSetupGateActive
+    ? t("app.ai.connectToMaintain")
+    : maintainAskOnly
+    ? (language === "ko" ? "읽기 전용 관리 대화에서 질문" : "Ask in read-only Maintain discussion")
+    : selectedMaintainTaskCopy?.actionLabel ?? t("app.common.submit");
+  const maintainSubmitTitle = aiSetupGateActive
+    ? t("app.ai.connectToMaintain")
+    : maintainAskOnly
     ? maintainDiscussionBusy
-      ? "Maintain discussion is already answering"
-      : exploreBlockedReason ?? "Ask without creating wiki changes"
+      ? (language === "ko" ? "관리 대화가 이미 답변 중입니다" : "Maintain discussion is already answering")
+      : exploreBlockedReason ?? (language === "ko" ? "위키 변경 없이 질문" : "Ask without creating wiki changes")
     : maintainSourceSelectionRequired
-      ? "Choose at least one source."
-      : maintainBlockedReason ?? selectedMaintainTask?.actionLabel;
-  const maintainSubmitDisabled = maintainAskOnly
+      ? (language === "ko" ? "소스를 하나 이상 선택하세요." : "Choose at least one source.")
+      : maintainBlockedReason ?? selectedMaintainTaskCopy?.actionLabel;
+  const maintainSubmitDisabled = aiSetupGateActive
+    ? false
+    : maintainAskOnly
     ? !maintainCanAskOnly
     : !maintainCanRun || maintainSourceSelectionRequired;
   const activeModelId = activeProvider
@@ -2208,6 +2448,7 @@ function App() {
   const buildProviderSetup = useProviderSetup(
     buildDraftProvider?.name ?? null,
     Boolean(buildDraft && buildDraftProvider),
+    "build_modal",
   );
   const selectedBuildProviderSetup =
     buildDraftProvider?.name === activeProvider?.name ? providerSetup : buildProviderSetup;
@@ -2219,35 +2460,94 @@ function App() {
     if (aiSetupPromptReason !== "build" || !selectedBuildProviderReady) return;
     completeAiSetupPrompt("build");
   }, [aiSetupPromptReason, selectedBuildProviderReady]);
+  const buildWikiSteps = useMemo(
+    () =>
+      language === "ko"
+        ? [
+            "소스 변경 읽는 중",
+            "소스 내용 추출 중",
+            "AI에게 위키 컴파일 요청 중",
+            "위키 페이지 정리 중",
+            "검토 스냅샷 준비 중",
+          ]
+        : BUILD_WIKI_STEPS,
+    [language],
+  );
+  const wikiUpdateSteps = useMemo(
+    () =>
+      language === "ko"
+        ? [
+            "선택한 채팅 수집 중",
+            "위키 맥락 읽는 중",
+            "위키 편집 적용 중",
+            "검토 스냅샷 준비 중",
+            "업데이트 요약 작성 중",
+          ]
+        : WIKI_UPDATE_STEPS,
+    [language],
+  );
+  const applyScopeOptions = useMemo(
+    () => [
+      { value: "question-and-answer" as const, label: t("app.apply.currentQa") },
+      { value: "selected-messages" as const, label: t("app.apply.chooseMessages") },
+    ],
+    [t],
+  );
+  const mapleGuideSuggestions = useMemo(
+    () => [
+      t("app.guide.suggestion.first"),
+      t("app.guide.suggestion.pdf"),
+      t("app.guide.suggestion.build"),
+      t("app.guide.suggestion.panels"),
+      t("app.guide.suggestion.review"),
+    ],
+    [t],
+  );
   const chatRunningSteps = useMemo(() => {
     const providerName = activeProvider ? displayProviderName(activeProvider) : "AI";
-    return [
-      "Preparing context",
-      "Reading selected page",
-      "Checking recent chat",
-      `Asking ${providerName}`,
-      "Writing answer",
-    ];
-  }, [activeProvider]);
+    return language === "ko"
+      ? [
+          "맥락 준비 중",
+          "선택한 페이지 읽는 중",
+          "최근 채팅 확인 중",
+          `${providerName}에 질문 중`,
+          "답변 작성 중",
+        ]
+      : [
+          "Preparing context",
+          "Reading selected page",
+          "Checking recent chat",
+          `Asking ${providerName}`,
+          "Writing answer",
+        ];
+  }, [activeProvider, language]);
   const chatRunningLabel =
-    chatRunningSteps[chatStatusStep % chatRunningSteps.length] ?? "Thinking";
+    chatRunningSteps[chatStatusStep % chatRunningSteps.length] ?? t("app.guide.thinking");
   const maintainDiscussionRunningSteps = useMemo(() => {
     const providerName = activeProvider ? displayProviderName(activeProvider) : "AI";
-    return [
-      "Preparing Maintain context",
-      "Checking current task",
-      "Reading selected page",
-      `Asking ${providerName}`,
-      "Writing answer",
-    ];
-  }, [activeProvider]);
+    return language === "ko"
+      ? [
+          "관리 맥락 준비 중",
+          "현재 작업 확인 중",
+          "선택한 페이지 읽는 중",
+          `${providerName}에 질문 중`,
+          "답변 작성 중",
+        ]
+      : [
+          "Preparing Maintain context",
+          "Checking current task",
+          "Reading selected page",
+          `Asking ${providerName}`,
+          "Writing answer",
+        ];
+  }, [activeProvider, language]);
   const maintainDiscussionRunningLabel = isStartingMaintainDiscussion
-    ? "Starting Maintain discussion"
+    ? t("app.status.startingMaintain")
     : maintainDiscussionRunningSteps[chatStatusStep % maintainDiscussionRunningSteps.length] ??
-      "Asking Maintain";
+      t("app.status.maintainDiscussion");
   const buildRunningLabel =
-    BUILD_WIKI_STEPS[buildStatusStep % BUILD_WIKI_STEPS.length] ?? "Building wiki";
-  const buildFallbackActiveStep = Math.min(buildStatusStep, BUILD_WIKI_STEPS.length - 1);
+    buildWikiSteps[buildStatusStep % buildWikiSteps.length] ?? t("app.status.buildingWiki");
+  const buildFallbackActiveStep = Math.min(buildStatusStep, buildWikiSteps.length - 1);
   const maintainRunningSteps = selectedMaintainTask?.runningSteps ?? [];
   const maintainActiveStep = maintainRunningSteps.length
     ? Math.min(maintainStatusStep, maintainRunningSteps.length - 1)
@@ -2256,10 +2556,10 @@ function App() {
     (maintainRunningSteps.length
       ? maintainRunningSteps[maintainStatusStep % maintainRunningSteps.length]
       : null) ??
-    selectedMaintainTask?.busyLabel ??
-    "Maintaining wiki";
-  const wikiUpdateActiveStep = Math.min(wikiUpdateStatusStep, WIKI_UPDATE_STEPS.length - 1);
-  const wikiUpdateRunningLabel = WIKI_UPDATE_STEPS[wikiUpdateActiveStep] ?? "Updating wiki";
+    (selectedMaintainTask ? maintainTaskUiCopy(selectedMaintainTask.id, language).busyLabel : null) ??
+    (language === "ko" ? "위키 관리 중" : "Maintaining wiki");
+  const wikiUpdateActiveStep = Math.min(wikiUpdateStatusStep, wikiUpdateSteps.length - 1);
+  const wikiUpdateRunningLabel = wikiUpdateSteps[wikiUpdateActiveStep] ?? t("app.status.updatingWiki");
   const showUndoneStatus = useMemo(() => {
     const undoneAt = workspace.changedMarker?.undoneAt;
     if (!undoneAt) return false;
@@ -2268,23 +2568,28 @@ function App() {
     return statusBadgeClockMs - undoneAtMs < TRANSIENT_UNDONE_STATUS_MS;
   }, [statusBadgeClockMs, workspace.changedMarker?.undoneAt]);
   const statusLabel = useMemo(() => {
-    if (isBuilding) return "Building wiki";
+    if (isBuilding) return t("app.status.buildingWiki");
     if (isMaintainOperationRunning && activeMaintainOperationTask) {
-      return activeMaintainOperationTask.busyLabel;
+      return maintainTaskUiCopy(activeMaintainOperationTask.id, language).busyLabel;
     }
-    if (isWikiUpdateRunning) return "Updating wiki";
-    if (exploreBusy) return isStartingExplore ? "Starting chat" : "Explore Chat";
+    if (isWikiUpdateRunning) return t("app.status.updatingWiki");
+    if (exploreBusy) return isStartingExplore ? t("app.status.startingChat") : t("app.status.exploreChat");
     if (maintainDiscussionBusy) {
-      return isStartingMaintainDiscussion ? "Starting Maintain discussion" : "Maintain discussion";
+      return isStartingMaintainDiscussion
+        ? t("app.status.startingMaintain")
+        : t("app.status.maintainDiscussion");
     }
     if (busy) return busy;
-    if (showUndoneStatus) return "Undone";
+    if (showUndoneStatus) return t("app.status.undone");
     if (reviewableChangedFiles.length > 0) {
-      if (unreviewedChangedFiles.length === 0) return "Generated changes reviewed";
-      return `${unreviewedChangedFiles.length} generated change${unreviewedChangedFiles.length === 1 ? "" : "s"} to review`;
+      if (unreviewedChangedFiles.length === 0) return t("app.status.generatedReviewed");
+      return t("app.status.generatedToReview", {
+        count: unreviewedChangedFiles.length,
+        plural: unreviewedChangedFiles.length === 1 ? "" : "s",
+      });
     }
     if (workspace.indexMd) return null;
-    return "Not loaded";
+    return t("app.status.notLoaded");
   }, [
     busy,
     exploreBusy,
@@ -2298,6 +2603,8 @@ function App() {
     showUndoneStatus,
     unreviewedChangedFiles.length,
     isWikiUpdateRunning,
+    language,
+    t,
     workspace.indexMd,
   ]);
 
@@ -3093,10 +3400,10 @@ function App() {
   );
   const workspaceTree = useMemo(
     () => [
-      { name: "Sources", path: "sources", isDir: true, children: sourceTree },
-      { name: "Wiki", path: "wiki", isDir: true, children: wikiTree, sectionStart: true },
+      { name: t("app.sidebar.sources"), path: "sources", isDir: true, children: sourceTree },
+      { name: t("app.sidebar.wiki"), path: "wiki", isDir: true, children: wikiTree, sectionStart: true },
       {
-        name: "Images & Files",
+        name: t("app.sidebar.imagesFiles"),
         path: "wiki/assets",
         isDir: true,
         children: imagesAndFilesTree,
@@ -3104,7 +3411,7 @@ function App() {
       },
       ...rootFileNodes,
     ],
-    [sourceTree, rootFileNodes, wikiTree, imagesAndFilesTree],
+    [sourceTree, rootFileNodes, wikiTree, imagesAndFilesTree, t],
   );
 
   useEffect(() => {
@@ -3400,7 +3707,7 @@ function App() {
       setSchemaUpdateAvailability("unknown");
       return;
     }
-    if (writeActionBlocked || hasPendingGeneratedChanges) return;
+    if (writeActionBlocked || hasPendingGeneratedChanges || !activeProviderReady) return;
     let cancelled = false;
     setSchemaUpdateAvailability("checking");
     invoke<SchemaUpdatePrompt>("check_schema_update_prompt")
@@ -3424,6 +3731,7 @@ function App() {
     };
   }, [
     hasPendingGeneratedChanges,
+    activeProviderReady,
     workspace.schemaMd,
     workspace.workspacePath,
     writeActionBlocked,
@@ -3901,6 +4209,19 @@ function App() {
   ]);
 
   useEffect(() => {
+    if (!mapleGuideOpen || mapleGuideMessages.length === 0) return;
+    const frameId = requestAnimationFrame(() => {
+      const messagesEl = mapleGuideMessagesRef.current;
+      if (!messagesEl) return;
+      messagesEl.scrollTo({
+        top: messagesEl.scrollHeight,
+        behavior: mapleGuideBusy ? "smooth" : "auto",
+      });
+    });
+    return () => cancelAnimationFrame(frameId);
+  }, [mapleGuideBusy, mapleGuideMessages, mapleGuideOpen]);
+
+  useEffect(() => {
     if (!applyDraft) return;
     function handleKeyDown(event: KeyboardEvent) {
       if (event.key === "Escape" && !wikiUpdateBusy) {
@@ -4264,10 +4585,8 @@ function App() {
     }
     if (!activeProviderReady) {
       showAiSetupPrompt("maintain");
-      setError(
-        `${activeProvider ? displayProviderName(activeProvider) : "AI"} setup is needed before updating schema.md.`,
-      );
-      void providerSetup.refresh();
+      setError(aiConnectionRequiredMessage("app.ai.connectRequiredSchema"));
+      void providerSetup.refresh("schema_update_blocked");
       return;
     }
     setBusy("Merging schema.md");
@@ -4417,10 +4736,8 @@ function App() {
 	        provider: draftProvider.name,
 	        setup_status: draftProviderSetup.statusKind,
 	      });
-	      setError(
-	        `${displayProviderName(draftProvider)} setup is needed before building the wiki.`,
-	      );
-      void draftProviderSetup.refresh();
+      setError(aiConnectionRequiredMessage("app.ai.connectRequiredBuild", draftProvider));
+      void draftProviderSetup.refresh("build_blocked");
       return;
     }
     setBusy("Starting wiki build");
@@ -4595,25 +4912,6 @@ function App() {
     }
   }
 
-  function resetMaintainFlow() {
-    setSelectedMaintainTaskId(null);
-    setMaintainInstruction("");
-    setMaintainAskOnly(false);
-    setMaintainUseSources(false);
-    setMaintainSelectedSourcePaths(new Set());
-    setMaintainSourcePickerExpanded(new Set());
-    setMaintainLastResult(null);
-    setMaintainStage("choose");
-  }
-
-  async function changeMaintainTask() {
-    if (maintainThread?.operationType || maintainThread?.messages.length) {
-      await createNewMaintainThread();
-      return;
-    }
-    resetMaintainFlow();
-  }
-
   function defaultMaintainSourceSelection(): Set<string> {
     if (selectedPath.startsWith("sources/") && sourceFiles.includes(selectedPath)) {
       return new Set([selectedPath]);
@@ -4680,10 +4978,8 @@ function App() {
     }
     if (!activeProviderReady) {
       showAiSetupPrompt("maintain");
-      setError(
-        `${activeProvider ? displayProviderName(activeProvider) : "AI"} setup is needed before running maintenance.`,
-      );
-      void providerSetup.refresh();
+      setError(aiConnectionRequiredMessage("app.ai.connectRequiredMaintenance"));
+      void providerSetup.refresh("maintain_blocked");
       return;
     }
     const trimmedInstruction = maintainInstruction.trim();
@@ -4884,10 +5180,8 @@ function App() {
     if (exploreBlockedReason || !workspace.workspacePath) return false;
     if (!activeProviderReady) {
       showAiSetupPrompt("chat");
-      setError(
-        `${activeProvider ? displayProviderName(activeProvider) : "AI"} setup is needed before asking chat.`,
-      );
-      void providerSetup.refresh();
+      setError(aiConnectionRequiredMessage("app.ai.connectRequiredChat"));
+      void providerSetup.refresh("explore_chat_blocked");
       return false;
     }
     const question = (questionOverride ?? exploreQuestion).trim();
@@ -4985,10 +5279,8 @@ function App() {
     }
     if (!activeProviderReady) {
       showAiSetupPrompt("maintain");
-      setError(
-        `${activeProvider ? displayProviderName(activeProvider) : "AI"} setup is needed before asking Maintain.`,
-      );
-      void providerSetup.refresh();
+      setError(aiConnectionRequiredMessage("app.ai.connectRequiredMaintainChat"));
+      void providerSetup.refresh("maintain_chat_blocked");
       return;
     }
     if (maintainDiscussionBusy) {
@@ -5247,10 +5539,8 @@ function App() {
     if (!chatThread || !applyDraft || updateWikiBlockedReason) return;
     if (!activeProviderReady) {
       showAiSetupPrompt("chat");
-      setError(
-        `${activeProvider ? displayProviderName(activeProvider) : "AI"} setup is needed before updating the wiki.`,
-      );
-      void providerSetup.refresh();
+      setError(aiConnectionRequiredMessage("app.ai.connectRequiredUpdate"));
+      void providerSetup.refresh("wiki_update_blocked");
       return;
     }
     const draft = applyDraft;
@@ -5626,28 +5916,28 @@ function App() {
       : null;
   const appUpdateLabel =
     appUpdateStatus === "checking"
-      ? "Checking…"
+      ? t("app.update.checking")
       : appUpdateStatus === "up-to-date"
-        ? "Up to date"
+        ? t("app.update.upToDate")
         : appUpdateStatus === "available"
-          ? "Update available"
+          ? t("app.update.available")
           : appUpdateStatus === "downloading"
             ? appUpdatePercent === null
-              ? "Downloading…"
-              : `Updating ${appUpdatePercent}%`
+              ? t("app.update.downloading")
+              : t("app.update.updatingPercent", { percent: appUpdatePercent })
             : appUpdateStatus === "installing"
-              ? "Installing…"
+              ? t("app.update.installing")
               : appUpdateStatus === "restarting"
-                ? "Restarting…"
+                ? t("app.update.restarting")
                 : appUpdateStatus === "error"
-                  ? "Retry update"
-                  : "Update";
+                  ? t("app.update.retry")
+                  : t("app.update.button");
   const appUpdateTitle =
     appUpdateStatus === "available" && appUpdate
-      ? `Install Maple ${appUpdate.version}`
+      ? t("app.update.installTitle", { version: appUpdate.version })
       : appUpdateStatus === "up-to-date"
-        ? "Maple is up to date"
-        : "Check for Maple updates";
+        ? t("app.update.upToDateTitle")
+        : t("app.update.checkTitle");
   const showAppUpdateButton =
     appUpdateStatus !== "idle" &&
     (appUpdateStatus !== "available" || Boolean(appUpdate));
@@ -5657,6 +5947,269 @@ function App() {
     appUpdateStatus === "installing" ||
     appUpdateStatus === "restarting";
 
+  function makeMapleGuideMessageId(prefix: string) {
+    return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  }
+
+  function mapleGuideHistoryJson(messages: MapleGuideMessage[]) {
+    return JSON.stringify(
+      messages
+        .filter(
+          (message) =>
+            message.status === "completed" &&
+            (message.role === "user" || message.role === "assistant") &&
+            message.text.trim(),
+        )
+        .slice(-8)
+        .map((message) => ({
+          role: message.role,
+          text: message.text,
+        })),
+    );
+  }
+
+  function buildMapleGuideAppState() {
+    const lines = [
+      `workspaceOpen: ${workspace.workspacePath ? "yes" : "no"}`,
+      `workspaceName: ${workspaceName || "none"}`,
+      `workspacePath: ${workspace.workspacePath || "none"}`,
+      `selectedPath: ${selectedPath || "none"}`,
+      `selectedFileLoaded: ${selectedDocument.content === null ? "no" : "yes"}`,
+      `viewMode: ${viewMode}`,
+      `rightPanelMode: ${rightPanelMode}`,
+      `statusLabel: ${statusLabel || "none"}`,
+      `activeOperation: ${activeOperationLabel || "none"}`,
+      `operationRunning: ${anyOperationBusy ? "yes" : "no"}`,
+      `sourceCount: ${sourceFiles.length}`,
+      `pendingSourceCount: ${pendingSourceCount}`,
+      `wikiPageCount: ${wikiPages.length}`,
+      `assetOrFileCount: ${imagesAndFiles.length}`,
+      `generatedChangesWaitingForReview: ${hasPendingGeneratedChanges ? "yes" : "no"}`,
+      `reviewableChangedFileCount: ${reviewableChangedFiles.length}`,
+      `outsideWikiChangedFileCount: ${outsideWikiChanges?.changedCount ?? 0}`,
+      `activeProvider: ${activeProvider?.label ?? activeProvider?.name ?? "unknown"}`,
+      `activeProviderReadyInUi: ${activeProviderReady ? "yes" : "unknown_or_not_ready"}`,
+      `providerSetupStatus: ${providerSetup.statusKind || "not_checked"}`,
+      `activeModel: ${activeModel?.label ?? activeModelId ?? "unknown"}`,
+      `activeReasoningEffort: ${activeReasoningEffort || "unknown"}`,
+    ];
+
+    if (pendingSourceFiles.length > 0) {
+      lines.push(
+        `pendingSources: ${pendingSourceFiles
+          .slice(0, 8)
+          .map((file) => `${file.state}:${file.path}`)
+          .join(", ")}`,
+      );
+    }
+
+    if (reviewableChangedFiles.length > 0) {
+      lines.push(
+        `reviewableChangedFiles: ${reviewableChangedFiles
+          .slice(0, 8)
+          .map((file) => `${file.status}:${file.path}`)
+          .join(", ")}`,
+      );
+    }
+
+    return lines.join("\n");
+  }
+
+  function mapleGuideErrorMessage(detail: string) {
+    const normalized = detail.trim();
+    if (/provider|login|installed|setup|helper|choose/i.test(normalized)) {
+      return [
+        t("app.guide.aiConnectionNeeded"),
+        "",
+        t("app.guide.aiConnectionSteps"),
+        normalized ? `\n${t("app.guide.errorDetails", { details: normalized })}` : "",
+      ].join("\n");
+    }
+    return normalized || t("app.guide.couldNotAnswer");
+  }
+
+  async function submitMapleGuideQuestionText(rawQuestion: string) {
+    const question = rawQuestion.trim();
+    if (!question || mapleGuideBusy) return;
+
+    const now = new Date().toISOString();
+    const userMessage: MapleGuideMessage = {
+      id: makeMapleGuideMessageId("guide-user"),
+      role: "user",
+      text: question,
+      status: "completed",
+      createdAt: now,
+      completedAt: now,
+    };
+    const assistantMessage: MapleGuideMessage = {
+      id: makeMapleGuideMessageId("guide-assistant"),
+      role: "assistant",
+      text: "",
+      status: "streaming",
+      createdAt: now,
+    };
+    const historyJson = mapleGuideHistoryJson(mapleGuideMessages);
+
+    setMapleGuideOpen(true);
+    setMapleGuideQuestion("");
+    setMapleGuideBusy(true);
+    setMapleGuideMessages((messages) => [...messages, userMessage, assistantMessage]);
+    track("maple guide asked", {
+      workspace_open: Boolean(workspace.workspacePath),
+      provider: activeProvider?.name ?? null,
+      source_count: sourceFiles.length,
+      pending_source_count: pendingSourceCount,
+      has_pending_review: hasPendingGeneratedChanges,
+    });
+
+    try {
+      const result = await invoke<MapleGuideAnswer>("ask_maple_guide", {
+        question,
+        historyJson,
+        appState: buildMapleGuideAppState(),
+      });
+      setMapleGuideMessages((messages) =>
+        messages.map((message) =>
+          message.id === assistantMessage.id
+            ? {
+                ...message,
+                text: result.answer,
+                status: "completed",
+                provider: result.provider,
+                model: result.model,
+                reasoningEffort: result.reasoningEffort,
+                completedAt: result.completedAt,
+              }
+            : message,
+        ),
+      );
+      track("maple guide answered", {
+        workspace_open: Boolean(workspace.workspacePath),
+        provider: result.provider,
+        model: result.model,
+      });
+    } catch (err) {
+      const detail = String(err);
+      setMapleGuideMessages((messages) =>
+        messages.map((message) =>
+          message.id === assistantMessage.id
+            ? {
+                ...message,
+                text: mapleGuideErrorMessage(detail),
+                status: "failed",
+                completedAt: new Date().toISOString(),
+              }
+            : message,
+        ),
+      );
+      track("maple guide failed", {
+        workspace_open: Boolean(workspace.workspacePath),
+        provider: activeProvider?.name ?? null,
+      });
+    } finally {
+      setMapleGuideBusy(false);
+    }
+  }
+
+  function submitMapleGuideQuestion(event: ReactFormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    void submitMapleGuideQuestionText(mapleGuideQuestion);
+  }
+
+  function renderMapleGuideWidget() {
+    const showIntro = mapleGuideMessages.length === 0;
+    return (
+      <div className={`maple-guide-widget${mapleGuideOpen ? " open" : ""}`}>
+        {mapleGuideOpen ? (
+          <section className="maple-guide-panel" aria-label={t("app.guide.title")}>
+            <header className="maple-guide-header">
+              <div>
+                <h2>{t("app.guide.title")}</h2>
+                <p>{t("app.guide.subtitle")}</p>
+              </div>
+              <button
+                type="button"
+                className="maple-guide-close"
+                aria-label={t("app.guide.close")}
+                onClick={() => setMapleGuideOpen(false)}
+              >
+                ×
+              </button>
+            </header>
+            <div ref={mapleGuideMessagesRef} className="maple-guide-messages">
+              {showIntro ? (
+                <div className="maple-guide-intro">
+                  <p>{t("app.guide.intro")}</p>
+                  <div className="maple-guide-suggestions">
+                    {mapleGuideSuggestions.map((suggestion) => (
+                      <button
+                        key={suggestion}
+                        type="button"
+                        disabled={mapleGuideBusy}
+                        onClick={() => void submitMapleGuideQuestionText(suggestion)}
+                      >
+                        {suggestion}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
+              {mapleGuideMessages.map((message) => (
+                <div
+                  key={message.id}
+                  className={`maple-guide-message maple-guide-message-${message.role} status-${message.status}`}
+                >
+                  {message.status === "streaming" && !message.text ? (
+                    <span className="chat-thinking">{t("app.guide.thinking")}</span>
+                  ) : message.role === "assistant" ? (
+                    <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.text}</ReactMarkdown>
+                  ) : (
+                    <p>{message.text}</p>
+                  )}
+                </div>
+              ))}
+            </div>
+            <form className="maple-guide-composer" onSubmit={submitMapleGuideQuestion}>
+              <textarea
+                value={mapleGuideQuestion}
+                placeholder={t("app.guide.placeholder")}
+                rows={2}
+                disabled={mapleGuideBusy}
+                onChange={(event) => setMapleGuideQuestion(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" && !event.shiftKey) {
+                    event.preventDefault();
+                    void submitMapleGuideQuestionText(mapleGuideQuestion);
+                  }
+                }}
+              />
+              <button
+                type="submit"
+                disabled={!mapleGuideQuestion.trim() || mapleGuideBusy}
+                aria-label={t("app.guide.ask")}
+                title={t("app.guide.ask")}
+              >
+                ↑
+              </button>
+            </form>
+          </section>
+        ) : null}
+        <button
+          type="button"
+          className="maple-guide-launch"
+          aria-label={mapleGuideOpen ? t("app.guide.close") : t("app.guide.open")}
+          title={t("app.guide.title")}
+          onClick={() => setMapleGuideOpen((open) => !open)}
+        >
+          <span className="maple-guide-launch-bubble" aria-hidden="true">
+            <span />
+            <span />
+          </span>
+        </button>
+      </div>
+    );
+  }
+
   void runner;
 
   if (!workspace.workspacePath) {
@@ -5665,25 +6218,51 @@ function App() {
         <div className="empty-state">
           <div className="empty-state-card">
             <h1>Maple</h1>
-            <p>Open or create a workspace to start.</p>
+            <div
+              className="empty-state-language"
+              role="group"
+              aria-label={t("app.empty.chooseLanguage")}
+            >
+              <span>{t("app.empty.chooseLanguage")}</span>
+              <div className="empty-state-language-options">
+                <button
+                  type="button"
+                  className={language === "ko" ? "selected" : ""}
+                  aria-pressed={language === "ko"}
+                  onClick={() => setLanguage("ko")}
+                >
+                  한국어
+                </button>
+                <button
+                  type="button"
+                  className={language === "en" ? "selected" : ""}
+                  aria-pressed={language === "en"}
+                  onClick={() => setLanguage("en")}
+                >
+                  English
+                </button>
+              </div>
+            </div>
+            <p>{t("app.empty.openOrCreate")}</p>
             <div className="empty-state-actions">
               <button
                 type="button"
                 className="primary"
-                onClick={() => pickWorkspace("Create new workspace", true)}
+                onClick={() => pickWorkspace(t("app.empty.createWorkspace"), true)}
               >
-                Create new workspace
+                {t("app.empty.createWorkspace")}
               </button>
               <button
                 type="button"
-                onClick={() => pickWorkspace("Open existing workspace")}
+                onClick={() => pickWorkspace(t("app.empty.openFolder"))}
               >
-                Open existing folder
+                {t("app.empty.openFolder")}
               </button>
             </div>
             {error ? <p className="empty-state-error">{error}</p> : null}
           </div>
         </div>
+        {renderMapleGuideWidget()}
       </main>
     );
   }
@@ -5711,8 +6290,8 @@ function App() {
     wikiUpdateRun && wikiUpdateRun.threadId === chatThread?.id ? wikiUpdateRun : null;
   const showExploreChatMessages = exploreChatMessages.length > 0 || Boolean(currentWikiUpdateRun);
   const wikiUpdateScopeLabel = currentWikiUpdateRun
-    ? (APPLY_SCOPE_OPTIONS.find((option) => option.value === currentWikiUpdateRun.scope)?.label ??
-      "Selected chat")
+    ? (applyScopeOptions.find((option) => option.value === currentWikiUpdateRun.scope)?.label ??
+      t("app.apply.chooseMessages"))
     : "";
   const wikiUpdateInstruction = currentWikiUpdateRun?.instruction.trim() ?? "";
   const wikiUpdateUserMessage =
@@ -5765,9 +6344,9 @@ function App() {
       >
         <OperationFeedPanel
           progress={workspaceOperationProgress}
-          title="Update wiki"
+          title={t("app.apply.title")}
           meta={wikiUpdateProgressMeta}
-          fallbackSteps={WIKI_UPDATE_STEPS}
+          fallbackSteps={wikiUpdateSteps}
           fallbackActiveIndex={wikiUpdateActiveStep}
           open={wikiUpdateFeedOpen}
           onToggle={() => setWikiUpdateFeedOpen((open) => !open)}
@@ -5777,7 +6356,7 @@ function App() {
         {canShowWikiUpdateReport ? (
           <div className="explore-chat-operation-actions">
             <button type="button" onClick={() => void openReportTab()}>
-              Show report
+              {t("app.operation.showReport")}
             </button>
           </div>
         ) : null}
@@ -5849,9 +6428,9 @@ function App() {
   }
 
   const centerHeaderPathParts = activeCenterTab?.kind === "report"
-    ? ["Operation report"]
+    ? [t("app.center.operationReport")]
     : viewMode === "graph"
-      ? ["Graph"]
+      ? [t("app.center.graph")]
       : selectedPath.split("/").filter(Boolean);
   const centerHeaderTitle = centerHeaderPathParts.join(" / ");
 
@@ -5880,21 +6459,21 @@ function App() {
                   onClick={() => {
                     if (topbarWorkspaceMenuRef.current) topbarWorkspaceMenuRef.current.open = false;
                     void switchWorkspace({
-                      title: "Create new workspace",
+                      title: t("app.empty.createWorkspace"),
                       initializeRootFiles: true,
                     });
                   }}
                 >
-                  Create new workspace…
+                  {t("app.topbar.createWorkspace")}
                 </button>
                 <button
                   type="button"
                   onClick={() => {
                     if (topbarWorkspaceMenuRef.current) topbarWorkspaceMenuRef.current.open = false;
-                    void switchWorkspace({ title: "Open existing workspace" });
+                    void switchWorkspace({ title: t("app.topbar.openWorkspace") });
                   }}
                 >
-                  Open existing workspace…
+                  {t("app.topbar.openWorkspace")}
                 </button>
                 <div className="topbar-workspace-dropdown-separator" role="separator" />
                 <button
@@ -5904,7 +6483,7 @@ function App() {
                     void closeWorkspace();
                   }}
                 >
-                  Close workspace
+                  {t("app.topbar.closeWorkspace")}
                 </button>
               </div>
             </details>
@@ -5919,8 +6498,16 @@ function App() {
             className="panel-toggle-btn"
             onClick={toggleLeftPanelCollapsed}
             aria-expanded={!leftPanelEffectivelyCollapsed}
-            aria-label={leftPanelEffectivelyCollapsed ? "Show source panel" : "Hide source panel"}
-            title={leftPanelEffectivelyCollapsed ? "Show source panel" : "Hide source panel"}
+            aria-label={
+              leftPanelEffectivelyCollapsed
+                ? t("app.topbar.showSourcePanel")
+                : t("app.topbar.hideSourcePanel")
+            }
+            title={
+              leftPanelEffectivelyCollapsed
+                ? t("app.topbar.showSourcePanel")
+                : t("app.topbar.hideSourcePanel")
+            }
           >
             <span
               className={`panel-toggle-icon panel-toggle-icon-left ${
@@ -5931,7 +6518,7 @@ function App() {
           </button>
         </div>
         <div className="topbar-center">
-          <div className="center-tab-strip" role="tablist" aria-label="Open workspace tabs">
+          <div className="center-tab-strip" role="tablist" aria-label={t("app.topbar.openTabs")}>
             {centerTabs.map((tab) => (
               <button
                 key={tab.id}
@@ -5944,7 +6531,7 @@ function App() {
               >
                 <span className="center-tab-title">{tab.title}</span>
                 {tab.kind === "workspace" && editBuffer?.path === tab.path && editDirty ? (
-                  <span className="center-tab-dirty" aria-label="Unsaved changes">
+                  <span className="center-tab-dirty" aria-label={t("app.common.unsaved")}>
                     *
                   </span>
                 ) : null}
@@ -5988,8 +6575,16 @@ function App() {
             className="panel-toggle-btn"
             onClick={toggleRightPanelCollapsed}
             aria-expanded={!rightPanelEffectivelyCollapsed}
-            aria-label={rightPanelEffectivelyCollapsed ? "Show explore panel" : "Hide explore panel"}
-            title={rightPanelEffectivelyCollapsed ? "Show explore panel" : "Hide explore panel"}
+            aria-label={
+              rightPanelEffectivelyCollapsed
+                ? t("app.topbar.showExplorePanel")
+                : t("app.topbar.hideExplorePanel")
+            }
+            title={
+              rightPanelEffectivelyCollapsed
+                ? t("app.topbar.showExplorePanel")
+                : t("app.topbar.hideExplorePanel")
+            }
           >
             <span
               className={`panel-toggle-icon panel-toggle-icon-right ${
@@ -5999,27 +6594,27 @@ function App() {
             />
           </button>
           {!rightPanelEffectivelyCollapsed ? (
-            <div className="right-panel-tabs" role="tablist" aria-label="Right panel">
+            <div className="right-panel-tabs" role="tablist" aria-label={t("app.topbar.rightPanel")}>
               <button
                 type="button"
                 className={rightPanelMode === "explore" ? "active" : ""}
                 onClick={() => changeRightPanelMode("explore")}
               >
-                Explore
+                {t("app.right.explore")}
               </button>
               <button
                 type="button"
                 className={rightPanelMode === "maintain" ? "active" : ""}
                 onClick={() => changeRightPanelMode("maintain")}
               >
-                Maintain
+                {t("app.right.maintain")}
               </button>
             </div>
           ) : null}
           <div className="topbar-command-actions">
             {showRightTopbarStop ? (
               <button type="button" className="topbar-btn cancel" onClick={cancelRunningOperation}>
-                Stop
+                {t("app.topbar.stop")}
               </button>
             ) : null}
             {showAppUpdateButton ? (
@@ -6040,7 +6635,7 @@ function App() {
               </button>
             ) : null}
             <details ref={topbarMenuRef} className="topbar-menu">
-              <summary aria-label="More actions">⋯</summary>
+              <summary aria-label={t("app.topbar.moreActions")}>⋯</summary>
               <div className="topbar-menu-items">
                 <button
                   type="button"
@@ -6050,7 +6645,7 @@ function App() {
                     void checkForAppUpdate();
                   }}
                 >
-                  Check for updates
+                  {t("app.topbar.checkUpdates")}
                 </button>
                 <button
                   type="button"
@@ -6059,7 +6654,7 @@ function App() {
                     setShowSettings(true);
                   }}
                 >
-                  Settings…
+                  {t("app.topbar.settings")}
                 </button>
                 <button
                   type="button"
@@ -6070,7 +6665,7 @@ function App() {
                     void finishGeneratedReview();
                   }}
                 >
-                  Done reviewing
+                  {t("app.topbar.doneReviewing")}
                 </button>
                 <button
                   type="button"
@@ -6081,7 +6676,7 @@ function App() {
                     void runCommand("undo_last_operation", "Undoing operation");
                   }}
                 >
-                  Undo last operation
+                  {t("app.topbar.undoLastOperation")}
                 </button>
                 {isSampleWorkspace ? (
                   <button
@@ -6093,7 +6688,7 @@ function App() {
                       void runCommand("reset_sample_workspace", "Resetting sample");
                     }}
                   >
-                    Reset sample workspace
+                    {t("app.topbar.resetSample")}
                   </button>
                 ) : null}
               </div>
@@ -6122,43 +6717,68 @@ function App() {
                 sourceImportBlockedReason
                   ? sourceImportBlockedReason
                   : canRemoveSourceFiles
-                  ? "Import sources"
-                  : "Finish reviewing or undo generated changes before importing more sources."
+                  ? t("app.sidebar.importSources")
+                  : t("app.sidebar.finishReviewBeforeImport")
               }
               onClick={importSourceFiles}
             >
-              Import
+              {t("app.common.import")}
             </button>
             {isBuilding ? (
               <button type="button" className="source-action-btn danger" onClick={cancelRunningOperation}>
-                Stop
+                {t("app.common.stop")}
               </button>
             ) : (
               <button
                 type="button"
                 className="source-action-btn primary"
-                disabled={Boolean(buildBlockedReason) || !hasPendingSourceChanges}
-                onClick={() => openBuildWiki(false)}
+                disabled={
+                  Boolean(buildBlockedReason) ||
+                  (!hasPendingSourceChanges && !aiSetupGateActive)
+                }
+                onClick={() =>
+                  aiSetupGateActive
+                    ? openAiSetupFromGate("build", "build_wiki")
+                    : openBuildWiki(false)
+                }
                 title={
-                  buildBlockedReason
+                  aiSetupGateActive
+                    ? t("app.ai.connectToBuild")
+                    : buildBlockedReason
                     ? buildBlockedReason
                     : hasPendingSourceChanges
-                    ? `${pendingSourceCount} pending source change(s)`
-                    : "No pending source changes"
+                    ? t("app.sidebar.pendingSourceChanges", { count: pendingSourceCount })
+                    : t("app.sidebar.noPendingSourceChanges")
                 }
               >
-                Build wiki
+                {aiSetupGateActive ? t("app.ai.connectToBuild") : t("app.sidebar.buildWiki")}
               </button>
             )}
           </div>
+          {aiSetupGateActive ? (
+            <section className="ai-readonly-panel" aria-label={t("app.ai.readOnlyTitle")}>
+              <strong>{t("app.ai.readOnlyTitle")}</strong>
+              <p>{t("app.ai.readOnlyBody")}</p>
+              <button
+                type="button"
+                onClick={() => openAiSetupFromGate("onboarding", "connect_ai")}
+              >
+                {t("app.ai.connect")}
+              </button>
+            </section>
+          ) : null}
           {showBuildOperationFeed ? (
             <OperationFeedPanel
               progress={workspaceOperationProgress}
-              title="Build wiki"
+              title={t("app.sidebar.buildWiki")}
               runningLabel={buildRunningLabel}
-              meta={[pendingSourceCount > 0 ? `${pendingSourceCount} source change(s)` : "Workspace build"]}
-              fallbackSteps={BUILD_WIKI_STEPS}
-              fallbackActiveIndex={isBuilding ? buildFallbackActiveStep : BUILD_WIKI_STEPS.length - 1}
+              meta={[
+                pendingSourceCount > 0
+                  ? t("app.sidebar.sourceChanges", { count: pendingSourceCount })
+                  : t("app.sidebar.workspaceBuild"),
+              ]}
+              fallbackSteps={buildWikiSteps}
+              fallbackActiveIndex={isBuilding ? buildFallbackActiveStep : buildWikiSteps.length - 1}
               open={buildFeedOpen}
               onToggle={() => setBuildFeedOpen((open) => !open)}
               onOpenPath={openDocumentReference}
@@ -6166,17 +6786,17 @@ function App() {
               compact
             />
           ) : showBuildCompletionSummary ? (
-            <section className="build-summary-panel" aria-label="Build wiki completion summary">
+            <section className="build-summary-panel" aria-label={t("app.sidebar.buildWiki")}>
               <div className="build-summary-header">
                 <div className="build-summary-title-block">
-                  <span className="build-summary-title">Build wiki</span>
-                  <span className="build-summary-state">Completed</span>
+                  <span className="build-summary-title">{t("app.sidebar.buildWiki")}</span>
+                  <span className="build-summary-state">{t("app.common.completed")}</span>
                 </div>
                 <button
                   type="button"
                   className="build-summary-dismiss"
-                  aria-label="Dismiss build summary"
-                  title="Dismiss build summary"
+                  aria-label={t("app.center.dismissError")}
+                  title={t("app.center.dismissError")}
                   onClick={() =>
                     setDismissedBuildSummaryOperationId(buildCompletionSummaryOperationId)
                   }
@@ -6196,21 +6816,20 @@ function App() {
             </section>
           ) : null}
           {hasOutsideWikiChanges ? (
-            <section className="outside-change-panel" aria-label="Outside wiki changes detected">
+            <section className="outside-change-panel" aria-label={t("app.outside.title")}>
               <div className="outside-change-header">
-                <strong>Outside wiki changes detected</strong>
+                <strong>{t("app.outside.title")}</strong>
                 <span>
-                  {outsideWikiChangeCount} file{outsideWikiChangeCount === 1 ? "" : "s"}
+                  {t("app.outside.count", {
+                    count: outsideWikiChangeCount,
+                    plural: outsideWikiChangeCount === 1 ? "" : "s",
+                  })}
                 </span>
               </div>
-              <p>
-                These wiki files changed outside Maple. Accept them as trusted, or restore the last
-                trusted Maple version.
-              </p>
+              <p>{t("app.outside.body")}</p>
               {pendingSourceCount > 0 ? (
                 <p className="outside-change-note">
-                  There are also pending source changes. Accepting these wiki edits will not mark
-                  sources ingested.
+                  {t("app.outside.sourceNote")}
                 </p>
               ) : null}
               <div className="outside-change-list">
@@ -6218,14 +6837,16 @@ function App() {
                   <div key={`${file.state ?? "changed"}-${file.path}`} className="outside-change-file">
                     <span className="outside-change-path">{file.path}</span>
                     <span className={`outside-change-state ${file.state ?? "changed"}`}>
-                      {wikiChangeStateLabel(file.state)}
+                      {wikiChangeStateLabel(file.state, language)}
                     </span>
                   </div>
                 ))}
                 {outsideWikiChangedFiles.length > 8 ? (
                   <div className="outside-change-more">
-                    {outsideWikiChangedFiles.length - 8} more file
-                    {outsideWikiChangedFiles.length - 8 === 1 ? "" : "s"}
+                    {t("app.outside.more", {
+                      count: outsideWikiChangedFiles.length - 8,
+                      plural: outsideWikiChangedFiles.length - 8 === 1 ? "" : "s",
+                    })}
                   </div>
                 ) : null}
               </div>
@@ -6236,7 +6857,7 @@ function App() {
                   title={activeOperationLabel ? `${activeOperationLabel} is running.` : undefined}
                   onClick={() => runCommand("accept_outside_wiki_changes", "Accepting outside changes")}
                 >
-                  Accept changes
+                  {t("app.outside.accept")}
                 </button>
                 <button
                   type="button"
@@ -6245,7 +6866,7 @@ function App() {
                   title={activeOperationLabel ? `${activeOperationLabel} is running.` : undefined}
                   onClick={() => runCommand("undo_outside_wiki_changes", "Undoing outside changes")}
                 >
-                  Undo changes
+                  {t("app.outside.undo")}
                 </button>
               </div>
             </section>
@@ -6266,20 +6887,22 @@ function App() {
             />
             {sourceFiles.length === 0 ? (
               <div className="sidebar-empty-guide">
-                <strong>Start with one topic.</strong>
+                <strong>{t("app.sidebar.startTopicTitle")}</strong>
                 <span>
-                  Import a small set of related sources, build the first wiki, then refine it
-                  before adding more.
+                  {t("app.sidebar.startTopicBody")}
                 </span>
               </div>
             ) : null}
           </div>
           {hasPendingGeneratedChanges && unreviewedChangedFiles.length > 0 ? (
-            <div className="sidebar-review-panel" aria-label="Generated changes to review">
+            <div className="sidebar-review-panel" aria-label={t("app.review.title")}>
               <div className="review-panel-header">
-                <strong>Review generated changes</strong>
+                <strong>{t("app.review.title")}</strong>
                 <span>
-                  {reviewedChangedCount}/{reviewableChangedFiles.length} viewed
+                  {t("app.review.viewed", {
+                    reviewed: reviewedChangedCount,
+                    total: reviewableChangedFiles.length,
+                  })}
                 </span>
               </div>
               <div className="review-change-list">
@@ -6297,7 +6920,7 @@ function App() {
                     title={`${file.path} (${file.status})`}
                   >
                     <span className="review-change-path">{displayFileName(file.path)}</span>
-                    <span className="review-change-state">Open</span>
+                    <span className="review-change-state">{t("app.review.open")}</span>
                   </button>
                 ))}
               </div>
@@ -6305,10 +6928,10 @@ function App() {
                 <button
                   type="button"
                   disabled={Boolean(finishReviewBlockedReason)}
-                  title={finishReviewBlockedReason ?? "Mark all remaining changes reviewed"}
+                  title={finishReviewBlockedReason ?? t("app.review.markAll")}
                   onClick={() => finishGeneratedReview()}
                 >
-                  Done reviewing
+                  {t("app.review.done")}
                 </button>
                 <button
                   type="button"
@@ -6317,7 +6940,7 @@ function App() {
                   title={undoBlockedReason ?? undefined}
                   onClick={() => runCommand("undo_last_operation", "Undoing operation")}
                 >
-                  Undo
+                  {t("app.review.undo")}
                 </button>
               </div>
             </div>
@@ -6327,7 +6950,7 @@ function App() {
         <button
           type="button"
           className={`panel-resize-handle ${leftPanelEffectivelyCollapsed ? "collapsed" : ""}`}
-          aria-label="Resize left panel"
+          aria-label={language === "ko" ? "왼쪽 패널 크기 조절" : "Resize left panel"}
           disabled={leftPanelEffectivelyCollapsed}
           onPointerDown={(event) => startPanelResize("left", event)}
         />
@@ -6360,12 +6983,12 @@ function App() {
                   title={schemaUpdateButtonTitle}
                   onClick={() => void openSchemaUpdatePrompt(true)}
                 >
-                  Update schema.md
+                  {t("app.center.updateSchema")}
                 </button>
               ) : null}
               {!activeReportContent && viewMode === "page" && selectedPathEditable ? (
                 editActiveForSelectedPath ? (
-                  <div className="center-edit-actions" aria-label="Editing actions">
+                  <div className="center-edit-actions" aria-label={t("app.center.editingActions")}>
                     <span className={`center-edit-status ${editDirty ? "dirty" : ""}`}>
                       {editStatusLabel}
                     </span>
@@ -6375,7 +6998,7 @@ function App() {
                       disabled={!editDirty || editBuffer?.saving}
                       onClick={() => void saveEditBuffer()}
                     >
-                      Save
+                      {t("app.common.save")}
                     </button>
                     <button
                       type="button"
@@ -6383,7 +7006,7 @@ function App() {
                       disabled={editBuffer?.saving}
                       onClick={discardEditBuffer}
                     >
-                      Cancel
+                      {t("app.common.cancel")}
                     </button>
                   </div>
                 ) : (
@@ -6391,15 +7014,15 @@ function App() {
                     type="button"
                     className="center-edit-btn"
                     disabled={!canStartEditing}
-                    title={editBlockedReason ?? `Edit ${displayFileName(selectedPath)}`}
+                    title={editBlockedReason ?? t("app.center.editFile", { file: displayFileName(selectedPath) })}
                     onClick={startEditingSelectedFile}
                   >
-                    Edit
+                    {t("app.common.edit")}
                   </button>
                 )
               ) : null}
               {activeReportContent ? (
-                <span className="center-subtitle">Read-only report</span>
+                <span className="center-subtitle">{t("app.center.readOnlyReport")}</span>
               ) : null}
               <div className="view-toggle">
                 <button
@@ -6407,14 +7030,14 @@ function App() {
                   className={`view-toggle-btn ${viewMode === "page" ? "active" : ""}`}
                   onClick={() => void openWorkspaceFile(selectedPath)}
                 >
-                  Page
+                  {t("app.center.page")}
                 </button>
                 <button
                   type="button"
                   className={`view-toggle-btn ${viewMode === "graph" ? "active" : ""}`}
                   onClick={() => void openGraphTab()}
                 >
-                  Graph
+                  {t("app.center.graph")}
                 </button>
               </div>
             </div>
@@ -6430,8 +7053,8 @@ function App() {
                   <button
                     type="button"
                     className="banner-dismiss"
-                    aria-label="Dismiss error"
-                    title="Dismiss error"
+                    aria-label={t("app.center.dismissError")}
+                    title={t("app.center.dismissError")}
                     onClick={() => setError(null)}
                   >
                     <X size={16} strokeWidth={2.2} aria-hidden="true" />
@@ -6441,9 +7064,9 @@ function App() {
 
               {interruptedOp?.interrupted ? (
                 <div className="banner banner-warn">
-                  <strong>Previous build was interrupted.</strong>
+                  <strong>{t("app.center.previousBuildInterrupted")}</strong>
                   <p>
-                    Operation <code>{interruptedOp.operationId}</code> didn't finish. Snapshot is intact.
+                    {t("app.center.interruptedBody", { operationId: interruptedOp.operationId ?? "" })}
                   </p>
                   <button
                     type="button"
@@ -6457,34 +7080,36 @@ function App() {
                       setInterruptedOp(null);
                     }}
                   >
-                    Discard and restore
+                    {t("app.center.discardRestore")}
                   </button>
                 </div>
               ) : null}
 
               {hasOfficePdfPreviewSources && sofficeInstalling ? (
                 <div className="banner banner-info">
-                  <strong>Watching for LibreOffice install…</strong>
+                  <strong>{t("app.center.libreWatching")}</strong>
                   <p>
-                    Terminal will say <code>libreoffice was successfully installed!</code> when done. Typically 5–10 min.
+                    {t("app.center.libreInstallDone")}
                     {sofficeInstallStartedAt
-                      ? ` (${Math.floor((Date.now() - sofficeInstallStartedAt) / 1000)}s elapsed)`
+                      ? ` ${t("app.center.elapsed", {
+                          seconds: Math.floor((Date.now() - sofficeInstallStartedAt) / 1000),
+                        })}`
                       : ""}
                   </p>
                 </div>
               ) : hasOfficePdfPreviewSources && sofficeStatus && !sofficeStatus.installed ? (
                 <div className="banner banner-warn">
-                  <strong>LibreOffice needed for Office files.</strong>
-                  <p>One-time install. Opens Terminal.</p>
+                  <strong>{t("app.center.libreNeeded")}</strong>
+                  <p>{t("app.center.libreOneTime")}</p>
                   <button
                     type="button"
                     disabled={anyOperationBusy}
                     title={activeOperationLabel ? `${activeOperationLabel} is running.` : undefined}
                     onClick={() =>
-                      runCommand("install_libreoffice", "Opening Terminal to install LibreOffice")
+                      runCommand("install_libreoffice", t("app.center.openingLibreSetup"))
                     }
                   >
-                    Install LibreOffice
+                    {t("app.center.installLibre")}
                   </button>
                 </div>
               ) : null}
@@ -6558,14 +7183,14 @@ function App() {
               ) : sourcePdfRender?.sourcePath === selectedPath &&
                 sourcePdfRender.status === "error" ? (
                 <div className="pptx-status pptx-status-error">
-                  <strong>Couldn't render slides.</strong>
+                  <strong>{t("app.center.couldntRender")}</strong>
                   <p>{sourcePdfRender.error}</p>
                   {sofficeStatus && !sofficeStatus.installed ? (
-                    <p>Install LibreOffice, then reopen this file.</p>
+                    <p>{t("app.center.installLibreReopen")}</p>
                   ) : null}
                 </div>
               ) : (
-                <div className="pptx-status">Rendering slides…</div>
+                <div className="pptx-status">{t("app.center.renderingPreview")}</div>
               )
             ) : editActiveForSelectedPath && editBuffer ? (
               <MarkdownEditor
@@ -6597,15 +7222,15 @@ function App() {
               <PlainTextDocument
                 content={
                   selectedDocument.path === selectedPath
-                    ? selectedDocument.content ?? `${selectedDocument.path} is not available.`
-                    : `Loading ${selectedPath}...`
+                    ? selectedDocument.content ?? t("app.center.notAvailable", { path: selectedDocument.path })
+                    : t("app.center.loadingPath", { path: selectedPath })
                 }
                 anchor={selectedDocument.path === selectedPath ? pendingAnchor : null}
                 onAnchorConsumed={() => setPendingAnchor(null)}
               />
             ) : (
               <MarkdownDocument
-                content={selectedDocument.content ?? `${selectedDocument.path} is not available.`}
+                content={selectedDocument.content ?? t("app.center.notAvailable", { path: selectedDocument.path })}
                 currentPath={selectedDocument.path}
                 workspacePath={workspace.workspacePath}
                 availableDocuments={availableDocuments}
@@ -6632,7 +7257,7 @@ function App() {
                   onClick={() => setConnectionsOpen((value) => !value)}
                   aria-expanded={connectionsOpen}
                 >
-                  <span>{connectionsOpen ? "Hide connections" : "Connections"}</span>
+                  <span>{connectionsOpen ? t("app.center.hideConnections") : t("app.center.connections")}</span>
                   <span className="center-connections-count">
                     {linkGraph[selectedPath].backlinks.length +
                       linkGraph[selectedPath].outbound.length}
@@ -6642,13 +7267,15 @@ function App() {
                   <div className="center-connections-body">
                     {linkGraph[selectedPath].backlinks.length === 0 &&
                     linkGraph[selectedPath].outbound.length === 0 ? (
-                      <p className="connections-empty">No connections to this page yet.</p>
+                      <p className="connections-empty">{t("app.center.noConnections")}</p>
                     ) : (
                       <>
                         {linkGraph[selectedPath].backlinks.length > 0 ? (
                           <>
                             <div className="connections-label">
-                              Linked from ({linkGraph[selectedPath].backlinks.length})
+                              {t("app.center.linkedFrom", {
+                                count: linkGraph[selectedPath].backlinks.length,
+                              })}
                             </div>
                             <ul className="connections-list">
                               {linkGraph[selectedPath].backlinks.map((path) => (
@@ -6672,7 +7299,9 @@ function App() {
                         {linkGraph[selectedPath].outbound.length > 0 ? (
                           <>
                             <div className="connections-label">
-                              Links from this page ({linkGraph[selectedPath].outbound.length})
+                              {t("app.center.linksFromPage", {
+                                count: linkGraph[selectedPath].outbound.length,
+                              })}
                             </div>
                             <ul className="connections-list">
                               {linkGraph[selectedPath].outbound.map((path) => (
@@ -6705,7 +7334,7 @@ function App() {
         <button
           type="button"
           className={`panel-resize-handle ${rightPanelEffectivelyCollapsed ? "collapsed" : ""}`}
-          aria-label="Resize right panel"
+          aria-label={language === "ko" ? "오른쪽 패널 크기 조절" : "Resize right panel"}
           disabled={rightPanelEffectivelyCollapsed}
           onPointerDown={(event) => startPanelResize("right", event)}
         />
@@ -6715,7 +7344,7 @@ function App() {
             <div className="explore-chat-shell">
               <header className="explore-chat-header">
                 <div className="explore-chat-heading">
-                  <span className="explore-chat-title">Explore Chat</span>
+                  <span className="explore-chat-title">{t("app.right.exploreChat")}</span>
                   <span className="explore-chat-context" title={selectedPath}>
                     {displayFileName(selectedPath)}
                   </span>
@@ -6733,7 +7362,7 @@ function App() {
                     className="explore-chat-header-btn"
                     onClick={() => void createNewChat()}
                     disabled={!workspace.workspacePath || blockingUiBusy}
-                    title="New chat"
+                    title={t("app.right.newChat")}
                   >
                     +
                   </button>
@@ -6743,16 +7372,16 @@ function App() {
                     className="explore-chat-header-btn"
                     onClick={() => void toggleChatHistory()}
                     disabled={!workspace.workspacePath || blockingUiBusy}
-                    title="History"
+                    title={t("app.right.history")}
                   >
-                    History
+                    {t("app.right.history")}
                   </button>
                 </div>
                 {chatHistoryOpen ? (
                   <div ref={chatHistoryPopoverRef} className="explore-chat-history-popover">
-                    <div className="explore-chat-history-title">Chats</div>
+                    <div className="explore-chat-history-title">{t("app.right.chats")}</div>
                     {chatThreads.length === 0 ? (
-                      <div className="explore-chat-history-empty">No saved chats yet.</div>
+                      <div className="explore-chat-history-empty">{t("app.right.noSavedChats")}</div>
                     ) : (
                       <ul className="explore-chat-history-list">
                         {chatThreads.map((thread) => {
@@ -6796,18 +7425,20 @@ function App() {
                         disabled={exploreBusy || wikiUpdateBusy || blockingUiBusy}
                         title={
                           wikiUpdateBusy
-                            ? "Update wiki from chat is running. Wait for it to finish before deleting this chat."
-                            : exploreBlockedReason ?? "Delete current chat"
+                            ? (language === "ko"
+                                ? "채팅에서 위키 업데이트가 실행 중입니다. 끝난 뒤 이 채팅을 삭제하세요."
+                                : "Update wiki from chat is running. Wait for it to finish before deleting this chat.")
+                            : exploreBlockedReason ?? t("app.right.deleteCurrentChat")
                         }
                       >
-                        Delete current chat
+                        {t("app.right.deleteCurrentChat")}
                       </button>
                     ) : null}
                   </div>
                 ) : null}
               </header>
               {!showExploreChatMessages ? (
-                <div className="explore-chat-empty">Ask about this page.</div>
+                <div className="explore-chat-empty">{t("app.right.askPage")}</div>
               ) : (
                 <div className="explore-chat-messages" ref={exploreChatMessagesRef}>
                   {exploreChatMessages.map((message, index) => (
@@ -6835,7 +7466,7 @@ function App() {
                         {message.role === "assistant" && message.runId ? (
                           <OperationFeedPanel
                             progress={chatRunProgressById[message.runId] ?? null}
-                            title="Progress"
+                            title={t("app.operation.progress")}
                             fallbackSteps={chatRunningSteps}
                             fallbackActiveIndex={Math.min(
                               chatStatusStep,
@@ -6894,6 +7525,10 @@ function App() {
               className="explore-chat-composer"
               onSubmit={(event) => {
                 event.preventDefault();
+                if (aiSetupGateActive) {
+                  openAiSetupFromGate("chat", "ask");
+                  return;
+                }
                 void askExploreChat();
               }}
             >
@@ -6904,6 +7539,7 @@ function App() {
                   context="chat"
                   className="chat-provider-setup"
                   showReady={showAiSetupReadyNotice}
+                  onAction={(action, status) => trackAiSetupAction(action, status, activeProvider)}
                 />
               ) : null}
               {workspaceUpdateExploreNotice ? (
@@ -6913,12 +7549,16 @@ function App() {
                 className="explore-chat-input"
                 value={exploreQuestion}
                 disabled={Boolean(exploreBlockedReason) || !workspace.workspacePath}
-                placeholder="Ask about this page…"
+                placeholder={t("app.right.askPlaceholder")}
                 rows={3}
                 onChange={(event) => setExploreQuestion(event.target.value)}
                 onKeyDown={(event) => {
                   if (event.key === "Enter" && !event.shiftKey) {
                     event.preventDefault();
+                    if (aiSetupGateActive) {
+                      openAiSetupFromGate("chat", "ask");
+                      return;
+                    }
                     if (exploreBlockedReason) {
                       return;
                     }
@@ -6934,7 +7574,7 @@ function App() {
                         settings={appSettings}
                         value={activeModelChoice}
                         disabled={exploreBusy || blockingUiBusy}
-                        ariaLabel="AI model"
+                        ariaLabel={t("app.right.aiModel")}
                         className="explore-chat-model-picker"
                         onChange={(selection) => void selectChatModelChoice(selection)}
                       />
@@ -6949,13 +7589,13 @@ function App() {
                       exploreWebSearchEnabled ? " active" : ""
                     }`}
                     aria-label={
-                      exploreWebSearchEnabled ? "Disable web search" : "Enable web search"
+                      exploreWebSearchEnabled ? t("app.right.disableWeb") : t("app.right.enableWeb")
                     }
                     aria-pressed={exploreWebSearchEnabled}
                     title={
                       exploreWebSearchEnabled
-                        ? "Web search on"
-                        : "Web search off"
+                        ? t("app.right.webOn")
+                        : t("app.right.webOff")
                     }
                     disabled={exploreBusy || blockingUiBusy}
                     onClick={() => setExploreWebSearchEnabled((enabled) => !enabled)}
@@ -6967,28 +7607,36 @@ function App() {
                   <button
                     type="button"
                     className="explore-chat-update"
-                    onClick={openLatestApplyDraft}
-                    disabled={!canOpenWikiUpdateDraft}
+                    onClick={
+                      aiSetupGateActive
+                        ? () => openAiSetupFromGate("chat", "update_wiki")
+                        : openLatestApplyDraft
+                    }
+                    disabled={aiSetupGateActive ? false : !canOpenWikiUpdateDraft}
                     title={
-                      updateWikiBlockedReason
+                      aiSetupGateActive
+                        ? t("app.ai.connectToUpdate")
+                        : updateWikiBlockedReason
                         ? updateWikiBlockedReason
                         : latestCompletedAssistantMessage
-                        ? "Update wiki from the latest answer"
-                        : "Ask the chat before updating the wiki"
+                        ? t("app.right.updateLatestAnswer")
+                        : t("app.right.askBeforeUpdate")
                     }
                   >
-                    Update wiki
+                    {t("app.right.updateWiki")}
                   </button>
                   <button
                     type="submit"
                     className="explore-chat-submit"
                     disabled={
-                      Boolean(exploreBlockedReason) ||
-                      !workspace.workspacePath ||
-                      !exploreQuestion.trim()
+                      aiSetupGateActive
+                        ? false
+                        : Boolean(exploreBlockedReason) ||
+                          !workspace.workspacePath ||
+                          !exploreQuestion.trim()
                     }
-                    title={exploreBlockedReason ?? "Ask"}
-                    aria-label="Ask"
+                    title={aiSetupGateActive ? t("app.ai.connectToAsk") : exploreBlockedReason ?? t("app.right.ask")}
+                    aria-label={aiSetupGateActive ? t("app.ai.connectToAsk") : t("app.right.ask")}
                   >
                     ↑
                   </button>
@@ -7000,7 +7648,7 @@ function App() {
             <div className="maintain-shell">
               <header className="explore-chat-header maintain-chat-header">
                 <div className="explore-chat-heading">
-                  <span className="explore-chat-title">Maintain</span>
+                  <span className="explore-chat-title">{t("app.right.maintain")}</span>
                   <span className="explore-chat-context" title={maintainThread?.title || ""}>
                     {maintainContextLabel}
                   </span>
@@ -7011,7 +7659,7 @@ function App() {
                     className="explore-chat-header-btn"
                     onClick={() => void createNewMaintainThread()}
                     disabled={!workspace.workspacePath}
-                    title="New maintain chat"
+                    title={t("app.right.newMaintainChat")}
                   >
                     +
                   </button>
@@ -7021,9 +7669,9 @@ function App() {
                     className="explore-chat-header-btn"
                     onClick={() => void toggleMaintainHistory()}
                     disabled={!workspace.workspacePath}
-                    title="History"
+                    title={t("app.right.history")}
                   >
-                    History
+                    {t("app.right.history")}
                   </button>
                 </div>
                 {maintainHistoryOpen ? (
@@ -7031,9 +7679,9 @@ function App() {
                     ref={maintainHistoryPopoverRef}
                     className="explore-chat-history-popover maintain-history-popover"
                   >
-                    <div className="explore-chat-history-title">Maintain chats</div>
+                    <div className="explore-chat-history-title">{t("app.right.maintainChats")}</div>
                     {maintainThreads.length === 0 ? (
-                      <div className="explore-chat-history-empty">No saved maintain chats yet.</div>
+                      <div className="explore-chat-history-empty">{t("app.right.noSavedMaintain")}</div>
                     ) : (
                       <ul className="explore-chat-history-list">
                         {maintainThreads.map((thread) => {
@@ -7074,9 +7722,9 @@ function App() {
                         className="explore-chat-delete"
                         onClick={() => void deleteCurrentMaintainThread()}
                         disabled={maintainDeleteDisabled}
-                        title={maintainDeleteBlockedReason ?? "Delete current chat"}
+                        title={maintainDeleteBlockedReason ?? t("app.right.deleteCurrentChat")}
                       >
-                        Delete current chat
+                        {t("app.right.deleteCurrentChat")}
                       </button>
                     ) : null}
                   </div>
@@ -7093,7 +7741,7 @@ function App() {
                         {message.runId ? (
                           <OperationFeedPanel
                             progress={chatRunProgressById[message.runId] ?? null}
-                            title="Progress"
+                            title={t("app.operation.progress")}
                             fallbackSteps={maintainDiscussionRunningSteps}
                             fallbackActiveIndex={Math.min(
                               chatStatusStep,
@@ -7150,27 +7798,33 @@ function App() {
 
                 {showMaintainTaskChoices ? (
                   <div className="maintain-empty-prompt">
-                    <p className="maintain-empty-title">What do you want to do?</p>
+                    <p className="maintain-empty-title">{t("app.right.whatDo")}</p>
                     {maintainTaskChoiceNotice ? (
                       <p className="maintain-message-note">{maintainTaskChoiceNotice}</p>
                     ) : null}
                   </div>
                 ) : null}
                 {showMaintainTaskChoices ? (
-                  <div className="maintain-task-list" aria-label="Maintain actions">
+                  <div className="maintain-task-list" aria-label={t("app.right.maintainActions")}>
                     {MAINTAIN_TASKS.map((task) => (
                       <button
                         key={task.id}
                         type="button"
                         className="maintain-task-card"
-                        title={task.label}
+                        title={maintainTaskUiCopy(task.id, language).label}
                         onClick={() => selectMaintainTask(task.id)}
                       >
                         <span className="maintain-task-card-copy">
-                          <span className="maintain-task-card-title">{task.label}</span>
-                          <span className="maintain-task-card-summary">{task.summary}</span>
+                          <span className="maintain-task-card-title">
+                            {maintainTaskUiCopy(task.id, language).label}
+                          </span>
+                          <span className="maintain-task-card-summary">
+                            {maintainTaskUiCopy(task.id, language).summary}
+                          </span>
                         </span>
-                        <span className="maintain-task-card-meta">{task.guidanceLabel}</span>
+                        <span className="maintain-task-card-meta">
+                          {maintainTaskUiCopy(task.id, language).guidanceLabel}
+                        </span>
                       </button>
                     ))}
                   </div>
@@ -7180,9 +7834,9 @@ function App() {
                   <div className="maintain-message maintain-message-assistant">
                     <OperationFeedPanel
                       progress={workspaceOperationProgress}
-                      title={selectedMaintainTask.label}
+                      title={selectedMaintainTaskCopy?.label ?? selectedMaintainTask.label}
                       runningLabel={maintainRunningLabel}
-                      meta={[selectedMaintainTask.busyLabel]}
+                      meta={[selectedMaintainTaskCopy?.busyLabel ?? selectedMaintainTask.busyLabel]}
                       fallbackSteps={selectedMaintainTask.runningSteps}
                       fallbackActiveIndex={maintainActiveStep}
                       open={maintainFeedOpen}
@@ -7203,7 +7857,7 @@ function App() {
                       onClick={() => void createNewMaintainThread()}
                       disabled={!workspace.workspacePath}
                     >
-                      Start task
+                      {t("app.right.startTask")}
                     </button>
                   </div>
                 ) : null}
@@ -7226,6 +7880,10 @@ function App() {
                   className="maintain-composer"
                   onSubmit={(event) => {
                     event.preventDefault();
+                    if (aiSetupGateActive) {
+                      openAiSetupFromGate("maintain", "maintain");
+                      return;
+                    }
                     void submitMaintainComposer();
                   }}
                 >
@@ -7236,35 +7894,23 @@ function App() {
                       context="maintain"
                       className="maintain-provider-setup"
                       showReady={showAiSetupReadyNotice}
+                      onAction={(action, status) => trackAiSetupAction(action, status, activeProvider)}
                     />
                   ) : null}
-                  <section className="maintain-task-context" aria-label="Selected Maintain task">
+                  <section className="maintain-task-context" aria-label={t("app.right.selectedMaintainTask")}>
                     <div className="maintain-task-context-copy">
                       <span className="maintain-task-context-title">
-                        {selectedMaintainTask.label}
+                        {selectedMaintainTaskCopy?.label ?? selectedMaintainTask.label}
                       </span>
                       <span className="maintain-task-context-hint">
-                        {maintainTaskContextHint(selectedMaintainTask)}
+                        {selectedMaintainTaskCopy?.contextHint ?? maintainTaskContextHint(selectedMaintainTask)}
                       </span>
                     </div>
-                    <button
-                      type="button"
-                      className="maintain-task-context-change"
-                      onClick={() => void changeMaintainTask()}
-                      disabled={!workspace.workspacePath}
-                      title={
-                        maintainThread?.messages.length
-                          ? "Start another Maintain task"
-                          : "Change task"
-                      }
-                    >
-                      Change
-                    </button>
                   </section>
                   {selectedMaintainTask.id === "updateRules" ? (
                     <details className="maintain-rule-details">
-                      <summary>Rule files</summary>
-                      <section className="maintain-rule-files" aria-label="Current rule files">
+                      <summary>{t("app.right.ruleFiles")}</summary>
+                      <section className="maintain-rule-files" aria-label={t("app.right.currentRuleFiles")}>
                         {RULE_FILE_GUIDES.map((ruleFile) => {
                           const canOpenRuleFile = availableDocuments.includes(ruleFile.path);
                           return (
@@ -7281,7 +7927,7 @@ function App() {
                                 disabled={!canOpenRuleFile}
                                 onClick={() => void openWorkspaceFile(ruleFile.path)}
                               >
-                                {canOpenRuleFile ? "Open" : "Missing"}
+                                {canOpenRuleFile ? t("app.common.open") : t("app.common.missing")}
                               </button>
                             </div>
                           );
@@ -7296,10 +7942,14 @@ function App() {
                       }`}
                       title={
                         sourceFiles.length === 0
-                          ? "No sources found in this workspace."
+                          ? (language === "ko" ? "이 워크스페이스에 소스가 없습니다." : "No sources found in this workspace.")
                           : maintainAskOnly
-                            ? "Source grounding applies when running a wiki improvement."
-                            : "Use sources for this Improve wiki run."
+                            ? (language === "ko"
+                                ? "소스 근거는 위키 개선을 실행할 때 적용됩니다."
+                                : "Source grounding applies when running a wiki improvement.")
+                            : (language === "ko"
+                                ? "이 위키 개선 작업에 소스를 사용합니다."
+                                : "Use sources for this Improve wiki run.")
                       }
                     >
                       <input
@@ -7311,18 +7961,21 @@ function App() {
                         }
                       />
                       <span className="maintain-source-toggle-copy">
-                        <span className="maintain-source-toggle-title">Use sources</span>
+                        <span className="maintain-source-toggle-title">{t("app.right.useSources")}</span>
                         <span className="maintain-source-toggle-hint">
-                          Re-read source files for this improvement.
+                          {t("app.right.useSourcesHint")}
                         </span>
                       </span>
                     </label>
                   ) : null}
                   {maintainSourceGroundingAvailable && maintainUseSources ? (
-                    <section className="maintain-source-picker" aria-label="Source picker">
+                    <section className="maintain-source-picker" aria-label={t("app.right.sourcePicker")}>
                       <header className="maintain-source-picker-header">
                         <span>
-                          {maintainSelectedSourcePathList.length} of {sourceFiles.length} selected
+                          {t("app.right.selectedCount", {
+                            selected: maintainSelectedSourcePathList.length,
+                            total: sourceFiles.length,
+                          })}
                         </span>
                         <span className="maintain-source-picker-actions">
                           <button
@@ -7330,14 +7983,14 @@ function App() {
                             onClick={() => setMaintainSelectedSourcePaths(new Set(sourceFiles))}
                             disabled={sourceFiles.length === 0}
                           >
-                            All
+                            {t("app.common.all")}
                           </button>
                           <button
                             type="button"
                             onClick={() => setMaintainSelectedSourcePaths(new Set())}
                             disabled={maintainSelectedSourcePathList.length === 0}
                           >
-                            Clear
+                            {t("app.common.clear")}
                           </button>
                         </span>
                       </header>
@@ -7358,7 +8011,7 @@ function App() {
                     rows={3}
                     disabled={Boolean(maintainComposerBlockedReason)}
                     title={maintainComposerBlockedReason ?? undefined}
-                    placeholder={selectedMaintainTask.placeholder}
+                    placeholder={selectedMaintainTaskCopy?.placeholder ?? selectedMaintainTask.placeholder}
                     onChange={(event) => setMaintainInstruction(event.target.value)}
                   />
                   <div className="maintain-composer-footer">
@@ -7369,7 +8022,7 @@ function App() {
                             settings={appSettings}
                             value={activeModelChoice}
                             disabled={anyOperationBusy}
-                            ariaLabel="Maintain AI model"
+                            ariaLabel={t("app.right.aiModel")}
                             className="explore-chat-model-picker"
                             align="right"
                             onChange={(selection) => void selectChatModelChoice(selection)}
@@ -7388,13 +8041,13 @@ function App() {
                         disabled={!workspace.workspacePath}
                         title={
                           maintainAskOnly
-                            ? "Ask only is on. Submit asks without changing files."
-                            : "Ask only is off. Turn on to submit without changing files."
+                            ? t("app.right.askOnlyOn")
+                            : t("app.right.askOnlyOff")
                         }
                         onClick={() => setMaintainAskOnly((askOnly) => !askOnly)}
                       >
                         <HelpCircle size={14} strokeWidth={2.2} aria-hidden="true" />
-                        Ask only
+                        {t("app.right.askOnly")}
                       </button>
                       <button
                         type="submit"
@@ -7422,17 +8075,19 @@ function App() {
           </span>
         ) : null}
         <span className="statusbar-meta">
-          {wikiPages.length} pages · {imagesAndFiles.length} files
+          {t("app.statusbar.counts", { pages: wikiPages.length, files: imagesAndFiles.length })}
         </span>
         <span className="statusbar-path" title={workspace.workspacePath}>
           {workspace.workspacePath}
         </span>
       </footer>
 
+      {renderMapleGuideWidget()}
+
         {expandedImage ? (
           <div className="image-lightbox" role="dialog" aria-modal="true">
             <button type="button" className="lightbox-close" onClick={() => setExpandedImage(null)}>
-              Close
+              {t("app.image.close")}
           </button>
           <img src={expandedImage.src} alt={expandedImage.alt} />
             {expandedImage.alt ? <p>{expandedImage.alt}</p> : null}
@@ -7444,8 +8099,8 @@ function App() {
             <div className="apply-modal asset-modal">
               <header className="apply-modal-header">
                 <div>
-                  <h2>Crop image</h2>
-                  <p>Drag to choose the visible area. Values use original image pixels.</p>
+                  <h2>{t("app.image.crop")}</h2>
+                  <p>{t("app.image.cropBody")}</p>
                 </div>
                 <button
                   type="button"
@@ -7532,7 +8187,7 @@ function App() {
                   }
                   onClick={() => void saveImageAssetCrop()}
                 >
-                  {assetBusyLabel(assetCropDraft.asset) ?? "Save crop"}
+                  {assetBusyLabel(assetCropDraft.asset) ?? t("app.common.save")}
                 </button>
                 <button
                   type="button"
@@ -7540,7 +8195,7 @@ function App() {
                   disabled={Boolean(assetBusyLabel(assetCropDraft.asset))}
                   onClick={() => setAssetCropDraft(null)}
                 >
-                  Cancel
+                  {t("app.common.cancel")}
                 </button>
               </div>
             </div>
@@ -7573,7 +8228,9 @@ function App() {
             <div className="apply-modal unsaved-edit-modal">
               <header className="apply-modal-header">
                 <div>
-                  <h2 id="unsaved-edit-title">Save changes?</h2>
+                  <h2 id="unsaved-edit-title">
+                    {language === "ko" ? "변경을 저장할까요?" : "Save changes?"}
+                  </h2>
                   <p>
                     {displayFileName(unsavedPrompt.path)} has unsaved edits before you{" "}
                     {unsavedPrompt.targetLabel}.
@@ -7582,21 +8239,21 @@ function App() {
               </header>
               <div className="unsaved-edit-actions">
                 <button type="button" onClick={() => resolveUnsavedPrompt("save")}>
-                  Save
+                  {t("app.common.save")}
                 </button>
                 <button
                   type="button"
                   className="secondary"
                   onClick={() => resolveUnsavedPrompt("discard")}
                 >
-                  Discard
+                  {language === "ko" ? "버리기" : "Discard"}
                 </button>
                 <button
                   type="button"
                   className="secondary"
                   onClick={() => resolveUnsavedPrompt("cancel")}
                 >
-                  Cancel
+                  {t("app.common.cancel")}
                 </button>
               </div>
             </div>
@@ -7621,17 +8278,17 @@ function App() {
                 <div>
                   <h2 id="build-modal-title">
                     {buildDraft.requiresWorkspaceContext
-                      ? "Tell Maple what this wiki is for"
+                      ? t("app.build.titleContext")
                       : buildDraft.force
-                        ? "Build wiki again"
-                        : "Build wiki"}
+                        ? t("app.build.titleAgain")
+                        : t("app.build.title")}
                   </h2>
                   <p>
                     {buildDraft.requiresWorkspaceContext
-                      ? "This helps Maple choose the right summaries, concepts, and guides."
+                      ? t("app.build.bodyContext")
                       : buildDraft.force
-                        ? "Reprocess current sources using the workspace rules."
-                        : "Process pending source changes into the wiki."}
+                        ? t("app.build.bodyAgain")
+                        : t("app.build.body")}
                   </p>
                 </div>
                 <button
@@ -7643,7 +8300,7 @@ function App() {
                   }}
                   disabled={isStartingBuild}
                 >
-                  Close
+                  {t("app.common.close")}
                 </button>
               </header>
 
@@ -7654,10 +8311,12 @@ function App() {
                       {sourceFiles.slice(0, 12).map((path) => (
                         <li key={path}>{path}</li>
                       ))}
-                      {sourceFiles.length > 12 ? <li>{sourceFiles.length - 12} more source(s)</li> : null}
+                      {sourceFiles.length > 12 ? (
+                        <li>{t("app.build.moreSources", { count: sourceFiles.length - 12 })}</li>
+                      ) : null}
                     </ul>
                   ) : (
-                    <p>No sources found.</p>
+                    <p>{t("app.build.noSources")}</p>
                   )
                 ) : pendingSourceFiles.length > 0 ? (
                   (["new", "modified", "removed"] as SourceState[]).map((state) => {
@@ -7665,7 +8324,7 @@ function App() {
                     if (!files.length) return null;
                     return (
                       <div key={state} className="source-group">
-                        <strong>{sourceStateLabel(state)}</strong>
+                        <strong>{sourceStateLabel(state, language)}</strong>
                         <ul>
                           {files.map((file) => (
                             <li key={`${state}-${file.path}`}>{file.path}</li>
@@ -7675,34 +8334,27 @@ function App() {
                     );
                   })
                 ) : (
-                  <p>No pending source changes were detected.</p>
+                  <p>{t("app.build.noPending")}</p>
                 )}
               </div>
 
               {buildDraft.requiresWorkspaceContext ? (
-                <section className="first-build-guide" aria-label="First build guide">
+                <section className="first-build-guide" aria-label={t("app.build.layersTitle")}>
                   <span className="first-build-guide-icon" aria-hidden="true">
                     <Lightbulb size={16} strokeWidth={2.2} />
                   </span>
                   <div className="first-build-guide-copy">
-                    <strong>Build in layers</strong>
-                    <p>
-                      Use this first build for one topic or area. Review the wiki, refine{" "}
-                      <code>schema.md</code> or the structure in the Maintain tab, then add the
-                      next group of sources.
-                    </p>
+                    <strong>{t("app.build.layersTitle")}</strong>
+                    <p>{t("app.build.layersBody")}</p>
                   </div>
                 </section>
               ) : null}
 
               {looksLikeExistingWikiImport && !buildDraft.force ? (
-                <section className="existing-wiki-choice" aria-label="Existing wiki import options">
+                <section className="existing-wiki-choice" aria-label={t("app.build.existingTitle")}>
                   <div>
-                    <strong>Existing wiki detected</strong>
-                    <p>
-                      These sources look like they already belong to the current wiki. Keep the wiki as
-                      the baseline to mark them ingested without asking AI to rewrite everything.
-                    </p>
+                    <strong>{t("app.build.existingTitle")}</strong>
+                    <p>{t("app.build.existingBody")}</p>
                   </div>
                   <button
                     type="button"
@@ -7711,20 +8363,20 @@ function App() {
                     disabled={Boolean(buildBlockedReason) || anyOperationBusy}
                     title={buildBlockedReason ?? (activeOperationLabel ? `${activeOperationLabel} is running.` : undefined)}
                   >
-                    Keep current wiki
+                    {t("app.build.keepCurrent")}
                   </button>
                 </section>
               ) : null}
 
               <label className="build-model-field">
-                <span>AI model</span>
+                <span>{t("app.build.aiModel")}</span>
                 {providers.length > 0 && buildDraftProvider ? (
                   <ModelReasoningPicker
                     providers={providers}
                     settings={appSettings}
                     value={buildModelChoice}
                     disabled={isStartingBuild || Boolean(buildBlockedReason)}
-                    ariaLabel="Build wiki AI model"
+                    ariaLabel={t("app.build.modelLabel")}
                     className="build-model-picker"
                     onChange={(selection) => void selectBuildModelChoice(selection)}
                   />
@@ -7738,8 +8390,8 @@ function App() {
               <label className="apply-note-field">
                 <span>
                   {buildDraft.requiresWorkspaceContext
-                    ? "What are you building?"
-                    : "What should the AI focus on?"}
+                    ? t("app.build.whatBuilding")
+                    : t("app.build.focus")}
                 </span>
                 <textarea
                   value={
@@ -7749,8 +8401,8 @@ function App() {
                   }
                   placeholder={
                     buildDraft.requiresWorkspaceContext
-                      ? "Example: This is for my robotics class. I want a beginner-friendly study wiki with exam review guides, formulas explained step by step, and links between core concepts."
-                      : "Optional: emphasize formulas, create an exam guide, or focus on the selected lecture."
+                      ? t("app.build.contextPlaceholder")
+                      : t("app.build.focusPlaceholder")
                   }
                   rows={buildDraft.requiresWorkspaceContext ? 5 : 4}
                   required={buildDraft.requiresWorkspaceContext}
@@ -7777,6 +8429,9 @@ function App() {
                   context="build"
                   className="build-provider-setup"
                   showReady={showAiSetupReadyNotice}
+                  onAction={(action, status) =>
+                    trackAiSetupAction(action, status, buildDraftProvider)
+                  }
                 />
               ) : null}
 
@@ -7790,7 +8445,7 @@ function App() {
                   }}
                   disabled={isStartingBuild}
                 >
-                  Cancel
+                  {t("app.common.cancel")}
                 </button>
                 <button
                   type="button"
@@ -7806,7 +8461,9 @@ function App() {
                   }
                   title={buildBlockedReason ?? undefined}
                 >
-                  {looksLikeExistingWikiImport && !buildDraft.force ? "Rebuild from sources" : "Build wiki"}
+                  {looksLikeExistingWikiImport && !buildDraft.force
+                    ? t("app.build.rebuild")
+                    : t("app.build.title")}
                 </button>
               </footer>
             </div>
@@ -7826,8 +8483,8 @@ function App() {
             <div className="apply-modal" onMouseDown={(event) => event.stopPropagation()}>
               <header className="apply-modal-header">
                 <div>
-                  <h2 id="apply-modal-title">Update wiki</h2>
-                  <p>AI will update the wiki where it fits. You can review changes after.</p>
+                  <h2 id="apply-modal-title">{t("app.apply.title")}</h2>
+                  <p>{t("app.apply.body")}</p>
                 </div>
                 <button
                   type="button"
@@ -7835,14 +8492,14 @@ function App() {
                   onClick={() => setApplyDraft(null)}
                   disabled={wikiUpdateBusy}
                 >
-                  Close
+                  {t("app.common.close")}
                 </button>
               </header>
 
               <fieldset className="apply-scope-group">
-                <legend>Use</legend>
+                <legend>{t("app.apply.use")}</legend>
                 <div className="apply-scope-options">
-                  {APPLY_SCOPE_OPTIONS.map((option) => (
+                  {applyScopeOptions.map((option) => (
                     <label
                       key={option.value}
                       className={`apply-scope-option${
@@ -7866,7 +8523,7 @@ function App() {
               {applyDraft.scope === "selected-messages" ? (
                 <div className="apply-message-picker">
                   {applyMessages.length === 0 ? (
-                    <p>No completed chat messages yet.</p>
+                    <p>{t("app.apply.noMessages")}</p>
                   ) : (
                     applyMessages.map((message) => (
                       <label key={message.id} className="apply-message-option">
@@ -7878,7 +8535,7 @@ function App() {
                         />
                         <span className="apply-message-option-body">
                           <span className="apply-message-option-meta">
-                            {message.role === "user" ? "You" : "AI"}
+                            {message.role === "user" ? t("app.apply.you") : t("app.common.ai")}
                             {message.contextPath
                               ? ` - ${displayFileName(message.contextPath)}`
                               : ""}
@@ -7892,10 +8549,10 @@ function App() {
               ) : null}
 
               <label className="apply-note-field">
-                <span>Note to AI</span>
+                <span>{t("app.apply.noteToAi")}</span>
                 <textarea
                   value={applyDraft.instruction}
-                  placeholder="Optional: make this concise, add an example, or connect it to earlier notes."
+                  placeholder={t("app.apply.placeholder")}
                   rows={4}
                   disabled={wikiUpdateBusy}
                   onChange={(event) =>
@@ -7913,7 +8570,7 @@ function App() {
                   onClick={() => setApplyDraft(null)}
                   disabled={wikiUpdateBusy}
                 >
-                  Cancel
+                  {t("app.common.cancel")}
                 </button>
                 <button
                   type="button"
@@ -7922,7 +8579,7 @@ function App() {
                   disabled={Boolean(updateWikiBlockedReason) || applySelectedCount === 0}
                   title={updateWikiBlockedReason ?? undefined}
                 >
-                  Apply
+                  {t("app.common.apply")}
                 </button>
               </footer>
             </div>
@@ -7945,33 +8602,27 @@ function App() {
             >
               <header className="apply-modal-header">
                 <div>
-                  <h2 id="schema-update-title">schema.md update available</h2>
-                  <p>
-                    Maple can ask AI to update schema.md using the latest standard workspace schema
-                    while preserving useful rules from this workspace.
-                  </p>
+                  <h2 id="schema-update-title">{t("app.schema.title")}</h2>
+                  <p>{t("app.schema.body")}</p>
                 </div>
                 <button
                   type="button"
                   className="apply-modal-close"
                   onClick={() => setSchemaUpdatePrompt(null)}
-                  aria-label="Close schema update"
+                  aria-label={t("app.common.close")}
                   disabled={schemaUpdateBusy}
                 >
                   ×
                 </button>
               </header>
               <div className="schema-update-copy">
-                <strong>What this update does</strong>
-                <p>
-                  Maple will ask AI to create a new schema.md draft using the latest standard
-                  schema and your current workspace rules.
-                </p>
+                <strong>{t("app.schema.what")}</strong>
+                <p>{t("app.schema.whatBody")}</p>
                 <ul>
-                  <li>Uses the standard workspace schema as the main structure.</li>
-                  <li>Preserves useful workspace context and durable preferences when possible.</li>
-                  <li>Shows the generated schema.md change for review before you accept it.</li>
-                  <li>You can keep the current schema and reopen this later from schema.md.</li>
+                  <li>{t("app.schema.item.structure")}</li>
+                  <li>{t("app.schema.item.preferences")}</li>
+                  <li>{t("app.schema.item.review")}</li>
+                  <li>{t("app.schema.item.reopen")}</li>
                 </ul>
               </div>
               <button
@@ -7979,7 +8630,7 @@ function App() {
                 className="schema-update-toggle"
                 onClick={() => setSchemaUpdateContentOpen((open) => !open)}
               >
-                {schemaUpdateContentOpen ? "Hide latest schema.md" : "View latest schema.md"}
+                {schemaUpdateContentOpen ? t("app.schema.hideLatest") : t("app.schema.viewLatest")}
               </button>
               {schemaUpdateContentOpen ? (
                 <pre className="schema-update-preview">{schemaUpdatePrompt.latestSchema}</pre>
@@ -7991,22 +8642,20 @@ function App() {
                   context="maintain"
                   className="build-provider-setup"
                   showReady={showAiSetupReadyNotice}
+                  onAction={(action, status) => trackAiSetupAction(action, status, activeProvider)}
                 />
               ) : null}
               {schemaUpdateBusy ? (
                 <div className="schema-update-running" role="status" aria-live="polite">
                   <span className="chat-thinking">
-                    Updating schema.md. Maple is asking AI to merge the latest workspace schema
-                    with your current rules. Please wait a moment.
+                    {t("app.schema.running")}
                   </span>
                   <div className="schema-update-running-detail">
                     <p>
-                      Maple is reading the current schema, agent files, recent log, and wiki
-                      structure before writing the draft.
+                      {t("app.schema.runningDetail1")}
                     </p>
                     <p>
-                      This can take a few minutes with higher-reasoning models. The generated
-                      change will appear for review when it finishes.
+                      {t("app.schema.runningDetail2")}
                     </p>
                   </div>
                 </div>
@@ -8018,7 +8667,7 @@ function App() {
                   onClick={() => setSchemaUpdatePrompt(null)}
                   disabled={schemaUpdateBusy}
                 >
-                  Keep current schema
+                  {t("app.schema.keep")}
                 </button>
                 <button
                   type="button"
@@ -8027,7 +8676,70 @@ function App() {
                   title={schemaUpdateBlockedReason ?? undefined}
                   onClick={() => void mergeStandardSchemaUpdate()}
                 >
-                  {schemaUpdateBusy ? "Updating..." : "Update schema.md"}
+                  {schemaUpdateBusy ? t("app.common.saving") : t("app.schema.update")}
+                </button>
+              </footer>
+            </div>
+          </div>
+        ) : null}
+
+        {showGlobalAiSetupWizard ? (
+          <div className="apply-modal-overlay" role="dialog" aria-modal="true" aria-labelledby="ai-setup-title">
+            <div className="apply-modal ai-setup-modal" onMouseDown={(event) => event.stopPropagation()}>
+              <header className="apply-modal-header">
+                <div>
+                  <span className="ai-setup-kicker">{t("app.common.ai")}</span>
+                  <h2 id="ai-setup-title">{t("app.ai.connectTitle")}</h2>
+                  <p>{t("app.ai.connectBody")}</p>
+                </div>
+                <button
+                  type="button"
+                  className="ai-setup-language-toggle"
+                  aria-label={t("app.empty.chooseLanguage")}
+                  onClick={() => setLanguage(language === "ko" ? "en" : "ko")}
+                >
+                  {language === "ko" ? "English" : "한국어"}
+                </button>
+              </header>
+              <section className="ai-setup-provider-section" aria-label={t("app.ai.chooseProvider")}>
+                <div className="ai-setup-provider-title">{t("app.ai.chooseProvider")}</div>
+                <div className="ai-setup-provider-grid">
+                  {providers.map((provider) => {
+                    const selected = provider.name === activeProvider?.name;
+                    return (
+                      <button
+                        key={provider.name}
+                        type="button"
+                        className={`ai-setup-provider-option${selected ? " selected" : ""}`}
+                        aria-pressed={selected}
+                        onClick={() => void selectAiSetupProvider(provider.name)}
+                      >
+                        <span>{displayProviderName(provider)}</span>
+                        <small>{aiProviderHint(provider, language)}</small>
+                        {selected ? <CheckCircle2 size={16} strokeWidth={2.2} aria-hidden="true" /> : null}
+                      </button>
+                    );
+                  })}
+                </div>
+              </section>
+              {activeProvider ? (
+                <ProviderSetupCard
+                  provider={activeProvider}
+                  setup={providerSetup}
+                  context={aiSetupWizardContext}
+                  className="ai-setup-provider-card"
+                  showReady
+                  onAction={(action, status) => trackAiSetupAction(action, status, activeProvider)}
+                />
+              ) : null}
+              <p className="ai-setup-skip-note">{t("app.ai.skipHint")}</p>
+              <footer className="apply-modal-actions">
+                <button
+                  type="button"
+                  className="apply-modal-secondary"
+                  onClick={skipAiSetupForNow}
+                >
+                  {t("app.ai.skip")}
                 </button>
               </footer>
             </div>
@@ -8037,8 +8749,8 @@ function App() {
         {dragOver ? (
           <div className="drop-overlay" aria-hidden>
             <div className="drop-overlay-card">
-              <strong>Drop to import</strong>
-              <p>PDF, Office, MD, TXT, JSON, CSV, HTML, or images</p>
+              <strong>{t("app.drop.title")}</strong>
+              <p>{t("app.drop.formats")}</p>
             </div>
           </div>
         ) : null}
@@ -8096,12 +8808,13 @@ function OperationFeedPanel({
   canOpenPath?: (path: string) => boolean;
   compact?: boolean;
 }) {
+  const { t } = useI18n();
   const events = progress?.events ?? [];
   const latest = events[events.length - 1];
   const running = progress?.running ?? (fallbackRunning && fallbackSteps.length > 0);
   const latestInProgress = [...events].reverse().find((event) => event.status === "in_progress");
   const stateLabel = progress?.error
-    ? "Error"
+    ? t("app.operation.error")
     : running
       ? latest?.status === "in_progress"
         ? latest.title
@@ -8109,8 +8822,8 @@ function OperationFeedPanel({
           latestInProgress?.title ||
           latest?.title ||
           fallbackSteps[fallbackActiveIndex] ||
-          "Running"
-      : latest?.title || "Finished";
+          t("app.operation.running")
+      : latest?.title || t("app.operation.finished");
   const showHeaderState = Boolean(stateLabel) && (!running || !runningLabel);
   const visibleEvents = events.slice(-80);
   const feedBodyRef = useRef<HTMLDivElement>(null);
@@ -8138,7 +8851,9 @@ function OperationFeedPanel({
           <span className="operation-feed-title">{title}</span>
           {showHeaderState ? <span className="operation-feed-state">{stateLabel}</span> : null}
         </span>
-        <span className="operation-feed-toggle">{open ? "Hide" : "Show"}</span>
+        <span className="operation-feed-toggle">
+          {open ? t("app.operation.hide") : t("app.operation.show")}
+        </span>
       </button>
       {meta?.length ? (
         <div className="operation-feed-meta">
@@ -8225,7 +8940,7 @@ function OperationFeedPanel({
               })}
             </ol>
           ) : (
-            <div className="operation-feed-empty">Waiting for runner events.</div>
+            <div className="operation-feed-empty">{t("app.operation.waiting")}</div>
           )}
           {progress?.error ? <div className="operation-feed-error">{progress.error}</div> : null}
         </div>
@@ -8285,6 +9000,7 @@ function GraphView({
   selectedPath: string;
   onOpenNode: (path: string) => void;
 }) {
+  const { t } = useI18n();
   const containerRef = useRef<HTMLDivElement>(null);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const fgRef = useRef<any>(null);
@@ -8348,7 +9064,7 @@ function GraphView({
   return (
     <div ref={containerRef} className="graph-view">
       {graphData.nodes.length === 0 ? (
-        <div className="graph-empty">No wiki pages to graph yet.</div>
+        <div className="graph-empty">{t("app.graph.empty")}</div>
       ) : (
         <ForceGraph2D
           ref={fgRef}
@@ -8453,6 +9169,7 @@ function PdfViewer({
   anchor?: string | null;
   onAnchorConsumed?: () => void;
 }) {
+  const { t } = useI18n();
   const containerRef = useRef<HTMLDivElement>(null);
   const consumedAnchorRef = useRef<string | null>(null);
   const onAnchorConsumedRef = useRef(onAnchorConsumed);
@@ -8561,8 +9278,10 @@ function PdfViewer({
 
   return (
     <div className="pdf-canvas-viewer">
-      {loading ? <div className="pdf-status">Loading PDF…</div> : null}
-      {error ? <div className="pdf-status pdf-status-error">PDF failed to load: {error}</div> : null}
+      {loading ? <div className="pdf-status">{t("app.pdf.loading")}</div> : null}
+      {error ? (
+        <div className="pdf-status pdf-status-error">{t("app.pdf.failed", { error })}</div>
+      ) : null}
       <div ref={containerRef} className="pdf-pages" />
     </div>
   );
@@ -8922,6 +9641,7 @@ function WorkspaceImageViewer({
   onEditAsset: (asset: WikiImageAsset) => void;
   onDeleteAsset: (asset: WikiImageAsset) => void;
 }) {
+  const { t, language } = useI18n();
   const title = asset ? imageAssetTitle(asset) : displayFileName(path);
   const description = asset ? imageAssetMeta(asset) : path;
   const canDeleteAsset = asset
@@ -8933,7 +9653,10 @@ function WorkspaceImageViewer({
       <div className="image-viewer-stage">
         <img src={makeWorkspaceAssetUrl(workspacePath, path)} alt={title} />
       </div>
-      <aside className="image-detail-panel" aria-label="Image details">
+      <aside
+        className="image-detail-panel"
+        aria-label={language === "ko" ? "이미지 세부 정보" : "Image details"}
+      >
         <div className="image-detail-header">
           <div>
             <h2>{title}</h2>
@@ -8945,7 +9668,7 @@ function WorkspaceImageViewer({
               {asset.protected ? (
                 <span className="protected">
                   <ShieldCheck size={13} aria-hidden="true" />
-                  Protected
+                  {t("app.image.protected")}
                 </span>
               ) : null}
             </div>
@@ -8956,11 +9679,11 @@ function WorkspaceImageViewer({
           <div className="image-detail-actions">
             <button type="button" disabled={Boolean(busyLabel)} onClick={() => onCropAsset(asset)}>
               <Crop size={15} aria-hidden="true" />
-              Crop
+              {t("app.image.cropAction")}
             </button>
             <button type="button" disabled={Boolean(busyLabel)} onClick={() => onEditAsset(asset)}>
               <Pencil size={15} aria-hidden="true" />
-              Info
+              {t("app.image.info")}
             </button>
             {canDeleteAsset ? (
               <button
@@ -8969,7 +9692,7 @@ function WorkspaceImageViewer({
                 onClick={() => onDeleteAsset(asset)}
               >
                 <Trash2 size={15} aria-hidden="true" />
-                Delete image
+                {t("app.image.delete")}
               </button>
             ) : null}
             {busyLabel ? (
@@ -8982,7 +9705,10 @@ function WorkspaceImageViewer({
 
         <section className="image-usage-section">
           <h3>
-            Used in {usages.length} page{usages.length === 1 ? "" : "s"}
+            {t("app.image.usedIn", {
+              count: usages.length,
+              plural: usages.length === 1 ? "" : "s",
+            })}
           </h3>
           {usages.length > 0 ? (
             <div className="image-usage-list">
@@ -9003,7 +9729,7 @@ function WorkspaceImageViewer({
               ))}
             </div>
           ) : (
-            <p className="image-usage-empty">No wiki page references this image yet.</p>
+            <p className="image-usage-empty">{t("app.image.noUsage")}</p>
           )}
         </section>
       </aside>
@@ -9066,6 +9792,7 @@ function AssetDetailsModal({
   onClose: () => void;
   onSave: () => void;
 }) {
+  const { t, language } = useI18n();
   const asset = draft.asset;
   const busy = Boolean(busyLabel);
   const folder = asset.displayPath.includes("/")
@@ -9077,7 +9804,7 @@ function AssetDetailsModal({
       <div className="apply-modal asset-modal asset-info-modal">
         <header className="apply-modal-header">
           <div>
-            <h2>Image info</h2>
+            <h2>{t("app.image.imageInfo")}</h2>
             <p>{displayFileName(asset.displayPath)}</p>
           </div>
           <button type="button" className="modal-close-btn" disabled={busy} onClick={onClose}>
@@ -9087,36 +9814,39 @@ function AssetDetailsModal({
 
         <div className="asset-info-summary">
           <div className="asset-info-row">
-            <span>Folder</span>
+            <span>{t("app.image.folder")}</span>
             <strong title={folder}>{folder}</strong>
           </div>
           <div className="asset-info-row">
-            <span>Owner</span>
+            <span>{t("app.image.owner")}</span>
             <strong>{imageAssetOwnerLabel(asset)}</strong>
           </div>
           <div className="asset-info-row">
-            <span>Origin</span>
+            <span>{t("app.image.origin")}</span>
             <strong title={imageAssetMeta(asset)}>{imageAssetMeta(asset)}</strong>
           </div>
           <div className="asset-info-row">
-            <span>Used in</span>
+            <span>{language === "ko" ? "사용 위치" : "Used in"}</span>
             <strong>
-              {usages.length} page{usages.length === 1 ? "" : "s"}
+              {t("app.image.usedIn", {
+                count: usages.length,
+                plural: usages.length === 1 ? "" : "s",
+              })}
             </strong>
           </div>
           {asset.protected ? (
             <div className="asset-info-row">
-              <span>Protection</span>
-              <strong>Preserved during AI updates</strong>
+              <span>{t("app.image.protection")}</span>
+              <strong>{t("app.image.preserved")}</strong>
             </div>
           ) : null}
         </div>
 
         <details className="asset-details-advanced">
-          <summary>Advanced metadata</summary>
+          <summary>{t("app.image.advanced")}</summary>
           <div className="asset-details-fields">
             <label>
-              <span>Alt text</span>
+              <span>{t("app.image.alt")}</span>
               <input
                 value={draft.alt}
                 disabled={busy}
@@ -9124,7 +9854,7 @@ function AssetDetailsModal({
               />
             </label>
             <label>
-              <span>Caption</span>
+              <span>{t("app.image.caption")}</span>
               <textarea
                 value={draft.caption}
                 disabled={busy}
@@ -9132,7 +9862,7 @@ function AssetDetailsModal({
               />
             </label>
             <label>
-              <span>User notes</span>
+              <span>{t("app.image.userNotes")}</span>
               <textarea
                 value={draft.userNotes}
                 disabled={busy}
@@ -9140,7 +9870,7 @@ function AssetDetailsModal({
               />
             </label>
             <label>
-              <span>AI notes</span>
+              <span>{t("app.image.aiNotes")}</span>
               <textarea
                 value={draft.semanticNotes}
                 disabled={busy}
@@ -9154,7 +9884,7 @@ function AssetDetailsModal({
                 disabled={busy}
                 onChange={(event) => onChange({ ...draft, protected: event.target.checked })}
               />
-              <span>Protect this image during AI updates</span>
+              <span>{t("app.image.protect")}</span>
             </label>
           </div>
         </details>
@@ -9166,10 +9896,10 @@ function AssetDetailsModal({
         ) : null}
         <div className="unsaved-edit-actions">
           <button type="button" disabled={busy} onClick={onSave}>
-            {busyLabel ?? "Save metadata"}
+            {busyLabel ?? t("app.image.saveMetadata")}
           </button>
           <button type="button" className="secondary" disabled={busy} onClick={onClose}>
-            Close
+            {t("app.common.close")}
           </button>
         </div>
       </div>

@@ -1,6 +1,8 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { track } from "./analytics";
+import { translate, useI18n, type UiLanguage } from "./i18n";
 
 export interface ProviderModel {
   id: string;
@@ -153,14 +155,6 @@ export function providerStatusFromReport(report: ProviderCheckReport): ProviderS
   };
 }
 
-export function singleReadyProviderCandidatePath(status: ProviderStatus | null): string | null {
-  if (!status || status.savedPath) return null;
-  const readyCandidates = status.candidates.filter(
-    (candidate) => candidate.runnable && candidate.loggedIn,
-  );
-  return readyCandidates.length === 1 ? readyCandidates[0].path : null;
-}
-
 function sleep(ms: number) {
   return new Promise<void>((resolve) => window.setTimeout(resolve, ms));
 }
@@ -175,6 +169,12 @@ export function helperName(provider?: ProviderInfo | null): string {
   if (provider?.name === "codex") return "Codex";
   if (provider?.name === "claude") return "Claude Code";
   return "the local AI helper";
+}
+
+function connectionAppName(provider?: ProviderInfo | null): string {
+  if (provider?.name === "codex") return "OpenAI Codex";
+  if (provider?.name === "claude") return "Claude Code";
+  return `${productName(provider)} connection app`;
 }
 
 function binaryName(provider?: ProviderInfo | null): string {
@@ -192,37 +192,52 @@ function subscriptionName(provider?: ProviderInfo | null): string {
   return "ChatGPT sign-in";
 }
 
-function diagnosticStateLabel(state: DiagnosticState): string {
+function diagnosticStateLabel(state: DiagnosticState, language: UiLanguage = "en"): string {
   switch (state) {
     case "pass":
-      return "OK";
+      return translate(language, "provider.status.ok");
     case "fail":
-      return "Needs attention";
+      return translate(language, "provider.status.needsAttention");
     case "pending":
-      return "Not checked";
+      return translate(language, "provider.status.notChecked");
     default:
-      return "Info";
+      return translate(language, "provider.status.info");
   }
 }
 
-function toolDetail(pathValue: string | null | undefined, version: string | null | undefined) {
-  if (!pathValue) return "Not found";
+function toolDetail(
+  pathValue: string | null | undefined,
+  version: string | null | undefined,
+  language: UiLanguage = "en",
+) {
+  if (!pathValue) return translate(language, "provider.detail.notFound");
   return version ? `${pathValue} (${version})` : pathValue;
 }
 
-function nodeVersionDetail(runtime: NodeRuntimeStatus): string {
+function nodeVersionDetail(runtime: NodeRuntimeStatus, language: UiLanguage = "en"): string {
   const version = runtime.nodeVersion || "unknown version";
   const path = runtime.nodePath || "an unknown path";
-  return `Maple found Node.js ${version} at ${path}. Maple needs Node.js ${runtime.requiredNodeMajor} or newer before it can use AI features.`;
+  return translate(language, "provider.node.old", {
+    version,
+    path,
+    required: runtime.requiredNodeMajor,
+  });
 }
 
-function nodeRuntimeDetail(runtime: NodeRuntimeStatus): string {
+function nodeRuntimeDetail(runtime: NodeRuntimeStatus, language: UiLanguage = "en"): string {
   if (runtime.nodeInstalled && runtime.nodeVersionSupported) {
     const version = runtime.nodeVersion || "an unknown version";
     const path = runtime.nodePath || "an unknown path";
-    return `Maple will use Node.js ${version} at ${path}.`;
+    return translate(language, "provider.node.ready", { version, path });
   }
-  return toolDetail(runtime.nodePath, runtime.nodeVersion);
+  return toolDetail(runtime.nodePath, runtime.nodeVersion, language);
+}
+
+function npmRuntimeDetail(runtime: NodeRuntimeStatus, language: UiLanguage = "en"): string {
+  if (runtime.npmInstalled) {
+    return translate(language, "provider.diag.npmReady");
+  }
+  return translate(language, "provider.diag.npmMissing");
 }
 
 export function providerSetupStatus(
@@ -244,50 +259,115 @@ export function providerSetupStatus(
   return "not_checked";
 }
 
+type ProviderConnectionAnalyticsProperties = Record<
+  string,
+  boolean | number | string | null | undefined
+>;
+
+export function providerConnectionErrorKind(error: unknown): string {
+  const message = String(error || "").toLowerCase();
+  if (message.includes("node")) return "node";
+  if (message.includes("npm")) return "npm";
+  if (message.includes("login") || message.includes("auth") || message.includes("sign-in")) {
+    return "auth";
+  }
+  if (message.includes("install")) return "install";
+  if (message.includes("multiple") || message.includes("choose") || message.includes("choice")) {
+    return "provider_choice";
+  }
+  if (message.includes("path")) return "path";
+  if (message.includes("not found") || message.includes("missing")) return "missing";
+  if (message.includes("permission") || message.includes("denied")) return "permission";
+  if (message.includes("timeout") || message.includes("timed out")) return "timeout";
+  return "unknown";
+}
+
+export function providerConnectionAnalyticsProperties(
+  providerName: string | null | undefined,
+  runtime: NodeRuntimeStatus | null,
+  status: ProviderStatus | null,
+  setupStatus: ProviderSetupStatus,
+  properties: ProviderConnectionAnalyticsProperties = {},
+): ProviderConnectionAnalyticsProperties {
+  return {
+    provider: providerName ?? null,
+    setup_status: setupStatus,
+    connection_ready: setupStatus === "provider_ready",
+    node_checked: Boolean(runtime),
+    node_installed: runtime?.nodeInstalled ?? null,
+    node_version_supported: runtime?.nodeVersionSupported ?? null,
+    npm_installed: runtime?.npmInstalled ?? null,
+    node_candidate_count: runtime?.nodeCandidates?.length ?? null,
+    provider_checked: Boolean(status),
+    provider_installed: status?.installed ?? null,
+    provider_logged_in: status?.loggedIn ?? null,
+    provider_choice_required: status?.choiceRequired ?? null,
+    provider_candidate_count: status?.candidates?.length ?? null,
+    provider_ready_candidate_count: status?.readyCandidateCount ?? null,
+    provider_warning_count: status?.warnings?.length ?? null,
+    provider_check_error: Boolean(status?.checkError),
+    provider_saved_path_present: Boolean(status?.savedPath),
+    provider_recommended_path_present: Boolean(status?.recommendedPath),
+    provider_install_path_present: Boolean(status?.installPath),
+    provider_version_present: Boolean(status?.version),
+    ...properties,
+  };
+}
+
 export function providerDiagnosticItems(
   provider: ProviderInfo | null | undefined,
   runtime: NodeRuntimeStatus | null,
   status: ProviderStatus | null,
   providerCheckError: string | null = null,
+  language: UiLanguage = "en",
 ): ProviderDiagnosticItem[] {
-  const helper = helperName(provider);
   const binary = binaryName(provider);
   const runtimeChecked = Boolean(runtime);
   const providerChecked = Boolean(status);
 
   return [
     {
-      label: "Node.js",
+      label: translate(language, "provider.diag.connectionSupport"),
       state: !runtimeChecked
         ? "pending"
         : runtime?.nodeInstalled && runtime.nodeVersionSupported
           ? "pass"
           : "fail",
-      detail: runtimeChecked && runtime ? nodeRuntimeDetail(runtime) : "Not checked yet",
+      detail:
+        runtimeChecked && runtime
+          ? nodeRuntimeDetail(runtime, language)
+          : translate(language, "provider.detail.notCheckedYet"),
       command: "node --version",
     },
     {
-      label: "npm",
+      label: translate(language, "provider.diag.setupSupport"),
       state: !runtimeChecked ? "pending" : runtime?.npmInstalled ? "pass" : "fail",
-      detail: runtimeChecked ? toolDetail(runtime?.npmPath, runtime?.npmVersion) : "Not checked yet",
+      detail: runtimeChecked
+        ? runtime
+          ? npmRuntimeDetail(runtime, language)
+          : translate(language, "provider.detail.notCheckedYet")
+        : translate(language, "provider.detail.notCheckedYet"),
       command: "npm --version",
     },
     {
-      label: `${helper} CLI`,
+      label: `${productName(provider)} connection`,
       state: providerCheckError ? "fail" : !providerChecked ? "pending" : status?.installed ? "pass" : "fail",
       detail: providerCheckError
-        ? "Check failed"
+        ? translate(language, "provider.detail.checkFailed")
         : providerChecked
-          ? toolDetail(status?.installPath, status?.version)
-          : "Not checked yet",
+          ? toolDetail(status?.installPath, status?.version, language)
+          : translate(language, "provider.detail.notCheckedYet"),
       command: `${binary} --version`,
     },
     {
-      label: `${helper} sign-in`,
+      label: `${productName(provider)} sign-in`,
       state: !providerChecked ? "pending" : status?.loggedIn ? "pass" : "fail",
       detail: providerChecked
-        ? status?.statusText || `No confirmed ${subscriptionName(provider)}`
-        : "Not checked yet",
+        ? status?.statusText ||
+          translate(language, "provider.detail.noConfirmed", {
+            subscription: subscriptionName(provider),
+          })
+        : translate(language, "provider.detail.notCheckedYet"),
       command: authCheckCommand(provider),
     },
   ];
@@ -303,11 +383,11 @@ export function formatProviderDiagnostics(
   const helper = helperName(provider);
   const product = productName(provider);
   const lines = [
-    "Please help diagnose this Maple AI setup issue.",
+    "Please help diagnose this Maple AI connection issue.",
     "",
     `Generated at: ${new Date().toISOString()}`,
     "",
-    "Maple setup model:",
+    "Maple connection model:",
     "- Maple is a local desktop app that opens file-based wiki workspaces.",
     `- Maple AI features need Node.js ${runtime?.requiredNodeMajor ?? 20} or newer for the local helper.`,
     `- ${product} support uses the ${helper} CLI command: ${binaryName(provider)}.`,
@@ -388,7 +468,7 @@ function supportEmailSubject(
   provider: ProviderInfo | null | undefined,
   setupStatus: ProviderSetupStatus,
 ) {
-  return `Maple AI setup issue - ${helperName(provider)} - ${setupStatus}`;
+  return `Maple AI connection issue - ${helperName(provider)} - ${setupStatus}`;
 }
 
 function supportEmailBody(diagnosticsText: string) {
@@ -399,7 +479,7 @@ function supportEmailBody(diagnosticsText: string) {
   return [
     "Hi Maple team,",
     "",
-    "Maple prepared this diagnostic report after an AI setup issue.",
+    "Maple prepared this diagnostic report after an AI connection issue.",
     "The full diagnostics were also copied to my clipboard.",
     "",
     "Diagnostics:",
@@ -408,11 +488,16 @@ function supportEmailBody(diagnosticsText: string) {
   ].join("\n");
 }
 
-function candidateSummary(candidate: ProviderCandidate) {
-  if (!candidate.exists) return "not found";
-  if (!candidate.runnable) return candidate.error ? `failed: ${candidate.error}` : "failed";
-  if (candidate.loggedIn) return `ready (${candidate.version || "version unknown"})`;
-  return `not signed in (${candidate.version || "version unknown"})`;
+function candidateSummary(candidate: ProviderCandidate, language: UiLanguage = "en") {
+  if (!candidate.exists) return translate(language, "provider.candidate.notFound");
+  if (!candidate.runnable) {
+    return candidate.error
+      ? translate(language, "provider.candidate.failedWithError", { error: candidate.error })
+      : translate(language, "provider.candidate.failed");
+  }
+  const version = candidate.version || translate(language, "provider.candidate.versionUnknown");
+  if (candidate.loggedIn) return translate(language, "provider.candidate.ready", { version });
+  return translate(language, "provider.candidate.notSignedIn", { version });
 }
 
 function candidateTone(candidate: ProviderCandidate) {
@@ -421,16 +506,35 @@ function candidateTone(candidate: ProviderCandidate) {
   return "danger";
 }
 
-function contextPhrase(context: ProviderSetupContext): string {
+function contextPhrase(context: ProviderSetupContext, language: UiLanguage = "en"): string {
   switch (context) {
     case "build":
-      return "before Maple can build this wiki";
+      return translate(language, "provider.context.build");
     case "chat":
-      return "before Maple can answer questions about this wiki";
+      return translate(language, "provider.context.chat");
     case "maintain":
-      return "before Maple can maintain this wiki";
+      return translate(language, "provider.context.maintain");
     default:
-      return "before Maple can use this AI provider";
+      return translate(language, "provider.context.settings");
+  }
+}
+
+export function providerSetupRecheckLabel(
+  setupStatus: ProviderSetupStatus,
+  language: UiLanguage = "en",
+): string {
+  switch (setupStatus) {
+    case "node_missing":
+    case "node_too_old":
+      return translate(language, "settings.provider.checkNodeInstall");
+    case "npm_missing":
+      return translate(language, "settings.provider.checkInstaller");
+    case "provider_logged_out":
+      return translate(language, "settings.provider.checkSignIn");
+    case "provider_choice_required":
+      return translate(language, "settings.provider.checkConnectionApp");
+    default:
+      return translate(language, "settings.provider.checkConnectionStatus");
   }
 }
 
@@ -455,19 +559,22 @@ export function providerSetupMessage(
   checking: boolean,
   providerCheckError: string | null,
   context: ProviderSetupContext,
+  language: UiLanguage = "en",
 ): ProviderSetupMessage {
   const product = productName(provider);
   const helper = helperName(provider);
+  const connectionApp = connectionAppName(provider);
   const setupStatus = providerSetupStatus(runtime, status, checking, providerCheckError);
   const installed = Boolean(status?.installed);
   const loggedIn = Boolean(status?.loggedIn);
+  const contextText = contextPhrase(context, language);
 
   if (setupStatus === "checking") {
     return {
-      title: "Checking AI setup",
-      body: `Maple is checking local tools ${contextPhrase(context)}.`,
-      statusText: "Checking...",
-      badgeLabel: "Checking",
+      title: translate(language, "provider.message.checking.title"),
+      body: translate(language, "provider.message.checking.body", { context: contextText }),
+      statusText: translate(language, "app.common.checking"),
+      badgeLabel: translate(language, "provider.message.checking.badge"),
       tone: "pending",
       command: null,
       actionKind: null,
@@ -476,10 +583,10 @@ export function providerSetupMessage(
 
   if (setupStatus === "not_checked") {
     return {
-      title: "AI setup not checked",
-      body: `Maple needs to check local setup ${contextPhrase(context)}.`,
-      statusText: "Not checked",
-      badgeLabel: "Not checked",
+      title: translate(language, "provider.message.notChecked.title"),
+      body: translate(language, "provider.message.notChecked.body", { context: contextText }),
+      statusText: translate(language, "provider.status.notChecked"),
+      badgeLabel: translate(language, "provider.message.notChecked.badge"),
       tone: "pending",
       command: null,
       actionKind: null,
@@ -488,10 +595,10 @@ export function providerSetupMessage(
 
   if (setupStatus === "node_missing") {
     return {
-      title: "Node.js needed first",
-      body: "Maple uses Node.js and npm to run the local AI helper setup.",
-      statusText: "Node.js not found",
-      badgeLabel: "Node.js needed",
+      title: translate(language, "provider.message.nodeMissing.title"),
+      body: translate(language, "provider.message.nodeMissing.body"),
+      statusText: translate(language, "provider.message.nodeMissing.status"),
+      badgeLabel: translate(language, "provider.message.nodeMissing.badge"),
       tone: "danger",
       command: null,
       actionKind: "node",
@@ -500,10 +607,12 @@ export function providerSetupMessage(
 
   if (setupStatus === "node_too_old" && runtime) {
     return {
-      title: "Update Node.js",
-      body: nodeVersionDetail(runtime),
-      statusText: `Node.js ${runtime.nodeVersion || "unknown"} is too old`,
-      badgeLabel: "Update needed",
+      title: translate(language, "settings.runtime.updateNode"),
+      body: nodeVersionDetail(runtime, language),
+      statusText: translate(language, "provider.message.nodeOld.status", {
+        version: runtime.nodeVersion || "unknown",
+      }),
+      badgeLabel: translate(language, "provider.message.nodeOld.badge"),
       tone: "danger",
       command: null,
       actionKind: "node",
@@ -512,10 +621,10 @@ export function providerSetupMessage(
 
   if (setupStatus === "npm_missing") {
     return {
-      title: "npm needed first",
-      body: `Maple can use an already-installed ${helper}, but this installer needs npm before it can install one.`,
-      statusText: "Node.js found · npm not found",
-      badgeLabel: "npm needed",
+      title: translate(language, "provider.message.npmMissing.title"),
+      body: translate(language, "provider.message.npmMissing.body", { helper }),
+      statusText: translate(language, "provider.message.npmMissing.status"),
+      badgeLabel: translate(language, "provider.message.npmMissing.badge"),
       tone: "danger",
       command: null,
       actionKind: "node",
@@ -524,10 +633,10 @@ export function providerSetupMessage(
 
   if (setupStatus === "provider_check_failed") {
     return {
-      title: "Maple couldn't finish the AI setup check",
-      body: "Maple found some tools, but one check failed before we could confirm the cause. Nothing was changed.",
-      statusText: "Setup check failed",
-      badgeLabel: "Check failed",
+      title: translate(language, "provider.message.checkFailed.title"),
+      body: translate(language, "provider.message.checkFailed.body"),
+      statusText: translate(language, "provider.detail.checkFailed"),
+      badgeLabel: translate(language, "provider.detail.checkFailed"),
       tone: "danger",
       command: null,
       actionKind: null,
@@ -536,10 +645,10 @@ export function providerSetupMessage(
 
   if (setupStatus === "provider_choice_required") {
     return {
-      title: `Choose which ${helper} to use`,
-      body: `Maple found multiple working ${helper} helpers. Choose one so Maple uses the same helper every time.`,
-      statusText: `Multiple working ${helper} helpers found`,
-      badgeLabel: "Choose helper",
+      title: translate(language, "provider.message.choice.title", { helper }),
+      body: translate(language, "provider.message.choice.body", { helper }),
+      statusText: translate(language, "provider.message.choice.status", { helper }),
+      badgeLabel: translate(language, "provider.message.choice.badge"),
       tone: "warning",
       command: null,
       actionKind: null,
@@ -548,10 +657,15 @@ export function providerSetupMessage(
 
   if (setupStatus === "provider_missing" || !installed) {
     return {
-      title: `${helper} setup needed`,
-      body: `Maple could not confirm ${helper} yet. It may already be installed, or Maple may need you to install it ${contextPhrase(context)}.`,
-      statusText: `${helper} not confirmed`,
-      badgeLabel: "Needs setup",
+      title: translate(language, "provider.message.missing.title", { helper, product }),
+      body: translate(language, "provider.message.missing.body", {
+        app: connectionApp,
+        helper,
+        product,
+        context: contextText,
+      }),
+      statusText: translate(language, "provider.message.missing.status", { helper, product }),
+      badgeLabel: translate(language, "provider.message.missing.badge"),
       tone: "danger",
       command: null,
       actionKind: null,
@@ -560,10 +674,14 @@ export function providerSetupMessage(
 
   if (setupStatus === "provider_logged_out" || !loggedIn) {
     return {
-      title: `${product} sign-in needed`,
-      body: `${helper} is installed, but Maple has not confirmed ${product} access yet.`,
-      statusText: `${helper} installed · not signed in`,
-      badgeLabel: "Sign-in needed",
+      title: translate(language, "provider.message.loggedOut.title", { product }),
+      body: translate(language, "provider.message.loggedOut.body", {
+        app: connectionApp,
+        helper,
+        product,
+      }),
+      statusText: translate(language, "provider.message.loggedOut.status", { helper }),
+      badgeLabel: translate(language, "provider.message.loggedOut.badge"),
       tone: "warning",
       command: provider?.loginCommand ?? null,
       actionKind: "login",
@@ -571,10 +689,12 @@ export function providerSetupMessage(
   }
 
   return {
-    title: `${product} connected`,
-    body: `${helper} is installed and signed in. Maple can use it now.`,
-    statusText: "AI connection confirmed",
-    badgeLabel: status?.warnings.length ? "Ready with warning" : "Ready",
+    title: translate(language, "provider.message.ready.title", { product }),
+    body: translate(language, "provider.message.ready.body", { helper, product }),
+    statusText: translate(language, "provider.message.ready.status"),
+    badgeLabel: status?.warnings.length
+      ? translate(language, "provider.message.readyWarning.badge")
+      : translate(language, "provider.message.ready.badge"),
     tone: status?.warnings.length ? "warning" : "ready",
     command: null,
     actionKind: null,
@@ -598,12 +718,13 @@ export function ProviderDiagnostics({
   setupStatus,
   defaultOpen = false,
 }: ProviderDiagnosticsProps) {
+  const { language, t } = useI18n();
   const [open, setOpen] = useState(defaultOpen);
   const [copied, setCopied] = useState(false);
   const [emailState, setEmailState] = useState<DiagnosticsEmailState>("idle");
   const currentSetupStatus =
     setupStatus ?? providerSetupStatus(runtime, status, false, providerCheckError);
-  const items = providerDiagnosticItems(provider, runtime, status, providerCheckError);
+  const items = providerDiagnosticItems(provider, runtime, status, providerCheckError, language);
   const diagnosticsText = formatProviderDiagnostics(
     provider,
     runtime,
@@ -660,44 +781,39 @@ export function ProviderDiagnostics({
           aria-expanded={open}
           onClick={() => setOpen((value) => !value)}
         >
-          {open ? "Hide troubleshooting" : "Troubleshooting details"}
+          {open ? t("provider.diag.hide") : t("provider.diag.details")}
         </button>
       </div>
 
       {open ? (
         <div className="provider-diagnostics-body">
           <div className="provider-diagnostics-required">
-            <div className="provider-diagnostics-heading">Needed state</div>
+            <div className="provider-diagnostics-heading">{t("provider.diag.neededState")}</div>
             <ul>
-              <li>Node.js and npm are available to Maple.</li>
-              <li>{helperName(provider)} is installed and executable.</li>
-              <li>
-                {authCheckCommand(provider)} confirms access to {productName(provider)}.
-              </li>
+              <li>{t("provider.diag.needNode")}</li>
+              <li>{t("provider.diag.needHelper", { product: productName(provider) })}</li>
+              <li>{t("provider.diag.needAuth", { product: productName(provider) })}</li>
             </ul>
           </div>
 
-          <div className="provider-diagnostics-heading">Current checks</div>
+          <div className="provider-diagnostics-heading">{t("provider.diag.currentChecks")}</div>
           <ul className="provider-diagnostics-list">
             {items.map((item) => (
               <li key={item.label} className={`provider-diagnostic-${item.state}`}>
                 <div className="provider-diagnostics-line">
                   <span className="provider-diagnostics-label">{item.label}</span>
                   <span className="provider-diagnostics-state">
-                    {diagnosticStateLabel(item.state)}
+                    {diagnosticStateLabel(item.state, language)}
                   </span>
                 </div>
                 <div className="provider-diagnostics-detail">{item.detail}</div>
-                {item.command ? (
-                  <code className="provider-diagnostics-command">{item.command}</code>
-                ) : null}
               </li>
             ))}
           </ul>
 
           {runtime?.nodeCandidates?.length ? (
             <>
-              <div className="provider-diagnostics-heading">Node.js candidates</div>
+              <div className="provider-diagnostics-heading">{t("provider.diag.nodeCandidates")}</div>
               <ul className="provider-diagnostics-list">
                 {runtime.nodeCandidates.map((candidate) => (
                   <li
@@ -708,18 +824,18 @@ export function ProviderDiagnostics({
                   >
                     <div className="provider-diagnostics-line">
                       <span className="provider-diagnostics-label">
-                        {candidate.selected ? "Selected" : candidate.source}
+                        {candidate.selected ? t("provider.diag.selected") : candidate.source}
                       </span>
                       <span className="provider-diagnostics-state">
                         {candidate.selected
-                          ? "Used by Maple"
+                          ? t("provider.diag.usedByMaple")
                           : candidate.supported
-                            ? "Available"
-                            : "Unsupported"}
+                            ? t("provider.diag.available")
+                            : t("provider.diag.unsupported")}
                       </span>
                     </div>
                     <div className="provider-diagnostics-detail">
-                      {toolDetail(candidate.path, candidate.version)}
+                      {toolDetail(candidate.path, candidate.version, language)}
                     </div>
                     {candidate.error ? (
                       <div className="provider-diagnostics-detail">{candidate.error}</div>
@@ -739,24 +855,16 @@ export function ProviderDiagnostics({
           ) : null}
           {providerCheckError ? (
             <div className="provider-diagnostics-error">
-              <div className="provider-diagnostics-heading">Check error</div>
+              <div className="provider-diagnostics-heading">{t("provider.diag.checkError")}</div>
               <pre>{providerCheckError}</pre>
             </div>
           ) : null}
 
           <div className="provider-diagnostics-help">
-            <strong>Still stuck?</strong>
-            <p>
-              Maple can prepare a setup report with tool versions, paths, and recent check results.
-              Email it to the official Maple support inbox; we usually review setup reports within
-              6 hours.
-            </p>
-            <p>
-              You can also copy the report to ask your ChatGPT/Claude.
-            </p>
-            <p>
-              The report excludes source documents, auth files, and API keys.
-            </p>
+            <strong>{t("provider.diag.stuck")}</strong>
+            <p>{t("provider.diag.help1")}</p>
+            <p>{t("provider.diag.help2")}</p>
+            <p>{t("provider.diag.help3")}</p>
           </div>
           <div className="provider-diagnostics-footer">
             <button
@@ -766,24 +874,24 @@ export function ProviderDiagnostics({
               disabled={emailState === "opening"}
             >
               {emailState === "opening"
-                ? "Opening email..."
+                ? t("provider.diag.openingEmail")
                 : emailState === "opened"
-                  ? "Email draft opened"
+                  ? t("provider.diag.emailOpened")
                   : emailState === "copied"
-                    ? "Diagnostics copied"
-                    : "Email setup report to Maple"}
+                    ? t("provider.diag.copied")
+                    : t("provider.diag.emailReport")}
             </button>
             <button
               type="button"
               className="provider-diagnostics-copy"
               onClick={() => void copyDiagnostics()}
             >
-              {copied ? "Copied" : "Copy report to ask ChatGPT/Claude"}
+              {copied ? t("app.common.copy") : t("provider.diag.copyReport")}
             </button>
           </div>
           {emailState === "failed" ? (
             <p className="provider-diagnostics-help">
-              Maple could not open an email draft or copy diagnostics. Use Copy diagnostics instead.
+              {t("provider.diag.failed")}
             </p>
           ) : null}
         </div>
@@ -796,62 +904,50 @@ interface ProviderCandidatePanelProps {
   provider: ProviderInfo | null | undefined;
   status: ProviderStatus | null;
   savingPath?: string | null;
-  clearingPath?: boolean;
   onUsePath: (path: string) => void;
-  onClearPath: () => void;
 }
 
 export function ProviderCandidatePanel({
   provider,
   status,
   savingPath = null,
-  clearingPath = false,
   onUsePath,
-  onClearPath,
 }: ProviderCandidatePanelProps) {
+  const { language, t } = useI18n();
   const candidates = status?.candidates ?? [];
   const recommended = candidates.find((candidate) => candidate.recommended);
   const helper = helperName(provider);
+  const product = productName(provider);
   const choiceRequired = Boolean(status?.choiceRequired);
   const readyWithoutSavedPath = Boolean(status?.installed && status.loggedIn && !status.savedPath);
   const recommendedButtonLabel =
     status?.savedPath === recommended?.path
-      ? "Using"
+      ? t("provider.candidate.using")
       : savingPath === recommended?.path
-        ? "Saving..."
+        ? t("app.common.saving")
         : choiceRequired
-          ? "Use recommended"
+          ? t("provider.candidate.useRecommended")
           : readyWithoutSavedPath
-            ? `Save this ${helper}`
-            : `Use this ${helper}`;
+            ? t("provider.candidate.saveThis", { helper })
+            : t("provider.candidate.useThis", { helper });
 
   return (
     <div className="provider-candidates">
       <div className="provider-candidates-header">
         <div>
-          <div className="provider-candidates-title">Installed helpers</div>
+          <div className="provider-candidates-title">{t("provider.candidate.installedHelpers")}</div>
           <p>
             {choiceRequired
-              ? `Maple found multiple working ${helper} helpers. Choose one so Maple uses it consistently.`
-              : `Maple checked likely locations for ${helper}. Choose a working helper to use it consistently.`}
+              ? t("provider.candidate.choiceBody", { helper })
+              : t("provider.candidate.checkedBody", { helper })}
           </p>
         </div>
-        {status?.savedPath ? (
-          <button
-            type="button"
-            className="provider-candidates-secondary"
-            onClick={onClearPath}
-            disabled={clearingPath}
-          >
-            {clearingPath ? "Forgetting..." : "Forget saved helper"}
-          </button>
-        ) : null}
       </div>
 
       {recommended ? (
         <div className="provider-candidates-recommended">
           <div>
-            <span>Recommended</span>
+            <span>{t("app.common.recommended")}</span>
             <code>{recommended.path}</code>
           </div>
           <button
@@ -875,9 +971,11 @@ export function ProviderCandidatePanel({
                 <div className="provider-candidate-main">
                   <div className="provider-candidate-line">
                     <code>{candidate.path}</code>
-                    <span>{candidate.saved ? "Saved" : candidate.source}</span>
+                    <span>{candidate.saved ? t("provider.candidate.saved") : candidate.source}</span>
                   </div>
-                  <div className="provider-candidate-status">{candidateSummary(candidate)}</div>
+                  <div className="provider-candidate-status">
+                    {candidateSummary(candidate, language)}
+                  </div>
                   {candidate.statusText ? (
                     <div className="provider-candidate-detail">{candidate.statusText}</div>
                   ) : null}
@@ -891,12 +989,12 @@ export function ProviderCandidatePanel({
                   disabled={!usable || savingPath === candidate.path || status?.savedPath === candidate.path}
                 >
                   {status?.savedPath === candidate.path
-                    ? "Using"
+                    ? t("provider.candidate.using")
                     : savingPath === candidate.path
-                      ? "Saving..."
+                      ? t("app.common.saving")
                       : readyWithoutSavedPath && candidate.runnable && candidate.loggedIn && !choiceRequired
-                        ? "Save this helper"
-                        : "Use this helper"}
+                        ? t("provider.candidate.saveThisHelper")
+                        : t("provider.candidate.useThisHelper")}
                 </button>
               </li>
             );
@@ -904,57 +1002,103 @@ export function ProviderCandidatePanel({
         </ul>
       ) : (
         <p className="provider-candidates-empty">
-          Maple did not find an installed {helper}. Install it, then recheck.
+          {t("provider.candidate.empty", { helper, product })}
         </p>
       )}
     </div>
   );
 }
 
-export function useProviderSetup(providerName?: string | null, enabled = true) {
+export function useProviderSetup(
+  providerName?: string | null,
+  enabled = true,
+  analyticsSurface = "workspace",
+) {
+  const { t } = useI18n();
   const [runtimeStatus, setRuntimeStatus] = useState<NodeRuntimeStatus | null>(null);
   const [providerStatus, setProviderStatus] = useState<ProviderStatus | null>(null);
   const [providerCheckError, setProviderCheckError] = useState<string | null>(null);
   const [checking, setChecking] = useState(false);
-  const [discovering, setDiscovering] = useState(false);
   const [showHelperCandidates, setShowHelperCandidates] = useState(false);
   const [savingPath, setSavingPath] = useState<string | null>(null);
-  const [clearingPath, setClearingPath] = useState(false);
   const [action, setAction] = useState<SetupAction>(null);
   const [error, setError] = useState<string | null>(null);
+  const runtimeStatusRef = useRef<NodeRuntimeStatus | null>(null);
+  const providerStatusRef = useRef<ProviderStatus | null>(null);
+  const providerCheckErrorRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    runtimeStatusRef.current = runtimeStatus;
+  }, [runtimeStatus]);
+
+  useEffect(() => {
+    providerStatusRef.current = providerStatus;
+  }, [providerStatus]);
+
+  useEffect(() => {
+    providerCheckErrorRef.current = providerCheckError;
+  }, [providerCheckError]);
 
   useEffect(() => {
     setRuntimeStatus(null);
     setProviderStatus(null);
     setProviderCheckError(null);
     setChecking(false);
-    setDiscovering(false);
     setShowHelperCandidates(false);
     setSavingPath(null);
-    setClearingPath(false);
     setAction(null);
     setError(null);
+    runtimeStatusRef.current = null;
+    providerStatusRef.current = null;
+    providerCheckErrorRef.current = null;
   }, [providerName]);
 
   const applyProviderReport = useCallback((report: ProviderCheckReport) => {
     const status = providerStatusFromReport(report);
+    providerStatusRef.current = status;
+    providerCheckErrorRef.current = status.checkError;
     setProviderStatus(status);
     setProviderCheckError(status.checkError);
     return status;
   }, []);
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (trigger = "manual") => {
     if (!providerName || !enabled) return;
+    const statusBefore = providerSetupStatus(
+      runtimeStatusRef.current,
+      providerStatusRef.current,
+      false,
+      providerCheckErrorRef.current,
+    );
+    track("ai connection check started", {
+      provider: providerName,
+      surface: analyticsSurface,
+      trigger,
+      status_before: statusBefore,
+    });
     setChecking(true);
     setAction(null);
     setError(null);
+    providerCheckErrorRef.current = null;
     setProviderCheckError(null);
     try {
       const runtime = await invoke<NodeRuntimeStatus>("check_node_runtime");
+      runtimeStatusRef.current = runtime;
       setRuntimeStatus(runtime);
 
       if (!runtime.nodeInstalled || !runtime.nodeVersionSupported) {
+        providerStatusRef.current = null;
         setProviderStatus(null);
+        const setupStatus = providerSetupStatus(runtime, null, false, null);
+        track(
+          "ai connection check completed",
+          providerConnectionAnalyticsProperties(providerName, runtime, null, setupStatus, {
+            surface: analyticsSurface,
+            trigger,
+            status_before: statusBefore,
+            blocked_at: runtime.nodeInstalled ? "node_version" : "node_install",
+          }),
+        );
         return;
       }
 
@@ -963,50 +1107,64 @@ export function useProviderSetup(providerName?: string | null, enabled = true) {
       if (status.choiceRequired) {
         setShowHelperCandidates(true);
       }
+      const setupStatus = providerSetupStatus(runtime, status, false, status.checkError);
+      track(
+        "ai connection check completed",
+        providerConnectionAnalyticsProperties(providerName, runtime, status, setupStatus, {
+          surface: analyticsSurface,
+          trigger,
+          status_before: statusBefore,
+          candidate_panel_shown: status.choiceRequired,
+        }),
+      );
     } catch (err) {
+      providerStatusRef.current = null;
+      providerCheckErrorRef.current = String(err);
       setProviderStatus(null);
       setProviderCheckError(String(err));
+      track("ai connection check failed", {
+        provider: providerName,
+        surface: analyticsSurface,
+        trigger,
+        status_before: statusBefore,
+        error_kind: providerConnectionErrorKind(err),
+      });
     } finally {
       setChecking(false);
     }
-  }, [applyProviderReport, enabled, providerName]);
-
-  const findInstalledHelper = useCallback(async () => {
-    if (!providerName || !enabled) return;
-    setDiscovering(true);
-    setError(null);
-    try {
-      const report = await invoke<ProviderCheckReport>("discover_provider_helpers", {
-        name: providerName,
-      });
-      const status = applyProviderReport(report);
-      const autoSavePath = singleReadyProviderCandidatePath(status);
-      if (autoSavePath) {
-        setSavingPath(autoSavePath);
-        try {
-          const savedReport = await invoke<ProviderCheckReport>("save_provider_path", {
-            name: providerName,
-            path: autoSavePath,
-          });
-          applyProviderReport(savedReport);
-        } catch (saveErr) {
-          setError(`Found a working helper, but failed to save it: ${String(saveErr)}`);
-        } finally {
-          setSavingPath(null);
-        }
-      }
-      setShowHelperCandidates(true);
-    } catch (err) {
-      setProviderCheckError(String(err));
-      setShowHelperCandidates(true);
-    } finally {
-      setDiscovering(false);
-    }
-  }, [applyProviderReport, enabled, providerName]);
+  }, [
+    analyticsSurface,
+    applyProviderReport,
+    enabled,
+    providerName,
+  ]);
 
   const saveProviderPath = useCallback(
     async (path: string) => {
       if (!providerName || !enabled) return;
+      const statusBefore = providerSetupStatus(
+        runtimeStatusRef.current,
+        providerStatusRef.current,
+        false,
+        providerCheckErrorRef.current,
+      );
+      const candidate = providerStatusRef.current?.candidates.find((item) => item.path === path);
+      track(
+        "ai connection helper save started",
+        providerConnectionAnalyticsProperties(
+          providerName,
+          runtimeStatusRef.current,
+          providerStatusRef.current,
+          statusBefore,
+          {
+            surface: analyticsSurface,
+            candidate_source: candidate?.source ?? null,
+            candidate_runnable: candidate?.runnable ?? null,
+            candidate_logged_in: candidate?.loggedIn ?? null,
+            candidate_recommended: candidate?.recommended ?? null,
+          },
+        ),
+      );
       setSavingPath(path);
       setError(null);
       try {
@@ -1015,131 +1173,336 @@ export function useProviderSetup(providerName?: string | null, enabled = true) {
           path,
         });
         applyProviderReport(report);
+        const status = providerStatusFromReport(report);
+        const setupStatus = providerSetupStatus(
+          runtimeStatusRef.current,
+          status,
+          false,
+          status.checkError,
+        );
+        track(
+          "ai connection helper saved",
+          providerConnectionAnalyticsProperties(providerName, runtimeStatusRef.current, status, setupStatus, {
+            surface: analyticsSurface,
+            status_before: statusBefore,
+          }),
+        );
         setShowHelperCandidates(true);
       } catch (err) {
-        setError(`Failed to save helper path: ${String(err)}`);
+        setError(t("settings.provider.savePathFailed", { error: String(err) }));
+        track("ai connection helper save failed", {
+          provider: providerName,
+          surface: analyticsSurface,
+          status_before: statusBefore,
+          error_kind: providerConnectionErrorKind(err),
+        });
       } finally {
         setSavingPath(null);
       }
     },
-    [applyProviderReport, enabled, providerName],
+    [analyticsSurface, applyProviderReport, enabled, providerName, t],
   );
 
-  const clearProviderPath = useCallback(async () => {
-    if (!providerName || !enabled) return;
-    setClearingPath(true);
-    setError(null);
-    try {
-      const report = await invoke<ProviderCheckReport>("clear_provider_path", {
-        name: providerName,
-      });
-      applyProviderReport(report);
-      setShowHelperCandidates(true);
-    } catch (err) {
-      setError(`Failed to forget helper path: ${String(err)}`);
-    } finally {
-      setClearingPath(false);
-    }
-  }, [applyProviderReport, enabled, providerName]);
-
   const pollProviderStatus = useCallback(
-    async (isDone: (status: ProviderStatus | null) => boolean) => {
+    async (isDone: (status: ProviderStatus | null) => boolean, trigger: string) => {
       if (!providerName || !enabled) return;
+      track("ai connection poll started", {
+        provider: providerName,
+        surface: analyticsSurface,
+        trigger,
+      });
       setChecking(true);
       setError(null);
+      providerCheckErrorRef.current = null;
       setProviderCheckError(null);
       try {
         for (let attempt = 0; attempt < 20; attempt += 1) {
           await sleep(attempt === 0 ? 2500 : 3000);
 
           const runtime = await invoke<NodeRuntimeStatus>("check_node_runtime");
+          runtimeStatusRef.current = runtime;
           setRuntimeStatus(runtime);
 
           if (!runtime.nodeInstalled || !runtime.nodeVersionSupported) {
+            providerStatusRef.current = null;
             setProviderStatus(null);
+            const setupStatus = providerSetupStatus(runtime, null, false, null);
+            track(
+              "ai connection poll attempt",
+              providerConnectionAnalyticsProperties(providerName, runtime, null, setupStatus, {
+                surface: analyticsSurface,
+                trigger,
+                attempt: attempt + 1,
+              }),
+            );
             continue;
           }
 
           const report = await invoke<ProviderCheckReport>("check_provider", { name: providerName });
           const status = applyProviderReport(report);
           setProviderStatus(status);
-          if (isDone(status)) return;
+          const setupStatus = providerSetupStatus(runtime, status, false, status.checkError);
+          track(
+            "ai connection poll attempt",
+            providerConnectionAnalyticsProperties(providerName, runtime, status, setupStatus, {
+              surface: analyticsSurface,
+              trigger,
+              attempt: attempt + 1,
+            }),
+          );
+          if (isDone(status)) {
+            track(
+              "ai connection poll completed",
+              providerConnectionAnalyticsProperties(providerName, runtime, status, setupStatus, {
+                surface: analyticsSurface,
+                trigger,
+                attempts: attempt + 1,
+              }),
+            );
+            return;
+          }
         }
+        const setupStatus = providerSetupStatus(
+          runtimeStatusRef.current,
+          providerStatusRef.current,
+          false,
+          providerCheckErrorRef.current,
+        );
+        track(
+          "ai connection poll timed out",
+          providerConnectionAnalyticsProperties(
+            providerName,
+            runtimeStatusRef.current,
+            providerStatusRef.current,
+            setupStatus,
+            {
+              surface: analyticsSurface,
+              trigger,
+              attempts: 20,
+            },
+          ),
+        );
       } catch (err) {
+        providerCheckErrorRef.current = String(err);
         setProviderCheckError(String(err));
+        track("ai connection poll failed", {
+          provider: providerName,
+          surface: analyticsSurface,
+          trigger,
+          error_kind: providerConnectionErrorKind(err),
+        });
       } finally {
         setChecking(false);
         setAction(null);
       }
     },
-    [applyProviderReport, enabled, providerName],
+    [analyticsSurface, applyProviderReport, enabled, providerName],
   );
 
   useEffect(() => {
-    void refresh();
+    void refresh("auto");
   }, [refresh]);
 
   const openNodeDownload = useCallback(async () => {
     const url = runtimeStatus?.installUrl || "https://nodejs.org/en/download";
+    const setupStatus = providerSetupStatus(
+      runtimeStatusRef.current,
+      providerStatusRef.current,
+      false,
+      providerCheckErrorRef.current,
+    );
+    track(
+      "ai connection action started",
+      providerConnectionAnalyticsProperties(
+        providerName,
+        runtimeStatusRef.current,
+        providerStatusRef.current,
+        setupStatus,
+        {
+          surface: analyticsSurface,
+          action: "node_download",
+          install_url_present: Boolean(runtimeStatus?.installUrl),
+        },
+      ),
+    );
     setError(null);
     try {
       await openUrl(url);
       setAction("node-download-opened");
+      track(
+        "ai connection action launched",
+        providerConnectionAnalyticsProperties(
+          providerName,
+          runtimeStatusRef.current,
+          providerStatusRef.current,
+          setupStatus,
+          {
+            surface: analyticsSurface,
+            action: "node_download",
+          },
+        ),
+      );
     } catch (err) {
-      setError(`Failed to open Node.js download: ${String(err)}`);
+      setError(t("settings.provider.openNodeFailed", { error: String(err) }));
+      track("ai connection action failed", {
+        provider: providerName ?? null,
+        surface: analyticsSurface,
+        action: "node_download",
+        setup_status: setupStatus,
+        error_kind: providerConnectionErrorKind(err),
+      });
     }
-  }, [runtimeStatus?.installUrl]);
+  }, [analyticsSurface, providerName, runtimeStatus?.installUrl, t]);
 
   const installProvider = useCallback(async () => {
     if (!providerName) return;
+    const setupStatus = providerSetupStatus(
+      runtimeStatusRef.current,
+      providerStatusRef.current,
+      false,
+      providerCheckErrorRef.current,
+    );
     if (!runtimeStatus?.nodeInstalled) {
-      setError("Install Node.js first, then recheck.");
+      setError(t("provider.action.finishNode"));
+      track("ai connection action blocked", {
+        provider: providerName,
+        surface: analyticsSurface,
+        action: "install",
+        setup_status: setupStatus,
+        blocker: "node_missing",
+      });
       return;
     }
     if (!runtimeStatus.nodeVersionSupported) {
-      setError(
-        `Update Node.js to version ${runtimeStatus.requiredNodeMajor} or newer, then recheck.`,
-      );
+      setError(t("settings.runtime.nodeOldBody"));
+      track("ai connection action blocked", {
+        provider: providerName,
+        surface: analyticsSurface,
+        action: "install",
+        setup_status: setupStatus,
+        blocker: "node_too_old",
+      });
       return;
     }
     if (!runtimeStatus.npmInstalled) {
-      setError("Install npm first, then recheck.");
+      setError(t("provider.action.getNpm"));
+      track("ai connection action blocked", {
+        provider: providerName,
+        surface: analyticsSurface,
+        action: "install",
+        setup_status: setupStatus,
+        blocker: "npm_missing",
+      });
       return;
     }
 
+    track(
+      "ai connection action started",
+      providerConnectionAnalyticsProperties(
+        providerName,
+        runtimeStatusRef.current,
+        providerStatusRef.current,
+        setupStatus,
+        {
+          surface: analyticsSurface,
+          action: "install",
+        },
+      ),
+    );
     setAction("installing-provider");
     setError(null);
     try {
       await invoke("install_provider", { name: providerName });
-      void pollProviderStatus((status) => Boolean(status?.installed));
+      track(
+        "ai connection action launched",
+        providerConnectionAnalyticsProperties(
+          providerName,
+          runtimeStatusRef.current,
+          providerStatusRef.current,
+          setupStatus,
+          {
+            surface: analyticsSurface,
+            action: "install",
+          },
+        ),
+      );
+      void pollProviderStatus((status) => Boolean(status?.installed), "install");
     } catch (err) {
       setAction(null);
-      setError(`Failed to launch installer: ${String(err)}`);
+      setError(t("settings.provider.launchInstallFailed", { error: String(err) }));
+      track("ai connection action failed", {
+        provider: providerName,
+        surface: analyticsSurface,
+        action: "install",
+        setup_status: setupStatus,
+        error_kind: providerConnectionErrorKind(err),
+      });
     }
   }, [
+    analyticsSurface,
     pollProviderStatus,
     providerName,
     runtimeStatus?.nodeInstalled,
     runtimeStatus?.nodeVersionSupported,
-    runtimeStatus?.requiredNodeMajor,
     runtimeStatus?.npmInstalled,
+    t,
   ]);
 
   const loginProvider = useCallback(async () => {
     if (!providerName) return;
+    const setupStatus = providerSetupStatus(
+      runtimeStatusRef.current,
+      providerStatusRef.current,
+      false,
+      providerCheckErrorRef.current,
+    );
 
+    track(
+      "ai connection action started",
+      providerConnectionAnalyticsProperties(
+        providerName,
+        runtimeStatusRef.current,
+        providerStatusRef.current,
+        setupStatus,
+        {
+          surface: analyticsSurface,
+          action: "login",
+        },
+      ),
+    );
     setAction("signing-in");
     setError(null);
     try {
       await invoke("login_provider", { name: providerName });
+      track(
+        "ai connection action launched",
+        providerConnectionAnalyticsProperties(
+          providerName,
+          runtimeStatusRef.current,
+          providerStatusRef.current,
+          setupStatus,
+          {
+            surface: analyticsSurface,
+            action: "login",
+          },
+        ),
+      );
       void pollProviderStatus(
         (status) => Boolean(status?.installed && status.loggedIn && !status.choiceRequired),
+        "login",
       );
     } catch (err) {
       setAction(null);
-      setError(`Failed to launch sign-in: ${String(err)}`);
+      setError(t("settings.provider.launchSignInFailed", { error: String(err) }));
+      track("ai connection action failed", {
+        provider: providerName,
+        surface: analyticsSurface,
+        action: "login",
+        setup_status: setupStatus,
+        error_kind: providerConnectionErrorKind(err),
+      });
     }
-  }, [pollProviderStatus, providerName]);
+  }, [analyticsSurface, pollProviderStatus, providerName, t]);
 
   const ready = Boolean(
     runtimeStatus?.nodeInstalled &&
@@ -1156,18 +1519,14 @@ export function useProviderSetup(providerName?: string | null, enabled = true) {
       providerStatus,
       providerCheckError,
       checking,
-      discovering,
       showHelperCandidates,
       savingPath,
-      clearingPath,
       action,
       error,
       ready,
       statusKind,
       refresh,
-      findInstalledHelper,
       saveProviderPath,
-      clearProviderPath,
       openNodeDownload,
       installProvider,
       loginProvider,
@@ -1175,10 +1534,7 @@ export function useProviderSetup(providerName?: string | null, enabled = true) {
     [
       action,
       checking,
-      clearingPath,
-      discovering,
       error,
-      findInstalledHelper,
       installProvider,
       loginProvider,
       openNodeDownload,
@@ -1191,7 +1547,6 @@ export function useProviderSetup(providerName?: string | null, enabled = true) {
       savingPath,
       showHelperCandidates,
       statusKind,
-      clearProviderPath,
     ],
   );
 }
@@ -1204,6 +1559,7 @@ interface ProviderSetupCardProps {
   context: ProviderSetupContext;
   className?: string;
   showReady?: boolean;
+  onAction?: (action: string, setupStatus: ProviderSetupStatus) => void;
 }
 
 export function ProviderSetupCard({
@@ -1212,7 +1568,9 @@ export function ProviderSetupCard({
   context,
   className,
   showReady = false,
+  onAction,
 }: ProviderSetupCardProps) {
+  const { language, t } = useI18n();
   const runtime = setup.runtimeStatus;
   const status = setup.providerStatus;
   const nodeReady = Boolean(runtime?.nodeInstalled && runtime.nodeVersionSupported);
@@ -1222,15 +1580,12 @@ export function ProviderSetupCard({
   const ready = nodeReady && installed && loggedIn && !status?.choiceRequired;
   const providerMissing = setup.statusKind === "provider_missing";
   const installBlocked = !nodeReady || !npmReady;
-  const canFindHelper =
-    nodeReady &&
-    [
-      "npm_missing",
-      "provider_missing",
-      "provider_logged_out",
-      "provider_choice_required",
-      "provider_check_failed",
-    ].includes(setup.statusKind);
+  const setupBlockedByNode = [
+    "node_missing",
+    "node_too_old",
+    "npm_missing",
+  ].includes(setup.statusKind);
+  const canShowCandidatePanel = !setupBlockedByNode;
   const showDiagnostics =
     !ready ||
     Boolean(status?.warnings.length) ||
@@ -1243,33 +1598,47 @@ export function ProviderSetupCard({
     setup.checking,
     setup.providerCheckError,
     context,
+    language,
   );
 
   if (ready && !showReady && !setup.error) return null;
 
-  let primaryAction: { label: string; onClick: () => void; disabled?: boolean } | null = null;
+  let primaryAction: {
+    action: string;
+    label: string;
+    onClick: () => void;
+    disabled?: boolean;
+  } | null = null;
 
   if (message.actionKind === "node") {
     primaryAction = {
+      action: "node_download",
       label:
         setup.statusKind === "npm_missing"
-          ? "Get npm"
+          ? t("provider.action.getNpm")
           : runtime?.nodeInstalled && !runtime.nodeVersionSupported
-            ? "Update Node.js"
-            : "Get Node.js",
+            ? t("settings.runtime.updateNode")
+            : t("settings.runtime.getNode"),
       onClick: setup.openNodeDownload,
     };
   } else if (message.actionKind === "install") {
     primaryAction = {
-      label: "Install in Terminal",
+      action: "install",
+      label: t("settings.provider.installTerminal"),
       onClick: setup.installProvider,
       disabled: !nodeReady || !npmReady,
     };
   } else if (message.actionKind === "login") {
     primaryAction = {
-      label: `Sign in with ${productName(provider)}`,
+      action: "login",
+      label: t("provider.action.signIn", { product: productName(provider) }),
       onClick: setup.loginProvider,
     };
+  }
+
+  function runSetupAction(action: string, callback: () => void) {
+    onAction?.(action, setup.statusKind);
+    callback();
   }
 
   const classes = [
@@ -1281,7 +1650,8 @@ export function ProviderSetupCard({
     .filter(Boolean)
     .join(" ");
   const showActions = !ready || Boolean(setup.error);
-  const showCandidatePanel = setup.showHelperCandidates && (!ready || Boolean(setup.error));
+  const showCandidatePanel =
+    canShowCandidatePanel && setup.showHelperCandidates && (!ready || Boolean(setup.error));
 
   return (
     <section className={classes} aria-live="polite">
@@ -1297,23 +1667,19 @@ export function ProviderSetupCard({
         </div>
         <div className="provider-setup-status">{message.statusText}</div>
         {setup.action === "node-download-opened" ? (
-          <p className="provider-setup-note">Finish installing Node.js, then recheck.</p>
+          <p className="provider-setup-note">{t("provider.action.finishNode")}</p>
         ) : null}
         {setup.action === "installing-provider" ? (
           <p className="provider-setup-note">
-            Terminal opened. Maple will keep checking for about a minute.
+            {t("provider.action.installWindowChecking", {
+              app: connectionAppName(provider),
+            })}
           </p>
         ) : null}
         {setup.action === "signing-in" ? (
           <p className="provider-setup-note">
-            Terminal opened. Maple will keep checking for about a minute.
+            {t("provider.action.signInWindowChecking", { product: productName(provider) })}
           </p>
-        ) : null}
-        {message.command ? (
-          <div className="provider-setup-command">
-            <span>Terminal will run</span>
-            <code>{message.command}</code>
-          </div>
         ) : null}
         {setup.error ? <div className="provider-setup-error">{setup.error}</div> : null}
       </div>
@@ -1323,28 +1689,18 @@ export function ProviderSetupCard({
             <button
               type="button"
               className="provider-setup-primary"
-              onClick={() => void setup.findInstalledHelper()}
-              disabled={setup.discovering || setup.checking}
-            >
-              {setup.discovering ? "Finding..." : `Find installed ${helperName(provider)}`}
-            </button>
-          ) : null}
-          {providerMissing ? (
-            <button
-              type="button"
-              className="provider-setup-secondary"
-              onClick={setup.installProvider}
+              onClick={() => runSetupAction("install", setup.installProvider)}
               disabled={installBlocked || setup.checking || Boolean(setup.action)}
-              title={installBlocked ? "Finish Node.js/npm setup first" : undefined}
+              title={installBlocked ? t("settings.provider.finishNode") : undefined}
             >
-              {`Install ${helperName(provider)}`}
+              {t("settings.provider.installProductHelper", { product: productName(provider) })}
             </button>
           ) : null}
           {primaryAction ? (
             <button
               type="button"
               className="provider-setup-primary"
-              onClick={primaryAction.onClick}
+              onClick={() => runSetupAction(primaryAction.action, primaryAction.onClick)}
               disabled={primaryAction.disabled || setup.checking || Boolean(setup.action)}
             >
               {primaryAction.label}
@@ -1353,21 +1709,13 @@ export function ProviderSetupCard({
           <button
             type="button"
             className="provider-setup-secondary"
-            onClick={() => void setup.refresh()}
+            onClick={() => runSetupAction("recheck", () => void setup.refresh("manual_recheck"))}
             disabled={setup.checking}
           >
-            {setup.checking ? "Checking..." : "Recheck"}
+            {setup.checking
+              ? t("app.common.checking")
+              : providerSetupRecheckLabel(setup.statusKind, language)}
           </button>
-          {canFindHelper && !providerMissing ? (
-            <button
-              type="button"
-              className="provider-setup-secondary"
-              onClick={() => void setup.findInstalledHelper()}
-              disabled={setup.discovering || setup.checking}
-            >
-              {setup.discovering ? "Finding..." : "Find installed helper"}
-            </button>
-          ) : null}
         </div>
       ) : null}
       {showCandidatePanel ? (
@@ -1375,9 +1723,10 @@ export function ProviderSetupCard({
           provider={provider}
           status={status}
           savingPath={setup.savingPath}
-          clearingPath={setup.clearingPath}
-          onUsePath={(path) => void setup.saveProviderPath(path)}
-          onClearPath={() => void setup.clearProviderPath()}
+          onUsePath={(path) => {
+            onAction?.("use_helper", setup.statusKind);
+            void setup.saveProviderPath(path);
+          }}
         />
       ) : null}
       {showDiagnostics ? (

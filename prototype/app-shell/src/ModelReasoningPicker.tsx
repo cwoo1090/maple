@@ -2,6 +2,7 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { KeyboardEvent } from "react";
 import { createPortal } from "react-dom";
 import type { AppSettings, ProviderInfo, ProviderModel } from "./ProviderSetup";
+import { useI18n } from "./i18n";
 
 export type ModelReasoningSelection = {
   provider: string;
@@ -60,6 +61,7 @@ export function ModelReasoningPicker({
   align = "left",
   onChange,
 }: ModelReasoningPickerProps) {
+  const { t } = useI18n();
   const rootRef = useRef<HTMLDivElement | null>(null);
   const menuRef = useRef<HTMLDivElement | null>(null);
   const [open, setOpen] = useState(false);
@@ -218,7 +220,7 @@ export function ModelReasoningPicker({
                   </span>
                   {(model.recommended || model.description) ? (
                     <span className="model-reasoning-model-meta">
-                      {[model.recommended ? "Recommended" : null, model.description]
+                      {[model.recommended ? t("app.model.recommended") : null, model.description]
                         .filter(Boolean)
                         .join(" · ")}
                     </span>
@@ -298,7 +300,7 @@ export function ModelReasoningPicker({
           {selectedProvider && selectedModel ? (
             <span className="model-reasoning-trigger-model">{selectedModel.label}</span>
           ) : (
-            <span className="model-reasoning-trigger-model">Choose model</span>
+            <span className="model-reasoning-trigger-model">{t("app.model.choose")}</span>
           )}
         </span>
         <span className="model-reasoning-caret" aria-hidden="true">
