@@ -1531,13 +1531,13 @@ test("new workspace schema scaffold documents wiki structure and durable rules",
   assert.doesNotMatch(schema, /type: summary \| concept \| guide/);
   assert.match(schema, /persistent, compounding wiki/);
   assert.match(schema, /## Operation Model/);
-  assert.match(schema, /sources\/ -> Build Wiki -> Explore -> Apply to Wiki -> Wiki Healthcheck -> Update Rules/);
+  assert.match(schema, /sources\/ -> Build Wiki -> Ask Wiki -> Apply to Wiki -> Wiki Healthcheck -> Update Rules/);
   assert.match(schema, /## Build Wiki Rules/);
   assert.match(schema, /Build Wiki should integrate scoped source changes/);
   assert.match(schema, /Do not rely only on extracted text for visually meaningful sources/);
   assert.match(schema, /Distinguish pages inspected for understanding from images embedded/);
-  assert.match(schema, /## Explore And Apply Rules/);
-  assert.match(schema, /Apply to Wiki should save durable value from Explore/);
+  assert.match(schema, /## Ask Wiki And Apply Rules/);
+  assert.match(schema, /Apply to Wiki should save durable value from Ask Wiki/);
   assert.match(schema, /## Durable Preferences And Agent Files/);
   assert.match(schema, /Save a user preference to `schema\.md` only when the user explicitly asks/);
   assert.match(schema, /AGENTS\.md` and `CLAUDE\.md` are short bootstrap files/);
@@ -1549,8 +1549,8 @@ test("new workspace schema scaffold documents wiki structure and durable rules",
   assert.match(schema, /lecture-03-notes\.md#attention-mechanism/);
   assert.match(schema, /include that locator in the visible link label/);
   assert.match(schema, /Do not use `#L\.\.\.` line anchors on Markdown source files/);
-  assert.match(schema, /Web references are external links used during Explore Chat/);
-  assert.match(schema, /found via Explore web search/);
+  assert.match(schema, /Web references are external links used during Ask Wiki/);
+  assert.match(schema, /found via Ask Wiki web search/);
   assert.match(schema, /## Visuals And Assets/);
   assert.match(schema, /smallest useful set/);
   assert.match(schema, /Save user-added images under `wiki\/assets\/user\/`/);
@@ -1614,7 +1614,7 @@ test("Build Wiki prompt includes first-build workspace context", async (t) => {
   assert.match(prompt, /Update AGENTS\.md or CLAUDE\.md only when the user explicitly asks/);
 });
 
-test("Explore Chat prompt uses extracted text for selected source decks", async (t) => {
+test("Ask Wiki prompt uses extracted text for selected source decks", async (t) => {
   const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "maple-source-chat-"));
   t.after(() => fs.rm(workspace, { recursive: true, force: true }));
   await fs.mkdir(path.join(workspace, "sources"), { recursive: true });
@@ -1637,7 +1637,7 @@ test("Explore Chat prompt uses extracted text for selected source decks", async 
   assert.match(prompt, /security alliance matters/);
 });
 
-test("Explore Chat source visuals attach explicitly referenced slide images", async (t) => {
+test("Ask Wiki source visuals attach explicitly referenced slide images", async (t) => {
   const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "maple-source-visual-chat-"));
   t.after(() => fs.rm(workspace, { recursive: true, force: true }));
   await fs.mkdir(path.join(workspace, "sources"), { recursive: true });
@@ -1705,7 +1705,7 @@ test("Explore Chat source visuals attach explicitly referenced slide images", as
   assert.match(prompt, /Do not unzip or dump the full Office\/PDF source/);
 });
 
-test("Explore Chat source visuals attach contact sheet for visual questions without page numbers", async (t) => {
+test("Ask Wiki source visuals attach contact sheet for visual questions without page numbers", async (t) => {
   const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "maple-source-contact-chat-"));
   t.after(() => fs.rm(workspace, { recursive: true, force: true }));
   await fs.mkdir(path.join(workspace, "sources"), { recursive: true });
@@ -1748,7 +1748,7 @@ test("Explore Chat source visuals attach contact sheet for visual questions with
   );
 });
 
-test("Explore Chat source visuals use Claude image path references", async (t) => {
+test("Ask Wiki source visuals use Claude image path references", async (t) => {
   const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "maple-source-path-chat-"));
   t.after(() => fs.rm(workspace, { recursive: true, force: true }));
   await fs.mkdir(path.join(workspace, "sources"), { recursive: true });
@@ -1818,7 +1818,7 @@ test("Explore Chat source visuals use Claude image path references", async (t) =
   assert.match(prompt, new RegExp(absolutePagePath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 });
 
-test("Explore Chat raw source images use Claude image path references", async (t) => {
+test("Ask Wiki raw source images use Claude image path references", async (t) => {
   const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "maple-raw-image-path-chat-"));
   t.after(() => fs.rm(workspace, { recursive: true, force: true }));
   await fs.mkdir(path.join(workspace, "sources"), { recursive: true });
@@ -1852,7 +1852,7 @@ test("Explore Chat raw source images use Claude image path references", async (t
   assert.match(prompt, new RegExp(absoluteImagePath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 });
 
-test("Explore Chat parses source page references conservatively", () => {
+test("Ask Wiki parses source page references conservatively", () => {
   assert.deepEqual(
     parseExplorePageReferences("12번 슬라이드랑 page 15-16도 봐줘", 20),
     [12, 15, 16],
@@ -1860,7 +1860,7 @@ test("Explore Chat parses source page references conservatively", () => {
   assert.deepEqual(parseExplorePageReferences("2026년에 나온 자료", 20), []);
 });
 
-test("Explore Chat attaches only selected wiki page asset images", async (t) => {
+test("Ask Wiki attaches only selected wiki page asset images", async (t) => {
   const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "maple-wiki-image-chat-"));
   t.after(() => fs.rm(workspace, { recursive: true, force: true }));
   await fs.mkdir(path.join(workspace, "wiki", "concepts"), { recursive: true });
@@ -1904,7 +1904,7 @@ test("Explore Chat attaches only selected wiki page asset images", async (t) => 
   assert.doesNotMatch(imageSection, /sources\/raw\.png/);
 });
 
-test("Explore Chat wiki images use Claude image path references", async (t) => {
+test("Ask Wiki wiki images use Claude image path references", async (t) => {
   const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "maple-wiki-image-path-chat-"));
   t.after(() => fs.rm(workspace, { recursive: true, force: true }));
   await fs.mkdir(path.join(workspace, "wiki", "concepts"), { recursive: true });
@@ -2022,7 +2022,7 @@ test("protected image validation restores asset files and orphaned references", 
   assert.equal(validated.find((change) => change.path === "wiki/concepts/rag.md")?.allowed, false);
 });
 
-test("Explore Chat source-only prompt asks for local answers", async (t) => {
+test("Ask Wiki source-only prompt asks for local answers", async (t) => {
   const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "maple-source-only-chat-"));
   t.after(() => fs.rm(workspace, { recursive: true, force: true }));
 
@@ -2035,9 +2035,10 @@ test("Explore Chat source-only prompt asks for local answers", async (t) => {
   assert.match(prompt, /Source-only mode/);
   assert.match(prompt, /Answer from the local wiki/);
   assert.match(prompt, /web search would be needed/);
+  assert.match(prompt, /direct them to Maple Guide from the lower-left speech-bubble button/);
 });
 
-test("Explore Chat web prompt requires local-first URL citations", async (t) => {
+test("Ask Wiki web prompt requires local-first URL citations", async (t) => {
   const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "maple-web-chat-"));
   t.after(() => fs.rm(workspace, { recursive: true, force: true }));
 
@@ -2057,7 +2058,7 @@ test("Explore Chat web prompt requires local-first URL citations", async (t) => 
 test("agent scaffold keeps operation boundary short and delegates content rules", () => {
   const instructions = workspaceAgentInstructions("Workspace Agent Instructions");
 
-  assert.match(instructions, /Explore Chat is read-only/);
+  assert.match(instructions, /Ask Wiki is for questions about sources and the existing wiki/);
   assert.match(
     instructions,
     /Build Wiki, Apply to Wiki, Wiki Healthcheck, Improve Wiki, Organize Sources, and Update Wiki Rules/,
@@ -2124,12 +2125,12 @@ test("Apply to wiki prompt marks web-search content as web references", () => {
     ],
   });
 
-  assert.match(prompt, /Some selected chat messages used Explore web search/);
+  assert.match(prompt, /Some selected chat messages used Ask Wiki web search/);
   assert.match(prompt, /Treat web-derived material according to schema\.md/);
   assert.match(prompt, /Do not perform fresh web search during Apply/);
-  assert.match(prompt, /\[used Explore web search\]/);
+  assert.match(prompt, /\[used Ask Wiki web search\]/);
   assert.doesNotMatch(prompt, /## Web References/);
-  assert.doesNotMatch(prompt, /found via Explore web search/);
+  assert.doesNotMatch(prompt, /found via Ask Wiki web search/);
 });
 
 test("maintenance prompts are thin operation briefs", async () => {

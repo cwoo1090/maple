@@ -3886,8 +3886,7 @@ button.tree-name-clickable {
   font-weight: 650;
 }
 
-.explore-chat-context,
-.explore-chat-state {
+.explore-chat-context {
   color: var(--text-faint);
   font-size: 11.5px;
 }
@@ -4068,6 +4067,74 @@ button.tree-name-clickable {
   color: var(--text-faint);
   font-size: 13px;
   padding: 8px 0;
+}
+
+.ask-wiki-guide {
+  display: grid;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid var(--accent-border);
+  border-radius: 8px;
+  background: var(--accent-bg);
+  color: var(--text);
+}
+
+.ask-wiki-guide-copy {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+
+.ask-wiki-guide-copy strong {
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.ask-wiki-guide-copy p {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 12.5px;
+  line-height: 1.4;
+}
+
+.ask-wiki-guide-copy span {
+  color: var(--text-dim);
+  font-size: 11.5px;
+}
+
+.ask-wiki-guide-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.ask-wiki-guide-actions button {
+  min-height: 30px;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  padding: 0 10px;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.ask-wiki-guide-primary {
+  border-color: var(--accent-border);
+  background: var(--accent);
+  color: white;
+}
+
+.ask-wiki-guide-primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+
+.ask-wiki-guide-secondary {
+  background: var(--bg-elevated);
+  color: var(--text-muted);
+}
+
+.ask-wiki-guide-secondary:hover:not(:disabled) {
+  background: var(--bg-hover);
+  color: var(--text);
 }
 
 .explore-chat-messages {

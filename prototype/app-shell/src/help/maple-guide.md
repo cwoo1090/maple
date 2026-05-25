@@ -28,7 +28,7 @@ Maple's workflow is:
 2. Import sources.
 3. Use the user's connected AI account to build the wiki.
 4. Review the AI-generated changes.
-5. Explore the generated wiki.
+5. Ask Wiki about the generated wiki.
 6. Maintain and improve the wiki as it grows.
 
 Maple uses the user's own AI subscription through a small local connection app:
@@ -102,20 +102,20 @@ Use Maple Guide for:
 
 - Questions about which Maple button or panel to use.
 - First-run guidance.
-- Explaining Build, Explore, Maintain, review, undo, imports, and AI connection.
+- Explaining Build wiki, Ask Wiki, Maintain, review, undo, imports, and AI connection.
 - Short troubleshooting when the app shows a setup or status message.
 
-Maple Guide is not Explore Chat:
+Maple Guide is not Ask Wiki:
 
 - Maple Guide answers questions about the Maple app.
-- Explore Chat answers questions about the user's wiki, sources, selected page, or study content.
+- Ask Wiki answers questions about the user's wiki, sources, selected page, or study content.
 
 Maple Guide may show suggested questions such as:
 
 - `What should I do first?`
 - `How do I add a PDF?`
 - `When should I click Build wiki?`
-- `Explore and Maintain are confusing.`
+- `Ask Wiki and Maintain are confusing.`
 - `How do I review AI changes?`
 
 Maple Guide uses the same connected AI account as the rest of Maple, so it needs AI connection before it can answer. If Maple Guide cannot answer because AI is not connected, tell the user to connect ChatGPT or Claude from the visible connection card or from `Settings...`.
@@ -134,7 +134,7 @@ The user can open AI settings from:
 - The top-right `...` / More actions menu.
 - `Settings...`.
 - The `Connect AI`, `Connect AI to build`, `Connect AI to ask`, `Connect AI to update`, or `Connect AI to maintain` buttons when Maple blocks an AI action.
-- The connection card shown in Build, Explore, Maintain, or the first-run AI setup modal.
+- The connection card shown in Build wiki, Ask Wiki, Maintain, or the first-run AI setup modal.
 
 Maple may show a global AI setup modal with:
 
@@ -159,7 +159,7 @@ General connection logic:
 - If Maple says sign-in is needed, use the sign-in action from the connection card.
 - If Maple says Node.js is needed, use the Node.js install action first, then return to Maple and check again.
 - If Maple finds multiple local connections, choose the recommended one unless the user knows they need another.
-- If the connection is ready, Maple can use it for Build, Explore, Maintain, and Maple Guide.
+- If the connection is ready, Maple can use it for Build wiki, Ask Wiki, Maintain, and Maple Guide.
 
 For non-technical users, avoid explaining technical internals unless they ask. Say:
 
@@ -291,7 +291,7 @@ If a build takes a while:
 
 Maple's AI-generated changes should be reviewed before being accepted.
 
-After Build wiki, Apply chat, or Maintain writes changes:
+After Build wiki, Apply to wiki, or Maintain writes changes:
 
 - Maple marks changes as ready to review.
 - Changed files appear in the review area or sidebar.
@@ -333,11 +333,11 @@ Use Undo when:
 
 Do not tell users to manually delete `.aiwiki/` snapshots. Use the UI.
 
-## Explore
+## Ask Wiki
 
-The right-side `Explore` panel is for asking questions about the current wiki or selected source/page.
+The right-side `Ask Wiki` panel is for asking questions about the current wiki or selected source/page.
 
-Use Explore when the user wants to:
+Use Ask Wiki when the user wants to:
 
 - Ask about the current page.
 - Ask a follow-up question while reading.
@@ -345,37 +345,41 @@ Use Explore when the user wants to:
 - Ask about a selected source file.
 - Get an explanation without immediately changing wiki files.
 
-Explore is usually read-only. It answers questions but does not automatically update the wiki.
+Ask Wiki answers questions first. It does not automatically create wiki files from sources.
+
+If the user wants to turn sources into wiki pages, explain:
+
+"To make a wiki from sources, run `Build wiki`. Ask Wiki is for asking questions about selected sources or the existing wiki."
 
 Important distinction:
 
-- `Explore Chat` answers questions about the user's wiki and sources.
+- `Ask Wiki` answers questions about the user's wiki and sources.
 - `Maple Guide` answers questions about how to use the Maple app.
 
 If a user asks "Where should I ask about my study content?":
 
 Answer:
 
-"Use the right-side Explore panel. Maple Guide is for app usage questions."
+"Use the right-side Ask Wiki panel. Maple Guide is for app usage questions."
 
-If a user asks "How do I save a useful Explore answer into the wiki?":
+If a user asks "How do I apply a useful Ask Wiki answer to the wiki?":
 
 Answer:
 
-"After an Explore answer is complete, use the `Update wiki` or apply action in the Explore panel. Maple will turn the selected chat content into wiki edits, then show those edits for review."
+"After an Ask Wiki answer is complete, use `Apply to wiki`. Maple will turn the selected answer into reviewable wiki edits."
 
-## Explore Web Search
+## Ask Wiki Web Search
 
-Explore may have a web/search toggle depending on provider support.
+Ask Wiki may have a web/search toggle depending on provider support.
 
 When web search is off:
 
-- Explore should answer from local wiki and sources.
+- Ask Wiki should answer from local wiki and sources.
 - If live external information is needed, it should say so instead of guessing.
 
 When web search is on:
 
-- Explore can use web results for missing current or external context.
+- Ask Wiki can use web results for missing current or external context.
 - The local workspace remains the main source.
 - Web-derived claims should be labeled and cited.
 
@@ -394,9 +398,9 @@ Use Maintain when the user wants to:
 - Update workspace rules.
 - Save durable preferences into `schema.md`, `AGENTS.md`, or related rules.
 
-Maintain differs from Explore:
+Maintain differs from Ask Wiki:
 
-- Explore is for asking and learning.
+- Ask Wiki is for asking and learning.
 - Maintain is for changing, organizing, or improving the wiki.
 
 Common Maintain tasks:
@@ -416,7 +420,7 @@ If the user says "I just want to ask what this page means":
 
 Suggest:
 
-"Use Explore, not Maintain."
+"Use Ask Wiki, not Maintain."
 
 ## Settings
 
@@ -526,7 +530,7 @@ Recommended answer:
 4. Click `Build wiki`.
 5. Review the generated files.
 6. Click `Done reviewing` if the result is useful.
-7. Use `Explore` to ask questions about the wiki.
+7. Use `Ask Wiki` to ask questions about the wiki.
 
 ### "What is a workspace?"
 
@@ -540,17 +544,17 @@ Sources are original files Maple reads from, such as PDFs, slides, Word document
 
 Build wiki asks the selected AI account to turn pending sources into a local wiki. It is the main compile step.
 
-### "What is the difference between Build wiki and Explore?"
+### "What is the difference between Build wiki and Ask Wiki?"
 
-Build wiki creates or updates wiki files from sources. Explore answers questions about existing wiki/source content without automatically changing files.
+Build wiki creates or updates wiki files from sources. Ask Wiki answers questions about existing wiki/source content without automatically creating files.
 
-### "What is the difference between Explore and Maintain?"
+### "What is the difference between Ask Wiki and Maintain?"
 
-Explore is for asking questions. Maintain is for improving or reorganizing the wiki.
+Ask Wiki is for asking questions. Maintain is for improving or reorganizing the wiki.
 
-### "How do I make AI update the wiki from an Explore answer?"
+### "How do I apply an Ask Wiki answer to the wiki?"
 
-Use the `Update wiki` action in the Explore panel after the answer completes. Maple will create a reviewable wiki update.
+Use `Apply to wiki` in the Ask Wiki panel after the answer completes. Maple will create a reviewable wiki update.
 
 ### "How do I know what AI changed?"
 
@@ -620,7 +624,7 @@ Maple Guide can:
 - Explain how to use Maple.
 - Explain which panel or action to use.
 - Interpret common statuses.
-- Help choose between Build, Explore, Maintain, and Settings.
+- Help choose between Build wiki, Ask Wiki, Maintain, and Settings.
 - Suggest better build instructions.
 - Explain the workspace folder model.
 - Explain review and undo.
@@ -655,7 +659,7 @@ Examples:
 - If generated changes are waiting for review, suggest reviewing or undoing before starting another write operation.
 - If the AI connection is not ready, suggest using the visible `Connect AI` button, connection card, or Settings.
 - If a workspace operation is running, suggest waiting or using Stop if appropriate.
-- If a selected file is present, refer to it when explaining Explore.
-- If the user is already in Explore or Maintain, answer in terms of the current right-side panel.
+- If a selected file is present, refer to it when explaining Ask Wiki.
+- If the user is already in Ask Wiki or Maintain, answer in terms of the current right-side panel.
 
 Do not claim live state that was not provided.

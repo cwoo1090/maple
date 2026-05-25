@@ -25,7 +25,7 @@ Use "wiki" as the core noun. Do not expose internal files such as `AGENTS.md`, `
 Main areas:
 
 - `Sources` in the left file panel
-- `Explore` in the right panel
+- `Ask Wiki` in the right panel
 - `Maintain` in the right panel
 
 Main action labels:
@@ -128,7 +128,7 @@ Center: selected content
   graph view
 
 Right: mode-specific agent/action panel
-  Explore chat
+  Ask Wiki
   Maintain actions
   operation status
   undo
@@ -140,15 +140,16 @@ The app should feel like an agent workspace inspired by Codex CLI, but with non-
 
 Areas are the user-facing surfaces. AI write operations are permission boundaries.
 
-### Explore
+### Ask Wiki
 
 Purpose: learn from the wiki and sources.
 
 Default behavior:
 
-- read-only chat
+- question-first chat
 - answer from `index.md`, `wiki/`, and `sources/` when needed
-- no file writes unless the user explicitly asks
+- no file writes unless the user explicitly runs `Apply to wiki`
+- if the user wants to create or update wiki pages from sources, direct them to `Build wiki`
 
 Allowed write targets when explicitly requested:
 
@@ -261,7 +262,7 @@ Wiki healthcheck may inspect and fix:
 
 If the user asks for an action outside the current area, the assistant should explain the boundary and offer the right action.
 
-Example in Explore:
+Example in Ask Wiki:
 
 ```text
 That changes source organization, which belongs in Maintain.
@@ -357,7 +358,7 @@ Every workspace should contain `AGENTS.md` and `schema.md`.
 - defines citation/linking/style rules
 - can evolve as the user teaches the wiki
 
-Explore and Build wiki may edit `schema.md` only with clear durable-rule intent. Improve wiki and Update rules may update `schema.md`, `AGENTS.md`, and `CLAUDE.md` when the user asks for durable conventions or agent behavior changes.
+Ask Wiki and Build wiki may edit `schema.md` only with clear durable-rule intent. Improve wiki and Update rules may update `schema.md`, `AGENTS.md`, and `CLAUDE.md` when the user asks for durable conventions or agent behavior changes.
 
 ## Source Management
 
@@ -669,7 +670,7 @@ MVP approach:
 
 Examples:
 
-- Explore modifying `sources/**` is forbidden.
+- Ask Wiki modifying `sources/**` is forbidden.
 - Wiki healthcheck and Improve wiki modifying `sources/**` are forbidden.
 - Organize sources may move/rename source files, but source file content hash changes are forbidden unless the user explicitly imports/replaces a source.
 
@@ -766,7 +767,7 @@ Do not build in MVP:
 - User can undo the last operation.
 - Wiki reader renders Markdown, properties, images, and wikilinks.
 - Graph view works from wikilinks.
-- Explore chat is read-only by default.
+- Ask Wiki is question-first by default.
 - User can explicitly `Apply to wiki`.
 - User can run `Wiki healthcheck`.
 - User can run `Improve wiki`, `Organize sources`, and `Update rules` with snapshot and undo.

@@ -568,11 +568,11 @@ const BUILD_WIKI_STEP_INTERVAL_MS = 4600;
 const MAINTAIN_STEP_INTERVAL_MS = 4600;
 const TRANSIENT_UNDONE_STATUS_MS = 10_000;
 const AI_SETUP_READY_NOTICE_MS = 3_000;
-const DEFAULT_WIKI_UPDATE_USER_MESSAGE = "Update this wiki using the selected chat.";
+const DEFAULT_WIKI_UPDATE_USER_MESSAGE = "Apply this answer to the wiki.";
 const DEFAULT_WIKI_UPDATE_ASSISTANT_INTRO =
-  "I'll update this wiki using the selected chat and current wiki context.";
+  "I'll apply this answer using the selected chat and current wiki context.";
 const INSTRUCTED_WIKI_UPDATE_ASSISTANT_INTRO =
-  "I'll update this wiki using your instruction, the selected chat, and current wiki context.";
+  "I'll apply this answer using your instruction, the selected chat, and current wiki context.";
 
 type InterruptedCheck = {
   interrupted: boolean;
@@ -974,11 +974,16 @@ function latestChatContextPath(thread: ChatThread): string | null {
   return latestMessageContext?.trim() || thread.initialContextPath?.trim() || null;
 }
 
-function displayMaintainThreadPreview(thread: ChatThreadSummary): string {
+function displayMaintainThreadPreview(
+  thread: ChatThreadSummary,
+  language: UiLanguage = "en",
+): string {
   if (thread.preview) return thread.preview;
   const base = thread.operationType
-    ? operationTypeLabel(thread.operationType)
-    : "No operation yet";
+    ? operationTypeLabel(thread.operationType, language)
+    : language === "ko"
+      ? "아직 작업 없음"
+      : "No operation yet";
   const timestamp = displayChatThreadTimestamp(thread.updatedAt);
   return timestamp ? `${base} - ${timestamp}` : base;
 }
@@ -1286,19 +1291,19 @@ function maintainTaskContextHint(task: MaintainTaskConfig): string {
   }
 }
 
-function operationTypeLabel(operationType?: string | null): string {
+function operationTypeLabel(operationType?: string | null, language: UiLanguage = "en"): string {
   const taskId = maintainTaskIdFromOperationType(operationType);
-  if (taskId) return MAINTAIN_TASK_BY_ID[taskId].label;
-  if (operationType === "build-wiki") return "Build wiki";
-  if (operationType === "apply-chat") return "Update wiki from chat";
+  if (taskId) return maintainTaskUiCopy(taskId, language).label;
+  if (operationType === "build-wiki") return translate(language, "app.sidebar.buildWiki");
+  if (operationType === "apply-chat") return translate(language, "app.right.updateWiki");
   if (
     operationType === "explore-chat" ||
     operationType === "study-chat" ||
     operationType === "side-chat"
   ) {
-    return "Explore Chat";
+    return translate(language, "app.right.exploreChat");
   }
-  return "Operation";
+  return language === "ko" ? "작업" : "Operation";
 }
 
 function isGenericMaintainCompletionMessage(text: string): boolean {
@@ -1512,6 +1517,7 @@ function App() {
   const { t, language, setLanguage } = useI18n();
   const appBodyRef = useRef<HTMLDivElement | null>(null);
   const exploreChatMessagesRef = useRef<HTMLDivElement | null>(null);
+  const exploreChatInputRef = useRef<HTMLTextAreaElement | null>(null);
   const maintainChatMessagesRef = useRef<HTMLDivElement | null>(null);
   const mapleGuideMessagesRef = useRef<HTMLDivElement | null>(null);
   const topbarWorkspaceMenuRef = useRef<HTMLDetailsElement | null>(null);
@@ -1623,6 +1629,7 @@ function App() {
   const [maintainFeedOpen, setMaintainFeedOpen] = useState(true);
   const [chatStatusStep, setChatStatusStep] = useState(0);
   const [exploreQuestion, setExploreQuestion] = useState("");
+  const [askWikiGuideDismissed, setAskWikiGuideDismissed] = useState(false);
   const [exploreWebSearchEnabled, setExploreWebSearchEnabled] = useState(false);
   const [providers, setProviders] = useState<ProviderInfo[]>([]);
   const [appSettings, setAppSettings] = useState<AppSettings | null>(null);
@@ -1741,7 +1748,7 @@ function App() {
     (backgroundBuildActive && workspaceOperationProgress?.running !== false) ||
     workspaceBuildProgressFailed;
   const isAskingWiki = exploreChatMessages.some((message) => message.status === "streaming");
-  const isStartingExplore = busy === "Starting chat";
+  const isStartingExplore = busy === "Starting Ask Wiki";
   const exploreBusy = isStartingExplore || isAskingWiki;
   const activeMaintainDiscussionRunId = maintainThreadMessages
     .slice()
@@ -1815,16 +1822,22 @@ function App() {
   const writeActionBlocked =
     workspaceWriteBusy || exploreBusy || maintainDiscussionBusy || blockingUiBusy;
   const anyOperationBusy = writeActionBlocked;
+  const askWikiLabel = t("app.right.exploreChat");
+  const buildWikiLabel = t("app.sidebar.buildWiki");
+  const applyToWikiLabel = t("app.right.updateWiki");
+  const maintainDiscussionLabel = t("app.status.maintainDiscussion");
+  const runningTitle = (label: string) =>
+    language === "ko" ? `${label} 실행 중입니다.` : `${label} is running.`;
   const activeWorkspaceWriteLabel = isBuilding
-    ? "Build wiki"
+    ? buildWikiLabel
     : isWikiUpdateRunning
-      ? "Update wiki from chat"
+      ? applyToWikiLabel
       : isMaintainOperationRunning && activeMaintainOperationTask
-        ? activeMaintainOperationTask.label
+        ? maintainTaskUiCopy(activeMaintainOperationTask.id, language).label
         : null;
   const activeOperationLabel =
     activeWorkspaceWriteLabel ??
-    (exploreBusy ? "Explore Chat" : maintainDiscussionBusy ? "Maintain discussion" : busy);
+    (exploreBusy ? askWikiLabel : maintainDiscussionBusy ? maintainDiscussionLabel : busy);
   const changedFiles =
     workspace.changedMarker?.changedFiles ?? workspace.changedMarker?.allChangedFiles ?? [];
   const reviewableChangedFiles = changedFiles.filter(isPendingReviewChange);
@@ -1854,9 +1867,9 @@ function App() {
       case "maintain":
         return "running Maintain";
       case "update-wiki":
-        return "updating the wiki";
+        return "applying to the wiki";
       case "explore":
-        return "asking chat";
+        return "asking Ask Wiki";
       case "review":
         return "finishing review";
       case "undo":
@@ -1871,45 +1884,109 @@ function App() {
     return "continuing";
   }
 
+  function actionInstruction(action: BlockedAction): string {
+    if (language !== "ko") return actionPhrase(action);
+    switch (action) {
+      case "build":
+        return "위키 빌드를 실행하세요";
+      case "maintain":
+        return "관리를 실행하세요";
+      case "update-wiki":
+        return "위키에 적용하세요";
+      case "explore":
+        return "대화하세요";
+      case "review":
+        return "검토를 완료하세요";
+      case "undo":
+        return "마지막 작업을 되돌리세요";
+      case "reset":
+        return "샘플 워크스페이스를 재설정하세요";
+      case "source-import":
+        return "소스를 가져오세요";
+      case "source-remove":
+        return "소스를 제거하세요";
+    }
+    return "계속하세요";
+  }
+
+  function waitForRunningActionMessage(label: string, action: BlockedAction): string {
+    return language === "ko"
+      ? `${runningTitle(label)} 끝난 뒤 ${actionInstruction(action)}`
+      : `${label} is running. Wait for it to finish before ${actionPhrase(action)}.`;
+  }
+
+  function waitForAnsweringActionMessage(label: string, action: BlockedAction): string {
+    return language === "ko"
+      ? `${label}이 답변 중입니다. 끝난 뒤 ${actionInstruction(action)}`
+      : `${label} is answering. Wait for it to finish before ${actionPhrase(action)}.`;
+  }
+
+  function waitForSchemaUpdateMessage(label: string, answering = false): string {
+    if (language === "ko") {
+      return answering
+        ? `${label}이 답변 중입니다. 끝난 뒤 schema.md를 업데이트하세요.`
+        : `${runningTitle(label)} 끝난 뒤 schema.md를 업데이트하세요.`;
+    }
+    return answering
+      ? `${label} is answering. Wait for it to finish before updating schema.md.`
+      : `${label} is running. Wait for it to finish before updating schema.md.`;
+  }
+
+  function waitForEditingMessage(label: string): string {
+    return language === "ko"
+      ? `${runningTitle(label)} 끝난 뒤 편집하세요.`
+      : `${label} is running. Wait for it to finish before editing.`;
+  }
+
   function getBlockedReason(action: BlockedAction): string | null {
     if (action === "explore") {
       if (exploreBusy) {
-        return "Explore Chat is already answering. Wait for it to finish before asking another question.";
+        return language === "ko"
+          ? "대화가 이미 답변 중입니다. 끝난 뒤 다시 질문하세요."
+          : "Ask Wiki is already answering. Wait for it to finish before asking another question.";
       }
       if (blockingUiBusy && activeOperationLabel) {
-        return `${activeOperationLabel} is running. Wait for it to finish before asking chat.`;
+        return language === "ko"
+          ? `${runningTitle(activeOperationLabel)} 끝난 뒤 대화하세요.`
+          : `${activeOperationLabel} is running. Wait for it to finish before asking Ask Wiki.`;
       }
       if (maintainDiscussionBusy) {
-        return "Maintain discussion is answering. Wait for it to finish before asking chat.";
+        return language === "ko"
+          ? "관리 대화가 답변 중입니다. 끝난 뒤 대화하세요."
+          : "Maintain discussion is answering. Wait for it to finish before asking Ask Wiki.";
       }
       return null;
     }
 
     if (activeWorkspaceWriteLabel) {
       if (action === "build") {
-        return activeWorkspaceWriteLabel === "Build wiki"
-          ? "Build wiki is already running."
-          : `${activeWorkspaceWriteLabel} is running. Wait for it to finish before building the wiki.`;
+        return isBuilding
+          ? language === "ko"
+            ? "위키 빌드가 이미 실행 중입니다."
+            : "Build wiki is already running."
+          : waitForRunningActionMessage(activeWorkspaceWriteLabel, action);
       }
       if (action === "maintain") {
-        return `${activeWorkspaceWriteLabel} is running. Wait for it to finish before running Maintain.`;
+        return waitForRunningActionMessage(activeWorkspaceWriteLabel, action);
       }
       if (action === "update-wiki") {
-        return `${activeWorkspaceWriteLabel} is running. Chat can answer, but wiki changes can be applied after it finishes.`;
+        return language === "ko"
+          ? `${runningTitle(activeWorkspaceWriteLabel)} 대화는 할 수 있지만, 위키 변경 적용은 끝난 뒤 할 수 있습니다.`
+          : `${activeWorkspaceWriteLabel} is running. Ask Wiki can answer, but wiki changes can be applied after it finishes.`;
       }
-      return `${activeWorkspaceWriteLabel} is running. Wait for it to finish before ${actionPhrase(action)}.`;
+      return waitForRunningActionMessage(activeWorkspaceWriteLabel, action);
     }
 
     if (exploreBusy) {
-      return `Explore Chat is answering. Wait for it to finish before ${actionPhrase(action)}.`;
+      return waitForAnsweringActionMessage(askWikiLabel, action);
     }
 
     if (maintainDiscussionBusy) {
-      return `Maintain discussion is answering. Wait for it to finish before ${actionPhrase(action)}.`;
+      return waitForAnsweringActionMessage(maintainDiscussionLabel, action);
     }
 
     if (blockingUiBusy && activeOperationLabel) {
-      return `${activeOperationLabel} is running. Wait for it to finish before ${actionPhrase(action)}.`;
+      return waitForRunningActionMessage(activeOperationLabel, action);
     }
 
     if (hasPendingGeneratedChanges && action !== "review" && action !== "undo") {
@@ -1932,22 +2009,26 @@ function App() {
   const schemaUpdateBlockedReason = hasPendingGeneratedChanges
     ? PENDING_GENERATED_CHANGES_ERROR
     : activeWorkspaceWriteLabel
-    ? `${activeWorkspaceWriteLabel} is running. Wait for it to finish before updating schema.md.`
+    ? waitForSchemaUpdateMessage(activeWorkspaceWriteLabel)
     : exploreBusy
-    ? "Explore Chat is answering. Wait for it to finish before updating schema.md."
+    ? waitForSchemaUpdateMessage(askWikiLabel, true)
     : maintainDiscussionBusy
-    ? "Maintain discussion is answering. Wait for it to finish before updating schema.md."
+    ? waitForSchemaUpdateMessage(maintainDiscussionLabel, true)
     : blockingUiBusy && activeOperationLabel
-    ? `${activeOperationLabel} is running. Wait for it to finish before updating schema.md.`
+    ? waitForSchemaUpdateMessage(activeOperationLabel)
     : writeActionBlocked
-    ? "A workspace action is running. Wait for it to finish before updating schema.md."
+    ? language === "ko"
+      ? "워크스페이스 작업이 실행 중입니다. 끝난 뒤 schema.md를 업데이트하세요."
+      : "A workspace action is running. Wait for it to finish before updating schema.md."
     : null;
   const schemaUpdateButtonTitle =
     language === "ko"
       ? "schema.md를 업데이트하기 전에 최신 표준 워크스페이스 스키마를 검토합니다"
       : "Review the latest standard workspace schema before updating schema.md";
   const workspaceUpdateExploreNotice = activeWorkspaceWriteLabel
-    ? "A workspace update is running. Chat can answer from the current saved files, but may not include changes still being generated."
+    ? language === "ko"
+      ? "워크스페이스 변경 작업이 실행 중입니다. 대화는 현재 저장된 파일 기준으로 답할 수 있지만, 아직 생성 중인 변경은 포함하지 않을 수 있습니다."
+      : "A workspace update is running. Ask Wiki can answer from the current saved files, but may not include changes still being generated."
     : null;
   const showRightTopbarStop = isMaintainOperationRunning || isWikiUpdateRunning;
   const isRightTopbarBusy = showRightTopbarStop;
@@ -1963,12 +2044,16 @@ function App() {
     (isAskingMaintainDiscussion ||
       currentMaintainActivityStatus === "running" ||
       activeMaintainOperationThreadId === maintainThread.id)
-      ? "Wait for this Maintain chat to finish before deleting it."
+      ? language === "ko"
+        ? "이 관리 채팅이 끝난 뒤 삭제하세요."
+        : "Wait for this Maintain chat to finish before deleting it."
       : null;
   const maintainDeleteDisabled = !maintainThread || Boolean(maintainDeleteBlockedReason);
   const maintainTaskChoiceNotice =
     maintainBlockedReason && activeWorkspaceWriteLabel
-      ? `${activeWorkspaceWriteLabel} is running. You can still choose a task and use Ask only.`
+      ? language === "ko"
+        ? `${runningTitle(activeWorkspaceWriteLabel)} 작업 선택과 질문만 하기는 계속 사용할 수 있습니다.`
+        : `${activeWorkspaceWriteLabel} is running. You can still choose a task and use Ask only.`
       : maintainBlockedReason;
   const maintainOperationIsCurrent = Boolean(
     maintainThread?.operationId &&
@@ -2009,7 +2094,7 @@ function App() {
   const showMaintainOperationFeed = Boolean(maintainStage === "running" && selectedMaintainTask);
   const maintainComposerBlockedReason = exploreBlockedReason;
   const maintainContextLabel = maintainThread?.operationType
-    ? operationTypeLabel(maintainThread.operationType)
+    ? operationTypeLabel(maintainThread.operationType, language)
     : selectedMaintainTask
     ? maintainTaskUiCopy(selectedMaintainTask.id, language).label
     : t("app.common.new");
@@ -2152,13 +2237,15 @@ function App() {
   const selectedPathEditable = isDirectlyEditableWorkspaceFile(selectedPath);
   const editBlockedReason =
     !selectedPathEditable
-      ? "This file is read-only."
+      ? language === "ko"
+        ? "이 파일은 읽기 전용입니다."
+        : "This file is read-only."
       : hasPendingGeneratedChanges
         ? PENDING_GENERATED_CHANGES_ERROR
         : activeWorkspaceWriteLabel
-          ? `${activeWorkspaceWriteLabel} is running. Wait for it to finish before editing.`
+          ? waitForEditingMessage(activeWorkspaceWriteLabel)
           : blockingUiBusy && activeOperationLabel
-            ? `${activeOperationLabel} is running. Wait for it to finish before editing.`
+            ? waitForEditingMessage(activeOperationLabel)
             : null;
   const canStartEditing = Boolean(
     workspace.workspacePath &&
@@ -2196,6 +2283,25 @@ function App() {
       !sourceStatus.lastBuiltAt &&
       wikiPages.length === 0,
   );
+  const askWikiGuideKind: "none" | "empty" | "first-build" | "pending" = !workspace.workspacePath
+    ? "none"
+    : sourceFiles.length === 0 && wikiPages.length === 0
+      ? "empty"
+      : hasPendingSourceChanges && !looksLikeExistingWikiImport && wikiPages.length === 0
+        ? "first-build"
+        : hasPendingSourceChanges && !looksLikeExistingWikiImport
+          ? "pending"
+          : "none";
+  const askWikiGuideResetKey = [
+    workspace.workspacePath,
+    askWikiGuideKind,
+    pendingSourceCount,
+    sourceFiles.length,
+    wikiPages.length,
+  ].join(":");
+  useEffect(() => {
+    setAskWikiGuideDismissed(false);
+  }, [askWikiGuideResetKey]);
   const canRemoveSourceFiles = !hasPendingGeneratedChanges;
   const pendingReviewOperationId = workspace.changedMarker?.operationId ?? null;
   const changedFileMap = useMemo(() => {
@@ -2612,7 +2718,6 @@ function App() {
     (selectedMaintainTask ? maintainTaskUiCopy(selectedMaintainTask.id, language).busyLabel : null) ??
     (language === "ko" ? "위키 관리 중" : "Maintaining wiki");
   const wikiUpdateActiveStep = Math.min(wikiUpdateStatusStep, wikiUpdateSteps.length - 1);
-  const wikiUpdateRunningLabel = wikiUpdateSteps[wikiUpdateActiveStep] ?? t("app.status.updatingWiki");
   const showUndoneStatus = useMemo(() => {
     const undoneAt = workspace.changedMarker?.undoneAt;
     if (!undoneAt) return false;
@@ -4064,7 +4169,11 @@ function App() {
               changed_file_count: 0,
               source_count: state.sourceFiles.length,
             });
-            setError("Build wiki stopped before progress was reported. Check the operation setup and try again.");
+            setError(
+              language === "ko"
+                ? "위키 빌드가 진행 상태를 보고하기 전에 중단됐습니다. 작업 설정을 확인하고 다시 시도하세요."
+                : "Build wiki stopped before progress was reported. Check the operation setup and try again.",
+            );
           }
           setBackgroundBuildActive(false);
           setBackgroundBuildStartedAt(null);
@@ -5250,7 +5359,7 @@ function App() {
       sourceFiles,
     );
     const usedRecentSourceFallback = contextPath !== selectedPath;
-    setBusy("Starting chat");
+    setBusy("Starting Ask Wiki");
     setError(null);
     const exploreQuestionProperties = {
       question_length: question.length,
@@ -5326,6 +5435,13 @@ function App() {
     } finally {
       setBusy(null);
     }
+  }
+
+  function continueAskWikiWithoutBuild() {
+    setAskWikiGuideDismissed(true);
+    requestAnimationFrame(() => {
+      exploreChatInputRef.current?.focus();
+    });
   }
 
   async function askMaintainDraftInMaintain() {
@@ -5547,7 +5663,11 @@ function App() {
           Boolean(message.text.trim()),
       );
     if (!latestAssistant) {
-      setError("Ask the chat before updating the wiki.");
+      setError(
+        language === "ko"
+          ? "답변을 적용하기 전에 먼저 위키와 대화하세요."
+          : "Ask Wiki before applying an answer.",
+      );
       return;
     }
     openApplyDraft(latestAssistant.id);
@@ -5669,7 +5789,7 @@ function App() {
         message_count: messageIds.length,
       });
       if (!result.runner.success) {
-        setError(`Wiki update exited with code ${result.runner.code ?? "unknown"}.`);
+        setError(`Apply to wiki exited with code ${result.runner.code ?? "unknown"}.`);
       }
     } catch (err) {
       const message = String(err);
@@ -5680,7 +5800,7 @@ function App() {
         message_count: messageIds.length,
       });
       setError(message);
-      appendLocalSystemMessage(threadId, `Wiki update failed before changes were written: ${message}`, "failed");
+      appendLocalSystemMessage(threadId, `Apply to wiki failed before changes were written: ${message}`, "failed");
     } finally {
       await refreshWorkspaceOperationProgressOnce();
       setWikiUpdateBusy(false);
@@ -6365,6 +6485,74 @@ function App() {
   const currentWikiUpdateRun =
     wikiUpdateRun && wikiUpdateRun.threadId === chatThread?.id ? wikiUpdateRun : null;
   const showExploreChatMessages = exploreChatMessages.length > 0 || Boolean(currentWikiUpdateRun);
+  const shouldShowAskWikiGuide =
+    askWikiGuideKind !== "none" && (askWikiGuideKind === "empty" || !askWikiGuideDismissed);
+  const askWikiGuideTitle =
+    askWikiGuideKind === "first-build"
+      ? t("app.askWiki.guide.firstBuild.title")
+      : askWikiGuideKind === "pending"
+        ? t("app.askWiki.guide.pending.title", { count: pendingSourceCount })
+        : t("app.askWiki.guide.empty.title");
+  const askWikiGuideBody =
+    askWikiGuideKind === "first-build"
+      ? t("app.askWiki.guide.firstBuild.body")
+      : askWikiGuideKind === "pending"
+        ? t("app.askWiki.guide.pending.body")
+        : t("app.askWiki.guide.empty.body");
+  const askWikiGuideCard = shouldShowAskWikiGuide ? (
+    <section className="ask-wiki-guide" aria-label={askWikiGuideTitle}>
+      <div className="ask-wiki-guide-copy">
+        <strong>{askWikiGuideTitle}</strong>
+        <p>{askWikiGuideBody}</p>
+        <span>{t("app.askWiki.guide.workflow")}</span>
+      </div>
+      <div className="ask-wiki-guide-actions">
+        {askWikiGuideKind === "empty" ? (
+          <button
+            type="button"
+            className="ask-wiki-guide-primary"
+            disabled={Boolean(sourceImportBlockedReason) || !canRemoveSourceFiles}
+            title={
+              sourceImportBlockedReason ??
+              (!canRemoveSourceFiles ? t("app.sidebar.finishReviewBeforeImport") : undefined)
+            }
+            onClick={importSourceFiles}
+          >
+            {t("app.sidebar.importSources")}
+          </button>
+        ) : (
+          <>
+            <button
+              type="button"
+              className="ask-wiki-guide-primary"
+              disabled={!aiSetupGateActive && Boolean(buildBlockedReason)}
+              title={
+                aiSetupGateActive
+                  ? t("app.ai.connectToBuild")
+                  : buildBlockedReason ?? t("app.sidebar.buildWiki")
+              }
+              onClick={() =>
+                aiSetupGateActive
+                  ? openAiSetupFromGate("build", "build_wiki")
+                  : openBuildWiki(false)
+              }
+            >
+              {t("app.sidebar.buildWiki")}
+            </button>
+            {askWikiGuideKind === "first-build" ? (
+              <button
+                type="button"
+                className="ask-wiki-guide-secondary"
+                onClick={continueAskWikiWithoutBuild}
+              >
+                {t("app.askWiki.guide.askOnly")}
+              </button>
+            ) : null}
+          </>
+        )}
+      </div>
+    </section>
+  ) : null;
   const wikiUpdateScopeLabel = currentWikiUpdateRun
     ? (applyScopeOptions.find((option) => option.value === currentWikiUpdateRun.scope)?.label ??
       t("app.apply.chooseMessages"))
@@ -6930,7 +7118,7 @@ function App() {
                 <button
                   type="button"
                   disabled={anyOperationBusy}
-                  title={activeOperationLabel ? `${activeOperationLabel} is running.` : undefined}
+                  title={activeOperationLabel ? runningTitle(activeOperationLabel) : undefined}
                   onClick={() => runCommand("accept_outside_wiki_changes", "Accepting outside changes")}
                 >
                   {t("app.outside.accept")}
@@ -6939,7 +7127,7 @@ function App() {
                   type="button"
                   className="danger"
                   disabled={anyOperationBusy}
-                  title={activeOperationLabel ? `${activeOperationLabel} is running.` : undefined}
+                  title={activeOperationLabel ? runningTitle(activeOperationLabel) : undefined}
                   onClick={() => runCommand("undo_outside_wiki_changes", "Undoing outside changes")}
                 >
                   {t("app.outside.undo")}
@@ -7180,7 +7368,7 @@ function App() {
                   <button
                     type="button"
                     disabled={anyOperationBusy}
-                    title={activeOperationLabel ? `${activeOperationLabel} is running.` : undefined}
+                    title={activeOperationLabel ? runningTitle(activeOperationLabel) : undefined}
                     onClick={() =>
                       runCommand("install_libreoffice", t("app.center.openingLibreSetup"))
                     }
@@ -7426,13 +7614,6 @@ function App() {
                   </span>
                 </div>
                 <div className="explore-chat-header-actions">
-                  {isAskingWiki ? (
-                    <span className="explore-chat-state">{chatRunningLabel}</span>
-                  ) : wikiUpdateBusy ? (
-                    <span className="explore-chat-state">{wikiUpdateRunningLabel}</span>
-                  ) : activeWorkspaceWriteLabel ? (
-                    <span className="explore-chat-state">{activeWorkspaceWriteLabel} running</span>
-                  ) : null}
                   <button
                     type="button"
                     className="explore-chat-header-btn"
@@ -7502,8 +7683,8 @@ function App() {
                         title={
                           wikiUpdateBusy
                             ? (language === "ko"
-                                ? "채팅에서 위키 업데이트가 실행 중입니다. 끝난 뒤 이 채팅을 삭제하세요."
-                                : "Update wiki from chat is running. Wait for it to finish before deleting this chat.")
+                                ? "위키에 적용이 실행 중입니다. 끝난 뒤 이 채팅을 삭제하세요."
+                                : "Apply to wiki is running. Wait for it to finish before deleting this chat.")
                             : exploreBlockedReason ?? t("app.right.deleteCurrentChat")
                         }
                       >
@@ -7514,7 +7695,9 @@ function App() {
                 ) : null}
               </header>
               {!showExploreChatMessages ? (
-                <div className="explore-chat-empty">{t("app.right.askPage")}</div>
+                <div className="explore-chat-empty">
+                  {askWikiGuideCard ?? t("app.right.askPage")}
+                </div>
               ) : (
                 <div className="explore-chat-messages" ref={exploreChatMessagesRef}>
                   {exploreChatMessages.map((message, index) => (
@@ -7621,7 +7804,9 @@ function App() {
               {workspaceUpdateExploreNotice ? (
                 <p className="explore-chat-workspace-note">{workspaceUpdateExploreNotice}</p>
               ) : null}
+              {showExploreChatMessages ? askWikiGuideCard : null}
               <textarea
+                ref={exploreChatInputRef}
                 className="explore-chat-input"
                 value={exploreQuestion}
                 disabled={Boolean(exploreBlockedReason) || !workspace.workspacePath}
@@ -7784,7 +7969,7 @@ function App() {
                                   ) : null}
                                 </span>
                                 <span className="explore-chat-history-preview">
-                                  {displayMaintainThreadPreview(thread)}
+                                  {displayMaintainThreadPreview(thread, language)}
                                 </span>
                               </button>
                             </li>
@@ -8437,7 +8622,7 @@ function App() {
                     className="existing-wiki-choice-btn"
                     onClick={() => void keepExistingWikiAsBaseline()}
                     disabled={Boolean(buildBlockedReason) || anyOperationBusy}
-                    title={buildBlockedReason ?? (activeOperationLabel ? `${activeOperationLabel} is running.` : undefined)}
+                    title={buildBlockedReason ?? (activeOperationLabel ? runningTitle(activeOperationLabel) : undefined)}
                   >
                     {t("app.build.keepCurrent")}
                   </button>

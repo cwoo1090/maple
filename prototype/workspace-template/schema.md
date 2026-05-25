@@ -32,9 +32,9 @@ workspace/
 - `sources/` stores immutable source material.
 - `wiki/` stores generated and maintained wiki pages.
 - `schema.md` stores durable wiki conventions and operation rules.
-- Explore Chat is read-only; write operations update the wiki only when explicitly invoked by the app.
+- Ask Wiki is for questions about sources and the existing wiki; write operations update the wiki only when explicitly invoked by the app.
 - Build Wiki compiles source changes into the existing wiki; it should not merely index files or create disconnected summaries.
-- Apply to Wiki turns useful Explore answers into durable wiki improvements.
+- Apply to Wiki turns useful Ask Wiki answers into durable wiki improvements.
 - Wiki healthcheck is the lint pass for the wiki; it applies the Wiki Healthcheck Rules below and fixes only conservative issues.
 - Keep one canonical page per durable concept and link to it instead of repeating the full explanation elsewhere.
 - `index.md` is for navigation. `log.md` records operation history and is not the source of truth for wiki facts.
@@ -44,12 +44,12 @@ workspace/
 The workspace should preserve this loop:
 
 ```text
-sources/ -> Build Wiki -> Explore -> Apply to Wiki -> Wiki Healthcheck -> Update Rules
+sources/ -> Build Wiki -> Ask Wiki -> Apply to Wiki -> Wiki Healthcheck -> Update Rules
 ```
 
 - Build Wiki ingests sources and integrates them into the existing wiki.
-- Explore answers from the compiled wiki first.
-- Apply to Wiki saves reusable Explore insights back into the wiki.
+- Ask Wiki answers from the compiled wiki first.
+- Apply to Wiki applies reusable Ask Wiki insights back into the wiki.
 - Wiki healthcheck applies the rules in `## Wiki Healthcheck Rules`.
 - Improve Wiki handles subjective restructuring, synthesis, and page-quality work.
 - Organize Sources moves or renames source files without changing their contents.
@@ -75,17 +75,19 @@ Build Wiki should integrate scoped source changes into the current wiki:
 - Append a concise dated entry to `log.md`.
 - Update `schema.md` only when the user explicitly asks for durable rule or convention changes.
 
-## Explore And Apply Rules
+## Ask Wiki And Apply Rules
 
-Explore Chat is read-only by default:
+Ask Wiki is question-first by default:
 
 - Use `index.md` first to locate relevant wiki pages.
 - Answer from the local wiki before reading raw sources.
 - Read sources only when the compiled wiki is incomplete, ambiguous, or needs source-level verification.
 - If web search is enabled, label web-derived claims and cite URLs near the claim.
 - Do not imply web results are curated local sources unless they have been explicitly captured under `sources/`.
+- If the user asks to create, build, or update a wiki from sources, explain that they should run Build Wiki.
+- If the user asks how to use Maple, where to click, or what an app feature means, direct them to Maple Guide from the lower-left speech-bubble button.
 
-Apply to Wiki should save durable value from Explore:
+Apply to Wiki should save durable value from Ask Wiki:
 
 - Do not dump the chat transcript into the wiki.
 - Preserve reusable explanations, corrected concepts, comparisons, guides, formulas, source-grounded answers, and useful open questions.
@@ -171,8 +173,8 @@ updated: 2026-05-03
 - If no reliable page, slide, line, or heading target exists, cite the source file and add a short visible locator such as section title, timestamp, paragraph, or surrounding phrase.
 - Prefer linking to the original imported source under `sources/`; do not cite generated preview/cache files such as `.pptx.pdf` unless that file is itself an imported source.
 - Do not use bare code-formatted source paths for inline source notes; they render as text and are not clickable.
-- Web references are external links used during Explore Chat; they are not curated source files and must not be added to frontmatter `sources`.
-- If web-derived content is applied to the wiki, cite it inline or in a `## Web References` section with title, URL, access date, and `found via Explore web search`.
+- Web references are external links used during Ask Wiki; they are not curated source files and must not be added to frontmatter `sources`.
+- If web-derived content is applied to the wiki, cite it inline or in a `## Web References` section with title, URL, access date, and `found via Ask Wiki web search`.
 
 ## Visuals And Assets
 
@@ -237,7 +239,7 @@ Wiki healthcheck should conservatively check and fix:
 - Source citations where a known exact locator is missing from the visible link label, left only as plain text after the link, or absent from a supported link fragment such as `#page=N`, `#slide=N`, `#Lstart-Lend`, or a Markdown heading anchor.
 - Broken local source links or source links that point to generated preview/cache files instead of imported files under `sources/`.
 - Web URLs incorrectly listed in frontmatter `sources`; remove them from frontmatter and cite them as web references instead.
-- Web-derived claims that lack inline URL citations or a `## Web References` entry with title, URL, access date, and `found via Explore web search`.
+- Web-derived claims that lack inline URL citations or a `## Web References` entry with title, URL, access date, and `found via Ask Wiki web search`.
 - Duplicate concept pages only when they are clearly duplicative; otherwise add cross-links.
 - Empty, very short, or vague pages using only existing wiki/source evidence.
 - Contradictions between pages, especially when newer sources supersede older claims.

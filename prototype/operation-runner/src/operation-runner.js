@@ -758,7 +758,7 @@ function workspaceAgentInstructions(title) {
     "",
     "## Operation Boundary",
     "",
-    "- Explore Chat is read-only. Do not modify workspace files during normal Q&A.",
+    "- Ask Wiki is for questions about sources and the existing wiki. Do not modify workspace files during normal Q&A.",
     "- Workspace files may be modified only by explicit app write operations: Build Wiki, Apply to Wiki, Wiki Healthcheck, Improve Wiki, Organize Sources, and Update Wiki Rules.",
     "- Treat `sources/` as immutable source material. Do not edit source file contents.",
     "- Update `schema.md` only when the user explicitly asks to remember a durable rule or workspace preference.",
@@ -1225,7 +1225,7 @@ async function runExploreChat(workspace, options = {}) {
 
   const question = String(options.question || "").trim();
   if (!question) {
-    throw new Error("Explore Chat requires a non-empty question.");
+    throw new Error("Ask Wiki requires a non-empty question.");
   }
 
   const provider = selectProvider(options.provider || "codex");
@@ -1553,7 +1553,7 @@ Use the built-in Maple Guide Knowledge Base below as your primary source of trut
 Hard rules:
 - Do not write, edit, rename, delete, or create files.
 - Do not run shell commands.
-- Do not answer as if you are Explore Chat. Explore Chat answers questions about wiki content; Maple Guide explains how to use the Maple app.
+- Do not answer as if you are Ask Wiki. Ask Wiki answers questions about wiki content; Maple Guide explains how to use the Maple app.
 - Use the current app state when it helps, but do not invent app state that was not provided.
 - Give short, concrete UI steps.
 - Answer in the same language as the user.
@@ -3154,7 +3154,7 @@ async function buildExploreChatPrompt(workspace, options) {
   }
   const webModeBlock = options.webSearch
     ? [
-        "Explore mode:",
+        "Ask Wiki mode:",
         "- Web search is enabled for this answer.",
         "- Use the local wiki and sources first.",
         "- Search the web only when the local workspace is missing current or external context.",
@@ -3162,7 +3162,7 @@ async function buildExploreChatPrompt(workspace, options) {
         "- Do not imply web results are part of `sources/`.",
       ].join("\n")
     : [
-        "Explore mode:",
+        "Ask Wiki mode:",
         "- Source-only mode. Answer from the local wiki, selected context, and sources available in the workspace.",
         "- If the question needs live or external information, say that web search would be needed instead of guessing.",
       ].join("\n");
@@ -3171,9 +3171,14 @@ async function buildExploreChatPrompt(workspace, options) {
 
 ${webModeBlock}
 
+Ask Wiki boundary:
+- If the user asks to create, build, or update a wiki from sources, explain that they should run Build wiki.
+- If the user asks how to use Maple, where to click, or what an app feature means, direct them to Maple Guide from the lower-left speech-bubble button.
+- Ask Wiki should answer questions about selected sources or the existing wiki. It should not create files directly.
+
 Visual grounding rules:
 - Use attached wiki images, attached source page/slide images, and path-referenced source images as the visual context for this answer.
-- Source page/slide images from .aiwiki/extracted are temporary Explore context, not wiki assets.
+- Source page/slide images from .aiwiki/extracted are temporary Ask Wiki context, not wiki assets.
 - Do not claim you inspected pages, slides, or images that were not attached or present in extracted text.
 - Do not unzip or dump the full Office/PDF source unless the attached or path-referenced visuals and extracted text are insufficient; if they are insufficient, say what is missing.
 
@@ -3254,7 +3259,7 @@ function buildApplyChatPrompt(workspace, payload) {
   const webReferenceRules = hasWebSearchMessages
     ? `
 Web search context:
-- Some selected chat messages used Explore web search.
+- Some selected chat messages used Ask Wiki web search.
 - Do not perform fresh web search during Apply; use only the selected chat content and cited URLs.
 - Treat web-derived material according to schema.md.
 `
@@ -3264,13 +3269,13 @@ Web search context:
     : "Context path hint: no single context path was provided.";
   const instruction = payload.instruction
     ? payload.instruction
-    : "Extract the durable wiki value from the selected chat messages and update the wiki concisely.";
+    : "Extract the durable wiki value from the selected chat messages and apply it to the wiki concisely.";
   const messages = payload.messages
     .map((message, index) => {
       const label = message.role === "user" ? "User" : "Assistant";
       const context = message.contextPath ? ` [context: ${message.contextPath}]` : "";
       const id = message.id ? ` id=${message.id}` : "";
-      const webSearch = message.webSearchEnabled ? " [used Explore web search]" : "";
+      const webSearch = message.webSearchEnabled ? " [used Ask Wiki web search]" : "";
       return `### ${index + 1}. ${label}${context}${id}${webSearch}\n\n${message.text}`;
     })
     .join("\n\n");
@@ -3282,7 +3287,7 @@ You are running an Apply to wiki operation for Maple.
 Use schema.md as the durable source of truth for wiki rules, workspace preferences, and operation behavior.
 
 Operation goal:
-- Turn selected Explore Chat content into durable wiki improvements.
+- Turn selected Ask Wiki content into durable wiki improvements.
 
 Apply request:
 - Scope: ${payload.scope}
@@ -3316,11 +3321,11 @@ function parseExploreChatHistory(historyJson) {
   try {
     parsed = JSON.parse(historyJson);
   } catch (_error) {
-    throw new Error("Explore Chat history must be valid JSON.");
+    throw new Error("Ask Wiki history must be valid JSON.");
   }
 
   if (!Array.isArray(parsed)) {
-    throw new Error("Explore Chat history must be a JSON array.");
+    throw new Error("Ask Wiki history must be a JSON array.");
   }
 
   return parsed
@@ -3354,7 +3359,7 @@ function renderExploreChatHistory(history) {
     .map((message) => {
       const label = message.role === "user" ? "User" : "Assistant";
       const context = message.contextPath ? ` [context: ${message.contextPath}]` : "";
-      const webSearch = message.webSearchEnabled ? " [used Explore web search]" : "";
+      const webSearch = message.webSearchEnabled ? " [used Ask Wiki web search]" : "";
       return `${label}${context}${webSearch}: ${message.text}`;
     })
     .join("\n\n");
@@ -3846,7 +3851,7 @@ async function buildExploreVisualSelectionPrompt(workspace, source, question, im
     ? "Inspect the contact sheet image file from the listed absolute path before choosing pages."
     : "Inspect the attached contact sheet before choosing pages.";
 
-  return `You are selecting source slide images for a Maple Explore Chat answer.
+  return `You are selecting source slide images for a Maple Ask Wiki answer.
 
 Return strict JSON only. Do not write files. Do not run shell commands.
 
