@@ -6501,9 +6501,15 @@ async fn start_explore_chat(
     ensure_provider_ready(&app, &provider_cache, &provider)?;
     let model = selected_model(&settings, &provider);
     let reasoning_effort = selected_reasoning_effort(&settings, &provider, &model);
+    let selected_path = selected_path.trim().to_string();
+    let context_path = if selected_path.is_empty() {
+        None
+    } else {
+        Some(selected_path.clone())
+    };
 
     let mut thread =
-        read_requested_or_new_chat_thread(&workspace, thread_id, Some(selected_path.clone()))?;
+        read_requested_or_new_chat_thread(&workspace, thread_id, context_path.clone())?;
     let history_json = build_history_json(&thread)?;
     let now = now_string();
     let user_message_id = make_local_id("msg");
@@ -6522,7 +6528,7 @@ async fn start_explore_chat(
         id: user_message_id,
         role: "user".to_string(),
         text: question.clone(),
-        context_path: Some(selected_path.clone()),
+        context_path: context_path.clone(),
         provider: Some(provider.clone()),
         model: Some(model.clone()),
         reasoning_effort: Some(reasoning_effort.clone()),
@@ -6536,7 +6542,7 @@ async fn start_explore_chat(
         id: assistant_message_id.clone(),
         role: "assistant".to_string(),
         text: String::new(),
-        context_path: Some(selected_path.clone()),
+        context_path: context_path.clone(),
         provider: Some(provider.clone()),
         model: Some(model.clone()),
         reasoning_effort: Some(reasoning_effort.clone()),
@@ -6569,14 +6575,16 @@ async fn start_explore_chat(
         reasoning_effort,
         "--question".to_string(),
         question,
-        "--selected-path".to_string(),
-        selected_path,
         "--history-json".to_string(),
         history_json,
         "--chat-id".to_string(),
         run_id,
         "--skip-provider-check".to_string(),
     ];
+    if !selected_path.is_empty() {
+        runner_args.push("--selected-path".to_string());
+        runner_args.push(selected_path);
+    }
     if web_search_enabled {
         runner_args.push("--web-search".to_string());
     }

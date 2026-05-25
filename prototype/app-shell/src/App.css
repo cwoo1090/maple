@@ -5280,6 +5280,61 @@ button.tree-name-clickable {
   line-height: 1.35;
 }
 
+.explore-chat-scope-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+.explore-chat-scope-label {
+  color: var(--text-faint);
+  font-size: 11.5px;
+}
+
+.explore-chat-scope-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--bg-sidebar);
+}
+
+.explore-chat-scope-option {
+  min-height: 23px;
+  border: 0;
+  border-radius: 5px;
+  padding: 0 8px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 11.5px;
+  font-weight: 650;
+}
+
+.explore-chat-scope-option:hover:not(:disabled) {
+  color: var(--text);
+  background: var(--bg-hover);
+}
+
+.explore-chat-scope-option.active {
+  background: var(--bg-elevated);
+  color: var(--text);
+  box-shadow: 0 1px 3px rgba(31, 26, 18, 0.12);
+}
+
+.explore-chat-scope-current {
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-faint);
+  font-size: 11.5px;
+}
+
 .explore-chat-input {
   width: 100%;
   min-height: 62px;

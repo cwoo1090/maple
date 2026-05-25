@@ -436,7 +436,7 @@ function parseArgs(argv) {
     }
 
     const next = rest[index + 1];
-    if (next && !next.startsWith("--")) {
+    if (next !== undefined && !next.startsWith("--")) {
       flags[flagName] = next;
       index += 1;
     } else {
@@ -3148,7 +3148,7 @@ async function buildExploreChatPrompt(workspace, options) {
             selectedPreparedText,
           )}`
         : `Selected file: ${selectedPath}`
-    : "No selected file was provided.";
+    : await renderDefaultAskWikiContext(workspace);
   if (sourceVisualBlock) {
     selectedBlock = `${selectedBlock}${sourceVisualBlock}`;
   }
@@ -3398,6 +3398,7 @@ async function readChatContextFile(workspace, relPath, maxChars) {
   if (
     normalized !== "index.md" &&
     normalized !== "log.md" &&
+    normalized !== "schema.md" &&
     !normalized.startsWith("wiki/") &&
     !normalized.startsWith("sources/")
   ) {
@@ -3416,6 +3417,28 @@ async function readChatContextFile(workspace, relPath, maxChars) {
   }
   if (content.length <= maxChars) return content;
   return `${content.slice(0, maxChars)}\n\n[truncated after ${maxChars} characters]`;
+}
+
+async function renderDefaultAskWikiContext(workspace) {
+  const contextFiles = [
+    ["index.md", 12000],
+    ["schema.md", 8000],
+  ];
+  const blocks = [];
+  for (const [relPath, maxChars] of contextFiles) {
+    const content = await readChatContextFile(workspace, relPath, maxChars);
+    if (content) {
+      blocks.push(renderContextBlock(`hidden default context: ${relPath}`, content));
+    }
+  }
+  if (!blocks.length) {
+    return "No selected file was provided. No hidden default context file was available.";
+  }
+  return [
+    "No user-selected file was provided.",
+    "Hidden default context (not shown as a selected file in the app):",
+    ...blocks,
+  ].join("\n\n");
 }
 
 async function collectWikiPageImageAttachments(

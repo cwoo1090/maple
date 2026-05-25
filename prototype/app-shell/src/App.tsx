@@ -656,6 +656,7 @@ const MIN_READING_TEXT_SIZE = 12;
 const MAX_READING_TEXT_SIZE = 20;
 const READING_TEXT_SIZE_STEP = 1;
 type CompactRevealPanel = "left" | "right" | null;
+type AskWikiContextScope = "wiki" | "current";
 
 const MAINTAIN_TASKS: MaintainTaskConfig[] = [
   {
@@ -1629,6 +1630,8 @@ function App() {
   const [maintainFeedOpen, setMaintainFeedOpen] = useState(true);
   const [chatStatusStep, setChatStatusStep] = useState(0);
   const [exploreQuestion, setExploreQuestion] = useState("");
+  const [askWikiContextScope, setAskWikiContextScope] =
+    useState<AskWikiContextScope>("wiki");
   const [askWikiGuideDismissed, setAskWikiGuideDismissed] = useState(false);
   const [exploreWebSearchEnabled, setExploreWebSearchEnabled] = useState(false);
   const [providers, setProviders] = useState<ProviderInfo[]>([]);
@@ -5352,19 +5355,24 @@ function App() {
     }
     const question = (questionOverride ?? exploreQuestion).trim();
     if (!question) return false;
-    const contextPath = exploreContextPathForQuestion(
-      question,
-      selectedPath,
-      lastImportedSourcePath,
-      sourceFiles,
-    );
-    const usedRecentSourceFallback = contextPath !== selectedPath;
+    const contextPath =
+      askWikiContextScope === "current"
+        ? exploreContextPathForQuestion(
+            question,
+            selectedPath,
+            lastImportedSourcePath,
+            sourceFiles,
+          )
+        : "";
+    const usedRecentSourceFallback =
+      askWikiContextScope === "current" && contextPath !== selectedPath;
     setBusy("Starting Ask Wiki");
     setError(null);
     const exploreQuestionProperties = {
       question_length: question.length,
       selected_path_present: Boolean(contextPath),
       selected_path_is_source: contextPath.startsWith("sources/"),
+      context_scope: askWikiContextScope,
       recent_import_source_fallback: usedRecentSourceFallback,
       web_search_enabled: exploreWebSearchEnabled,
       existing_thread: Boolean(chatThread?.id),
@@ -5511,18 +5519,19 @@ function App() {
 
   async function createNewChat() {
     if (blockingUiBusy || !workspace.workspacePath) return;
+    const initialContextPath = askWikiContextScope === "current" ? selectedPath : "";
     if (
       chatThread &&
       chatThread.messages.length === 0 &&
       !chatThread.operationType &&
-      (chatThread.initialContextPath ?? "") === selectedPath
+      (chatThread.initialContextPath ?? "") === initialContextPath
     ) {
       setChatHistoryOpen(false);
       return;
     }
     try {
       const thread = await invoke<ChatThread>("create_chat_thread", {
-        initialContextPath: selectedPath,
+        initialContextPath,
       });
       setChatThread(thread);
       markChatThreadSeen(thread);
@@ -6487,6 +6496,12 @@ function App() {
   const showExploreChatMessages = exploreChatMessages.length > 0 || Boolean(currentWikiUpdateRun);
   const shouldShowAskWikiGuide =
     askWikiGuideKind !== "none" && (askWikiGuideKind === "empty" || !askWikiGuideDismissed);
+  const askWikiContextLabel =
+    askWikiContextScope === "current"
+      ? displayFileName(selectedPath)
+      : t("app.right.scopeAllWiki");
+  const askWikiContextTitle =
+    askWikiContextScope === "current" ? selectedPath : t("app.right.scopeAllWikiTitle");
   const askWikiGuideTitle =
     askWikiGuideKind === "first-build"
       ? t("app.askWiki.guide.firstBuild.title")
@@ -7609,8 +7624,8 @@ function App() {
               <header className="explore-chat-header">
                 <div className="explore-chat-heading">
                   <span className="explore-chat-title">{t("app.right.exploreChat")}</span>
-                  <span className="explore-chat-context" title={selectedPath}>
-                    {displayFileName(selectedPath)}
+                  <span className="explore-chat-context" title={askWikiContextTitle}>
+                    {askWikiContextLabel}
                   </span>
                 </div>
                 <div className="explore-chat-header-actions">
@@ -7805,6 +7820,40 @@ function App() {
                 <p className="explore-chat-workspace-note">{workspaceUpdateExploreNotice}</p>
               ) : null}
               {showExploreChatMessages ? askWikiGuideCard : null}
+              <div className="explore-chat-scope-row" role="group" aria-label={t("app.right.scopeLabel")}>
+                <span className="explore-chat-scope-label">{t("app.right.scopeLabel")}</span>
+                <div className="explore-chat-scope-control">
+                  <button
+                    type="button"
+                    className={`explore-chat-scope-option${
+                      askWikiContextScope === "wiki" ? " active" : ""
+                    }`}
+                    aria-pressed={askWikiContextScope === "wiki"}
+                    title={t("app.right.scopeAllWikiTitle")}
+                    disabled={!workspace.workspacePath}
+                    onClick={() => setAskWikiContextScope("wiki")}
+                  >
+                    {t("app.right.scopeAllWiki")}
+                  </button>
+                  <button
+                    type="button"
+                    className={`explore-chat-scope-option${
+                      askWikiContextScope === "current" ? " active" : ""
+                    }`}
+                    aria-pressed={askWikiContextScope === "current"}
+                    title={t("app.right.scopeCurrentTitle")}
+                    disabled={!workspace.workspacePath}
+                    onClick={() => setAskWikiContextScope("current")}
+                  >
+                    {t("app.right.scopeCurrent")}
+                  </button>
+                </div>
+                {askWikiContextScope === "current" ? (
+                  <span className="explore-chat-scope-current" title={selectedPath}>
+                    {displayFileName(selectedPath)}
+                  </span>
+                ) : null}
+              </div>
               <textarea
                 ref={exploreChatInputRef}
                 className="explore-chat-input"

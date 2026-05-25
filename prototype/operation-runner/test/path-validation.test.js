@@ -63,6 +63,7 @@ const {
   writeWikiManifest,
   undoLastOperation,
   wikiSchemaTemplate,
+  parseArgs,
 } = require("../src/operation-runner");
 
 async function pathExists(filePath) {
@@ -73,6 +74,22 @@ async function pathExists(filePath) {
     return false;
   }
 }
+
+test("parseArgs preserves empty flag values", () => {
+  const parsed = parseArgs([
+    "explore-chat",
+    "/tmp/workspace",
+    "--question",
+    "What is this workspace?",
+    "--selected-path",
+    "",
+    "--history-json",
+    "[]",
+  ]);
+
+  assert.equal(parsed.flags["selected-path"], "");
+  assert.equal(parsed.flags["history-json"], "[]");
+});
 
 test("normalizes safe relative paths", () => {
   assert.equal(normalizeRelativePath("wiki/concepts/memory.md"), "wiki/concepts/memory.md");
@@ -2036,6 +2053,24 @@ test("Ask Wiki source-only prompt asks for local answers", async (t) => {
   assert.match(prompt, /Answer from the local wiki/);
   assert.match(prompt, /web search would be needed/);
   assert.match(prompt, /direct them to Maple Guide from the lower-left speech-bubble button/);
+});
+
+test("Ask Wiki broad prompt uses hidden default wiki context", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "maple-broad-chat-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  await fs.writeFile(path.join(workspace, "index.md"), "# Index\n\n- [[Concept A]]\n");
+  await fs.writeFile(path.join(workspace, "schema.md"), "# Schema\n\nAnswer from the wiki first.\n");
+
+  const prompt = await buildExploreChatPrompt(workspace, {
+    selectedPath: "",
+    question: "What are the main themes?",
+    history: [],
+  });
+
+  assert.match(prompt, /No user-selected file was provided/);
+  assert.match(prompt, /Hidden default context/);
+  assert.match(prompt, /hidden default context: index\.md/);
+  assert.match(prompt, /hidden default context: schema\.md/);
 });
 
 test("Ask Wiki web prompt requires local-first URL citations", async (t) => {
