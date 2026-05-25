@@ -146,6 +146,14 @@ struct AppCommandResult {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct ImportSourcesResult {
+    runner: Option<RunnerOutput>,
+    state: WorkspaceState,
+    imported_source_paths: Vec<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct SchemaUpdatePrompt {
     available: bool,
     reason: String,
@@ -5724,20 +5732,22 @@ async fn reset_sample_workspace(
 async fn import_sources(
     source_paths: Vec<String>,
     state: State<'_, WorkspaceStore>,
-) -> Result<AppCommandResult, String> {
+) -> Result<ImportSourcesResult, String> {
     let workspace = current_workspace(&state)?;
     ensure_no_pending_generated_changes(&workspace)?;
     let source_dir = workspace.join(SOURCE_DIR);
     fs::create_dir_all(&source_dir)
         .map_err(|error| format!("Failed to create source directory: {error}"))?;
 
+    let mut imported_source_paths = Vec::new();
     for source_path in source_paths {
-        import_source_file(&source_dir, &source_path)?;
+        imported_source_paths.push(import_source_file(&source_dir, &source_path)?);
     }
 
-    Ok(AppCommandResult {
+    Ok(ImportSourcesResult {
         runner: None,
         state: load_state_at(&workspace)?,
+        imported_source_paths,
     })
 }
 
@@ -8349,7 +8359,7 @@ fn first_existing_path(paths: &[PathBuf]) -> Option<PathBuf> {
     paths.iter().find(|path| path.exists()).cloned()
 }
 
-fn import_source_file(source_dir: &Path, source_path: &str) -> Result<(), String> {
+fn import_source_file(source_dir: &Path, source_path: &str) -> Result<String, String> {
     let source = PathBuf::from(source_path);
     let source = source
         .canonicalize()
@@ -8381,7 +8391,11 @@ fn import_source_file(source_dir: &Path, source_path: &str) -> Result<(), String
         .ok()
         .is_some_and(|destination| destination == source)
     {
-        return Ok(());
+        return Ok(format!(
+            "{}/{}",
+            SOURCE_DIR,
+            file_name.to_string_lossy().replace('\\', "/")
+        ));
     }
 
     let destination = unique_destination(source_dir, Path::new(file_name))?;
@@ -8394,7 +8408,14 @@ fn import_source_file(source_dir: &Path, source_path: &str) -> Result<(), String
         )
     })?;
 
-    Ok(())
+    let imported_file_name = destination
+        .file_name()
+        .ok_or_else(|| format!("Imported source has no file name: {}", destination.display()))?;
+    Ok(format!(
+        "{}/{}",
+        SOURCE_DIR,
+        imported_file_name.to_string_lossy().replace('\\', "/")
+    ))
 }
 
 fn is_supported_source_extension(extension: &str) -> bool {
@@ -8708,7 +8729,8 @@ mod tests {
         default_workspace_schema, delete_wiki_image_asset_from_workspace,
         ensure_asset_master_file_for_edit, ensure_maintain_thread_task_matches,
         ensure_no_pending_generated_changes, extract_partial_answer_from_events,
-        finalize_provider_check_report, html_to_text_preview, initialize_workspace_files,
+        finalize_provider_check_report, html_to_text_preview, import_source_file,
+        initialize_workspace_files,
         is_readable_workspace_preview_path, is_supported_source_extension,
         is_valid_asset_relative_path, load_state_at, login_command_for_settings,
         maintain_operation_assistant_text, maintain_operation_user_text, make_chat_thread,
@@ -8853,6 +8875,33 @@ mod tests {
                 "{extension} should be importable"
             );
         }
+    }
+
+    #[test]
+    fn source_import_returns_workspace_relative_destination() {
+        let workspace = unique_test_workspace("maple-import-return");
+        let outside = unique_test_workspace("maple-import-source");
+        fs::create_dir_all(workspace.join("sources")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let source = outside.join("notes.md");
+        fs::write(&source, "# Notes\n").unwrap();
+
+        let imported = import_source_file(&workspace.join("sources"), source.to_str().unwrap())
+            .unwrap();
+
+        assert_eq!(imported, "sources/notes.md");
+        assert_eq!(
+            fs::read_to_string(workspace.join("sources").join("notes.md")).unwrap(),
+            "# Notes\n"
+        );
+
+        let duplicate = import_source_file(&workspace.join("sources"), source.to_str().unwrap())
+            .unwrap();
+        assert_eq!(duplicate, "sources/notes-2.md");
+        assert!(workspace.join("sources").join("notes-2.md").is_file());
+
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(outside);
     }
 
     #[test]

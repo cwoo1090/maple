@@ -1252,6 +1252,7 @@ async function runExploreChat(workspace, options = {}) {
   const wikiImageAttachments = await collectWikiPageImageAttachments(
     workspace,
     options.selectedPath || "",
+    { imageInputMode: getProviderImageInputMode(provider) },
   );
   const sourceVisualContext = await collectExploreSourceVisualContext(workspace, provider, {
     selectedPath: options.selectedPath || "",
@@ -1261,8 +1262,9 @@ async function runExploreChat(workspace, options = {}) {
     model,
     reasoningEffort,
   });
+  const attachedWikiImages = wikiImageAttachments.filter((image) => image.attached !== false);
   const imageAttachments = mergeExploreImageAttachments(
-    wikiImageAttachments,
+    attachedWikiImages,
     sourceVisualContext.imageAttachments,
   );
   const imageAttachmentBytes = await sumImageAttachmentBytes(imageAttachments);
@@ -1780,6 +1782,15 @@ async function runMaintenanceOperation(workspace, options = {}) {
         sourcePaths: options.sourcePaths,
       })
     : null;
+  if (sourceGrounding) {
+    await selectBuildWikiVisualInputs(workspace, provider, {
+      ...options,
+      model,
+      reasoningEffort,
+      operationId,
+      operationDir,
+    }, sourceGrounding.preparedSources);
+  }
   const forbiddenPathRules = sourceGroundingEnabled
     ? Array.from(new Set([...(config.forbiddenPathRules || []), "sources/**"]))
     : config.forbiddenPathRules || [];
@@ -3161,10 +3172,10 @@ async function buildExploreChatPrompt(workspace, options) {
 ${webModeBlock}
 
 Visual grounding rules:
-- Use attached wiki images and attached source page/slide images as the visual context for this answer.
+- Use attached wiki images, attached source page/slide images, and path-referenced source images as the visual context for this answer.
 - Source page/slide images from .aiwiki/extracted are temporary Explore context, not wiki assets.
 - Do not claim you inspected pages, slides, or images that were not attached or present in extracted text.
-- Do not unzip or dump the full Office/PDF source unless the attached visuals and extracted text are insufficient; if they are insufficient, say what is missing.
+- Do not unzip or dump the full Office/PDF source unless the attached or path-referenced visuals and extracted text are insufficient; if they are insufficient, say what is missing.
 
 Math formatting rules:
 - Wrap block equations in $$...$$ and inline formulas in $...$.
@@ -3421,6 +3432,10 @@ async function collectWikiPageImageAttachments(
   }
 
   const maxImages = options.maxImages || EXPLORE_CHAT_IMAGE_ATTACHMENT_LIMIT;
+  const imageInputMode = options.imageInputMode ||
+    (options.provider ? getProviderImageInputMode(options.provider) : "attached-images");
+  const attached = imageInputMode === "attached-images";
+  const pathReferenced = imageInputMode === "path-referenced-images";
   const pageDir = path.posix.dirname(normalized);
   const seen = new Set();
   const attachments = [];
@@ -3439,7 +3454,13 @@ async function collectWikiPageImageAttachments(
     }
     if (!stat.isFile()) continue;
 
-    attachments.push({ path: imagePath, absolutePath });
+    attachments.push({
+      path: imagePath,
+      absolutePath,
+      attached,
+      imageInputPath: pathReferenced ? absolutePath : "",
+      imageInputMode,
+    });
     if (attachments.length >= maxImages) break;
   }
 
@@ -3448,33 +3469,78 @@ async function collectWikiPageImageAttachments(
 
 async function collectExploreSourceVisualContext(workspace, provider, options = {}) {
   const selectedPath = normalizeRelativePath(options.selectedPath || "");
-  const supportsImages = provider?.supportsImageAttachments === true;
+  const imageInputMode = getProviderImageInputMode(provider);
+  const supportsImages = imageInputMode === "attached-images";
+  const supportsImagePathReferences = imageInputMode === "path-referenced-images";
+  const supportsVisionInputs = imageInputMode !== "provider-image-unsupported-fallback";
   const base = {
     mode: "none",
     sourcePath: selectedPath,
     provider: provider?.name || "",
     providerSupportsImageAttachments: supportsImages,
+    providerSupportsImagePathReferences: supportsImagePathReferences,
+    imageInputMode,
     extractionOperationId: "",
     pageCount: 0,
     contactSheetPath: "",
+    contactSheetInputPath: "",
     contactSheetAttached: false,
     requestedPages: [],
     attachedPages: [],
+    pathReferencedImages: [],
     imageAttachments: [],
     promptImageBytes: 0,
+    pathReferencedImageBytes: 0,
     selectionMode: "none",
     selectionReason: "",
     error: null,
   };
 
-  if (!selectedPath || !selectedPath.startsWith("sources/") || !isExtractableSource(selectedPath)) {
+  if (!selectedPath || !selectedPath.startsWith("sources/")) {
     return base;
   }
-  if (!supportsImages) {
+
+  if (!isExtractableSource(selectedPath) && !isPromptImageSource(selectedPath)) {
+    return base;
+  }
+
+  if (!supportsVisionInputs) {
     return {
       ...base,
       mode: "provider-image-unsupported",
-      selectionReason: "provider does not support image attachments",
+      selectionReason: "provider does not support image visual inputs",
+    };
+  }
+
+  if (isPromptImageSource(selectedPath)) {
+    const imagePath = safeJoin(workspace, selectedPath);
+    const imageInput = {
+      type: "source-image",
+      page: 1,
+      reason: "selected source image",
+      path: selectedPath,
+      imageInputPath: supportsImagePathReferences ? imagePath : "",
+      absolutePath: imagePath,
+      fullImage: selectedPath,
+    };
+    return {
+      ...base,
+      mode: "source-on-demand",
+      pageCount: 1,
+      imageAttachments: supportsImages ? [imageInput] : [],
+      attachedPages: supportsImages
+        ? [{
+          page: 1,
+          path: selectedPath,
+          fullImage: selectedPath,
+          reason: "selected source image",
+        }]
+        : [],
+      pathReferencedImages: supportsImagePathReferences ? [imageInput] : [],
+      promptImageBytes: await fileSizeOrZero(imagePath),
+      pathReferencedImageBytes: supportsImagePathReferences ? await fileSizeOrZero(imagePath) : 0,
+      selectionMode: supportsImagePathReferences ? "source-image-path-reference" : "source-image-attached",
+      selectionReason: "selected source is an image",
     };
   }
 
@@ -3512,6 +3578,7 @@ async function collectExploreSourceVisualContext(workspace, provider, options = 
   if (!visualQuestion) return context;
 
   const attachments = [];
+  const pathReferencedImages = [];
   const selectedEntries = [];
   let selectionMode = requestedPages.length > 0 ? "explicit-page-reference" : "contact-sheet-only";
   let selectionReason = requestedPages.length > 0
@@ -3525,12 +3592,20 @@ async function collectExploreSourceVisualContext(workspace, provider, options = 
     }
   } else {
     if (source.contactSheetPath) {
-      attachments.push({
+      const contactSheetInputPath = safeJoin(workspace, source.contactSheetPath);
+      const contactSheetInput = {
         type: "source-contact-sheet",
         path: source.contactSheetPath,
-        absolutePath: safeJoin(workspace, source.contactSheetPath),
-      });
+        imageInputPath: supportsImagePathReferences ? contactSheetInputPath : "",
+        absolutePath: contactSheetInputPath,
+      };
+      if (supportsImages) {
+        attachments.push(contactSheetInput);
+      } else if (supportsImagePathReferences) {
+        pathReferencedImages.push(contactSheetInput);
+      }
       context.contactSheetAttached = true;
+      context.contactSheetInputPath = supportsImagePathReferences ? contactSheetInputPath : "";
     }
 
     if (!options.skipAiSelection && source.contactSheetPath) {
@@ -3538,6 +3613,7 @@ async function collectExploreSourceVisualContext(workspace, provider, options = 
         const aiSelection = await selectExploreSourcePagesWithProvider(workspace, provider, {
           ...options,
           source,
+          imageInputMode,
         });
         const normalized = normalizeExploreSelectedSlideEntries(
           aiSelection.selectedPages,
@@ -3576,21 +3652,32 @@ async function collectExploreSourceVisualContext(workspace, provider, options = 
   }
 
   const seenAttachmentPaths = new Set(attachments.map((attachment) => attachment.path));
+  const seenPathReferencePaths = new Set(pathReferencedImages.map((image) => image.path));
   for (const entry of selectedEntries) {
     const page = Number(entry.page);
     const pageInfo = source.pages.find((item) => item.page === page);
-    if (!pageInfo?.promptImage || seenAttachmentPaths.has(pageInfo.promptImage)) continue;
-    seenAttachmentPaths.add(pageInfo.promptImage);
-    attachments.push({
+    if (!pageInfo?.promptImage) continue;
+    const pageInputPath = safeJoin(workspace, pageInfo.promptImage);
+    const pageInput = {
       type: "source-page",
       page,
       reason: entry.reason || "",
       path: pageInfo.promptImage,
-      absolutePath: safeJoin(workspace, pageInfo.promptImage),
+      imageInputPath: supportsImagePathReferences ? pageInputPath : "",
+      absolutePath: pageInputPath,
       fullImage: pageInfo.fullImage || "",
-    });
+    };
+    if (supportsImages && !seenAttachmentPaths.has(pageInfo.promptImage)) {
+      seenAttachmentPaths.add(pageInfo.promptImage);
+      attachments.push(pageInput);
+    } else if (supportsImagePathReferences && !seenPathReferencePaths.has(pageInfo.promptImage)) {
+      seenPathReferencePaths.add(pageInfo.promptImage);
+      pathReferencedImages.push(pageInput);
+    }
   }
 
+  const attachmentBytes = await sumImageAttachmentBytes(attachments);
+  const pathReferenceBytes = await sumImageAttachmentBytes(pathReferencedImages);
   return {
     ...context,
     mode: selectionMode === "source-visual-unavailable" ? "source-visual-unavailable" : "source-on-demand",
@@ -3603,7 +3690,9 @@ async function collectExploreSourceVisualContext(workspace, provider, options = 
         fullImage: attachment.fullImage || "",
         reason: attachment.reason || "",
       })),
-    promptImageBytes: await sumImageAttachmentBytes(attachments),
+    pathReferencedImages,
+    promptImageBytes: attachmentBytes + pathReferenceBytes,
+    pathReferencedImageBytes: pathReferenceBytes,
     selectionMode,
     selectionReason,
     error: selectionError,
@@ -3682,7 +3771,8 @@ function normalizeExploreSourceArtifacts(workspace, options) {
 }
 
 async function selectExploreSourcePagesWithProvider(workspace, provider, options) {
-  if (!provider?.supportsImageAttachments || !options.source?.contactSheetPath) {
+  const imageInputMode = options.imageInputMode || getProviderImageInputMode(provider);
+  if (imageInputMode === "provider-image-unsupported-fallback" || !options.source?.contactSheetPath) {
     return { mode: "contact-sheet-only", selectedPages: [] };
   }
 
@@ -3694,13 +3784,20 @@ async function selectExploreSourcePagesWithProvider(workspace, provider, options
   const eventsPath = path.join(chatDir, `${sourceSlug}-source-visual-selection-events.jsonl`);
   const stderrPath = path.join(chatDir, `${sourceSlug}-source-visual-selection-stderr.log`);
   const lastMessagePath = path.join(chatDir, `${sourceSlug}-source-visual-selection.json`);
-  const prompt = await buildExploreVisualSelectionPrompt(workspace, options.source, options.question || "");
+  const prompt = await buildExploreVisualSelectionPrompt(
+    workspace,
+    options.source,
+    options.question || "",
+    imageInputMode,
+  );
   const args = provider.buildExecArgs({
     workspace,
     model: options.model || provider.defaultModel,
     reasoningEffort: selectedReasoningEffort(provider, options.model || provider.defaultModel, options),
     lastMessagePath,
-    imageAttachments: [safeJoin(workspace, options.source.contactSheetPath)],
+    imageAttachments: imageInputMode === "attached-images"
+      ? [safeJoin(workspace, options.source.contactSheetPath)]
+      : [],
     maxTurns: 4,
     sandbox: "read-only",
   });
@@ -3732,13 +3829,22 @@ async function selectExploreSourcePagesWithProvider(workspace, provider, options
   };
 }
 
-async function buildExploreVisualSelectionPrompt(workspace, source, question) {
+async function buildExploreVisualSelectionPrompt(workspace, source, question, imageInputMode = "attached-images") {
   const extractedText = source.textPath
     ? await fsp.readFile(safeJoin(workspace, source.textPath), "utf8").catch(() => "")
     : "";
   const clippedText = extractedText.length > 12000
     ? `${extractedText.slice(0, 12000)}\n\n[truncated after 12000 characters]`
     : extractedText;
+  const contactSheetPath = imageInputMode === "path-referenced-images"
+    ? safeJoin(workspace, source.contactSheetPath)
+    : source.contactSheetPath;
+  const contactSheetLabel = imageInputMode === "path-referenced-images"
+    ? "Contact sheet image file to inspect by absolute path"
+    : "Contact sheet attached";
+  const contactSheetInstruction = imageInputMode === "path-referenced-images"
+    ? "Inspect the contact sheet image file from the listed absolute path before choosing pages."
+    : "Inspect the attached contact sheet before choosing pages.";
 
   return `You are selecting source slide images for a Maple Explore Chat answer.
 
@@ -3746,10 +3852,12 @@ Return strict JSON only. Do not write files. Do not run shell commands.
 
 Source: ${source.sourcePath}
 Page count: ${source.pageCount}
-Contact sheet attached: ${source.contactSheetPath}
+${contactSheetLabel}: ${contactSheetPath}
 
 User question:
 ${String(question || "").trim()}
+
+${contactSheetInstruction}
 
 Pick at most ${EXPLORE_SOURCE_VISUAL_PAGE_LIMIT} page images that are likely needed to answer the question.
 Prefer the exact slide containing the referenced photo, chart, table, screenshot, diagram, or visual claim.
@@ -3945,20 +4053,33 @@ async function sumImageAttachmentBytes(attachments) {
 function buildExploreVisualInputReport(options) {
   const sourceContext = options.sourceVisualContext || {};
   const sourceImageAttachments = sourceContext.imageAttachments || [];
+  const pathReferencedImages = sourceContext.pathReferencedImages || [];
   const wikiImageAttachments = options.wikiImageAttachments || [];
+  const attachedWikiImageCount = wikiImageAttachments.filter((image) => image.attached !== false).length;
+  const pathReferencedWikiImageCount = wikiImageAttachments.filter((image) => image.imageInputPath).length;
   const imageAttachments = options.imageAttachments || [];
   const sourceReport = sourceContext.sourcePath
     ? {
         sourcePath: sourceContext.sourcePath,
         mode: sourceContext.mode || "none",
+        imageInputMode: sourceContext.imageInputMode || "none",
         extractionOperationId: sourceContext.extractionOperationId || "",
         pageCount: sourceContext.pageCount || 0,
         contactSheetAttached: Boolean(sourceContext.contactSheetAttached),
         contactSheetPath: sourceContext.contactSheetAttached
           ? sourceContext.contactSheetPath || ""
           : "",
+        contactSheetInputPath: sourceContext.contactSheetInputPath || "",
         requestedPages: sourceContext.requestedPages || [],
         attachedPages: sourceContext.attachedPages || [],
+        pathReferencedImages: pathReferencedImages.map((image) => ({
+          type: image.type || "",
+          page: image.page || null,
+          path: image.path || "",
+          imageInputPath: image.imageInputPath || "",
+          fullImage: image.fullImage || "",
+          reason: image.reason || "",
+        })),
         selectionMode: sourceContext.selectionMode || "none",
         selectionReason: sourceContext.selectionReason || "",
         error: sourceContext.error || null,
@@ -3973,10 +4094,13 @@ function buildExploreVisualInputReport(options) {
         : "none",
     provider: options.provider?.name || "",
     providerSupportsImageAttachments: options.provider?.supportsImageAttachments === true,
-    wikiImageAttachmentCount: wikiImageAttachments.length,
+    providerSupportsImagePathReferences: options.provider?.supportsImagePathReferences === true,
+    wikiImageAttachmentCount: attachedWikiImageCount,
+    wikiPathReferencedImageCount: pathReferencedWikiImageCount,
     sourceImageAttachmentCount: sourceImageAttachments.length,
+    pathReferencedImageCount: pathReferencedImages.length,
     imageAttachmentCount: imageAttachments.length,
-    promptImageBytes: options.imageAttachmentBytes || 0,
+    promptImageBytes: (options.imageAttachmentBytes || 0) + (sourceContext.pathReferencedImageBytes || 0),
     source: sourceReport,
   };
 }
@@ -4045,12 +4169,20 @@ function normalizeWikiAssetImageTarget(pageDir, target) {
 
 function renderWikiImageAttachmentsForPrompt(images) {
   if (!Array.isArray(images) || images.length === 0) return "";
+  const hasPathReferences = images.some((image) => image.imageInputPath);
   const lines = [
     "",
     "Wiki images from the selected page:",
-    ...images.map((image) => `- ${image.path}`),
+    ...images.map((image) => {
+      if (image.imageInputPath) {
+        return `- ${image.imageInputPath} (wiki asset: ${image.path})`;
+      }
+      return `- ${image.path}`;
+    }),
     "",
-    "Use these image files as visual context when they are relevant to the question.",
+    hasPathReferences
+      ? "Inspect these image files by absolute path when they are relevant to the question."
+      : "Use these attached image files as visual context when they are relevant to the question.",
   ];
   return `\n\n${lines.join("\n")}`;
 }
@@ -4068,7 +4200,11 @@ function renderExploreSourceVisualContextForPrompt(context) {
   ];
 
   if (context.contactSheetAttached && context.contactSheetPath) {
-    lines.push(`- Contact sheet attached: ${context.contactSheetPath}`);
+    if (context.contactSheetInputPath) {
+      lines.push(`- Contact sheet image file to inspect by absolute path: ${context.contactSheetInputPath}`);
+    } else {
+      lines.push(`- Contact sheet attached: ${context.contactSheetPath}`);
+    }
   }
 
   if (Array.isArray(context.attachedPages) && context.attachedPages.length > 0) {
@@ -4077,17 +4213,27 @@ function renderExploreSourceVisualContextForPrompt(context) {
       const reason = page.reason ? ` (${page.reason})` : "";
       lines.push(`  - Page ${page.page}: ${page.path}${reason}`);
     }
-  } else if (context.contactSheetAttached) {
+  }
+
+  if (Array.isArray(context.pathReferencedImages) && context.pathReferencedImages.length > 0) {
+    lines.push("- Source image files to inspect by absolute path:");
+    for (const image of context.pathReferencedImages) {
+      const reason = image.reason ? ` (${image.reason})` : "";
+      const pageLabel = image.page ? `Page ${image.page}` : image.type || "Image";
+      const fullImage = image.fullImage ? `; full image: ${image.fullImage}` : "";
+      lines.push(`  - ${pageLabel}: ${image.imageInputPath}${fullImage}${reason}`);
+    }
+  } else if (!context.attachedPages?.length && context.contactSheetAttached) {
     lines.push("- No full source slide image was confidently selected; use the contact sheet only as overview.");
   }
 
   if (context.mode === "provider-image-unsupported") {
-    lines.push("- This provider cannot receive image attachments.");
+    lines.push("- This provider cannot receive image visual inputs.");
   }
   if (context.error) {
     lines.push(`- Visual selection note: ${context.error}`);
   }
-  lines.push("- If the attached visual context is not enough, say which source page image is needed.");
+  lines.push("- If the visual context is not enough, say which source page image is needed.");
 
   return `\n\n${lines.join("\n")}`;
 }

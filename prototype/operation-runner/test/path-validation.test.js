@@ -1748,6 +1748,110 @@ test("Explore Chat source visuals attach contact sheet for visual questions with
   );
 });
 
+test("Explore Chat source visuals use Claude image path references", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "maple-source-path-chat-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  await fs.mkdir(path.join(workspace, "sources"), { recursive: true });
+  await fs.writeFile(path.join(workspace, "sources", "deck.pptx"), "placeholder\n");
+
+  const extractedDir = path.join(workspace, ".aiwiki", "extracted", "20260504120000", "deck");
+  await fs.mkdir(path.join(extractedDir, "pages"), { recursive: true });
+  await fs.mkdir(path.join(extractedDir, "prompt-images"), { recursive: true });
+  const pages = [];
+  for (let page = 1; page <= 12; page += 1) {
+    const pageName = String(page).padStart(2, "0");
+    await fs.writeFile(path.join(extractedDir, "pages", `page-${pageName}.png`), `png-${page}`);
+    await fs.writeFile(path.join(extractedDir, "prompt-images", `page-${pageName}.jpg`), `jpg-${page}`);
+    pages.push({
+      page,
+      image: `pages/page-${pageName}.png`,
+      promptImage: `prompt-images/page-${pageName}.jpg`,
+      textChars: page === 12 ? 30 : 0,
+    });
+  }
+  await fs.writeFile(
+    path.join(extractedDir, "manifest.json"),
+    `${JSON.stringify({
+      pageCount: 12,
+      pages,
+      textPath: "text.md",
+    }, null, 2)}\n`,
+  );
+  await fs.writeFile(
+    path.join(extractedDir, "text.md"),
+    "# Extracted PDF Text\n\n## Page 12\n\nThis slide explains the Naver visit photo.\n",
+  );
+
+  const context = await collectExploreSourceVisualContext(
+    workspace,
+    { name: "claude", supportsImageAttachments: false, supportsImagePathReferences: true },
+    {
+      selectedPath: "sources/deck.pptx",
+      question: "12번 슬라이드 사진은 무슨 의미야?",
+      operationId: "chat",
+      skipAiSelection: true,
+    },
+  );
+
+  const absolutePagePath = path.join(
+    workspace,
+    ".aiwiki",
+    "extracted",
+    "20260504120000",
+    "deck",
+    "prompt-images",
+    "page-12.jpg",
+  );
+  assert.equal(context.mode, "source-on-demand");
+  assert.equal(context.imageInputMode, "path-referenced-images");
+  assert.deepEqual(context.imageAttachments, []);
+  assert.deepEqual(context.pathReferencedImages.map((image) => image.imageInputPath), [absolutePagePath]);
+
+  const prompt = await buildExploreChatPrompt(workspace, {
+    selectedPath: "sources/deck.pptx",
+    question: "12번 슬라이드 사진은 무슨 의미야?",
+    history: [],
+    sourceVisualContext: context,
+  });
+
+  assert.match(prompt, /Source image files to inspect by absolute path/);
+  assert.match(prompt, new RegExp(absolutePagePath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+});
+
+test("Explore Chat raw source images use Claude image path references", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "maple-raw-image-path-chat-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  await fs.mkdir(path.join(workspace, "sources"), { recursive: true });
+  await fs.writeFile(path.join(workspace, "sources", "diagram.png"), "png");
+
+  const context = await collectExploreSourceVisualContext(
+    workspace,
+    { name: "claude", supportsImageAttachments: false, supportsImagePathReferences: true },
+    {
+      selectedPath: "sources/diagram.png",
+      question: "이 이미지 설명해줘",
+      operationId: "chat",
+    },
+  );
+
+  const absoluteImagePath = path.join(workspace, "sources", "diagram.png");
+  assert.equal(context.mode, "source-on-demand");
+  assert.equal(context.selectionMode, "source-image-path-reference");
+  assert.deepEqual(context.imageAttachments, []);
+  assert.deepEqual(context.pathReferencedImages.map((image) => image.imageInputPath), [absoluteImagePath]);
+
+  const prompt = await buildExploreChatPrompt(workspace, {
+    selectedPath: "sources/diagram.png",
+    question: "이 이미지 설명해줘",
+    history: [],
+    sourceVisualContext: context,
+  });
+
+  assert.match(prompt, /Selected file: sources\/diagram\.png/);
+  assert.match(prompt, /Source image files to inspect by absolute path/);
+  assert.match(prompt, new RegExp(absoluteImagePath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+});
+
 test("Explore Chat parses source page references conservatively", () => {
   assert.deepEqual(
     parseExplorePageReferences("12번 슬라이드랑 page 15-16도 봐줘", 20),
@@ -1798,6 +1902,42 @@ test("Explore Chat attaches only selected wiki page asset images", async (t) => 
   assert.match(prompt, /wiki\/assets\/diagram\.webp/);
   const imageSection = prompt.slice(prompt.indexOf("Wiki images from the selected page"));
   assert.doesNotMatch(imageSection, /sources\/raw\.png/);
+});
+
+test("Explore Chat wiki images use Claude image path references", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "maple-wiki-image-path-chat-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  await fs.mkdir(path.join(workspace, "wiki", "concepts"), { recursive: true });
+  await fs.mkdir(path.join(workspace, "wiki", "assets"), { recursive: true });
+  await fs.writeFile(path.join(workspace, "wiki", "assets", "chart.png"), "png");
+  await fs.writeFile(
+    path.join(workspace, "wiki", "concepts", "robotics.md"),
+    [
+      "# Robotics",
+      "",
+      "![chart](../assets/chart.png)",
+    ].join("\n"),
+  );
+
+  const absoluteImagePath = path.join(workspace, "wiki", "assets", "chart.png");
+  const images = await collectWikiPageImageAttachments(workspace, "wiki/concepts/robotics.md", {
+    provider: { name: "claude", supportsImageAttachments: false, supportsImagePathReferences: true },
+  });
+
+  assert.deepEqual(images.map((image) => image.path), ["wiki/assets/chart.png"]);
+  assert.deepEqual(images.map((image) => image.imageInputPath), [absoluteImagePath]);
+  assert.deepEqual(images.map((image) => image.attached), [false]);
+
+  const prompt = await buildExploreChatPrompt(workspace, {
+    selectedPath: "wiki/concepts/robotics.md",
+    question: "What does the chart show?",
+    history: [],
+    wikiImageAttachments: images,
+  });
+
+  assert.match(prompt, /Wiki images from the selected page/);
+  assert.match(prompt, /Inspect these image files by absolute path/);
+  assert.match(prompt, new RegExp(absoluteImagePath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 });
 
 test("auto-registers referenced wiki image assets only", async (t) => {
@@ -2085,6 +2225,64 @@ test("Improve Wiki source grounding is opt-in and does not allow source edits", 
   assert.match(prompt, /sources\/lecture-02\.pdf \(new\)/);
   assert.match(prompt, /Extracted text: \.aiwiki\/extracted\/op\/lecture-02\/text\.md/);
   assert.doesNotMatch(prompt, /runner updates it only after a successful build/);
+});
+
+test("Improve Wiki source grounding renders Claude source image path references", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "maple-improve-image-path-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  await fs.mkdir(path.join(workspace, "sources"), { recursive: true });
+  await fs.writeFile(path.join(workspace, "sources", "diagram.png"), "png");
+
+  const preparedSources = {
+    sources: [{
+      sourcePath: "sources/diagram.png",
+      sourceSlug: "diagram",
+      textPath: "",
+      manifestPath: "",
+      sourceImage: "sources/diagram.png",
+      pageImages: [],
+      promptPageImages: [],
+      selectedPromptImages: [],
+    }],
+    imageAttachments: [],
+    visualInput: null,
+  };
+
+  await selectBuildWikiVisualInputs(
+    workspace,
+    { name: "claude", supportsImageAttachments: false, supportsImagePathReferences: true },
+    {
+      operationId: "op",
+      operationDir: path.join(workspace, ".aiwiki", "operations", "op"),
+      dryRun: true,
+    },
+    preparedSources,
+  );
+
+  const absoluteImagePath = path.join(workspace, "sources", "diagram.png");
+  assert.deepEqual(preparedSources.imageAttachments, []);
+  assert.equal(preparedSources.sources[0].pagesToInspect[0].imageInputPath, absoluteImagePath);
+
+  const prompt = await buildMaintenancePrompt(workspace, {
+    operationType: "improve-wiki",
+    label: "Improve wiki",
+    instruction: "Use the diagram source.",
+    allowedPathRules: IMPROVE_WIKI_ALLOWED_PATHS,
+    forbiddenPathRules: ["sources/**"],
+    sourceMoveOnly: true,
+    sourceStatus: {
+      files: [{ path: "sources/diagram.png", state: "new" }],
+    },
+    sourceGrounding: {
+      sourcePaths: ["sources/diagram.png"],
+      preparedSources,
+    },
+  });
+
+  assert.match(prompt, /Source image path for inspection:/);
+  assert.match(prompt, new RegExp(absoluteImagePath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.match(prompt, /Pages inspected through path-referenced images/);
+  assert.doesNotMatch(prompt, /Source image attached to this prompt/);
 });
 
 test("source picker JSON parser accepts only source-relative paths", () => {

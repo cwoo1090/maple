@@ -247,6 +247,10 @@ type AppCommandResult = {
   state: WorkspaceState;
 };
 
+type ImportSourcesResult = AppCommandResult & {
+  importedSourcePaths: string[];
+};
+
 type SchemaUpdatePrompt = {
   available: boolean;
   reason: string;
@@ -1472,6 +1476,38 @@ function wikiTitleProperties(state: WorkspaceState) {
   };
 }
 
+function primaryImportedSourcePath(result: ImportSourcesResult): string | null {
+  const available = new Set(result.state.sourceFiles ?? []);
+  return (
+    result.importedSourcePaths.find((sourcePath) => available.has(sourcePath)) ??
+    result.importedSourcePaths[0] ??
+    null
+  );
+}
+
+function questionReferencesRecentSource(question: string) {
+  const normalized = question.trim().toLowerCase();
+  if (!normalized) return false;
+  return (
+    /\b(source|sources|file|files|imported|uploaded|added|attachment|attachments)\b/i.test(normalized) ||
+    /\b(this|that|the)\s+(file|source|attachment)\b/i.test(normalized) ||
+    /(소스|자료|파일|첨부|업로드|올린|넣은|가져온|추가한|방금|이거|그거|이 파일|그 파일)/.test(
+      normalized,
+    )
+  );
+}
+
+function exploreContextPathForQuestion(
+  question: string,
+  selectedPath: string,
+  lastImportedSourcePath: string | null,
+  sourceFiles: string[],
+) {
+  if (selectedPath.startsWith("sources/")) return selectedPath;
+  if (!lastImportedSourcePath || !sourceFiles.includes(lastImportedSourcePath)) return selectedPath;
+  return questionReferencesRecentSource(question) ? lastImportedSourcePath : selectedPath;
+}
+
 function App() {
   const { t, language, setLanguage } = useI18n();
   const appBodyRef = useRef<HTMLDivElement | null>(null);
@@ -1495,6 +1531,8 @@ function App() {
     );
   }
   const [selectedPath, setSelectedPath] = useState("index.md");
+  const [lastImportedSourcePath, setLastImportedSourcePath] = useState<string | null>(null);
+  const [pendingImportedSourceOpenPath, setPendingImportedSourceOpenPath] = useState<string | null>(null);
   const [selectedDocument, setSelectedDocument] = useState<SelectedDocument>({
     path: "index.md",
     content: null,
@@ -1987,6 +2025,11 @@ function App() {
   const hasOutsideWikiChanges = outsideWikiChangeCount > 0;
   const rootFiles = workspace.rootFiles ?? [];
   const sourceFiles = workspace.sourceFiles ?? [];
+  useEffect(() => {
+    setLastImportedSourcePath((current) =>
+      current && sourceFiles.includes(current) ? current : null,
+    );
+  }, [sourceFiles]);
   const maintainSelectedSourcePathList = useMemo(
     () => sourceFiles.filter((path) => maintainSelectedSourcePaths.has(path)),
     [maintainSelectedSourcePaths, sourceFiles],
@@ -2086,6 +2129,16 @@ function App() {
     () => Array.from(new Set([...rootFiles, ...workspace.wikiFiles, ...workspace.sourceFiles])),
     [rootFiles, workspace.wikiFiles, workspace.sourceFiles],
   );
+  useEffect(() => {
+    if (!pendingImportedSourceOpenPath) return;
+    if (!availableDocuments.includes(pendingImportedSourceOpenPath)) return;
+    const sourcePath = pendingImportedSourceOpenPath;
+    void (async () => {
+      await openWorkspaceFile(sourcePath);
+      setPendingImportedSourceOpenPath((current) => (current === sourcePath ? null : current));
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [availableDocuments, pendingImportedSourceOpenPath]);
   const activeCenterTab = useMemo(
     () => centerTabs.find((tab) => tab.id === activeCenterTabId) ?? centerTabs[0],
     [activeCenterTabId, centerTabs],
@@ -3646,6 +3699,8 @@ function App() {
       setBackgroundBuildStartedAt(null);
       handledBuildOperationIdRef.current = null;
       setChatRunProgressById({});
+      setLastImportedSourcePath(null);
+      setPendingImportedSourceOpenPath(null);
       return;
     }
     setBackgroundBuildActive(false);
@@ -3654,6 +3709,8 @@ function App() {
     setCenterTabs([workspaceCenterTab("index.md")]);
     setActiveCenterTabId("workspace:index.md");
     setSelectedPath("index.md");
+    setLastImportedSourcePath(null);
+    setPendingImportedSourceOpenPath(null);
     setViewMode("page");
     let cancelled = false;
     (async () => {
@@ -5186,11 +5243,20 @@ function App() {
     }
     const question = (questionOverride ?? exploreQuestion).trim();
     if (!question) return false;
+    const contextPath = exploreContextPathForQuestion(
+      question,
+      selectedPath,
+      lastImportedSourcePath,
+      sourceFiles,
+    );
+    const usedRecentSourceFallback = contextPath !== selectedPath;
     setBusy("Starting chat");
     setError(null);
     const exploreQuestionProperties = {
       question_length: question.length,
-      selected_path_present: Boolean(selectedPath),
+      selected_path_present: Boolean(contextPath),
+      selected_path_is_source: contextPath.startsWith("sources/"),
+      recent_import_source_fallback: usedRecentSourceFallback,
       web_search_enabled: exploreWebSearchEnabled,
       existing_thread: Boolean(chatThread?.id),
     };
@@ -5200,7 +5266,7 @@ function App() {
       const thread = await invoke<ChatThread>("start_explore_chat", {
         threadId: chatThread?.id ?? null,
         question,
-        selectedPath,
+        selectedPath: contextPath,
         webSearchEnabled: exploreWebSearchEnabled,
       });
       setExploreQuestion("");
@@ -5225,12 +5291,12 @@ function App() {
 
       try {
         const freshThread = await invoke<ChatThread>("create_chat_thread", {
-          initialContextPath: selectedPath,
+          initialContextPath: contextPath,
         });
         const thread = await invoke<ChatThread>("start_explore_chat", {
           threadId: freshThread.id,
           question,
-          selectedPath,
+          selectedPath: contextPath,
           webSearchEnabled: exploreWebSearchEnabled,
         });
         setExploreQuestion("");
@@ -5653,11 +5719,16 @@ function App() {
     setBusy("Importing sources");
     setError(null);
     try {
-      const result = await invoke<AppCommandResult>("import_sources", {
+      const result = await invoke<ImportSourcesResult>("import_sources", {
         sourcePaths: supported,
       });
       setRunner(result.runner);
       setWorkspace(result.state);
+      const importedSourcePath = primaryImportedSourcePath(result);
+      if (importedSourcePath) {
+        setLastImportedSourcePath(importedSourcePath);
+        setPendingImportedSourceOpenPath(importedSourcePath);
+      }
       track("source import completed", {
         ...sourceAnalyticsProperties(supported),
         result: result.runner?.success === false ? "failed" : "success",
@@ -5718,9 +5789,14 @@ function App() {
       }
 
       setBusy("Importing sources");
-      const result = await invoke<AppCommandResult>("import_sources", { sourcePaths });
+      const result = await invoke<ImportSourcesResult>("import_sources", { sourcePaths });
       setRunner(result.runner);
       setWorkspace(result.state);
+      const importedSourcePath = primaryImportedSourcePath(result);
+      if (importedSourcePath) {
+        setLastImportedSourcePath(importedSourcePath);
+        setPendingImportedSourceOpenPath(importedSourcePath);
+      }
       track("source import completed", {
         ...sourceAnalyticsProperties(sourcePaths),
         result: result.runner?.success === false ? "failed" : "success",
