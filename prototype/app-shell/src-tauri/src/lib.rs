@@ -6486,6 +6486,7 @@ async fn start_explore_chat(
     thread_id: Option<String>,
     question: String,
     selected_path: String,
+    selection_context: Option<String>,
     web_search_enabled: bool,
     state: State<'_, WorkspaceStore>,
     provider_cache: State<'_, ProviderStatusCache>,
@@ -6502,6 +6503,9 @@ async fn start_explore_chat(
     let model = selected_model(&settings, &provider);
     let reasoning_effort = selected_reasoning_effort(&settings, &provider, &model);
     let selected_path = selected_path.trim().to_string();
+    let selection_context = selection_context
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
     let context_path = if selected_path.is_empty() {
         None
     } else {
@@ -6581,6 +6585,10 @@ async fn start_explore_chat(
         run_id,
         "--skip-provider-check".to_string(),
     ];
+    if let Some(selection_context) = selection_context {
+        runner_args.push("--selection-context".to_string());
+        runner_args.push(selection_context);
+    }
     if !selected_path.is_empty() {
         runner_args.push("--selected-path".to_string());
         runner_args.push(selected_path);

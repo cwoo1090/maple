@@ -648,6 +648,29 @@ body.panel-resizing * {
   cursor: col-resize !important;
 }
 
+.selection-chat-action {
+  position: fixed;
+  z-index: 100;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 30px;
+  padding: 0 10px;
+  border: 1px solid var(--accent-border);
+  border-radius: 999px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1;
+  box-shadow: 0 10px 24px rgba(31, 26, 18, 0.2);
+  transform: translateX(-50%);
+}
+
+.selection-chat-action:hover {
+  background: var(--accent-hover);
+}
+
 .app-center {
   background: var(--bg);
   display: flex;
@@ -3967,8 +3990,16 @@ button.tree-name-clickable {
   padding: 0;
 }
 
+.explore-chat-history-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 26px;
+  align-items: stretch;
+  gap: 4px;
+}
+
 .explore-chat-history-item {
   width: 100%;
+  min-width: 0;
   display: grid;
   gap: 2px;
   padding: 7px 8px;
@@ -3993,7 +4024,7 @@ button.tree-name-clickable {
 }
 
 .explore-chat-history-item:disabled,
-.explore-chat-delete:disabled {
+.explore-chat-history-delete:disabled {
   cursor: not-allowed;
   opacity: 0.55;
 }
@@ -4060,15 +4091,30 @@ button.tree-name-clickable {
   }
 }
 
-.explore-chat-delete {
-  width: 100%;
-  margin-top: 8px;
-  padding: 7px 8px;
-  border: 1px solid var(--border);
+.explore-chat-history-delete {
+  display: grid;
+  width: 26px;
+  min-height: 100%;
+  place-items: center;
+  border: 1px solid transparent;
   border-radius: 6px;
-  background: var(--bg);
-  color: var(--text-muted);
-  font-size: 12px;
+  background: transparent;
+  color: var(--text-faint);
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.explore-chat-history-delete:hover:not(:disabled) {
+  border-color: var(--border);
+  background: var(--accent-bg);
+  color: var(--accent);
+}
+
+.explore-chat-history-delete:focus-visible {
+  outline: none;
+  border-color: var(--accent-border);
+  box-shadow: 0 0 0 2px rgba(224, 78, 26, 0.12);
 }
 
 .explore-chat-empty {
@@ -5297,6 +5343,76 @@ button.tree-name-clickable {
   color: var(--text-faint);
   font-size: 11.5px;
   line-height: 1.35;
+}
+
+.explore-chat-selection-context {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  padding: 7px 8px;
+  border: 1px solid var(--accent-border);
+  border-radius: 7px;
+  background: var(--accent-bg);
+}
+
+.explore-chat-selection-title {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  color: var(--accent);
+  font-size: 11.5px;
+  font-weight: 700;
+}
+
+.explore-chat-selection-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  min-width: 0;
+}
+
+.explore-chat-selection-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 100%;
+  min-height: 24px;
+  padding: 0 5px 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-elevated);
+  color: var(--text-muted);
+  font-size: 11.5px;
+  line-height: 1;
+}
+
+.explore-chat-selection-chip-label {
+  min-width: 0;
+  max-width: 150px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 650;
+}
+
+.explore-chat-selection-chip-meta {
+  flex: 0 0 auto;
+  color: var(--text-faint);
+}
+
+.explore-chat-selection-chip button {
+  display: grid;
+  width: 18px;
+  height: 18px;
+  place-items: center;
+  border-radius: 999px;
+  color: var(--text-faint);
+}
+
+.explore-chat-selection-chip button:hover {
+  background: var(--bg-hover);
+  color: var(--accent);
 }
 
 .explore-chat-scope-row {

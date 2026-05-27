@@ -368,6 +368,21 @@ type ExploreChatMessage = {
   completedAt?: string;
 };
 
+type ChatSelectionSnippet = {
+  id: string;
+  text: string;
+  sourceLabel: string;
+  sourcePath?: string;
+};
+
+type ChatSelectionAction = {
+  text: string;
+  sourceLabel: string;
+  sourcePath?: string;
+  x: number;
+  y: number;
+};
+
 type MapleGuideMessage = {
   id: string;
   role: "user" | "assistant";
@@ -658,10 +673,11 @@ const COLLAPSED_RIGHT_HEADER_BUSY_WIDTH = 148;
 const MIN_LEFT_PANEL_WIDTH = 180;
 const MAX_LEFT_PANEL_WIDTH = 480;
 const MIN_RIGHT_PANEL_WIDTH = 260;
-const MAX_RIGHT_PANEL_WIDTH = 560;
 const MIN_CENTER_PANEL_WIDTH = 420;
 const MIN_COMPACT_CENTER_PANEL_WIDTH = 300;
 const RESIZE_HANDLE_WIDTH = 1;
+const MAX_CHAT_SELECTION_SNIPPETS = 4;
+const MAX_CHAT_SELECTION_TEXT_CHARS = 6000;
 const DEFAULT_READING_TEXT_SIZE = 15;
 const MIN_READING_TEXT_SIZE = 12;
 const MAX_READING_TEXT_SIZE = 20;
@@ -1084,6 +1100,27 @@ function isMissingChatThreadError(error: unknown): boolean {
 
 function makeOptimisticChatId(prefix: string): string {
   return `${prefix}-optimistic-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function normalizeChatSelectionText(text: string): string {
+  return text
+    .replace(/\u00a0/g, " ")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function chatSelectionCharLabel(count: number, language: UiLanguage): string {
+  return language === "ko" ? `${count.toLocaleString()}자` : `${count.toLocaleString()} chars`;
+}
+
+function renderChatSelectionContext(snippets: ChatSelectionSnippet[]): string {
+  return snippets
+    .map((snippet, index) => {
+      const source = snippet.sourcePath || snippet.sourceLabel;
+      return [`Selected text ${index + 1}`, `Source: ${source}`, "Text:", snippet.text].join("\n");
+    })
+    .join("\n\n");
 }
 
 function optimisticChatTitle(question: string): string {
@@ -1673,6 +1710,8 @@ function App() {
   const [maintainFeedOpen, setMaintainFeedOpen] = useState(true);
   const [chatStatusStep, setChatStatusStep] = useState(0);
   const [exploreQuestion, setExploreQuestion] = useState("");
+  const [chatSelectionSnippets, setChatSelectionSnippets] = useState<ChatSelectionSnippet[]>([]);
+  const [chatSelectionAction, setChatSelectionAction] = useState<ChatSelectionAction | null>(null);
   const [askWikiContextScope, setAskWikiContextScope] =
     useState<AskWikiContextScope>("wiki");
   const [askWikiGuideDismissed, setAskWikiGuideDismissed] = useState(false);
@@ -1715,7 +1754,7 @@ function App() {
       LEGACY_RIGHT_PANEL_WIDTH_KEY,
       DEFAULT_RIGHT_PANEL_WIDTH,
       MIN_RIGHT_PANEL_WIDTH,
-      MAX_RIGHT_PANEL_WIDTH,
+      Number.POSITIVE_INFINITY,
     ),
   );
   const [leftPanelCollapsed, setLeftPanelCollapsed] = useState(() =>
@@ -2875,13 +2914,10 @@ function App() {
         MIN_RIGHT_PANEL_WIDTH,
         Math.max(
           MIN_RIGHT_PANEL_WIDTH,
-          Math.min(
-            MAX_RIGHT_PANEL_WIDTH,
-            layoutWidth -
-              bodyCenterMinWidth -
-              (leftPanelEffectivelyCollapsed ? 0 : leftPanelColumnWidth + RESIZE_HANDLE_WIDTH) -
-              RESIZE_HANDLE_WIDTH,
-          ),
+          layoutWidth -
+            bodyCenterMinWidth -
+            (leftPanelEffectivelyCollapsed ? 0 : leftPanelColumnWidth + RESIZE_HANDLE_WIDTH) -
+            RESIZE_HANDLE_WIDTH,
         ),
       );
   const bodyGridTemplateColumns = `${
@@ -2982,10 +3018,7 @@ function App() {
         return;
       }
 
-      const maxRight = Math.min(
-        MAX_RIGHT_PANEL_WIDTH,
-        rect.width - centerMinWidth - RESIZE_HANDLE_WIDTH - leftFootprint,
-      );
+      const maxRight = rect.width - centerMinWidth - RESIZE_HANDLE_WIDTH - leftFootprint;
       const nextRight = clampNumber(
         rect.right - moveEvent.clientX,
         MIN_RIGHT_PANEL_WIDTH,
@@ -5129,24 +5162,31 @@ function App() {
     }
   }
 
-  async function deleteCurrentMaintainThread() {
-    if (!maintainThread || maintainDeleteDisabled) return;
+  async function deleteMaintainThread(threadId: string) {
+    const targetSummary = maintainThreads.find((thread) => thread.id === threadId);
+    const targetActivity = targetSummary ? getMaintainThreadActivity(targetSummary) : null;
+    const deletingCurrent = maintainThread?.id === threadId;
+    if (targetActivity?.status === "running" || (deletingCurrent && maintainDeleteDisabled)) return;
+
     try {
       const thread = await invoke<ChatThread>("delete_maintain_thread", {
-        threadId: maintainThread.id,
+        threadId,
       });
-      setMaintainThread(thread);
-      markMaintainThreadSeen(thread);
-      const taskId = maintainTaskIdFromThread(thread);
-      setSelectedMaintainTaskId(taskId);
-      setMaintainInstruction("");
-      setMaintainAskOnly(false);
-      setMaintainUseSources(false);
-      setMaintainSelectedSourcePaths(new Set());
-      setMaintainSourcePickerExpanded(new Set());
-      setMaintainLastResult(null);
-      setMaintainStage(maintainStageFromThread(thread));
+      if (deletingCurrent || maintainThread?.id !== thread.id) {
+        setMaintainThread(thread);
+        markMaintainThreadSeen(thread);
+        const taskId = maintainTaskIdFromThread(thread);
+        setSelectedMaintainTaskId(taskId);
+        setMaintainInstruction("");
+        setMaintainAskOnly(false);
+        setMaintainUseSources(false);
+        setMaintainSelectedSourcePaths(new Set());
+        setMaintainSourcePickerExpanded(new Set());
+        setMaintainLastResult(null);
+        setMaintainStage(maintainStageFromThread(thread));
+      }
       await refreshMaintainHistorySummaries();
+      setMaintainHistoryOpen(true);
     } catch (err) {
       setError(`Failed to delete maintain chat: ${String(err)}`);
     }
@@ -5417,6 +5457,153 @@ function App() {
     return thread;
   }
 
+  function selectionSourceFromNode(node: Node | null): Pick<ChatSelectionSnippet, "sourceLabel" | "sourcePath"> | null {
+    const element = node instanceof Element ? node : node?.parentElement;
+    if (!element) return null;
+    if (
+      element.closest(
+        [
+          "textarea",
+          "input",
+          "select",
+          "button",
+          "[contenteditable='true']",
+          ".explore-chat-composer",
+          ".selection-chat-action",
+          ".modal",
+          ".maple-guide-panel",
+        ].join(","),
+      )
+    ) {
+      return null;
+    }
+
+    const assistantMessage = element.closest<HTMLElement>(
+      ".explore-chat-msg-assistant, .maintain-message-assistant",
+    );
+    if (assistantMessage) {
+      return {
+        sourceLabel:
+          assistantMessage.dataset.selectionSource ||
+          (language === "ko" ? "AI 답변" : "AI answer"),
+        sourcePath: assistantMessage.dataset.selectionPath || undefined,
+      };
+    }
+
+    if (element.closest(".app-center")) {
+      return { sourceLabel: displayFileName(selectedPath), sourcePath: selectedPath };
+    }
+
+    return null;
+  }
+
+  function updateChatSelectionAction() {
+    if (!workspace.workspacePath) {
+      setChatSelectionAction(null);
+      return;
+    }
+    const selection = window.getSelection();
+    if (!selection || selection.rangeCount === 0 || selection.isCollapsed) {
+      setChatSelectionAction(null);
+      return;
+    }
+
+    const range = selection.getRangeAt(0);
+    const source = selectionSourceFromNode(range.commonAncestorContainer);
+    const text = normalizeChatSelectionText(selection.toString());
+    if (!source || text.length < 2) {
+      setChatSelectionAction(null);
+      return;
+    }
+
+    const rect = range.getBoundingClientRect();
+    const fallbackRect = Array.from(range.getClientRects()).find(
+      (item) => item.width > 0 && item.height > 0,
+    );
+    const targetRect = rect.width > 0 && rect.height > 0 ? rect : fallbackRect;
+    if (!targetRect) {
+      setChatSelectionAction(null);
+      return;
+    }
+
+    const buttonWidth = language === "ko" ? 112 : 122;
+    const x = clampNumber(
+      targetRect.left + targetRect.width / 2,
+      12 + buttonWidth / 2,
+      window.innerWidth - 12 - buttonWidth / 2,
+    );
+    const preferredY = targetRect.top - 38;
+    const y =
+      preferredY > 8
+        ? preferredY
+        : Math.min(window.innerHeight - 42, targetRect.bottom + 8);
+    setChatSelectionAction({
+      ...source,
+      text:
+        text.length > MAX_CHAT_SELECTION_TEXT_CHARS
+          ? text.slice(0, MAX_CHAT_SELECTION_TEXT_CHARS).trim()
+          : text,
+      x,
+      y,
+    });
+  }
+
+  function addCurrentSelectionToChat() {
+    if (!chatSelectionAction) return;
+    const snippet: ChatSelectionSnippet = {
+      id: makeOptimisticChatId("selection"),
+      text: chatSelectionAction.text,
+      sourceLabel: chatSelectionAction.sourceLabel,
+      sourcePath: chatSelectionAction.sourcePath,
+    };
+    setChatSelectionSnippets((current) => {
+      const withoutDuplicate = current.filter(
+        (item) =>
+          item.text !== snippet.text ||
+          item.sourcePath !== snippet.sourcePath ||
+          item.sourceLabel !== snippet.sourceLabel,
+      );
+      return [...withoutDuplicate, snippet].slice(-MAX_CHAT_SELECTION_SNIPPETS);
+    });
+    setChatSelectionAction(null);
+    window.getSelection()?.removeAllRanges();
+    requestAnimationFrame(() => exploreChatInputRef.current?.focus());
+  }
+
+  function removeChatSelectionSnippet(snippetId: string) {
+    setChatSelectionSnippets((current) => current.filter((snippet) => snippet.id !== snippetId));
+  }
+
+  useEffect(() => {
+    setChatSelectionSnippets([]);
+    setChatSelectionAction(null);
+  }, [workspace.workspacePath]);
+
+  useEffect(() => {
+    const scheduleSelectionUpdate = () => {
+      window.setTimeout(updateChatSelectionAction, 0);
+    };
+    const clearSelectionAction = () => setChatSelectionAction(null);
+    const clearCollapsedSelectionAction = () => {
+      const selection = window.getSelection();
+      if (!selection || selection.isCollapsed) setChatSelectionAction(null);
+    };
+
+    document.addEventListener("pointerup", scheduleSelectionUpdate);
+    document.addEventListener("keyup", scheduleSelectionUpdate);
+    document.addEventListener("selectionchange", clearCollapsedSelectionAction);
+    document.addEventListener("scroll", clearSelectionAction, true);
+    window.addEventListener("resize", clearSelectionAction);
+
+    return () => {
+      document.removeEventListener("pointerup", scheduleSelectionUpdate);
+      document.removeEventListener("keyup", scheduleSelectionUpdate);
+      document.removeEventListener("selectionchange", clearCollapsedSelectionAction);
+      document.removeEventListener("scroll", clearSelectionAction, true);
+      window.removeEventListener("resize", clearSelectionAction);
+    };
+  }, [language, selectedPath, workspace.workspacePath]);
+
   async function askExploreChat(questionOverride?: string): Promise<boolean> {
     if (exploreBlockedReason || !workspace.workspacePath) return false;
     if (!activeProviderReady) {
@@ -5427,6 +5614,8 @@ function App() {
     }
     const question = (questionOverride ?? exploreQuestion).trim();
     if (!question) return false;
+    const selectionContext = renderChatSelectionContext(chatSelectionSnippets);
+    const selectionSnippetCount = chatSelectionSnippets.length;
     const contextPath =
       askWikiContextScope === "current"
         ? exploreContextPathForQuestion(
@@ -5457,6 +5646,7 @@ function App() {
       completedAt: optimisticCreatedAt,
     };
     setExploreQuestion("");
+    setChatSelectionSnippets([]);
     setChatThread((current) => {
       const baseThread = current ?? chatThread;
       const messages = [...(baseThread?.messages ?? []), optimisticUserMessage];
@@ -5485,6 +5675,8 @@ function App() {
       recent_import_source_fallback: usedRecentSourceFallback,
       web_search_enabled: exploreWebSearchEnabled,
       existing_thread: Boolean(chatThread?.id),
+      selected_text_snippets: selectionSnippetCount,
+      selected_text_context_length: selectionContext.length,
     };
     track("explore question submitted", exploreQuestionProperties);
 
@@ -5521,6 +5713,7 @@ function App() {
         threadId: chatThread?.id ?? null,
         question,
         selectedPath: contextPath,
+        selectionContext,
         webSearchEnabled: exploreWebSearchEnabled,
       });
       startReturnedThread = true;
@@ -5552,6 +5745,7 @@ function App() {
           threadId: freshThread.id,
           question,
           selectedPath: contextPath,
+          selectionContext,
           webSearchEnabled: exploreWebSearchEnabled,
         });
         startReturnedThread = true;
@@ -5726,18 +5920,30 @@ function App() {
     }
   }
 
-  async function deleteCurrentChat() {
-    if (!chatThread) return;
-    if (exploreBusy || wikiUpdateBusy || blockingUiBusy) return;
+  async function deleteChatThread(threadId: string) {
+    const targetSummary = chatThreads.find((thread) => thread.id === threadId);
+    const targetActivity = targetSummary ? getExploreThreadActivity(targetSummary) : null;
+    const deletingCurrent = chatThread?.id === threadId;
+    if (
+      blockingUiBusy ||
+      targetActivity?.status === "running" ||
+      (deletingCurrent && (exploreBusy || wikiUpdateBusy))
+    ) {
+      return;
+    }
+
     try {
       const thread = await invoke<ChatThread>("delete_chat_thread", {
-        threadId: chatThread.id,
+        threadId,
       });
-      setChatThread(thread);
-      markChatThreadSeen(thread);
-      setApplyDraft(null);
-      setWikiUpdateRun((current) => (current?.threadId === chatThread.id ? null : current));
+      if (deletingCurrent || chatThread?.id !== thread.id) {
+        setChatThread(thread);
+        markChatThreadSeen(thread);
+        setApplyDraft(null);
+      }
+      setWikiUpdateRun((current) => (current?.threadId === threadId ? null : current));
       await refreshChatHistorySummaries();
+      setChatHistoryOpen(true);
     } catch (err) {
       if (isMissingChatThreadError(err)) {
         await recoverMissingChatThread().catch((recoverErr) => {
@@ -7117,6 +7323,22 @@ function App() {
         </div>
       </header>
 
+      {chatSelectionAction ? (
+        <button
+          type="button"
+          className="selection-chat-action"
+          style={{
+            left: chatSelectionAction.x,
+            top: chatSelectionAction.y,
+          }}
+          onMouseDown={(event) => event.preventDefault()}
+          onClick={addCurrentSelectionToChat}
+        >
+          <Quote size={13} strokeWidth={2.2} aria-hidden="true" />
+          {language === "ko" ? "채팅에 추가" : "Add to chat"}
+        </button>
+      ) : null}
+
       <div
         ref={appBodyRef}
         className="app-body"
@@ -7805,7 +8027,7 @@ function App() {
                           const activity = getExploreThreadActivity(thread);
                           const showMarker = shouldShowExploreThreadMarker(thread, activity);
                           return (
-                            <li key={thread.id}>
+                            <li key={thread.id} className="explore-chat-history-row">
                               <button
                                 type="button"
                                 className={`explore-chat-history-item${
@@ -7829,28 +8051,40 @@ function App() {
                                   {displayChatThreadPreview(thread)}
                                 </span>
                               </button>
+                              <button
+                                type="button"
+                                className="explore-chat-history-delete"
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  void deleteChatThread(thread.id);
+                                }}
+                                disabled={
+                                  blockingUiBusy ||
+                                  activity.status === "running" ||
+                                  (thread.id === chatThread?.id && (exploreBusy || wikiUpdateBusy))
+                                }
+                                aria-label={
+                                  language === "ko"
+                                    ? `채팅 삭제: ${thread.title}`
+                                    : `Delete chat: ${thread.title}`
+                                }
+                                title={
+                                  activity.status === "running"
+                                    ? language === "ko"
+                                      ? "이 채팅이 끝난 뒤 삭제하세요."
+                                      : "Wait for this chat to finish before deleting it."
+                                    : language === "ko"
+                                      ? "채팅 삭제"
+                                      : "Delete chat"
+                                }
+                              >
+                                <X size={13} strokeWidth={2.4} aria-hidden="true" />
+                              </button>
                             </li>
                           );
                         })}
                       </ul>
                     )}
-                    {chatThread ? (
-                      <button
-                        type="button"
-                        className="explore-chat-delete"
-                        onClick={() => void deleteCurrentChat()}
-                        disabled={exploreBusy || wikiUpdateBusy || blockingUiBusy}
-                        title={
-                          wikiUpdateBusy
-                            ? (language === "ko"
-                                ? "위키에 적용이 실행 중입니다. 끝난 뒤 이 채팅을 삭제하세요."
-                                : "Apply to wiki is running. Wait for it to finish before deleting this chat.")
-                            : exploreBlockedReason ?? t("app.right.deleteCurrentChat")
-                        }
-                      >
-                        {t("app.right.deleteCurrentChat")}
-                      </button>
-                    ) : null}
                   </div>
                 ) : null}
               </header>
@@ -7869,6 +8103,16 @@ function App() {
                       {index === wikiUpdateInsertIndex ? wikiUpdateRunBlock : null}
                       <div
                         className={`explore-chat-msg explore-chat-msg-${message.role}`}
+                        data-selection-source={
+                          message.role === "assistant"
+                            ? message.contextPath
+                              ? displayFileName(message.contextPath)
+                              : t("app.right.exploreChat")
+                            : undefined
+                        }
+                        data-selection-path={
+                          message.role === "assistant" ? message.contextPath || undefined : undefined
+                        }
                       >
                         {message.contextPath ? (
                           canOpenDocumentReference(message.contextPath) ? (
@@ -7969,6 +8213,42 @@ function App() {
                 <p className="explore-chat-workspace-note">{workspaceUpdateExploreNotice}</p>
               ) : null}
               {showExploreChatMessages ? askWikiGuideCard : null}
+              {chatSelectionSnippets.length > 0 ? (
+                <div className="explore-chat-selection-context" aria-live="polite">
+                  <div className="explore-chat-selection-title">
+                    <Quote size={13} strokeWidth={2.2} aria-hidden="true" />
+                    <span>
+                      {language === "ko"
+                        ? `선택 텍스트 ${chatSelectionSnippets.length}개 포함`
+                        : `${chatSelectionSnippets.length} selected text ${
+                            chatSelectionSnippets.length === 1 ? "snippet" : "snippets"
+                          } included`}
+                    </span>
+                  </div>
+                  <div className="explore-chat-selection-chips">
+                    {chatSelectionSnippets.map((snippet) => (
+                      <span key={snippet.id} className="explore-chat-selection-chip">
+                        <span className="explore-chat-selection-chip-label">
+                          {snippet.sourceLabel}
+                        </span>
+                        <span className="explore-chat-selection-chip-meta">
+                          {chatSelectionCharLabel(snippet.text.length, language)}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => removeChatSelectionSnippet(snippet.id)}
+                          aria-label={
+                            language === "ko" ? "선택 텍스트 제거" : "Remove selected text"
+                          }
+                          title={language === "ko" ? "선택 텍스트 제거" : "Remove selected text"}
+                        >
+                          <X size={12} strokeWidth={2.4} aria-hidden="true" />
+                        </button>
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
               <div className="explore-chat-scope-row" role="group" aria-label={t("app.right.scopeLabel")}>
                 <span className="explore-chat-scope-label">{t("app.right.scopeLabel")}</span>
                 <div className="explore-chat-scope-control">
@@ -8147,7 +8427,7 @@ function App() {
                           const activity = getMaintainThreadActivity(thread);
                           const showMarker = shouldShowMaintainThreadMarker(thread, activity);
                           return (
-                            <li key={thread.id}>
+                            <li key={thread.id} className="explore-chat-history-row">
                               <button
                                 type="button"
                                 className={`explore-chat-history-item${
@@ -8170,22 +8450,39 @@ function App() {
                                   {displayMaintainThreadPreview(thread, language)}
                                 </span>
                               </button>
+                              <button
+                                type="button"
+                                className="explore-chat-history-delete"
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  void deleteMaintainThread(thread.id);
+                                }}
+                                disabled={
+                                  activity.status === "running" ||
+                                  (thread.id === maintainThread?.id && maintainDeleteDisabled)
+                                }
+                                aria-label={
+                                  language === "ko"
+                                    ? `관리 채팅 삭제: ${thread.title}`
+                                    : `Delete maintain chat: ${thread.title}`
+                                }
+                                title={
+                                  activity.status === "running"
+                                    ? language === "ko"
+                                      ? "이 관리 채팅이 끝난 뒤 삭제하세요."
+                                      : "Wait for this Maintain chat to finish before deleting it."
+                                    : language === "ko"
+                                      ? "관리 채팅 삭제"
+                                      : "Delete maintain chat"
+                                }
+                              >
+                                <X size={13} strokeWidth={2.4} aria-hidden="true" />
+                              </button>
                             </li>
                           );
                         })}
                       </ul>
                     )}
-                    {maintainThread ? (
-                      <button
-                        type="button"
-                        className="explore-chat-delete"
-                        onClick={() => void deleteCurrentMaintainThread()}
-                        disabled={maintainDeleteDisabled}
-                        title={maintainDeleteBlockedReason ?? t("app.right.deleteCurrentChat")}
-                      >
-                        {t("app.right.deleteCurrentChat")}
-                      </button>
-                    ) : null}
                   </div>
                 ) : null}
               </header>
@@ -8198,6 +8495,16 @@ function App() {
                   <div
                     key={message.id}
                     className={`maintain-message maintain-message-${message.role}`}
+                    data-selection-source={
+                      message.role === "assistant"
+                        ? message.contextPath
+                          ? displayFileName(message.contextPath)
+                          : t("app.right.maintain")
+                        : undefined
+                    }
+                    data-selection-path={
+                      message.role === "assistant" ? message.contextPath || undefined : undefined
+                    }
                   >
                     {message.role === "assistant" ? (
                       <>

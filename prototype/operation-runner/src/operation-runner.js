@@ -284,6 +284,7 @@ async function main(argv = process.argv.slice(2)) {
           chatId: flags["chat-id"] || "",
           question: flags.question || "",
           selectedPath: flags["selected-path"] || "",
+          selectionContext: flags["selection-context"] || "",
           historyJson: flags["history-json"] || "",
           webSearch: Boolean(flags["web-search"]),
           skipProviderCheck: Boolean(flags["skip-provider-check"]),
@@ -3223,6 +3224,10 @@ Math formatting rules:
 Current selected context:
 ${selectedBlock}
 
+User-selected text snippets attached to this question:
+Use these snippets as explicit user-provided context, especially for references like "this", "that", or "the selected part".
+${renderUserSelectedTextContext(options.selectionContext)}
+
 Recent conversation:
 ${renderExploreChatHistory(history)}
 
@@ -3342,6 +3347,10 @@ Current selected context:
 ${selectedLine}
 
 ${retrievalBlock}
+
+User-selected text snippets attached to this question:
+Use these snippets as explicit user-provided context, especially for references like "this", "that", or "the selected part".
+${renderUserSelectedTextContext(options.selectionContext)}
 
 Recent conversation:
 ${renderExploreChatHistory(history)}
@@ -4091,6 +4100,12 @@ function renderExploreChatHistory(history) {
       return `${label}${context}${webSearch}: ${message.text}`;
     })
     .join("\n\n");
+}
+
+function renderUserSelectedTextContext(selectionContext) {
+  const text = String(selectionContext || "").trim();
+  if (!text) return "No user-selected text snippets were attached.";
+  return text.length > 20000 ? `${text.slice(0, 20000)}\n\n[truncated]` : text;
 }
 
 function renderSourceStatusForPrompt(sourceStatus, options = {}) {
