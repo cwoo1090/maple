@@ -9260,7 +9260,7 @@ mod tests {
 
         assert!(schema.contains("persistent, compounding wiki"));
         assert!(schema.contains("## Build Wiki Rules"));
-        assert!(schema.contains("## Explore And Apply Rules"));
+        assert!(schema.contains("## Ask Wiki And Apply Rules"));
         assert!(schema.contains("#Lstart-Lend"));
         assert!(schema.contains("lecture-03.txt#L15-L17"));
         assert!(schema.contains("include that locator in the visible link label"));
