@@ -58,6 +58,16 @@ const MAX_FULL_SLIDE_ATTACHMENTS_TOTAL = 20;
 const SLIDE_SELECTION_TIMEOUT_MS = 2 * 60 * 1000;
 const EXPLORE_CHAT_HISTORY_LIMIT = 6;
 const EXPLORE_CHAT_HISTORY_TEXT_LIMIT = 2000;
+const ASK_WIKI_INDEX_PATH = ".aiwiki/cache/ask-wiki-index.json";
+const ASK_WIKI_INDEX_VERSION = 2;
+const ASK_WIKI_INDEX_CHUNK_CHAR_LIMIT = 1800;
+const ASK_WIKI_FAST_CONTEXT_CHAR_LIMIT = 12000;
+const ASK_WIKI_FAST_CHUNK_LIMIT = 18;
+const ASK_WIKI_FAST_HIT_LIMIT = 8;
+const ASK_WIKI_FAST_NEIGHBOR_RADIUS = 1;
+const ASK_WIKI_GLOBAL_CONTEXT_CHAR_LIMIT = 20000;
+const ASK_WIKI_TEXT_SOURCE_EXTENSIONS = new Set([".md", ".txt", ".html", ".htm"]);
+const ASK_WIKI_FAST_PATH_ENABLED = false;
 const MAPLE_GUIDE_HISTORY_LIMIT = 8;
 const MAPLE_GUIDE_HISTORY_TEXT_LIMIT = 1600;
 const MAPLE_GUIDE_APP_STATE_LIMIT = 6000;
@@ -1249,35 +1259,58 @@ async function runExploreChat(workspace, options = {}) {
   const history = parseExploreChatHistory(options.historyJson);
   const webSearchEnabled = Boolean(options.webSearch);
   const startedAt = new Date().toISOString();
-  const wikiImageAttachments = await collectWikiPageImageAttachments(
-    workspace,
-    options.selectedPath || "",
-    { imageInputMode: getProviderImageInputMode(provider) },
-  );
-  const sourceVisualContext = await collectExploreSourceVisualContext(workspace, provider, {
-    selectedPath: options.selectedPath || "",
-    question,
-    operationId: chatId,
-    chatDir,
-    model,
-    reasoningEffort,
-  });
-  const attachedWikiImages = wikiImageAttachments.filter((image) => image.attached !== false);
-  const imageAttachments = mergeExploreImageAttachments(
-    attachedWikiImages,
-    sourceVisualContext.imageAttachments,
-  );
-  const imageAttachmentBytes = await sumImageAttachmentBytes(imageAttachments);
-  const prompt = await buildExploreChatPrompt(workspace, {
-    ...options,
-    model,
-    reasoningEffort,
-    history,
-    operationId: chatId,
-    wikiImageAttachments,
-    sourceVisualContext,
-    webSearch: webSearchEnabled,
-  });
+  const fastChatContext = ASK_WIKI_FAST_PATH_ENABLED
+    ? await prepareFastExploreChatContext(workspace, {
+        selectedPath: options.selectedPath || "",
+        question,
+        webSearch: webSearchEnabled,
+      })
+    : { enabled: false, reason: "fast-path-disabled" };
+  let wikiImageAttachments = [];
+  let sourceVisualContext = { mode: "none" };
+  let imageAttachments = [];
+  let imageAttachmentBytes = 0;
+  let prompt;
+  if (fastChatContext.enabled) {
+    prompt = await buildFastExploreChatPrompt(workspace, {
+      ...options,
+      model,
+      reasoningEffort,
+      history,
+      retrieval: fastChatContext.retrieval,
+      webSearch: webSearchEnabled,
+    });
+  } else {
+    wikiImageAttachments = await collectWikiPageImageAttachments(
+      workspace,
+      options.selectedPath || "",
+      { imageInputMode: getProviderImageInputMode(provider) },
+    );
+    sourceVisualContext = await collectExploreSourceVisualContext(workspace, provider, {
+      selectedPath: options.selectedPath || "",
+      question,
+      operationId: chatId,
+      chatDir,
+      model,
+      reasoningEffort,
+    });
+    const attachedWikiImages = wikiImageAttachments.filter((image) => image.attached !== false);
+    imageAttachments = mergeExploreImageAttachments(
+      attachedWikiImages,
+      sourceVisualContext.imageAttachments,
+    );
+    imageAttachmentBytes = await sumImageAttachmentBytes(imageAttachments);
+    prompt = await buildExploreChatPrompt(workspace, {
+      ...options,
+      model,
+      reasoningEffort,
+      history,
+      operationId: chatId,
+      wikiImageAttachments,
+      sourceVisualContext,
+      webSearch: webSearchEnabled,
+    });
+  }
   const promptPath = path.join(chatDir, "prompt.md");
   const eventsPath = path.join(chatDir, "events.jsonl");
   const stderrPath = path.join(chatDir, "stderr.log");
@@ -1290,7 +1323,7 @@ async function runExploreChat(workspace, options = {}) {
     model,
     reasoningEffort,
     lastMessagePath,
-    maxTurns: 8,
+    maxTurns: fastChatContext.enabled ? 3 : 8,
     imageAttachments: imageAttachments.map((image) => image.absolutePath),
     webSearch: webSearchEnabled,
   });
@@ -1334,6 +1367,7 @@ async function runExploreChat(workspace, options = {}) {
     selectedPath: options.selectedPath || "",
     question,
     historyCount: history.length,
+    retrieval: buildAskWikiRetrievalReport(fastChatContext),
     imageAttachments: imageAttachments.map((image) => image.path),
     visualInput: buildExploreVisualInputReport({
       provider,
@@ -3196,6 +3230,700 @@ User question:
 ${String(options.question || "").trim()}
 
 Answer now.`;
+}
+
+async function prepareFastExploreChatContext(workspace, options = {}) {
+  const selectedPath = normalizeRelativePath(options.selectedPath || "") || "";
+  const question = String(options.question || "").trim();
+
+  if (options.webSearch) {
+    return { enabled: false, reason: "web-search-enabled" };
+  }
+  if (selectedPath && selectedPath.startsWith("sources/")) {
+    return { enabled: false, reason: "selected-source" };
+  }
+  if (selectedPath && !isAskWikiIndexablePath(selectedPath)) {
+    return { enabled: false, reason: "selected-path-not-indexable" };
+  }
+  if (isExploreVisualQuestion(question) || parseExplorePageReferences(question).length > 0) {
+    return { enabled: false, reason: "visual-or-page-question" };
+  }
+
+  const index = await loadAskWikiKeywordIndex(workspace);
+  const retrieval = retrieveAskWikiIndexChunks(index, {
+    question,
+    selectedPath,
+    chunkLimit: ASK_WIKI_FAST_CHUNK_LIMIT,
+    charLimit: ASK_WIKI_FAST_CONTEXT_CHAR_LIMIT,
+  });
+  if (!selectedPath) {
+    retrieval.globalContext = await loadAskWikiGlobalContext(workspace);
+  }
+  if (!retrieval.chunks.length) {
+    return {
+      enabled: false,
+      reason: "no-indexed-wiki-context",
+      index,
+    };
+  }
+  if (
+    !selectedPath &&
+    retrieval.queryTerms.length > 0 &&
+    !retrieval.chunks.some((chunk) => isAskWikiContentPath(chunk.path))
+  ) {
+    return {
+      enabled: false,
+      reason: "no-indexed-wiki-content",
+      index,
+      retrieval,
+    };
+  }
+
+  return {
+    enabled: true,
+    reason: "keyword-index",
+    index,
+    retrieval,
+  };
+}
+
+async function loadAskWikiGlobalContext(workspace) {
+  const blocks = [];
+  let charCount = 0;
+  for (const relPath of ["schema.md", "index.md"]) {
+    const remaining = ASK_WIKI_GLOBAL_CONTEXT_CHAR_LIMIT - charCount;
+    if (remaining <= 0) break;
+    const content = await readChatContextFile(workspace, relPath, remaining);
+    if (!content) continue;
+    blocks.push({
+      path: relPath,
+      text: content,
+      charCount: content.length,
+    });
+    charCount += content.length;
+  }
+  return blocks;
+}
+
+async function buildFastExploreChatPrompt(workspace, options) {
+  const history = Array.isArray(options.history)
+    ? options.history
+    : parseExploreChatHistory(options.historyJson);
+  const selectedPath = normalizeRelativePath(options.selectedPath || "") || "";
+  const retrievalBlock = renderAskWikiRetrievedContext(options.retrieval);
+  const selectedLine = selectedPath
+    ? `Selected Ask Wiki scope: ${selectedPath}`
+    : "Selected Ask Wiki scope: whole wiki";
+
+  return `Follow the workspace instructions in AGENTS.md or CLAUDE.md.
+
+Ask Wiki mode:
+- Fast local keyword index mode. The runner already selected compact wiki/source chunks with keyword retrieval.
+- Answer from the retrieved local wiki/source context first.
+- Do not scan the whole workspace unless the retrieved context is clearly insufficient.
+- If the local context is insufficient, say what is missing and suggest the relevant next step: select the source/page, use a visual question, run Build wiki, or enable web search.
+- Source-only mode. If the question needs live or external information, say that web search would be needed instead of guessing.
+
+Ask Wiki boundary:
+- If the user asks to create, build, or update a wiki from sources, explain that they should run Build wiki.
+- If the user asks how to use Maple, where to click, or what an app feature means, direct them to Maple Guide from the lower-left speech-bubble button.
+- Ask Wiki should answer questions about selected sources or the existing wiki. It should not create files directly.
+
+Visual grounding rules:
+- This fast path did not attach images or source page renders.
+- Do not claim you inspected pages, slides, charts, figures, or images unless their content appears in the retrieved text.
+- If visual inspection is needed, say that the visual/deep Ask Wiki path is needed.
+
+Math formatting rules:
+- Wrap block equations in $$...$$ and inline formulas in $...$.
+- Do not leave raw LaTeX commands such as \\frac, \\sqrt, \\tau, or \\approx outside math delimiters.
+
+Current selected context:
+${selectedLine}
+
+${retrievalBlock}
+
+Recent conversation:
+${renderExploreChatHistory(history)}
+
+User question:
+${String(options.question || "").trim()}
+
+Answer now.`;
+}
+
+async function loadAskWikiKeywordIndex(workspace) {
+  const sources = await collectAskWikiIndexSources(workspace);
+  const indexPath = safeJoin(workspace, ASK_WIKI_INDEX_PATH);
+  const cached = await readAskWikiIndex(indexPath);
+  if (cached && askWikiIndexSourcesMatch(cached.sources, sources)) {
+    return { ...cached, rebuilt: false };
+  }
+
+  const chunks = [];
+  for (const source of sources) {
+    let content;
+    try {
+      content = await fsp.readFile(safeJoin(workspace, source.path), "utf8");
+    } catch (_error) {
+      continue;
+    }
+    const indexableContent = normalizeAskWikiIndexContent(source.path, content);
+    const sourceChunks = chunkMarkdownForAskWikiIndex(source.path, indexableContent);
+    for (const chunk of sourceChunks) {
+      chunks.push({
+        ...chunk,
+        sourceMtimeMs: source.mtimeMs,
+        sourceSize: source.size,
+      });
+    }
+  }
+
+  const index = {
+    schemaVersion: ASK_WIKI_INDEX_VERSION,
+    generatedAt: new Date().toISOString(),
+    sources,
+    chunks,
+    rebuilt: true,
+  };
+
+  await ensureDir(path.dirname(indexPath));
+  await fsp.writeFile(indexPath, `${JSON.stringify(index, null, 2)}\n`);
+  return index;
+}
+
+async function readAskWikiIndex(indexPath) {
+  let raw;
+  try {
+    raw = await fsp.readFile(indexPath, "utf8");
+  } catch (_error) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(raw);
+    if (
+      parsed &&
+      parsed.schemaVersion === ASK_WIKI_INDEX_VERSION &&
+      Array.isArray(parsed.sources) &&
+      Array.isArray(parsed.chunks)
+    ) {
+      return parsed;
+    }
+  } catch (_error) {}
+  return null;
+}
+
+async function collectAskWikiIndexSources(workspace) {
+  const sources = [];
+  const addSource = async (relPath) => {
+    const normalized = normalizeRelativePath(relPath);
+    if (!normalized || !isAskWikiIndexablePath(normalized)) return;
+    let stat;
+    try {
+      stat = await fsp.stat(safeJoin(workspace, normalized));
+    } catch (_error) {
+      return;
+    }
+    if (!stat.isFile()) return;
+    sources.push({
+      path: normalized,
+      size: stat.size,
+      mtimeMs: Math.trunc(stat.mtimeMs),
+    });
+  };
+
+  for (const relPath of ["index.md", "schema.md", "log.md"]) {
+    await addSource(relPath);
+  }
+
+  const wikiRoot = path.join(workspace, "wiki");
+  if (await exists(wikiRoot)) {
+    await walkFiles(workspace, wikiRoot, async (_absolutePath, relPath, stat) => {
+      if (!stat.isFile() || !/\.md$/i.test(relPath)) return;
+      await addSource(relPath);
+    });
+  }
+
+  const sourceRoot = path.join(workspace, SOURCE_DIR);
+  if (await exists(sourceRoot)) {
+    await walkFiles(workspace, sourceRoot, async (_absolutePath, relPath, stat) => {
+      if (!stat.isFile() || !isAskWikiTextSourcePath(relPath)) return;
+      await addSource(relPath);
+    });
+  }
+
+  sources.sort((a, b) => a.path.localeCompare(b.path));
+  return sources;
+}
+
+function isAskWikiIndexablePath(relPath) {
+  const normalized = normalizeRelativePath(relPath);
+  if (!normalized) return false;
+  if (["index.md", "schema.md", "log.md"].includes(normalized)) return true;
+  if (normalized.startsWith("wiki/") && /\.md$/i.test(normalized)) return true;
+  return isAskWikiTextSourcePath(normalized);
+}
+
+function isAskWikiTextSourcePath(relPath) {
+  const normalized = normalizeRelativePath(relPath);
+  if (!normalized || !normalized.startsWith(`${SOURCE_DIR}/`)) return false;
+  return ASK_WIKI_TEXT_SOURCE_EXTENSIONS.has(path.extname(normalized).toLowerCase());
+}
+
+function isAskWikiContentPath(relPath) {
+  const normalized = normalizeRelativePath(relPath);
+  return Boolean(normalized && (normalized.startsWith("wiki/") || normalized.startsWith(`${SOURCE_DIR}/`)));
+}
+
+function normalizeAskWikiIndexContent(relPath, content) {
+  if (/\.html?$/i.test(relPath)) {
+    return htmlToPlainText(content);
+  }
+  return content;
+}
+
+function askWikiIndexSourcesMatch(left, right) {
+  if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) {
+    return false;
+  }
+  for (let index = 0; index < left.length; index += 1) {
+    if (
+      left[index]?.path !== right[index]?.path ||
+      Number(left[index]?.size) !== Number(right[index]?.size) ||
+      Number(left[index]?.mtimeMs) !== Number(right[index]?.mtimeMs)
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function chunkMarkdownForAskWikiIndex(relPath, content) {
+  const sections = splitMarkdownSectionsForAskWikiIndex(relPath, content);
+  const chunks = [];
+  let chunkIndex = 0;
+  for (const section of sections) {
+    for (const text of splitTextIntoAskWikiChunks(section.text, ASK_WIKI_INDEX_CHUNK_CHAR_LIMIT)) {
+      chunks.push({
+        id: `${relPath}#${chunkIndex + 1}`,
+        path: relPath,
+        heading: section.heading,
+        text,
+        chunkIndex,
+        charCount: text.length,
+      });
+      chunkIndex += 1;
+    }
+  }
+  return chunks;
+}
+
+function splitMarkdownSectionsForAskWikiIndex(relPath, content) {
+  const fallbackHeading = path.basename(relPath, path.extname(relPath)).replace(/[-_]+/g, " ");
+  const lines = String(content || "").replace(/\r\n/g, "\n").split("\n");
+  const sections = [];
+  let currentHeading = fallbackHeading;
+  let currentLines = [];
+
+  const flush = () => {
+    const text = currentLines.join("\n").trim();
+    if (text) {
+      sections.push({
+        heading: currentHeading,
+        text,
+      });
+    }
+    currentLines = [];
+  };
+
+  for (const line of lines) {
+    const headingMatch = /^(#{1,6})\s+(.+?)\s*#*\s*$/.exec(line.trimEnd());
+    if (headingMatch && currentLines.some((entry) => entry.trim())) {
+      flush();
+      currentHeading = cleanAskWikiHeading(headingMatch[2]) || fallbackHeading;
+      currentLines.push(line);
+      continue;
+    }
+    if (headingMatch && !currentLines.some((entry) => entry.trim())) {
+      currentHeading = cleanAskWikiHeading(headingMatch[2]) || fallbackHeading;
+    }
+    currentLines.push(line);
+  }
+  flush();
+
+  return sections.length
+    ? sections
+    : [
+        {
+          heading: fallbackHeading,
+          text: String(content || "").trim(),
+        },
+      ].filter((section) => section.text);
+}
+
+function cleanAskWikiHeading(heading) {
+  return String(heading || "")
+    .replace(/\[([^\]]+)]\([^)]+\)/g, "$1")
+    .replace(/[`*_~]/g, "")
+    .trim();
+}
+
+function splitTextIntoAskWikiChunks(text, limit) {
+  const chunks = [];
+  let current = "";
+  const flush = () => {
+    if (current.trim()) {
+      chunks.push(current.trim());
+      current = "";
+    }
+  };
+
+  for (const paragraph of String(text || "").split(/\n{2,}/)) {
+    const block = paragraph.trim();
+    if (!block) continue;
+    if (block.length > limit) {
+      flush();
+      for (let index = 0; index < block.length; index += limit) {
+        chunks.push(block.slice(index, index + limit).trim());
+      }
+      continue;
+    }
+    const next = current ? `${current}\n\n${block}` : block;
+    if (next.length > limit) {
+      flush();
+      current = block;
+    } else {
+      current = next;
+    }
+  }
+  flush();
+  return chunks;
+}
+
+function retrieveAskWikiIndexChunks(index, options = {}) {
+  const selectedPath = normalizeRelativePath(options.selectedPath || "") || "";
+  const terms = extractAskWikiQueryTerms(options.question || "");
+  const chunkLimit = options.chunkLimit || ASK_WIKI_FAST_CHUNK_LIMIT;
+  const charLimit = options.charLimit || ASK_WIKI_FAST_CONTEXT_CHAR_LIMIT;
+  const allChunks = Array.isArray(index?.chunks) ? index.chunks : [];
+  const scopedChunks = selectedPath
+    ? allChunks.filter((chunk) => chunk.path === selectedPath)
+    : allChunks;
+  const scored = scopedChunks
+    .map((chunk) => ({
+      ...chunk,
+      score: scoreAskWikiChunk(chunk, terms, selectedPath),
+    }))
+    .sort(compareAskWikiScoredChunks);
+
+  let candidates = scored.filter((chunk) => chunk.score > 0);
+  if (!candidates.length && selectedPath) {
+    candidates = scored;
+  }
+  if (!candidates.length && !selectedPath && !terms.length) {
+    candidates = fallbackAskWikiIndexChunks(scored);
+  }
+
+  const expandedCandidates = expandAskWikiRetrievedChunks(scored, candidates, {
+    hitLimit: options.hitLimit || ASK_WIKI_FAST_HIT_LIMIT,
+    neighborRadius:
+      Number.isInteger(options.neighborRadius) && options.neighborRadius >= 0
+        ? options.neighborRadius
+        : ASK_WIKI_FAST_NEIGHBOR_RADIUS,
+  });
+  const chunks = [];
+  let charCount = 0;
+  for (const chunk of expandedCandidates) {
+    if (chunks.length >= chunkLimit) break;
+    const rawText = String(chunk.text || "");
+    const text = clipText(rawText, Math.min(rawText.length, ASK_WIKI_INDEX_CHUNK_CHAR_LIMIT));
+    const nextCharCount = charCount + text.length;
+    if (chunks.length > 0 && nextCharCount > charLimit) continue;
+    chunks.push({
+      id: chunk.id,
+      path: chunk.path,
+      heading: chunk.heading,
+      text,
+      score: chunk.score,
+      retrievalRole: chunk.retrievalRole || "hit",
+      matchedChunkIndex:
+        Number.isInteger(chunk.matchedChunkIndex) && chunk.matchedChunkIndex >= 0
+          ? chunk.matchedChunkIndex
+          : chunk.chunkIndex,
+      chunkIndex: chunk.chunkIndex,
+      charCount: text.length,
+    });
+    charCount += text.length;
+  }
+
+  return {
+    mode: "keyword-index",
+    scope: selectedPath ? "selected-page" : "whole-wiki",
+    selectedPath,
+    indexPath: ASK_WIKI_INDEX_PATH,
+    queryTerms: terms,
+    totalFiles: Array.isArray(index?.sources) ? index.sources.length : 0,
+    totalChunks: allChunks.length,
+    chunkCount: chunks.length,
+    charCount,
+    hitLimit: options.hitLimit || ASK_WIKI_FAST_HIT_LIMIT,
+    neighborRadius:
+      Number.isInteger(options.neighborRadius) && options.neighborRadius >= 0
+        ? options.neighborRadius
+        : ASK_WIKI_FAST_NEIGHBOR_RADIUS,
+    chunks,
+  };
+}
+
+function expandAskWikiRetrievedChunks(scoredChunks, candidates, options = {}) {
+  const hitLimit = Math.max(1, Number(options.hitLimit) || ASK_WIKI_FAST_HIT_LIMIT);
+  const neighborRadius = Math.max(0, Number(options.neighborRadius) || 0);
+  const topHits = candidates.slice(0, hitLimit);
+  if (neighborRadius === 0 || !topHits.length) {
+    return candidates.map((chunk) => ({ ...chunk, retrievalRole: "hit" }));
+  }
+
+  const scoredByKey = new Map();
+  for (const chunk of scoredChunks) {
+    const key = askWikiChunkKey(chunk.path, chunk.chunkIndex);
+    scoredByKey.set(key, chunk);
+  }
+
+  const expanded = [];
+  const seen = new Set();
+  const addChunk = (chunk, role, matchedChunkIndex) => {
+    if (!chunk) return;
+    const key = askWikiChunkKey(chunk.path, chunk.chunkIndex);
+    if (seen.has(key)) return;
+    seen.add(key);
+    expanded.push({
+      ...chunk,
+      retrievalRole: role,
+      matchedChunkIndex,
+    });
+  };
+
+  for (const hit of topHits) {
+    addChunk(hit, "hit", hit.chunkIndex);
+    for (let distance = 1; distance <= neighborRadius; distance += 1) {
+      const before = scoredByKey.get(askWikiChunkKey(hit.path, Number(hit.chunkIndex || 0) - distance));
+      const after = scoredByKey.get(askWikiChunkKey(hit.path, Number(hit.chunkIndex || 0) + distance));
+      addChunk(before, "nearby", hit.chunkIndex);
+      addChunk(after, "nearby", hit.chunkIndex);
+    }
+  }
+
+  for (const candidate of candidates) {
+    addChunk(candidate, "hit", candidate.chunkIndex);
+  }
+  return expanded;
+}
+
+function askWikiChunkKey(relPath, chunkIndex) {
+  return `${relPath || ""}#${Number(chunkIndex || 0)}`;
+}
+
+function scoreAskWikiChunk(chunk, terms, selectedPath) {
+  const text = String(chunk.text || "").toLowerCase();
+  const heading = String(chunk.heading || "").toLowerCase();
+  const relPath = String(chunk.path || "").toLowerCase();
+  let score = selectedPath && chunk.path === selectedPath ? 12 : 0;
+  if (!terms.length) {
+    if (selectedPath && chunk.path === selectedPath) return score + 1;
+    if (chunk.path === "index.md") return 1;
+    return 0;
+  }
+
+  let matchedTerms = 0;
+  for (const term of terms) {
+    const normalized = term.toLowerCase();
+    let matched = false;
+    if (relPath.includes(normalized)) {
+      score += 5;
+      matched = true;
+    }
+    if (heading.includes(normalized)) {
+      score += 7;
+      matched = true;
+    }
+    const occurrences = countAskWikiTermOccurrences(text, normalized);
+    if (occurrences > 0) {
+      score += Math.min(occurrences, 8) * (normalized.length >= 4 ? 2 : 1);
+      matched = true;
+    }
+    if (matched) matchedTerms += 1;
+  }
+  if (matchedTerms > 1) {
+    score += matchedTerms * 2;
+  }
+  return score;
+}
+
+function countAskWikiTermOccurrences(text, term) {
+  if (!text || !term) return 0;
+  let count = 0;
+  let index = text.indexOf(term);
+  while (index !== -1) {
+    count += 1;
+    index = text.indexOf(term, index + term.length);
+  }
+  return count;
+}
+
+function compareAskWikiScoredChunks(a, b) {
+  return (
+    b.score - a.score ||
+    askWikiPathPriority(a.path) - askWikiPathPriority(b.path) ||
+    String(a.path || "").localeCompare(String(b.path || "")) ||
+    Number(a.chunkIndex || 0) - Number(b.chunkIndex || 0)
+  );
+}
+
+function fallbackAskWikiIndexChunks(scoredChunks) {
+  return scoredChunks
+    .slice()
+    .sort(
+      (a, b) =>
+        askWikiPathPriority(a.path) - askWikiPathPriority(b.path) ||
+        String(a.path || "").localeCompare(String(b.path || "")) ||
+        Number(a.chunkIndex || 0) - Number(b.chunkIndex || 0),
+    );
+}
+
+function askWikiPathPriority(relPath) {
+  if (String(relPath || "").startsWith("wiki/")) return 0;
+  if (String(relPath || "").startsWith(`${SOURCE_DIR}/`)) return 1;
+  if (relPath === "index.md") return 2;
+  if (relPath === "schema.md") return 3;
+  if (relPath === "log.md") return 4;
+  return 5;
+}
+
+function extractAskWikiQueryTerms(question) {
+  const stopwords = new Set([
+    "about",
+    "again",
+    "answer",
+    "could",
+    "explain",
+    "find",
+    "from",
+    "give",
+    "help",
+    "more",
+    "page",
+    "please",
+    "search",
+    "show",
+    "tell",
+    "that",
+    "this",
+    "what",
+    "when",
+    "where",
+    "which",
+    "whole",
+    "wiki",
+    "대해",
+    "더",
+    "뭐야",
+    "무엇",
+    "설명",
+    "알려",
+    "있는",
+    "이게",
+    "이거",
+    "찾아",
+    "찾아봐",
+    "해줘",
+  ]);
+  return Array.from(new Set(String(question || "").match(/[A-Za-z0-9가-힣]{2,}/g) || []))
+    .map((token) => token.trim())
+    .filter((token) => token.length >= 2 && !stopwords.has(token.toLowerCase()))
+    .slice(0, 12);
+}
+
+function renderAskWikiRetrievedContext(retrieval) {
+  const globalContext = Array.isArray(retrieval?.globalContext) ? retrieval.globalContext : [];
+  const chunks = Array.isArray(retrieval?.chunks) ? retrieval.chunks : [];
+  if (!chunks.length && !globalContext.length) {
+    return "Retrieved local context: no indexed wiki/source chunks were available.";
+  }
+
+  const lines = [
+    "Retrieved local context (keyword index):",
+    `- Scope: ${retrieval.scope}`,
+    `- Index: ${retrieval.indexPath}`,
+    `- Query terms: ${retrieval.queryTerms.length ? retrieval.queryTerms.join(", ") : "none"}`,
+    `- Retrieved chunks: ${retrieval.chunkCount} of ${retrieval.totalChunks}`,
+    "",
+  ];
+
+  if (globalContext.length) {
+    lines.push("Whole wiki grounding files:");
+    globalContext.forEach((block) => {
+      lines.push(`### ${block.path}`);
+      lines.push(block.text);
+      lines.push("");
+    });
+    lines.push("Retrieved wiki/source chunks:");
+    lines.push("");
+  }
+
+  chunks.forEach((chunk, index) => {
+    const heading = chunk.heading ? ` (${chunk.heading})` : "";
+    lines.push(`### Chunk ${index + 1}: ${chunk.path}${heading}`);
+    lines.push(`Score: ${chunk.score}`);
+    if (chunk.retrievalRole === "nearby") {
+      lines.push(`Nearby chunk for chunk index ${chunk.matchedChunkIndex}`);
+    }
+    lines.push(chunk.text);
+    lines.push("");
+  });
+
+  return lines.join("\n").trim();
+}
+
+function buildAskWikiRetrievalReport(context) {
+  if (!context?.enabled || !context.retrieval) {
+    return {
+      mode: "deep",
+      reason: context?.reason || "fast-path-disabled",
+    };
+  }
+
+  const retrieval = context.retrieval;
+  return {
+    mode: "keyword-index",
+    reason: context.reason,
+    indexPath: retrieval.indexPath,
+    scope: retrieval.scope,
+    selectedPath: retrieval.selectedPath,
+    queryTerms: retrieval.queryTerms,
+    totalFiles: retrieval.totalFiles,
+    totalChunks: retrieval.totalChunks,
+    chunkCount: retrieval.chunkCount,
+    charCount: retrieval.charCount,
+    globalContext: Array.isArray(retrieval.globalContext)
+      ? retrieval.globalContext.map((block) => ({
+          path: block.path,
+          charCount: block.charCount,
+        }))
+      : [],
+    hitLimit: retrieval.hitLimit,
+    neighborRadius: retrieval.neighborRadius,
+    rebuilt: Boolean(context.index?.rebuilt),
+    chunks: retrieval.chunks.map((chunk) => ({
+      path: chunk.path,
+      heading: chunk.heading,
+      score: chunk.score,
+      retrievalRole: chunk.retrievalRole,
+      matchedChunkIndex: chunk.matchedChunkIndex,
+      chunkIndex: chunk.chunkIndex,
+      charCount: chunk.charCount,
+    })),
+  };
 }
 
 async function readApplyChatPayload(workspace, options) {
@@ -7305,6 +8033,11 @@ module.exports = {
 	  sourcePathsForBuild,
 	  renderPreparedSourcesForPrompt,
 	  buildExploreChatPrompt,
+  buildFastExploreChatPrompt,
+  prepareFastExploreChatContext,
+  loadAskWikiKeywordIndex,
+  retrieveAskWikiIndexChunks,
+  buildAskWikiRetrievalReport,
   collectWikiPageImageAttachments,
   collectExploreSourceVisualContext,
   parseExplorePageReferences,

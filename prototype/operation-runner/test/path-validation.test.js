@@ -16,6 +16,7 @@ const {
   UPDATE_RULES_ALLOWED_PATHS,
   buildApplyChatPrompt,
   buildExploreChatPrompt,
+  buildFastExploreChatPrompt,
   buildMaintenancePrompt,
   buildWikiPrompt,
   calculateFullSlideBudget,
@@ -52,6 +53,9 @@ const {
   readRenderedPdfResult,
   renderPreparedSourcesForPrompt,
   renderSourceStatusForPrompt,
+  loadAskWikiKeywordIndex,
+  prepareFastExploreChatContext,
+  retrieveAskWikiIndexChunks,
   resolveOperationId,
   selectBuildWikiVisualInputs,
   sourcePathsForBuild,
@@ -2071,6 +2075,225 @@ test("Ask Wiki broad prompt uses hidden default wiki context", async (t) => {
   assert.match(prompt, /Hidden default context/);
   assert.match(prompt, /hidden default context: index\.md/);
   assert.match(prompt, /hidden default context: schema\.md/);
+});
+
+test("Ask Wiki fast path retrieves keyword chunks from the local wiki index", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "maple-fast-chat-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  await fs.mkdir(path.join(workspace, "wiki", "concepts"), { recursive: true });
+  await fs.writeFile(path.join(workspace, "index.md"), "# Index\n\n- [[Actuator Requirement Selection]]\n");
+  await fs.writeFile(path.join(workspace, "schema.md"), "# Schema\n\nAnswer from local notes.\n");
+  await fs.writeFile(
+    path.join(workspace, "wiki", "concepts", "actuator.md"),
+    [
+      "# Actuator Requirement Selection",
+      "",
+      "Requirement selection compares torque, speed, cost, and manufacturability.",
+      "Pareto-front reasoning is useful for pruning actuator candidates.",
+    ].join("\n"),
+  );
+
+  const context = await prepareFastExploreChatContext(workspace, {
+    selectedPath: "",
+    question: "액추에이터 requirement selection 설명해줘",
+    webSearch: false,
+  });
+
+  assert.equal(context.enabled, true);
+  assert.equal(context.retrieval.scope, "whole-wiki");
+  assert.equal(
+    context.retrieval.chunks.some((chunk) => chunk.path === "wiki/concepts/actuator.md"),
+    true,
+  );
+  assert.deepEqual(
+    context.retrieval.globalContext.map((block) => block.path),
+    ["schema.md", "index.md"],
+  );
+  assert.equal(await pathExists(path.join(workspace, ".aiwiki", "cache", "ask-wiki-index.json")), true);
+
+  const prompt = await buildFastExploreChatPrompt(workspace, {
+    selectedPath: "",
+    question: "액추에이터 requirement selection 설명해줘",
+    history: [],
+    retrieval: context.retrieval,
+  });
+  assert.match(prompt, /Fast local keyword index mode/);
+  assert.match(prompt, /Whole wiki grounding files/);
+  assert.match(prompt, /Answer from local notes/);
+  assert.match(prompt, /Pareto-front reasoning/);
+  assert.match(prompt, /Retrieved local context \(keyword index\)/);
+});
+
+test("Ask Wiki fast path expands neighboring chunks around keyword hits", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "maple-fast-neighbor-chat-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  await fs.mkdir(path.join(workspace, "wiki", "concepts"), { recursive: true });
+  await fs.writeFile(path.join(workspace, "index.md"), "# Index\n\n- [[Drive Notes]]\n");
+  await fs.writeFile(path.join(workspace, "schema.md"), "# Schema\n\nAnswer from local notes.\n");
+  await fs.writeFile(
+    path.join(workspace, "wiki", "concepts", "drive.md"),
+    [
+      "# Before",
+      "",
+      "Neighbor before context explains the motor sizing assumptions.",
+      "",
+      "# Target",
+      "",
+      "The azimuth controller uses a staged torque envelope for stable motion.",
+      "",
+      "# After",
+      "",
+      "Neighbor after context explains the thermal derating consequence.",
+    ].join("\n"),
+  );
+
+  const index = await loadAskWikiKeywordIndex(workspace);
+  const retrieval = retrieveAskWikiIndexChunks(index, {
+    selectedPath: "",
+    question: "azimuth controller 설명해줘",
+  });
+  const retrievedText = retrieval.chunks.map((chunk) => chunk.text).join("\n");
+
+  assert.match(retrievedText, /staged torque envelope/);
+  assert.match(retrievedText, /Neighbor before context/);
+  assert.match(retrievedText, /Neighbor after context/);
+  assert.equal(
+    retrieval.chunks.some((chunk) => chunk.retrievalRole === "nearby"),
+    true,
+  );
+});
+
+test("Ask Wiki fast path retrieves real text from readable source files", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "maple-fast-source-chat-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  await fs.mkdir(path.join(workspace, "sources", "notes"), { recursive: true });
+  await fs.writeFile(path.join(workspace, "index.md"), "# Index\n\n- [[Motor Notes]]\n");
+  await fs.writeFile(path.join(workspace, "schema.md"), "# Schema\n\nAnswer from local notes.\n");
+  await fs.writeFile(
+    path.join(workspace, "sources", "notes", "motor-current-control.txt"),
+    [
+      "Motor current control lecture notes.",
+      "",
+      "The PI loop needs feedforward voltage terms and anti-windup near voltage saturation.",
+    ].join("\n"),
+  );
+
+  const context = await prepareFastExploreChatContext(workspace, {
+    selectedPath: "",
+    question: "current control feedforward anti-windup 설명해줘",
+    webSearch: false,
+  });
+
+  assert.equal(context.enabled, true);
+  assert.equal(
+    context.retrieval.chunks.some(
+      (chunk) =>
+        chunk.path === "sources/notes/motor-current-control.txt" &&
+        chunk.text.includes("feedforward voltage terms"),
+    ),
+    true,
+  );
+});
+
+test("Ask Wiki fast path defers when keyword retrieval has no real hit", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "maple-fast-miss-chat-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  await fs.mkdir(path.join(workspace, "wiki", "concepts"), { recursive: true });
+  await fs.writeFile(path.join(workspace, "index.md"), "# Index\n\n- [[Actuator Notes]]\n");
+  await fs.writeFile(path.join(workspace, "schema.md"), "# Schema\n\nAnswer from local notes.\n");
+  await fs.writeFile(path.join(workspace, "wiki", "concepts", "actuator.md"), "# Actuator\n\nTorque notes.\n");
+
+  const context = await prepareFastExploreChatContext(workspace, {
+    selectedPath: "",
+    question: "unmatched zirconium archive details",
+    webSearch: false,
+  });
+
+  assert.equal(context.enabled, false);
+  assert.equal(context.reason, "no-indexed-wiki-context");
+});
+
+test("Ask Wiki fast path defers when retrieval only found the catalog", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "maple-fast-catalog-chat-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  await fs.mkdir(path.join(workspace, "wiki", "concepts"), { recursive: true });
+  await fs.writeFile(
+    path.join(workspace, "index.md"),
+    "# Index\n\n- document-archive-details - one-line catalog entry only\n",
+  );
+  await fs.writeFile(path.join(workspace, "schema.md"), "# Schema\n\nAnswer from local notes.\n");
+  await fs.writeFile(path.join(workspace, "wiki", "concepts", "actuator.md"), "# Actuator\n\nTorque notes.\n");
+
+  const context = await prepareFastExploreChatContext(workspace, {
+    selectedPath: "",
+    question: "document archive details 정확한 내용 설명해줘",
+    webSearch: false,
+  });
+
+  assert.equal(context.enabled, false);
+  assert.equal(context.reason, "no-indexed-wiki-content");
+});
+
+test("Ask Wiki fast path stays inside the selected wiki page scope", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "maple-fast-selected-chat-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  await fs.mkdir(path.join(workspace, "wiki", "concepts"), { recursive: true });
+  await fs.writeFile(path.join(workspace, "index.md"), "# Index\n");
+  await fs.writeFile(
+    path.join(workspace, "wiki", "concepts", "motors.md"),
+    "# Motors\n\nMotor notes mention torque and duty cycle.\n",
+  );
+  await fs.writeFile(
+    path.join(workspace, "wiki", "concepts", "sensors.md"),
+    "# Sensors\n\nSensor notes mention torque only as a calibration disturbance.\n",
+  );
+
+  const index = await loadAskWikiKeywordIndex(workspace);
+  const retrieval = retrieveAskWikiIndexChunks(index, {
+    selectedPath: "wiki/concepts/motors.md",
+    question: "torque 정리해줘",
+  });
+
+  assert.equal(retrieval.scope, "selected-page");
+  assert.equal(retrieval.chunks.length > 0, true);
+  assert.deepEqual(
+    Array.from(new Set(retrieval.chunks.map((chunk) => chunk.path))),
+    ["wiki/concepts/motors.md"],
+  );
+});
+
+test("Ask Wiki fast path defers to deep mode for web, source, and visual questions", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "maple-fast-disabled-chat-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  await fs.mkdir(path.join(workspace, "wiki", "concepts"), { recursive: true });
+  await fs.mkdir(path.join(workspace, "sources"), { recursive: true });
+  await fs.writeFile(path.join(workspace, "wiki", "concepts", "robotics.md"), "# Robotics\n\nRobot notes.\n");
+  await fs.writeFile(path.join(workspace, "sources", "deck.pdf"), "placeholder\n");
+
+  assert.equal(
+    (await prepareFastExploreChatContext(workspace, {
+      selectedPath: "",
+      question: "latest robotics news",
+      webSearch: true,
+    })).reason,
+    "web-search-enabled",
+  );
+  assert.equal(
+    (await prepareFastExploreChatContext(workspace, {
+      selectedPath: "sources/deck.pdf",
+      question: "summarize",
+      webSearch: false,
+    })).reason,
+    "selected-source",
+  );
+  assert.equal(
+    (await prepareFastExploreChatContext(workspace, {
+      selectedPath: "wiki/concepts/robotics.md",
+      question: "이 그림 설명해줘",
+      webSearch: false,
+    })).reason,
+    "visual-or-page-question",
+  );
 });
 
 test("Ask Wiki web prompt requires local-first URL citations", async (t) => {

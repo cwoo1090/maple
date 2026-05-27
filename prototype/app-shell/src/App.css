@@ -6337,6 +6337,120 @@ button.tree-name-clickable {
   background: transparent;
 }
 
+.wiki-document .markdown-mermaid,
+.markdown-edit-preview .markdown-mermaid {
+  overflow-x: auto;
+  margin: 0.9rem 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 14px 16px;
+  background: #f5f2e9;
+  color: var(--text);
+  text-align: left;
+}
+
+.wiki-document .markdown-mermaid svg,
+.markdown-edit-preview .markdown-mermaid svg {
+  display: block;
+  height: auto;
+  max-width: none;
+  margin: 0;
+}
+
+.wiki-document .markdown-mermaid-inline,
+.markdown-edit-preview .markdown-mermaid-inline {
+  cursor: zoom-in;
+  transition:
+    border-color 140ms ease,
+    background 140ms ease;
+}
+
+.wiki-document .markdown-mermaid-inline:hover,
+.markdown-edit-preview .markdown-mermaid-inline:hover {
+  border-color: var(--accent-border);
+  background: #faf8ef;
+}
+
+.wiki-document .markdown-mermaid-inline:focus-visible,
+.markdown-edit-preview .markdown-mermaid-inline:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+
+.mermaid-modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 130;
+  display: grid;
+  place-items: center;
+  padding: 28px;
+  background: rgba(31, 26, 18, 0.48);
+  backdrop-filter: blur(7px);
+}
+
+.mermaid-modal {
+  width: min(1400px, 96vw);
+  height: min(900px, 86vh);
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 12px;
+  padding: 16px;
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  background: var(--bg-elevated);
+  color: var(--text);
+  box-shadow: 0 24px 80px rgba(31, 26, 18, 0.3);
+}
+
+.mermaid-modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.mermaid-modal-header h2 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 650;
+}
+
+.mermaid-modal-close {
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 1px solid var(--border-strong);
+  border-radius: 7px;
+  background: var(--bg);
+  color: var(--text-muted);
+}
+
+.mermaid-modal-close:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.wiki-document .mermaid-modal-diagram,
+.markdown-edit-preview .mermaid-modal-diagram {
+  min-height: 0;
+  height: 100%;
+  margin: 0;
+  padding: 18px;
+}
+
+.wiki-document .markdown-mermaid[data-mermaid-state="error"],
+.markdown-edit-preview .markdown-mermaid[data-mermaid-state="error"] {
+  white-space: pre;
+  text-align: left;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  font-size: 0.88em;
+  color: var(--danger);
+  background: #fff7f4;
+}
+
 .wiki-document blockquote {
   border-left: 3px solid var(--accent);
   padding-left: 14px;

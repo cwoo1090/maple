@@ -4,6 +4,7 @@ import {
   Fragment,
   isValidElement,
   useEffect,
+  useId,
   useLayoutEffect,
   useMemo,
   useRef,
@@ -74,6 +75,16 @@ import { setAnalyticsContext, track } from "./analytics";
 import { translate, useI18n, type UiLanguage } from "./i18n";
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
+
+type MermaidApi = typeof import("mermaid").default;
+
+let mermaidInstance: MermaidApi | null = null;
+
+const MIN_READABLE_MERMAID_NODE_WIDTH = 220;
+const MIN_READABLE_MERMAID_CHAIN_WIDTH = 1000;
+const MAX_READABLE_MERMAID_CHAIN_WIDTH = 5000;
+const MERMAID_FONT_SIZE = 16;
+const MERMAID_MODAL_SCALE = 1.45;
 
 type ChangedFile = {
   path: string;
@@ -1069,6 +1080,15 @@ function writeSeenThreadMap(
 
 function isMissingChatThreadError(error: unknown): boolean {
   return /Failed to read chat thread .*(No such file|os error 2)/i.test(String(error));
+}
+
+function makeOptimisticChatId(prefix: string): string {
+  return `${prefix}-optimistic-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function optimisticChatTitle(question: string): string {
+  const characters = Array.from(question);
+  return characters.length > 40 ? `${characters.slice(0, 40).join("")}...` : question;
 }
 
 function displayProviderName(provider: ProviderInfo): string {
@@ -2670,14 +2690,16 @@ function App() {
     return language === "ko"
       ? [
           "맥락 준비 중",
-          "선택한 페이지 읽는 중",
+          "위키 색인 검색 중",
+          "선택한 페이지 확인 중",
           "최근 채팅 확인 중",
           `${providerName}에 질문 중`,
           "답변 작성 중",
         ]
       : [
           "Preparing context",
-          "Reading selected page",
+          "Searching wiki index",
+          "Checking selected page",
           "Checking recent chat",
           `Asking ${providerName}`,
           "Writing answer",
@@ -5368,6 +5390,42 @@ function App() {
       askWikiContextScope === "current" && contextPath !== selectedPath;
     setBusy("Starting Ask Wiki");
     setError(null);
+    const optimisticCreatedAt = new Date().toISOString();
+    const optimisticUserMessageId = makeOptimisticChatId("msg");
+    const optimisticUserMessage: ExploreChatMessage = {
+      id: optimisticUserMessageId,
+      role: "user",
+      text: question,
+      contextPath: contextPath || undefined,
+      provider: activeProvider?.name,
+      model: activeModelId || undefined,
+      reasoningEffort: activeReasoningEffort || undefined,
+      webSearchEnabled: exploreWebSearchEnabled,
+      status: "completed",
+      createdAt: optimisticCreatedAt,
+      completedAt: optimisticCreatedAt,
+    };
+    setExploreQuestion("");
+    setChatThread((current) => {
+      const baseThread = current ?? chatThread;
+      const messages = [...(baseThread?.messages ?? []), optimisticUserMessage];
+      return {
+        schemaVersion: baseThread?.schemaVersion ?? 1,
+        id: baseThread?.id ?? makeOptimisticChatId("thread"),
+        title:
+          baseThread && baseThread.messages.length > 0
+            ? baseThread.title
+            : optimisticChatTitle(question),
+        createdAt: baseThread?.createdAt ?? optimisticCreatedAt,
+        updatedAt: optimisticCreatedAt,
+        initialContextPath: baseThread?.initialContextPath ?? (contextPath || null),
+        operationType: baseThread?.operationType ?? null,
+        operationId: baseThread?.operationId ?? null,
+        draftOperationType: baseThread?.draftOperationType ?? null,
+        changedFiles: baseThread?.changedFiles ?? [],
+        messages,
+      };
+    });
     const exploreQuestionProperties = {
       question_length: question.length,
       selected_path_present: Boolean(contextPath),
@@ -5379,6 +5437,34 @@ function App() {
     };
     track("explore question submitted", exploreQuestionProperties);
 
+    let startReturnedThread = false;
+    const showOptimisticFailure = (err: unknown) => {
+      const failedAt = new Date().toISOString();
+      const failedMessage: ExploreChatMessage = {
+        id: makeOptimisticChatId("msg"),
+        role: "assistant",
+        text: String(err),
+        contextPath: contextPath || undefined,
+        provider: activeProvider?.name,
+        model: activeModelId || undefined,
+        reasoningEffort: activeReasoningEffort || undefined,
+        webSearchEnabled: exploreWebSearchEnabled,
+        status: "failed",
+        createdAt: failedAt,
+        completedAt: failedAt,
+      };
+      setChatThread((current) => {
+        if (!current?.messages.some((message) => message.id === optimisticUserMessageId)) {
+          return current;
+        }
+        return {
+          ...current,
+          updatedAt: failedAt,
+          messages: [...current.messages, failedMessage],
+        };
+      });
+    };
+
     try {
       const thread = await invoke<ChatThread>("start_explore_chat", {
         threadId: chatThread?.id ?? null,
@@ -5386,7 +5472,7 @@ function App() {
         selectedPath: contextPath,
         webSearchEnabled: exploreWebSearchEnabled,
       });
-      setExploreQuestion("");
+      startReturnedThread = true;
       setChatThread(thread);
       markChatThreadSeen(thread);
       await refreshChatHistorySummaries();
@@ -5402,6 +5488,7 @@ function App() {
           result: "failed",
           error_kind: errorKindFromText(String(err)),
         });
+        if (!startReturnedThread) showOptimisticFailure(err);
         setError(String(err));
         return false;
       }
@@ -5416,7 +5503,7 @@ function App() {
           selectedPath: contextPath,
           webSearchEnabled: exploreWebSearchEnabled,
         });
-        setExploreQuestion("");
+        startReturnedThread = true;
         setChatThread(thread);
         markChatThreadSeen(thread);
         setApplyDraft(null);
@@ -5437,6 +5524,7 @@ function App() {
           error_kind: errorKindFromText(String(retryErr)),
           recovered_thread: false,
         });
+        if (!startReturnedThread) showOptimisticFailure(retryErr);
         setError(String(retryErr));
         return false;
       }
@@ -7788,7 +7876,7 @@ function App() {
                   {currentWikiUpdateRun && wikiUpdateInsertIndex === -1
                     ? wikiUpdateRunBlock
                     : null}
-                  {isAskingWiki ? (
+                  {exploreBusy ? (
                     <div className="chat-thinking" aria-live="polite">
                       {chatRunningLabel}
                     </div>
@@ -10312,6 +10400,222 @@ const MarkdownCalloutBlockquote: Components["blockquote"] = ({ children, classNa
   );
 };
 
+const MarkdownPreBlock: Components["pre"] = ({ children, ...props }) => {
+  const mermaidSource = extractMermaidCodeBlock(children);
+  if (mermaidSource !== null) {
+    return <MarkdownMermaidDiagram chart={mermaidSource} />;
+  }
+
+  return <pre {...props}>{children}</pre>;
+};
+
+function MarkdownMermaidDiagram({ chart }: { chart: string }) {
+  const [expanded, setExpanded] = useState(false);
+
+  useEffect(() => {
+    if (!expanded) return;
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setExpanded(false);
+      }
+    };
+
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [expanded]);
+
+  return (
+    <>
+      <MermaidDiagramSurface
+        chart={chart}
+        className="markdown-mermaid markdown-mermaid-inline"
+        interactive
+        onClick={() => setExpanded(true)}
+      />
+      {expanded ? (
+        <div
+          className="mermaid-modal-overlay"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Expanded Mermaid diagram"
+          onMouseDown={() => setExpanded(false)}
+        >
+          <div className="mermaid-modal" onMouseDown={(event) => event.stopPropagation()}>
+            <header className="mermaid-modal-header">
+              <h2>Diagram</h2>
+              <button
+                type="button"
+                className="mermaid-modal-close"
+                aria-label="Close expanded diagram"
+                onClick={() => setExpanded(false)}
+              >
+                <X size={16} aria-hidden="true" />
+              </button>
+            </header>
+            <MermaidDiagramSurface
+              chart={chart}
+              className="markdown-mermaid mermaid-modal-diagram"
+              scale={MERMAID_MODAL_SCALE}
+            />
+          </div>
+        </div>
+      ) : null}
+    </>
+  );
+}
+
+function MermaidDiagramSurface({
+  chart,
+  className,
+  interactive = false,
+  scale = 1,
+  onClick,
+}: {
+  chart: string;
+  className: string;
+  interactive?: boolean;
+  scale?: number;
+  onClick?: () => void;
+}) {
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const diagramId = useId().replace(/:/g, "");
+
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+
+    let cancelled = false;
+    container.dataset.mermaidState = "pending";
+    container.removeAttribute("data-processed");
+    container.textContent = chart;
+
+    getMermaid()
+      .then((mermaid) => mermaid.run({ nodes: [container] }))
+      .then(() => {
+        if (cancelled) return;
+        sizeReadableMermaidSvg(container, chart, scale);
+        container.dataset.mermaidState = "rendered";
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        console.error("Failed to render Mermaid diagram", error);
+        container.dataset.mermaidState = "error";
+        container.textContent = chart;
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [chart, scale]);
+
+  return (
+    <div
+      ref={containerRef}
+      className={className}
+      data-mermaid-id={diagramId}
+      data-mermaid-state="pending"
+      role={interactive ? "button" : undefined}
+      tabIndex={interactive ? 0 : undefined}
+      aria-label={interactive ? "Open expanded Mermaid diagram" : undefined}
+      onClick={interactive ? onClick : undefined}
+      onKeyDown={
+        interactive
+          ? (event) => {
+              if (event.key === "Enter" || event.key === " ") {
+                event.preventDefault();
+                onClick?.();
+              }
+            }
+          : undefined
+      }
+    >
+      {chart}
+    </div>
+  );
+}
+
+function extractMermaidCodeBlock(children: ReactNode): string | null {
+  const childNodes = Children.toArray(children);
+  if (childNodes.length !== 1) return null;
+
+  const child = childNodes[0];
+  if (!isValidElement<{ className?: string; children?: ReactNode }>(child)) return null;
+  if (!/\blanguage-mermaid\b/i.test(child.props.className ?? "")) return null;
+
+  return renderedLinkLabel(child.props.children).trim();
+}
+
+function sizeReadableMermaidSvg(container: HTMLElement, chart: string, scale: number) {
+  const svg = container.querySelector("svg");
+  const viewBox = svg?.getAttribute("viewBox");
+  if (!svg || !viewBox) return;
+
+  const [, , rawWidth, rawHeight] = viewBox.split(/\s+/).map(Number);
+  if (!Number.isFinite(rawWidth) || !Number.isFinite(rawHeight) || rawWidth <= 0 || rawHeight <= 0) {
+    return;
+  }
+
+  const readableWidth = estimateReadableMermaidWidth(chart);
+  const targetWidth = Math.max(rawWidth, readableWidth) * scale;
+
+  svg.style.width = `${Math.ceil(targetWidth)}px`;
+  svg.style.height = `${Math.ceil(rawHeight * (targetWidth / rawWidth))}px`;
+  svg.style.maxWidth = "none";
+  svg.removeAttribute("width");
+  svg.removeAttribute("height");
+}
+
+function estimateReadableMermaidWidth(chart: string) {
+  const direction = chart.match(/^\s*(?:flowchart|graph)\s+(LR|RL)\b/im);
+  if (!direction) return 0;
+
+  const nodes = new Set<string>();
+  for (const match of chart.matchAll(/(?:^|[\s;])([A-Za-z][\w-]*)\s*(?=\[|\(|\{)/gm)) {
+    nodes.add(match[1]);
+  }
+
+  if (nodes.size < 2) return 0;
+
+  return Math.min(
+    Math.max(nodes.size * MIN_READABLE_MERMAID_NODE_WIDTH, MIN_READABLE_MERMAID_CHAIN_WIDTH),
+    MAX_READABLE_MERMAID_CHAIN_WIDTH,
+  );
+}
+
+async function getMermaid() {
+  if (!mermaidInstance) {
+    const module = await import("mermaid");
+    mermaidInstance = module.default;
+    mermaidInstance.initialize({
+      startOnLoad: false,
+      securityLevel: "strict",
+      htmlLabels: true,
+      fontSize: MERMAID_FONT_SIZE,
+      flowchart: {
+        useMaxWidth: false,
+        diagramPadding: 16,
+        nodeSpacing: 50,
+        rankSpacing: 80,
+        wrappingWidth: 170,
+      },
+      theme: "base",
+      themeVariables: {
+        background: "#fbfaf5",
+        fontSize: `${MERMAID_FONT_SIZE}px`,
+        primaryColor: "#edf3ff",
+        primaryBorderColor: "#5673b9",
+        primaryTextColor: "#2b261e",
+        lineColor: "#6f6a5d",
+        fontFamily:
+          'Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+      },
+    });
+  }
+
+  return mermaidInstance;
+}
+
 function extractMarkdownCallout(
   children: ReactNode,
 ): { type: string; title: string | null; children: ReactNode } | null {
@@ -10385,6 +10689,76 @@ function renderedLinkLabel(node: ReactNode): string {
   return "";
 }
 
+function renderInlineWikiLinkToken(
+  raw: string,
+  options: {
+    currentPath: string;
+    availableDocuments: string[];
+    workspacePath: string;
+    onOpenDocument: (path: string, anchor?: string | null) => void;
+    editLinks?: boolean;
+    onEditLink?: (link: { href: string; label: string }) => void;
+  },
+): ReactNode | null {
+  const wikiLink = parseInlineWikiLinkToken(raw);
+  if (!wikiLink) return null;
+
+  const target = resolveWorkspaceDocumentReference(
+    wikiLink.target,
+    options.currentPath,
+    options.availableDocuments,
+    options.workspacePath,
+  );
+  if (target) {
+    const href = `${target.path}${target.anchor ? `#${target.anchor}` : ""}`;
+    return (
+      <a
+        href={href}
+        className={options.editLinks ? "markdown-edit-link" : undefined}
+        title={
+          options.editLinks
+            ? "Click to edit this section. Cmd-click to open the page."
+            : target.path
+        }
+        onClick={(event) => {
+          event.preventDefault();
+          if (options.editLinks && !event.metaKey && !event.ctrlKey) {
+            event.stopPropagation();
+            options.onEditLink?.({ href: wikiLink.target, label: wikiLink.label });
+            return;
+          }
+          options.onOpenDocument(target.path, target.anchor);
+        }}
+      >
+        {wikiLink.label}
+      </a>
+    );
+  }
+
+  return (
+    <span
+      role={options.editLinks ? "button" : undefined}
+      tabIndex={options.editLinks ? 0 : undefined}
+      className="broken-wikilink"
+      title={
+        options.editLinks
+          ? "Click to edit this link."
+          : `No page named "${wikiLink.target}" yet`
+      }
+      onClick={
+        options.editLinks
+          ? (event) => {
+              event.stopPropagation();
+              options.onEditLink?.({ href: wikiLink.target, label: wikiLink.label });
+            }
+          : undefined
+      }
+    >
+      {wikiLink.label}
+    </span>
+  );
+}
+
 function WorkspaceAwareMarkdown({
   content,
   currentPath,
@@ -10405,6 +10779,26 @@ function WorkspaceAwareMarkdown({
   const renderedContent = normalizeMarkdownForDisplay(content, currentPath, availableDocuments);
   const components: Components = {
     blockquote: MarkdownCalloutBlockquote,
+    pre: MarkdownPreBlock,
+    code({ children, className, node: _node, ...props }) {
+      if (!className) {
+        const wikiLink = renderInlineWikiLinkToken(renderedLinkLabel(children), {
+          currentPath,
+          availableDocuments,
+          workspacePath,
+          onOpenDocument,
+          editLinks,
+          onEditLink,
+        });
+        if (wikiLink) return wikiLink;
+      }
+
+      return (
+        <code {...props} className={className}>
+          {children}
+        </code>
+      );
+    },
     a({ href, children, ...props }) {
       if (href?.startsWith("aiwiki-broken://")) {
         const target = decodeURIComponent(href.slice("aiwiki-broken://".length));
@@ -10592,6 +10986,24 @@ function MarkdownDocument({
 
   const components: Components = {
     blockquote: MarkdownCalloutBlockquote,
+    pre: MarkdownPreBlock,
+    code({ children, className, node: _node, ...props }) {
+      if (!className) {
+        const wikiLink = renderInlineWikiLinkToken(renderedLinkLabel(children), {
+          currentPath,
+          availableDocuments,
+          workspacePath,
+          onOpenDocument,
+        });
+        if (wikiLink) return wikiLink;
+      }
+
+      return (
+        <code {...props} className={className}>
+          {children}
+        </code>
+      );
+    },
     a({ href, children, ...props }) {
       if (href?.startsWith("aiwiki-broken://")) {
         const target = decodeURIComponent(href.slice("aiwiki-broken://".length));
@@ -12725,7 +13137,9 @@ function normalizeMarkdownForDisplay(
   return transformMarkdownOutsideCode(content, (segment) =>
     convertWikiLinks(
       normalizeLooseMarkdownLinkDestinations(
-        convertEscapedMathDelimiters(convertMarkdownDirectiveCallouts(segment)),
+        convertEscapedMathDelimiters(
+          normalizeEscapedWikiLinkDelimiters(convertMarkdownDirectiveCallouts(segment)),
+        ),
       ),
       currentPath,
       availableDocuments,
@@ -12907,6 +13321,31 @@ function convertWikiLinks(
 
     return `[${escapeMarkdownLinkLabel(label || resolvedPath)}](${formatMarkdownLinkDestination(resolvedPath)})`;
   });
+}
+
+function normalizeEscapedWikiLinkDelimiters(content: string) {
+  return content.replace(/\\?\[\\?\[([^\]\n]+?)\\?\]\\?\]/g, (_match, body: string) => {
+    return `[[${body}]]`;
+  });
+}
+
+function parseInlineWikiLinkToken(raw: string): { target: string; label: string } | null {
+  const normalized = raw.trim().replace(/\\([\[\]|])/g, "$1");
+  if (!normalized || normalized.includes("\n")) return null;
+
+  const match = normalized.match(/^\[\[([^\]\n]+?)\]\]$/);
+  if (!match) return null;
+
+  const body = match[1];
+  const divider = body.indexOf("|");
+  const target = divider === -1 ? body.trim() : body.slice(0, divider).trim();
+  if (!target) return null;
+
+  const label = divider === -1 ? humanizeWikiLinkLabel(target) : body.slice(divider + 1).trim();
+  return {
+    target,
+    label: label || humanizeWikiLinkLabel(target),
+  };
 }
 
 function transformMarkdownOutsideCode(
