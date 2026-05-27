@@ -2742,7 +2742,7 @@ function normalizeChatMarkdown(markdown) {
 }
 
 function normalizeKoreanPostpositionEmphasis(segment) {
-  return segment.replace(/\\?\*\\?\*([^*\n]+?)\\?\*\\?\*(?=[가-힣])/g, (_match, content) => {
+  return segment.replace(/\\?\*\\?\*([^*]+?)\\?\*\\?\*(?=[가-힣])/g, (_match, content) => {
     return `<strong>${escapeHtml(content)}</strong>`;
   });
 }

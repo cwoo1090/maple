@@ -231,27 +231,49 @@ async function answerWithGemini({
     throw httpError(503, "Chat is not configured yet. Set GEMINI_API_KEY in local env or on the Vercel project.");
   }
 
-  const agentResult = await runReadOnlyWikiAgent({
-    apiKey,
-    model,
-    data,
-    question,
-    initialContext: context,
-    initialChunks: chunks,
-    history,
-    scope,
-    selectedPage,
-    images,
-    webSearch,
-  });
+  let lastCapacityError = null;
+  const modelsToTry = geminiModelFallbackOrder(model);
 
-  return {
-    answer: agentResult.answer,
-    references: agentResult.webReferences,
-    localReferences: agentResult.localReferences,
-    model,
-    webSearch,
-  };
+  for (let index = 0; index < modelsToTry.length; index += 1) {
+    const candidateModel = modelsToTry[index];
+    try {
+      const agentResult = await runReadOnlyWikiAgent({
+        apiKey,
+        model: candidateModel,
+        data,
+        question,
+        initialContext: context,
+        initialChunks: chunks,
+        history,
+        scope,
+        selectedPage,
+        images,
+        webSearch,
+      });
+
+      return {
+        answer: agentResult.answer,
+        references: agentResult.webReferences,
+        localReferences: agentResult.localReferences,
+        model: candidateModel,
+        webSearch,
+      };
+    } catch (error) {
+      if (!isGeminiCapacityError(error) || index === modelsToTry.length - 1) {
+        if (isGeminiCapacityError(error) && lastCapacityError) {
+          throw httpError(503, "Gemini is temporarily busy across the available chat models. Please try again shortly.");
+        }
+        throw error;
+      }
+
+      lastCapacityError = error;
+      console.warn(
+        `Gemini model ${candidateModel} is temporarily busy; retrying with ${modelsToTry[index + 1]}.`,
+      );
+    }
+  }
+
+  throw lastCapacityError || httpError(502, "Gemini request failed.");
 }
 
 async function runReadOnlyWikiAgent({
@@ -403,10 +425,37 @@ async function callGeminiPayload({
 
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
-    throw httpError(502, payload.error?.message || "Gemini request failed.");
+    const error = httpError(geminiHttpStatus(response.status), payload.error?.message || "Gemini request failed.");
+    error.geminiStatusCode = response.status;
+    error.geminiStatus = payload.error?.status || "";
+    error.geminiModel = model;
+    throw error;
   }
 
   return payload;
+}
+
+function geminiModelFallbackOrder(model) {
+  const primary = cleanEnv(model);
+  const models = [primary, ...chatModelOptions()].filter(isGeminiModel);
+  return [...new Set(models)];
+}
+
+function geminiHttpStatus(statusCode) {
+  return statusCode === 429 || statusCode >= 500 ? 503 : 502;
+}
+
+function isGeminiCapacityError(error) {
+  const statusCode = Number(error?.geminiStatusCode || error?.statusCode);
+  const status = cleanEnv(error?.geminiStatus);
+  const message = cleanEnv(error?.message);
+  return (
+    statusCode === 429 ||
+    statusCode === 503 ||
+    status === "RESOURCE_EXHAUSTED" ||
+    status === "UNAVAILABLE" ||
+    /high demand|overload|temporarily|try again later|resource exhausted|unavailable/i.test(message)
+  );
 }
 
 function buildGeminiParts({

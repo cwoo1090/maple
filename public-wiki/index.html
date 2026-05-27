@@ -9,10 +9,105 @@
       content="A published Maple wiki for robot hardware study."
     />
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="preload" href="/data/snapshot.json" as="fetch" crossorigin />
     <title>Robot Hardware Wiki</title>
+    <style>
+      :root {
+        color-scheme: light;
+        font-family:
+          -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI",
+          system-ui, sans-serif;
+        color: #1f1a12;
+        background: #fbfaf6;
+      }
+
+      body {
+        margin: 0;
+        min-width: 320px;
+        min-height: 100vh;
+        background: #fbfaf6;
+      }
+
+      .initial-loading {
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        padding: 32px;
+        background:
+          linear-gradient(180deg, #ffffff 0, rgba(255, 255, 255, 0) 360px),
+          #f8f8f4;
+      }
+
+      .initial-loading-inner {
+        width: min(420px, 100%);
+      }
+
+      .initial-loading-title {
+        margin: 0 0 18px;
+        font-size: 18px;
+        font-weight: 760;
+        letter-spacing: 0;
+      }
+
+      .initial-loading-lines {
+        display: grid;
+        gap: 10px;
+      }
+
+      .initial-loading-line {
+        height: 12px;
+        border-radius: 999px;
+        background:
+          linear-gradient(100deg, #ede9dc 0%, #ffffff 42%, #e5e0d2 72%),
+          #ede9dc;
+        background-size: 220% 100%;
+        animation: initial-loading-shimmer 1.6s ease-in-out infinite;
+      }
+
+      .initial-loading-line:nth-child(1) {
+        width: 82%;
+      }
+
+      .initial-loading-line:nth-child(2) {
+        width: 100%;
+        animation-delay: 0.08s;
+      }
+
+      .initial-loading-line:nth-child(3) {
+        width: 58%;
+        animation-delay: 0.16s;
+      }
+
+      @keyframes initial-loading-shimmer {
+        0% {
+          background-position: 120% 0;
+        }
+
+        100% {
+          background-position: -120% 0;
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .initial-loading-line {
+          animation: none;
+        }
+      }
+    </style>
   </head>
   <body>
-    <div id="app"></div>
+    <div id="app">
+      <main class="initial-loading" role="status" aria-live="polite" aria-label="Loading wiki">
+        <div class="initial-loading-inner">
+          <p class="initial-loading-title">Robot Hardware Wiki</p>
+          <div class="initial-loading-lines" aria-hidden="true">
+            <div class="initial-loading-line"></div>
+            <div class="initial-loading-line"></div>
+            <div class="initial-loading-line"></div>
+          </div>
+        </div>
+      </main>
+    </div>
     <script type="module" src="/src/main.js"></script>
   </body>
 </html>
