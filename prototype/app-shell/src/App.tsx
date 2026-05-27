@@ -1534,12 +1534,25 @@ function exploreContextPathForQuestion(
   return questionReferencesRecentSource(question) ? lastImportedSourcePath : selectedPath;
 }
 
+const CHAT_AUTO_SCROLL_BOTTOM_THRESHOLD_PX = 96;
+
+function isNearScrollBottom(element: HTMLElement) {
+  return (
+    element.scrollHeight - element.scrollTop - element.clientHeight <=
+    CHAT_AUTO_SCROLL_BOTTOM_THRESHOLD_PX
+  );
+}
+
 function App() {
   const { t, language, setLanguage } = useI18n();
   const appBodyRef = useRef<HTMLDivElement | null>(null);
   const exploreChatMessagesRef = useRef<HTMLDivElement | null>(null);
+  const exploreChatStickToBottomRef = useRef(true);
+  const exploreChatAutoScrollThreadIdRef = useRef<string | null>(null);
   const exploreChatInputRef = useRef<HTMLTextAreaElement | null>(null);
   const maintainChatMessagesRef = useRef<HTMLDivElement | null>(null);
+  const maintainChatStickToBottomRef = useRef(true);
+  const maintainChatAutoScrollThreadIdRef = useRef<string | null>(null);
   const mapleGuideMessagesRef = useRef<HTMLDivElement | null>(null);
   const topbarWorkspaceMenuRef = useRef<HTMLDetailsElement | null>(null);
   const topbarMenuRef = useRef<HTMLDetailsElement | null>(null);
@@ -1556,6 +1569,16 @@ function App() {
     setError((current) =>
       current && prefixes.some((prefix) => current.startsWith(prefix)) ? null : current,
     );
+  }
+  function updateExploreChatStickToBottom() {
+    const messagesEl = exploreChatMessagesRef.current;
+    if (!messagesEl) return;
+    exploreChatStickToBottomRef.current = isNearScrollBottom(messagesEl);
+  }
+  function updateMaintainChatStickToBottom() {
+    const messagesEl = maintainChatMessagesRef.current;
+    if (!messagesEl) return;
+    maintainChatStickToBottomRef.current = isNearScrollBottom(messagesEl);
   }
   const [selectedPath, setSelectedPath] = useState("index.md");
   const [lastImportedSourcePath, setLastImportedSourcePath] = useState<string | null>(null);
@@ -1744,6 +1767,10 @@ function App() {
   );
   const isWikiUpdateRunning =
     wikiUpdateBusy || chatSummaryWikiUpdateRunning || workspaceWikiUpdateRunning;
+  const workspaceWikiUpdateEventCount =
+    workspaceOperationProgress?.operationType === "apply-chat"
+      ? workspaceOperationProgress.events.length
+      : 0;
   const activeExploreRunId = exploreChatMessages
     .slice()
     .reverse()
@@ -1798,6 +1825,11 @@ function App() {
   const workspaceMaintainOperationTaskId = workspaceOperationProgress?.running
     ? maintainTaskIdFromOperationType(workspaceOperationProgress.operationType)
     : null;
+  const workspaceMaintainOperationEventCount =
+    workspaceOperationProgress?.operationType &&
+    maintainTaskIdFromOperationType(workspaceOperationProgress.operationType)
+      ? workspaceOperationProgress.events.length
+      : 0;
   const workspaceMaintainOperationTask = workspaceMaintainOperationTaskId
     ? MAINTAIN_TASK_BY_ID[workspaceMaintainOperationTaskId]
     : null;
@@ -4348,6 +4380,11 @@ function App() {
 
   useEffect(() => {
     if (exploreChatMessages.length === 0 && !wikiUpdateRun) return;
+    const currentThreadId = chatThread?.id ?? null;
+    const threadChanged = currentThreadId !== exploreChatAutoScrollThreadIdRef.current;
+    exploreChatAutoScrollThreadIdRef.current = currentThreadId;
+    if (!threadChanged && !exploreChatStickToBottomRef.current) return;
+
     const frameId = requestAnimationFrame(() => {
       const messagesEl = exploreChatMessagesRef.current;
       if (!messagesEl) return;
@@ -4355,6 +4392,7 @@ function App() {
         top: messagesEl.scrollHeight,
         behavior: isAskingWiki || wikiUpdateBusy ? "smooth" : "auto",
       });
+      exploreChatStickToBottomRef.current = true;
     });
     return () => cancelAnimationFrame(frameId);
   }, [
@@ -4367,12 +4405,17 @@ function App() {
     wikiUpdateBusy,
     wikiUpdateRun,
     wikiUpdateStatusStep,
-    workspaceOperationProgress?.events.length,
+    workspaceWikiUpdateEventCount,
     activeExploreRunId ? chatRunProgressById[activeExploreRunId]?.events.length : 0,
   ]);
 
   useEffect(() => {
     if (maintainThreadMessages.length === 0 && !maintainDiscussionBusy) return;
+    const currentThreadId = maintainThread?.id ?? null;
+    const threadChanged = currentThreadId !== maintainChatAutoScrollThreadIdRef.current;
+    maintainChatAutoScrollThreadIdRef.current = currentThreadId;
+    if (!threadChanged && !maintainChatStickToBottomRef.current) return;
+
     const frameId = requestAnimationFrame(() => {
       const messagesEl = maintainChatMessagesRef.current;
       if (!messagesEl) return;
@@ -4380,6 +4423,7 @@ function App() {
         top: messagesEl.scrollHeight,
         behavior: maintainDiscussionBusy || isMaintainOperationRunning ? "smooth" : "auto",
       });
+      maintainChatStickToBottomRef.current = true;
     });
     return () => cancelAnimationFrame(frameId);
   }, [
@@ -4393,7 +4437,7 @@ function App() {
     latestMaintainThreadMessage?.text,
     maintainStage,
     maintainThreadMessages.length,
-    workspaceOperationProgress?.events.length,
+    workspaceMaintainOperationEventCount,
     activeMaintainDiscussionRunId
       ? chatRunProgressById[activeMaintainDiscussionRunId]?.events.length
       : 0,
@@ -4498,10 +4542,14 @@ function App() {
       const wikiPagePaths = workspace.wikiFiles.filter(
         (p) => p.endsWith(".md") && shouldShowWikiFileInSidebar(p),
       );
-      const allPaths = ["index.md", ...wikiPagePaths, "log.md"];
+      const sourcePaths = workspace.sourceFiles ?? [];
+      const allPaths = ["index.md", ...wikiPagePaths, "log.md", ...sourcePaths];
+      const contentPaths = allPaths.filter(
+        (path) => !path.startsWith("sources/") || isReadableWorkspaceTextPreview(path),
+      );
 
       const contents = await Promise.all(
-        allPaths.map(async (path) => {
+        contentPaths.map(async (path) => {
           if (path === "index.md") return [path, workspace.indexMd ?? ""] as const;
           if (path === "log.md") return [path, workspace.logMd ?? ""] as const;
           try {
@@ -4519,7 +4567,7 @@ function App() {
       const outbound: Record<string, Set<string>> = {};
       const imageUsage = new Map<string, ImageAssetUsage[]>();
       for (const [path, content] of contents) {
-        outbound[path] = new Set(extractWikiLinkTargets(content, path, allPaths));
+        outbound[path] = new Set(extractWorkspaceLinkTargets(content, path, allPaths));
         const pageImageCounts = new Map<string, number>();
         for (const reference of extractMarkdownImageReferences(content)) {
           const assetPath = resolveWorkspacePath(path, reference.src);
@@ -4560,6 +4608,7 @@ function App() {
   }, [
     workspace.workspacePath,
     workspace.wikiFiles.length,
+    workspace.sourceFiles.length,
     workspace.indexMd,
     workspace.logMd,
     workspace.changedMarker?.completedAt,
@@ -5189,6 +5238,7 @@ function App() {
       setError("Choose at least one source for this wiki improvement.");
       return;
     }
+    maintainChatStickToBottomRef.current = true;
     setBusy(selectedMaintainTask.busyLabel);
     setError(null);
     setWorkspaceOperationProgress(null);
@@ -5388,6 +5438,7 @@ function App() {
         : "";
     const usedRecentSourceFallback =
       askWikiContextScope === "current" && contextPath !== selectedPath;
+    exploreChatStickToBottomRef.current = true;
     setBusy("Starting Ask Wiki");
     setError(null);
     const optimisticCreatedAt = new Date().toISOString();
@@ -5566,6 +5617,7 @@ function App() {
       return;
     }
     const launchedThreadId = maintainThread.id;
+    maintainChatStickToBottomRef.current = true;
     setBusy("Starting Maintain discussion");
     setError(null);
     const maintainDiscussionProperties = {
@@ -5838,6 +5890,7 @@ function App() {
       setError("Choose at least one message to apply.");
       return;
     }
+    exploreChatStickToBottomRef.current = true;
     setWikiUpdateBusy(true);
     setWikiUpdateRun({
       id: `wiki-update-${Date.now()}`,
@@ -7612,7 +7665,6 @@ function App() {
             {!activeReportContent &&
             viewMode === "page" &&
             !editActiveForSelectedPath &&
-            selectedPath.endsWith(".md") &&
             linkGraph[selectedPath] ? (
               <div
                 ref={centerConnectionsRef}
@@ -7666,9 +7718,14 @@ function App() {
                         {linkGraph[selectedPath].outbound.length > 0 ? (
                           <>
                             <div className="connections-label">
-                              {t("app.center.linksFromPage", {
-                                count: linkGraph[selectedPath].outbound.length,
-                              })}
+                              {t(
+                                selectedPath.startsWith("sources/")
+                                  ? "app.center.linksFromSource"
+                                  : "app.center.linksFromPage",
+                                {
+                                  count: linkGraph[selectedPath].outbound.length,
+                                },
+                              )}
                             </div>
                             <ul className="connections-list">
                               {linkGraph[selectedPath].outbound.map((path) => (
@@ -7802,7 +7859,11 @@ function App() {
                   {askWikiGuideCard ?? t("app.right.askPage")}
                 </div>
               ) : (
-                <div className="explore-chat-messages" ref={exploreChatMessagesRef}>
+                <div
+                  className="explore-chat-messages"
+                  ref={exploreChatMessagesRef}
+                  onScroll={updateExploreChatStickToBottom}
+                >
                   {exploreChatMessages.map((message, index) => (
                     <Fragment key={message.id}>
                       {index === wikiUpdateInsertIndex ? wikiUpdateRunBlock : null}
@@ -8128,7 +8189,11 @@ function App() {
                   </div>
                 ) : null}
               </header>
-              <div className="maintain-chat-messages" ref={maintainChatMessagesRef}>
+              <div
+                className="maintain-chat-messages"
+                ref={maintainChatMessagesRef}
+                onScroll={updateMaintainChatStickToBottom}
+              >
                 {visibleMaintainThreadMessages.map((message) => (
                   <div
                     key={message.id}
@@ -13393,24 +13458,46 @@ function transformMarkdownOutsideInlineCode(
   return result;
 }
 
-function extractWikiLinkTargets(
+function extractWorkspaceLinkTargets(
   content: string,
   currentPath: string,
   availablePaths: string[],
 ): string[] {
   const targets = new Set<string>();
   const stripped = content.replace(/```[\s\S]*?```|~~~[\s\S]*?~~~/g, "");
-  const matches = stripped.matchAll(/\[\[([^\]\n]+?)\]\]/g);
-  for (const m of matches) {
+
+  for (const m of stripped.matchAll(/\[\[([^\]\n]+?)\]\]/g)) {
     const body = m[1];
     const divider = body.indexOf("|");
     const target = divider === -1 ? body.trim() : body.slice(0, divider).trim();
     const resolved = resolveWikiLinkTarget(currentPath, target, availablePaths);
-    if (!resolved) continue;
-    const path = resolved.split("#")[0];
-    if (path && path !== currentPath) targets.add(path);
+    addResolvedWorkspaceLinkTarget(targets, resolved, currentPath);
   }
+
+  const normalizedLinks = normalizeLooseMarkdownLinkDestinations(stripped);
+  for (const m of normalizedLinks.matchAll(/!?\[[^\]\n]*\]\(([^)\n]+)\)/g)) {
+    const resolved = resolveWorkspaceDocumentReference(m[1], currentPath, availablePaths);
+    addResolvedWorkspaceLinkTarget(targets, resolved?.path ?? null, currentPath);
+  }
+
+  for (const sourcePath of availablePaths) {
+    if (!sourcePath.startsWith("sources/")) continue;
+    if (stripped.includes(sourcePath)) {
+      addResolvedWorkspaceLinkTarget(targets, sourcePath, currentPath);
+    }
+  }
+
   return Array.from(targets);
+}
+
+function addResolvedWorkspaceLinkTarget(
+  targets: Set<string>,
+  resolved: string | null | undefined,
+  currentPath: string,
+) {
+  if (!resolved) return;
+  const path = resolved.split("#")[0];
+  if (path && path !== currentPath) targets.add(path);
 }
 
 function resolveWikiLinkTarget(
