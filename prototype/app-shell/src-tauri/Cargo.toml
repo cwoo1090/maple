@@ -1,6 +1,6 @@
 [package]
 name = "maple"
-version = "0.1.15"
+version = "0.1.16"
 description = "A local AI wiki builder for compiling sources into a maintained wiki."
 authors = ["chulwoo ahn"]
 edition = "2021"
