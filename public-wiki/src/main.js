@@ -5,6 +5,7 @@ import MarkdownIt from "markdown-it";
 import sanitizeHtml from "sanitize-html";
 import * as pdfjs from "pdfjs-dist";
 import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.mjs?url";
+import { enableMathProtection } from "./markdown-math.js";
 
 pdfjs.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
@@ -17,15 +18,18 @@ const MAX_READER_TABS = 12;
 const MAX_CHAT_THREADS = 12;
 const CHAT_HISTORY_LIMIT = 6;
 const CHAT_HISTORY_TEXT_LIMIT = 1600;
+const CHAT_SCROLL_BOTTOM_THRESHOLD = 32;
 const READER_GUIDE_KEY = "_guide";
 const DEFAULT_LAYOUT = {
   sidebarWidth: 268,
   chatWidth: 356,
+  mobileChatHeight: 50,
   sidebarCollapsed: false,
 };
 const PANEL_LIMITS = {
   sidebar: { min: 220, max: 420 },
   chat: { min: 280, max: 560 },
+  mobileChatHeight: { min: 36, max: 88 },
 };
 const CHAT_THINKING_LABELS = [
   "Checking wiki context",
@@ -38,7 +42,7 @@ const chatMarkdown = new MarkdownIt({
   linkify: true,
   breaks: true,
   typographer: true,
-});
+}).use(enableMathProtection);
 const chatSanitizeOptions = {
   allowedTags: [
     ...sanitizeHtml.defaults.allowedTags,
@@ -77,7 +81,7 @@ const state = {
   chatThreads: [],
   activeChatThreadId: "",
   chatHistoryOpen: false,
-  isAsking: false,
+  askingThreadIds: new Set(),
   webSearch: false,
   chatScope: "wiki",
   connectionsOpen: false,
@@ -89,6 +93,7 @@ const pdfViews = new Map();
 const sourceTextCache = new Map();
 let connectionGraph = null;
 let scrollSaveFrame = null;
+let chatScrollSaveFrame = null;
 let mermaidInstance = null;
 
 init().catch((error) => {
@@ -125,7 +130,8 @@ async function init() {
 }
 
 function render(options = {}) {
-  const { preserveSidebarScroll = true } = options;
+  const { preserveSidebarScroll = true, chatForceBottom = false } = options;
+  saveChatScrollPosition();
   const sidebarScrollTop = preserveSidebarScroll ? document.querySelector(".sidebar")?.scrollTop || 0 : 0;
   const readerTabsScrollLeft = document.querySelector(".reader-tabs")?.scrollLeft || 0;
   const { snapshot } = state;
@@ -156,6 +162,16 @@ function render(options = {}) {
             <span class="publish-brand-title">${escapeHtml(snapshot.manifest.title)}</span>
             <span class="publish-brand-meta">${snapshot.manifest.pageCount} pages / ${snapshot.manifest.publicSourceCount} sources</span>
           </a>
+          ${
+            activeSource
+              ? ""
+              : `
+                <button class="publish-chat-toggle" type="button" data-chat-toggle aria-label="Open Ask Wiki">
+                  ${renderChatIcon("publish-chat-icon")}
+                  <span>Ask</span>
+                </button>
+              `
+          }
         </div>
       </header>
 
@@ -239,6 +255,7 @@ function render(options = {}) {
   if (preserveSidebarScroll) restoreSidebarScroll(sidebarScrollTop);
   restoreReaderTabsScroll(readerTabsScrollLeft);
   keepActiveReaderTabInView();
+  restoreChatScrollPosition({ forceBottom: chatForceBottom });
 }
 
 function loadLayoutState() {
@@ -252,6 +269,11 @@ function loadLayoutState() {
   return {
     sidebarWidth: clamp(Number(stored.sidebarWidth) || DEFAULT_LAYOUT.sidebarWidth, PANEL_LIMITS.sidebar.min, PANEL_LIMITS.sidebar.max),
     chatWidth: clamp(Number(stored.chatWidth) || DEFAULT_LAYOUT.chatWidth, PANEL_LIMITS.chat.min, PANEL_LIMITS.chat.max),
+    mobileChatHeight: clamp(
+      Number(stored.mobileChatHeight) || DEFAULT_LAYOUT.mobileChatHeight,
+      PANEL_LIMITS.mobileChatHeight.min,
+      PANEL_LIMITS.mobileChatHeight.max,
+    ),
     sidebarCollapsed: stored.sidebarCollapsed ?? DEFAULT_LAYOUT.sidebarCollapsed,
   };
 }
@@ -391,6 +413,60 @@ function saveChatThreads() {
   }
 }
 
+function isChatThreadAsking(threadId) {
+  return Boolean(threadId && state.askingThreadIds.has(threadId));
+}
+
+function activeChatIsAsking() {
+  return isChatThreadAsking(state.activeChatThreadId);
+}
+
+function chatThreadById(threadId) {
+  return state.chatThreads.find((thread) => thread.id === threadId) || null;
+}
+
+function saveChatScrollPosition() {
+  const messages = document.querySelector("[data-chat-messages]");
+  const threadId = messages?.dataset.chatThreadId || "";
+  if (!messages || !threadId) return;
+  const thread = chatThreadById(threadId);
+  if (!thread) return;
+
+  const maxScrollTop = Math.max(0, messages.scrollHeight - messages.clientHeight);
+  thread.chatScrollTop = Math.max(0, Math.min(messages.scrollTop, maxScrollTop));
+  thread.chatStickToBottom = maxScrollTop - messages.scrollTop <= CHAT_SCROLL_BOTTOM_THRESHOLD;
+}
+
+function scheduleChatScrollSave() {
+  if (chatScrollSaveFrame) return;
+  chatScrollSaveFrame = requestAnimationFrame(() => {
+    chatScrollSaveFrame = null;
+    saveChatScrollPosition();
+    saveChatThreads();
+  });
+}
+
+function restoreChatScrollPosition({ forceBottom = false } = {}) {
+  const threadId = state.activeChatThreadId;
+  requestAnimationFrame(() => {
+    const messages = document.querySelector("[data-chat-messages]");
+    if (!messages) return;
+
+    const thread = threadId ? chatThreadById(threadId) : null;
+    const maxScrollTop = Math.max(0, messages.scrollHeight - messages.clientHeight);
+    const hasSavedPosition = Number.isFinite(thread?.chatScrollTop);
+    const shouldUseBottom =
+      forceBottom ||
+      !thread ||
+      !hasSavedPosition ||
+      thread.chatStickToBottom;
+
+    messages.scrollTop = shouldUseBottom
+      ? messages.scrollHeight
+      : Math.max(0, Math.min(thread.chatScrollTop, maxScrollTop));
+  });
+}
+
 function ensureActiveChatThread() {
   if (state.activeChatThreadId) {
     const existing = state.chatThreads.find((thread) => thread.id === state.activeChatThreadId);
@@ -404,6 +480,7 @@ function ensureActiveChatThread() {
     createdAt: now,
     updatedAt: now,
     initialContextLabel: currentChatContextLabel(),
+    initialContextPageKey: currentChatContextPageKey(),
     messages: [],
   };
   state.activeChatThreadId = thread.id;
@@ -417,15 +494,49 @@ function syncActiveChatThread() {
   thread.title = firstUser ? firstUser.text.replace(/\s+/g, " ").trim().slice(0, 54) : "New chat";
   thread.updatedAt = new Date().toISOString();
   thread.initialContextLabel = thread.initialContextLabel || currentChatContextLabel();
+  thread.initialContextPageKey = thread.initialContextPageKey || currentChatContextPageKey();
   thread.messages = state.messages.slice();
   state.chatThreads = [
     thread,
     ...state.chatThreads.filter((item) => item.id !== thread.id),
   ].slice(0, MAX_CHAT_THREADS);
   saveChatThreads();
+  return thread;
+}
+
+function appendMessageToChatThread(threadId, message, { markUnread = false } = {}) {
+  const thread = state.chatThreads.find((item) => item.id === threadId);
+  if (!thread) return null;
+
+  const baseMessages =
+    threadId === state.activeChatThreadId
+      ? state.messages
+      : Array.isArray(thread.messages)
+        ? thread.messages
+        : [];
+  const nextMessages = [...baseMessages, message];
+  const firstUser = nextMessages.find((item) => item.role === "user");
+  thread.title = firstUser ? firstUser.text.replace(/\s+/g, " ").trim().slice(0, 54) : "New chat";
+  thread.updatedAt = new Date().toISOString();
+  thread.messages = nextMessages.slice();
+  if (markUnread) {
+    thread.unreadAnswer = true;
+  } else if (threadId === state.activeChatThreadId) {
+    thread.unreadAnswer = false;
+  }
+  state.chatThreads = [
+    thread,
+    ...state.chatThreads.filter((item) => item.id !== thread.id),
+  ].slice(0, MAX_CHAT_THREADS);
+  if (threadId === state.activeChatThreadId) {
+    state.messages = thread.messages.slice();
+  }
+  saveChatThreads();
+  return thread;
 }
 
 function createNewChat() {
+  saveChatScrollPosition();
   state.messages = [];
   state.activeChatThreadId = "";
   state.chatHistoryOpen = false;
@@ -435,16 +546,28 @@ function createNewChat() {
 }
 
 function openChatThread(threadId) {
-  const thread = state.chatThreads.find((item) => item.id === threadId);
+  saveChatScrollPosition();
+  const thread = chatThreadById(threadId);
   if (!thread) return;
+  if (thread.unreadAnswer) {
+    thread.chatStickToBottom = true;
+  }
+  thread.unreadAnswer = false;
   state.activeChatThreadId = thread.id;
   state.messages = Array.isArray(thread.messages) ? thread.messages : [];
   state.chatHistoryOpen = false;
   saveChatThreads();
+  const contextPage = latestChatContextPage(thread);
+  if (contextPage && contextPage.key !== state.activePageKey) {
+    navigate(contextPage.key);
+    return;
+  }
   render();
 }
 
 function deleteChatThread(threadId) {
+  if (isChatThreadAsking(threadId)) return;
+  saveChatScrollPosition();
   const threadIndex = state.chatThreads.findIndex((item) => item.id === threadId);
   if (threadIndex === -1) return;
 
@@ -463,6 +586,49 @@ function deleteChatThread(threadId) {
 
 function currentChatContextLabel() {
   return state.chatScope === "current" ? chatContextLabel() : "Whole wiki";
+}
+
+function currentChatContextPageKey() {
+  if (state.chatScope !== "current") return "";
+  return findPage(state.activePageKey)?.key || "";
+}
+
+function pageFromMessageContext(message) {
+  if (!message) return null;
+  if (message.contextPageKey) {
+    const page = findPage(message.contextPageKey);
+    if (page) return page;
+  }
+
+  if (message.contextPath) {
+    const pageMatch = parsePageHref(message.contextPath);
+    if (pageMatch) return findPage(pageMatch.pageKey);
+  }
+
+  const label = String(message.contextLabel || "").trim();
+  if (!label || /^whole wiki$/i.test(label)) return null;
+  if (/^wiki index$/i.test(label)) return findPage("index");
+  return state.snapshot.pages.find((page) => page.title === label) || null;
+}
+
+function pageFromMessageReferences(message) {
+  const references = Array.isArray(message?.references) ? message.references : [];
+  for (const reference of references) {
+    if (isWebReference(reference)) continue;
+    const page = reference.pageKey ? findPage(reference.pageKey) : null;
+    if (page) return page;
+  }
+  return null;
+}
+
+function latestChatContextPage(thread) {
+  const messages = Array.isArray(thread?.messages) ? thread.messages : [];
+  for (const message of messages.slice().reverse()) {
+    const contextPage = pageFromMessageContext(message) || pageFromMessageReferences(message);
+    if (contextPage) return contextPage;
+  }
+  if (thread?.initialContextPageKey) return findPage(thread.initialContextPageKey);
+  return null;
 }
 
 function chatHistoryForApi() {
@@ -752,10 +918,16 @@ function sourceFileLabel(sourcePath) {
 function layoutValues() {
   const sidebarWidth = clamp(state.layout.sidebarWidth, PANEL_LIMITS.sidebar.min, PANEL_LIMITS.sidebar.max);
   const chatWidth = clamp(state.layout.chatWidth, PANEL_LIMITS.chat.min, PANEL_LIMITS.chat.max);
+  const mobileChatHeight = clamp(
+    Number(state.layout.mobileChatHeight) || DEFAULT_LAYOUT.mobileChatHeight,
+    PANEL_LIMITS.mobileChatHeight.min,
+    PANEL_LIMITS.mobileChatHeight.max,
+  );
 
   return {
     "sidebar-width": `${sidebarWidth}px`,
     "chat-width": `${chatWidth}px`,
+    "mobile-chat-height": String(mobileChatHeight),
     "sidebar-column": state.layout.sidebarCollapsed ? "0px" : `${sidebarWidth}px`,
     "sidebar-rail": state.layout.sidebarCollapsed ? "0px" : "1px",
     "chat-rail": "1px",
@@ -834,10 +1006,67 @@ function startPanelResize(event) {
   window.addEventListener("pointercancel", stopResize);
 }
 
+function setMobileChatHeight(nextHeight) {
+  state.layout.mobileChatHeight = clamp(
+    nextHeight,
+    PANEL_LIMITS.mobileChatHeight.min,
+    PANEL_LIMITS.mobileChatHeight.max,
+  );
+  applyLayoutVariables();
+}
+
+function startMobileChatHeightDrag(event) {
+  if (!window.matchMedia("(max-width: 559px)").matches) return;
+  if (!document.body.classList.contains("show-chat")) return;
+
+  event.preventDefault();
+  const handle = event.currentTarget;
+  const pointerId = event.pointerId;
+  const viewportHeight = window.visualViewport?.height || window.innerHeight || 1;
+  const startY = event.clientY;
+  const startHeight = clamp(
+    Number(state.layout.mobileChatHeight) || DEFAULT_LAYOUT.mobileChatHeight,
+    PANEL_LIMITS.mobileChatHeight.min,
+    PANEL_LIMITS.mobileChatHeight.max,
+  );
+
+  handle.setPointerCapture?.(pointerId);
+  handle.classList.add("active");
+  document.body.classList.add("is-resizing-chat-sheet");
+
+  const onMove = (moveEvent) => {
+    const deltaPercent = ((startY - moveEvent.clientY) / viewportHeight) * 100;
+    setMobileChatHeight(startHeight + deltaPercent);
+  };
+
+  const stopDrag = () => {
+    window.removeEventListener("pointermove", onMove);
+    window.removeEventListener("pointerup", stopDrag);
+    window.removeEventListener("pointercancel", stopDrag);
+    handle.releasePointerCapture?.(pointerId);
+    handle.classList.remove("active");
+    document.body.classList.remove("is-resizing-chat-sheet");
+    saveLayoutState();
+  };
+
+  window.addEventListener("pointermove", onMove);
+  window.addEventListener("pointerup", stopDrag);
+  window.addEventListener("pointercancel", stopDrag);
+}
+
+function adjustMobileChatHeight(delta) {
+  setMobileChatHeight(
+    (Number(state.layout.mobileChatHeight) || DEFAULT_LAYOUT.mobileChatHeight) + delta,
+  );
+  saveLayoutState();
+}
+
 function focusChatInput() {
   requestAnimationFrame(() => {
     const panel = document.querySelector("[data-chat-panel]");
-    panel?.scrollIntoView({ block: "nearest" });
+    if (!document.body.classList.contains("show-chat")) {
+      panel?.scrollIntoView({ block: "nearest" });
+    }
     panel?.querySelector("textarea")?.focus();
   });
 }
@@ -981,6 +1210,10 @@ function renderTreeRoot(root, label) {
     `;
   }
 
+  if (root === "concepts") {
+    return renderConceptTree(label, pages);
+  }
+
   const folders = groupByFolder(pages);
   return `
     <section class="nav-section">
@@ -1003,6 +1236,49 @@ function renderTreeRoot(root, label) {
           `;
           },
         )
+        .join("")}
+    </section>
+  `;
+}
+
+function renderConceptTree(label, pages) {
+  const folders = groupConceptPages(pages);
+  return `
+    <section class="nav-section">
+      <h3>${label}</h3>
+      ${folders
+        .sort((a, b) => folderSortKey("concepts", a.label).localeCompare(folderSortKey("concepts", b.label)))
+        .map((folder) => {
+          const isActiveFolder = folder.pages.some((page) => page.key === state.activePageKey);
+          return `
+            <details class="nav-folder" ${isActiveFolder ? "open" : ""}>
+              <summary>
+                <span>${escapeHtml(folder.label)}</span>
+                <small>${folder.pages.length}</small>
+              </summary>
+              <div class="folder-items">
+                ${folder.directPages.map(renderPageLink).join("")}
+                ${folder.subfolders
+                  .sort((a, b) => a.label.localeCompare(b.label))
+                  .map((subfolder) => {
+                    const isActiveSubfolder = subfolder.pages.some((page) => page.key === state.activePageKey);
+                    return `
+                      <details class="nav-folder nav-subfolder" ${isActiveSubfolder ? "open" : ""}>
+                        <summary>
+                          <span>${escapeHtml(subfolder.label)}</span>
+                          <small>${subfolder.pages.length}</small>
+                        </summary>
+                        <div class="folder-items">
+                          ${subfolder.pages.map(renderPageLink).join("")}
+                        </div>
+                      </details>
+                    `;
+                  })
+                  .join("")}
+              </div>
+            </details>
+          `;
+        })
         .join("")}
     </section>
   `;
@@ -1082,9 +1358,8 @@ function renderPageReader(page) {
           ${page.updated ? `<span>Updated ${escapeHtml(formatDate(page.updated))}</span>` : ""}
         </div>
       </div>
-      ${showConnections ? renderConnectionsToggle(connections) : ""}
     </div>
-    ${showConnections ? renderConnectionsPanel(connections) : ""}
+    ${showConnections ? renderConnectionsBadge(connections) : ""}
     <article class="wiki-content">
       ${page.html}
     </article>
@@ -1103,12 +1378,20 @@ function renderSourceReader(source) {
           <span>${escapeHtml(formatBytes(source.size))}</span>
         </div>
       </div>
-      ${renderConnectionsToggle(connections)}
     </div>
-    ${renderConnectionsPanel(connections)}
+    ${renderConnectionsBadge(connections)}
     <article class="source-viewer ${source.type === "pdf" ? "source-viewer-pdf" : ""}">
       ${renderSourceBody(source)}
     </article>
+  `;
+}
+
+function renderConnectionsBadge(connections) {
+  return `
+    <div class="connections-badge ${state.connectionsOpen ? "open" : ""}" data-connections-badge>
+      ${renderConnectionsToggle(connections)}
+      ${renderConnectionsPanel(connections)}
+    </div>
   `;
 }
 
@@ -1145,11 +1428,13 @@ function renderConnectionsPanel(connections) {
 }
 
 function syncConnectionsPanel() {
+  const badge = document.querySelector("[data-connections-badge]");
   const button = document.querySelector("[data-connections-toggle]");
   const panel = document.querySelector("[data-connections-panel]");
   if (!button || !panel) return;
 
   const isOpen = state.connectionsOpen;
+  badge?.classList.toggle("open", isOpen);
   button.classList.toggle("active", isOpen);
   button.setAttribute("aria-expanded", isOpen ? "true" : "false");
   button.querySelector("[data-connections-label]").textContent = isOpen ? "Hide connections" : "Connections";
@@ -1191,8 +1476,17 @@ function renderConnectionLink(item) {
 function renderChatPanel() {
   const contextLabel = currentChatContextLabel();
   const webSearchSupported = state.chatConfig.webSearchSupported !== false;
+  const chatIsAsking = activeChatIsAsking();
   return `
     <aside class="chat-panel" data-chat-panel>
+      <div
+        class="chat-sheet-drag-handle"
+        data-chat-height-handle
+        role="separator"
+        aria-orientation="horizontal"
+        aria-label="Resize Ask Wiki panel"
+        tabindex="0"
+      ></div>
       <div class="chat-header">
         <div class="chat-heading">
           <h2>Ask Wiki</h2>
@@ -1212,10 +1506,13 @@ function renderChatPanel() {
           >
             History
           </button>
+          <button class="chat-header-btn chat-close-btn" type="button" data-chat-close title="Close Ask Wiki" aria-label="Close Ask Wiki">
+            ×
+          </button>
         </div>
         ${state.chatHistoryOpen ? renderChatHistoryPopover() : ""}
       </div>
-      <div class="chat-messages" data-chat-messages>
+      <div class="chat-messages" data-chat-messages data-chat-thread-id="${escapeHtml(state.activeChatThreadId)}">
         ${renderMessages()}
       </div>
       <form class="chat-form" data-chat-form>
@@ -1227,7 +1524,7 @@ function renderChatPanel() {
               type="button"
               data-chat-scope="current"
               aria-pressed="${state.chatScope === "current" ? "true" : "false"}"
-              ${state.isAsking ? "disabled" : ""}
+              ${chatIsAsking ? "disabled" : ""}
             >
               This page
             </button>
@@ -1236,7 +1533,7 @@ function renderChatPanel() {
               type="button"
               data-chat-scope="wiki"
               aria-pressed="${state.chatScope === "wiki" ? "true" : "false"}"
-              ${state.isAsking ? "disabled" : ""}
+              ${chatIsAsking ? "disabled" : ""}
             >
               Whole wiki
             </button>
@@ -1246,7 +1543,7 @@ function renderChatPanel() {
           name="question"
           rows="3"
           placeholder="Ask about ${state.chatScope === "current" ? "this page" : "this wiki"}..."
-          ${state.isAsking ? "disabled" : ""}
+          ${chatIsAsking ? "disabled" : ""}
         ></textarea>
         <div class="chat-composer-footer">
           <div class="chat-model-controls">
@@ -1258,13 +1555,13 @@ function renderChatPanel() {
               aria-label="${webSearchSupported ? (state.webSearch ? "Disable internet search" : "Allow internet search") : "Internet search is unavailable for this model"}"
               title="${webSearchSupported ? (state.webSearch ? "Internet search enabled" : "Allow internet search when needed") : "Internet search is unavailable for this model"}"
               aria-pressed="${state.webSearch ? "true" : "false"}"
-              ${state.isAsking || !webSearchSupported ? "disabled" : ""}
+              ${chatIsAsking || !webSearchSupported ? "disabled" : ""}
             >
               ${renderGlobeIcon("globe-icon")}
             </button>
           </div>
-          <button class="chat-submit" type="submit" aria-label="Ask" title="Ask" ${state.isAsking ? "disabled" : ""}>
-            ${state.isAsking ? `<span class="chat-submit-dot" aria-hidden="true"></span>` : renderSendIcon("send-icon")}
+          <button class="chat-submit" type="submit" aria-label="Ask" title="Ask" ${chatIsAsking ? "disabled" : ""}>
+            ${chatIsAsking ? `<span class="chat-submit-dot" aria-hidden="true"></span>` : renderSendIcon("send-icon")}
           </button>
         </div>
       </form>
@@ -1274,10 +1571,11 @@ function renderChatPanel() {
 
 function renderChatModelPicker() {
   const options = chatModelOptionsForUi();
+  const chatIsAsking = activeChatIsAsking();
   return `
     <label class="chat-model-picker">
       <span class="sr-only">Chat model</span>
-      <select data-chat-model aria-label="Chat model" ${state.isAsking ? "disabled" : ""}>
+      <select data-chat-model aria-label="Chat model" ${chatIsAsking ? "disabled" : ""}>
         ${options
           .map(
             (option) => `
@@ -1330,15 +1628,24 @@ function renderChatHistoryPopover() {
             const title = chatThreadTitle(thread);
             const preview = chatThreadPreview(thread);
             const isActive = thread.id === state.activeChatThreadId;
+            const activity = chatThreadActivity(thread);
+            const showMarker = activity.status === "running" || activity.status === "ready";
             return `
               <li class="chat-history-row">
                 <button
-                  class="chat-history-item ${isActive ? "active" : ""}"
+                  class="chat-history-item ${isActive ? "active" : ""} status-${activity.status}"
                   type="button"
                   data-chat-thread="${escapeHtml(thread.id)}"
-                  title="${escapeHtml(title)}"
+                  title="${escapeHtml(`${title} - ${activity.label}`)}"
                 >
-                  <span class="chat-history-name">${escapeHtml(title)}</span>
+                  <span class="chat-history-main">
+                    <span class="chat-history-name">${escapeHtml(title)}</span>
+                    ${
+                      showMarker
+                        ? `<span class="chat-thread-status-dot status-${activity.status}" aria-label="${escapeHtml(activity.label)}" title="${escapeHtml(activity.label)}"></span>`
+                        : ""
+                    }
+                  </span>
                   <span class="chat-history-preview">${escapeHtml(preview)}</span>
                 </button>
                 <button
@@ -1346,7 +1653,8 @@ function renderChatHistoryPopover() {
                   type="button"
                   data-chat-delete="${escapeHtml(thread.id)}"
                   aria-label="Delete chat: ${escapeHtml(title)}"
-                  title="Delete chat"
+                  title="${activity.status === "running" ? "Wait for this answer to finish before deleting it." : "Delete chat"}"
+                  ${activity.status === "running" ? "disabled" : ""}
                 >
                   x
                 </button>
@@ -1357,6 +1665,19 @@ function renderChatHistoryPopover() {
       </ul>
     </div>
   `;
+}
+
+function chatThreadActivity(thread) {
+  if (isChatThreadAsking(thread?.id)) {
+    return { status: "running", label: "Preparing answer" };
+  }
+  if (thread?.unreadAnswer) {
+    return { status: "ready", label: "Answer ready" };
+  }
+  if (!Array.isArray(thread?.messages) || thread.messages.length === 0) {
+    return { status: "empty", label: "No messages yet" };
+  }
+  return { status: "finished", label: "Finished" };
 }
 
 function chatThreadTitle(thread) {
@@ -1568,9 +1889,7 @@ function renderMessages() {
 
   const messages = state.messages
     .map((message, messageIndex) => {
-      const context = message.contextLabel
-        ? `<div class="message-context" title="${escapeHtml(message.contextLabel)}">${escapeHtml(message.contextLabel)}</div>`
-        : "";
+      const context = renderMessageContext(message);
       if (message.role === "user") {
         return `
           <div class="message user">
@@ -1580,7 +1899,7 @@ function renderMessages() {
         `;
       }
       const references = orderReferencesForDisplay(
-        displayedReferencesForAnswer(message.text, message.references || []),
+        displayedReferencesForAnswer(message.text, message.references || [], message),
         message.webSearchEnabled,
       );
       return `
@@ -1593,7 +1912,29 @@ function renderMessages() {
     })
     .join("");
 
-  return `${messages}${state.isAsking ? renderChatThinking() : ""}`;
+  const pendingMessage = activeChatIsAsking()
+    ? `<div class="message assistant message-pending" data-chat-pending-status>${renderChatThinking()}</div>`
+    : "";
+
+  return `${messages}${pendingMessage}`;
+}
+
+function renderMessageContext(message) {
+  const label = String(message?.contextLabel || "").trim();
+  if (!label) return "";
+  const page = pageFromMessageContext(message);
+  if (!page) {
+    return `<div class="message-context" title="${escapeHtml(label)}">${escapeHtml(label)}</div>`;
+  }
+
+  return `
+    <a
+      class="message-context message-context-link"
+      href="${page.path}"
+      data-route="${escapeHtml(page.key)}"
+      title="Open ${escapeHtml(page.title)}"
+    >${escapeHtml(label)}</a>
+  `;
 }
 
 function renderChatThinking() {
@@ -1601,8 +1942,13 @@ function renderChatThinking() {
     <div class="chat-thinking" role="status" aria-live="polite" aria-label="Ask Wiki is preparing an answer">
       ${CHAT_THINKING_LABELS.map(
         (label, index) => `
-          <span class="chat-thinking-label" style="--thinking-index: ${index};" aria-hidden="true">
-            <span>${escapeHtml(label)}</span>
+          <span
+            class="chat-thinking-label"
+            data-thinking-label="${escapeHtml(label)}"
+            style="--thinking-index: ${index};"
+            aria-hidden="true"
+          >
+            <span class="chat-thinking-text">${escapeHtml(label)}</span>
             <span class="chat-thinking-dots" aria-hidden="true">
               <span>.</span><span>.</span><span>.</span>
             </span>
@@ -1729,6 +2075,23 @@ function renderSendIcon(className) {
   `;
 }
 
+function renderChatIcon(className) {
+  return `
+    <svg
+      class="${className}"
+      aria-hidden="true"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      stroke-width="2"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+    >
+      <path d="M21 12a8 8 0 0 1-8 8H7l-4 3v-6a8 8 0 1 1 18-5Z"></path>
+    </svg>
+  `;
+}
+
 function syncChatScopeState() {
   document.querySelectorAll("[data-chat-scope]").forEach((button) => {
     const isActive = button.getAttribute("data-chat-scope") === state.chatScope;
@@ -1774,9 +2137,23 @@ function bindEvents() {
     });
   });
 
+  document.querySelector("[data-chat-messages]")?.addEventListener("scroll", scheduleChatScrollSave, { passive: true });
   document.querySelector("[data-chat-form]")?.addEventListener("submit", askWiki);
   document.querySelector("[data-chat-form] textarea")?.addEventListener("keydown", handleChatTextareaKeydown);
   document.querySelector("[data-chat-new]")?.addEventListener("click", createNewChat);
+  document.querySelector("[data-chat-close]")?.addEventListener("click", () => {
+    document.body.classList.remove("show-chat");
+  });
+  document.querySelector("[data-chat-height-handle]")?.addEventListener("pointerdown", startMobileChatHeightDrag);
+  document.querySelector("[data-chat-height-handle]")?.addEventListener("keydown", (event) => {
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      adjustMobileChatHeight(5);
+    } else if (event.key === "ArrowDown") {
+      event.preventDefault();
+      adjustMobileChatHeight(-5);
+    }
+  });
   document.querySelector("[data-chat-history-toggle]")?.addEventListener("click", () => {
     state.chatHistoryOpen = !state.chatHistoryOpen;
     render();
@@ -1830,9 +2207,15 @@ function bindEvents() {
   document.querySelector("[data-sidebar-toggle]")?.addEventListener("click", () => {
     document.body.classList.toggle("show-sidebar");
   });
-  document.querySelector("[data-overlay-close]")?.addEventListener("click", () => {
+  document.querySelector("[data-chat-toggle]")?.addEventListener("click", () => {
     document.body.classList.remove("show-sidebar");
-    render();
+    document.body.classList.add("show-chat");
+    focusChatInput();
+  });
+  document.querySelector("[data-overlay-close]")?.addEventListener("click", () => {
+    const hadSidebarOpen = document.body.classList.contains("show-sidebar");
+    document.body.classList.remove("show-sidebar", "show-chat");
+    if (hadSidebarOpen) render();
   });
 }
 
@@ -1971,7 +2354,7 @@ function handleChatTextareaKeydown(event) {
   if (event.altKey || event.ctrlKey || event.metaKey) return;
 
   const form = event.currentTarget.form;
-  if (!form || state.isAsking || !form.question.value.trim()) return;
+  if (!form || activeChatIsAsking() || !form.question.value.trim()) return;
 
   event.preventDefault();
   form.requestSubmit();
@@ -1981,33 +2364,45 @@ async function askWiki(event) {
   event.preventDefault();
   const form = event.currentTarget;
   const question = form.question.value.trim();
-  if (!question) return;
+  if (!question || activeChatIsAsking()) return;
 
   const history = chatHistoryForApi();
   const contextLabel = currentChatContextLabel();
+  const contextPageKey = currentChatContextPageKey();
+  const requestPageKey = state.activePageKey;
+  const requestModel = state.chatConfig.model;
+  const requestWebSearch = state.webSearch;
+  const requestScope = state.chatScope;
   const now = new Date().toISOString();
-  state.messages.push({
-    role: "user",
-    text: question,
-    contextLabel,
-    webSearchEnabled: state.webSearch,
-    createdAt: now,
-  });
-  state.isAsking = true;
-  syncActiveChatThread();
-  render();
+  state.messages = [
+    ...state.messages,
+    {
+      role: "user",
+      text: question,
+      contextLabel,
+      contextPageKey,
+      webSearchEnabled: requestWebSearch,
+      createdAt: now,
+    },
+  ];
+  const thread = syncActiveChatThread();
+  const threadId = thread.id;
+  state.askingThreadIds.add(threadId);
+  thread.chatStickToBottom = true;
+  render({ chatForceBottom: true });
   scrollChatMessagesToBottom();
 
+  let assistantMessage;
   try {
     const response = await fetch("/api/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         question,
-        pageKey: state.activePageKey,
-        model: state.chatConfig.model,
-        webSearch: state.webSearch,
-        scope: state.chatScope,
+        pageKey: requestPageKey,
+        model: requestModel,
+        webSearch: requestWebSearch,
+        scope: requestScope,
         history,
       }),
     });
@@ -2030,39 +2425,47 @@ async function askWiki(event) {
           : state.chatConfig.models,
       };
     }
-    state.messages.push({
+    assistantMessage = {
       role: "assistant",
       text: payload.answer,
       references: payload.references || [],
-      contextLabel: payload.context?.scope === "current" ? payload.context.pageTitle : "Whole wiki",
+      contextLabel: payload.context?.scope === "current" ? payload.context.pageTitle || contextLabel : "Whole wiki",
+      contextPageKey: payload.context?.scope === "current" ? payload.context.pageKey || contextPageKey : "",
       provider: payload.provider,
       model: payload.model,
       webSearchEnabled: payload.webSearch,
-      createdAt: now,
+      createdAt: new Date().toISOString(),
       completedAt: new Date().toISOString(),
-    });
-    form.reset();
+    };
   } catch (error) {
-    state.messages.push({
+    assistantMessage = {
       role: "assistant",
       text: chatErrorMessage(error),
       references: [],
       contextLabel,
+      contextPageKey,
       createdAt: now,
       completedAt: new Date().toISOString(),
-    });
+    };
   } finally {
-    state.isAsking = false;
-    syncActiveChatThread();
-    render();
-    scrollChatMessagesToBottom();
+    const finishedInBackground = state.activeChatThreadId !== threadId;
+    state.askingThreadIds.delete(threadId);
+    appendMessageToChatThread(threadId, assistantMessage, { markUnread: finishedInBackground });
+    if (state.activeChatThreadId === threadId || state.chatHistoryOpen) {
+      render({ chatForceBottom: state.activeChatThreadId === threadId });
+    }
+    if (state.activeChatThreadId === threadId) {
+      scrollChatMessagesToBottom();
+    }
   }
 }
 
 function scrollChatMessagesToBottom() {
   requestAnimationFrame(() => {
     const messages = document.querySelector("[data-chat-messages]");
-    if (messages) messages.scrollTop = messages.scrollHeight;
+    if (!messages) return;
+    messages.scrollTop = messages.scrollHeight;
+    saveChatScrollPosition();
   });
 }
 
@@ -2106,7 +2509,7 @@ function navigate(pageKey, hash = "") {
   state.sidebarTab = "pages";
   const nextUrl = hash ? `${page.path}#${hash}` : page.path;
   history.pushState(null, "", nextUrl);
-  document.body.classList.remove("show-sidebar");
+  document.body.classList.remove("show-sidebar", "show-chat");
   render();
   scrollToReaderPosition(hash);
 }
@@ -2118,7 +2521,7 @@ function navigateSource(sourcePath, fragment = "") {
   state.sidebarTab = "sources";
   const nextUrl = fragment ? `${source.url}#${fragment}` : source.url;
   history.pushState(null, "", nextUrl);
-  document.body.classList.remove("show-sidebar");
+  document.body.classList.remove("show-sidebar", "show-chat");
   render();
   if (!fragment) scrollToReaderPosition();
 }
@@ -2640,9 +3043,48 @@ function groupByFolder(pages) {
   }, {});
 }
 
+function groupConceptPages(pages) {
+  const folders = new Map();
+  for (const page of pages) {
+    const parts = page.key.split("/");
+    const folderKey = parts[1] || "concepts";
+    const subfolderKey = parts[2] || "";
+    if (!folders.has(folderKey)) {
+      folders.set(folderKey, {
+        key: folderKey,
+        label: titleCase(folderKey || "Concepts"),
+        pages: [],
+        directPages: [],
+        subfolders: new Map(),
+      });
+    }
+    const folder = folders.get(folderKey);
+    folder.pages.push(page);
+    if (!subfolderKey) {
+      folder.directPages.push(page);
+      continue;
+    }
+    if (!folder.subfolders.has(subfolderKey)) {
+      folder.subfolders.set(subfolderKey, {
+        key: subfolderKey,
+        label: titleCase(subfolderKey),
+        pages: [],
+      });
+    }
+    folder.subfolders.get(subfolderKey).pages.push(page);
+  }
+
+  return [...folders.values()].map((folder) => ({
+    ...folder,
+    subfolders: [...folder.subfolders.values()],
+  }));
+}
+
 function folderLabelForPage(page) {
   const parts = page.key.split("/");
-  if (parts[0] === "concepts") return titleCase(parts[1] || "Concepts");
+  if (parts[0] === "concepts") {
+    return [parts[1], parts[2]].filter(Boolean).map(titleCase).join(" / ") || "Concepts";
+  }
   if (parts[0] === "summaries") {
     if (parts[1] === "textbooks" && parts[2]) return `Textbooks / ${titleCase(parts[2])}`;
     return titleCase(parts[1] || "Summaries");
@@ -2687,6 +3129,7 @@ function folderSortKey(root, folder) {
     concepts: [
       "Actuator Design",
       "Transmissions",
+      "Robot Kinematics",
       "Motor Fundamentals",
       "Motor Modeling",
       "Motor Drivers",
@@ -2724,27 +3167,159 @@ function formatBytes(value) {
 }
 
 function formatAnswer(text, references = [], messageIndex = 0) {
-  const citationNumbers = new Set(
+  const webCitationNumbers = new Set(
     references
+      .filter(isWebReference)
       .map((reference) => Number(reference.citationNumber))
       .filter((number) => Number.isInteger(number) && number > 0),
   );
   const normalizedText = removeUnavailableCitations(
     normalizeChatMarkdown(String(text || "").trim()),
-    citationNumbers,
+    webCitationNumbers,
   );
-  const linkedText = linkifyCitations(normalizedText, citationNumbers, messageIndex);
+  const linkedText = linkifyCitations(normalizedText, webCitationNumbers, messageIndex);
   return sanitizeHtml(chatMarkdown.render(linkedText), chatSanitizeOptions);
 }
 
 function normalizeChatMarkdown(markdown) {
-  return transformMarkdownOutsideCode(markdown, normalizeKoreanPostpositionEmphasis);
+  return transformMarkdownOutsideCode(markdown, (segment) =>
+    linkifyWikiLinksInSegment(normalizeKoreanPostpositionEmphasis(segment)),
+  );
 }
 
 function normalizeKoreanPostpositionEmphasis(segment) {
   return segment.replace(/\\?\*\\?\*([^*]+?)\\?\*\\?\*(?=[가-힣])/g, (_match, content) => {
     return `<strong>${escapeHtml(content)}</strong>`;
   });
+}
+
+function linkifyWikiLinksInSegment(segment) {
+  return segment.replace(/\[\[([^\[\]\n]+?)\]\]/g, (match, rawLink) => {
+    const link = parseWikiLink(rawLink);
+    if (!link.target) return match;
+
+    const resolved = resolveWikiLinkTarget(link.target);
+    const label = link.label || resolved?.label || fallbackWikiLinkLabel(link.target);
+    if (!resolved) return escapeMarkdownText(label);
+
+    return `[${escapeMarkdownLinkText(label)}](${escapeMarkdownLinkHref(resolved.href)})`;
+  });
+}
+
+function parseWikiLink(rawLink) {
+  const [rawTarget = "", ...labelParts] = String(rawLink || "").split("|");
+  return {
+    target: rawTarget.trim(),
+    label: labelParts.join("|").trim(),
+  };
+}
+
+function resolveWikiLinkTarget(target) {
+  const { targetPath, hash } = splitWikiLinkHash(target);
+  const page = resolveWikiLinkPage(targetPath);
+  if (page) {
+    return {
+      href: hash ? `${page.path}#${hash}` : page.path,
+      label: page.title,
+    };
+  }
+
+  const source = resolveWikiLinkSource(targetPath);
+  if (source) {
+    return {
+      href: hash ? `${source.url}#${hash}` : source.url,
+      label: source.title,
+    };
+  }
+
+  return null;
+}
+
+function splitWikiLinkHash(target) {
+  const normalized = String(target || "").trim();
+  const hashIndex = normalized.indexOf("#");
+  if (hashIndex === -1) return { targetPath: normalized, hash: "" };
+  return {
+    targetPath: normalized.slice(0, hashIndex).trim(),
+    hash: normalized.slice(hashIndex + 1).trim(),
+  };
+}
+
+function resolveWikiLinkPage(targetPath) {
+  const routeMatch = parsePageHref(targetPath);
+  if (routeMatch) return findPage(routeMatch.pageKey);
+
+  const key = normalizeWikiLinkKey(targetPath);
+  return findPage(key) || findPageByTitle(targetPath);
+}
+
+function resolveWikiLinkSource(targetPath) {
+  const routeMatch = parseSourceHref(targetPath);
+  if (routeMatch) return findSource(routeMatch.sourcePath);
+
+  const key = normalizeWikiLinkKey(targetPath);
+  const keyWithoutSourcePrefix = key.replace(/^sources\//, "");
+  return state.snapshot.sources?.find((source) => {
+    const sourcePath = normalizeWikiLinkKey(source.path);
+    const sourceKey = normalizeWikiLinkKey(source.key || "");
+    return (
+      sourcePath === key ||
+      sourceKey === key ||
+      sourceKey === keyWithoutSourcePrefix ||
+      normalizeTextKey(source.title) === normalizeTextKey(targetPath)
+    );
+  }) || null;
+}
+
+function normalizeWikiLinkKey(targetPath) {
+  const slug = state.snapshot.manifest.slug;
+  let key = decodeURIComponent(String(targetPath || "").trim())
+    .replace(/\\/g, "/")
+    .replace(/^\/+/, "");
+
+  if (key.startsWith(`${slug}/`)) key = key.slice(slug.length + 1);
+  if (key.startsWith("wiki/")) key = key.slice("wiki/".length);
+  if (key === slug || key === "index.md") return "index";
+  return key.replace(/\.md$/i, "").replace(/^\/+/, "");
+}
+
+function findPageByTitle(title) {
+  const normalized = normalizeTextKey(title);
+  if (!normalized) return null;
+  return state.snapshot.pages.find((page) => normalizeTextKey(page.title) === normalized) || null;
+}
+
+function normalizeTextKey(value) {
+  return String(value || "").trim().replace(/\s+/g, " ").toLowerCase();
+}
+
+function fallbackWikiLinkLabel(target) {
+  const { targetPath } = splitWikiLinkHash(target);
+  const key = normalizeWikiLinkKey(targetPath);
+  const leaf = key.split("/").filter(Boolean).pop() || targetPath;
+  return titleCase(leaf);
+}
+
+function escapeMarkdownLinkText(value) {
+  return String(value || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/\\/g, "\\\\")
+    .replace(/\[/g, "\\[")
+    .replace(/\]/g, "\\]");
+}
+
+function escapeMarkdownLinkHref(href) {
+  return encodeURI(String(href || ""))
+    .replace(/\(/g, "%28")
+    .replace(/\)/g, "%29");
+}
+
+function escapeMarkdownText(value) {
+  return String(value || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/([\\`*_{}\[\]()#+\-.!|>])/g, "\\$1");
 }
 
 function transformMarkdownOutsideCode(markdown, transform) {
@@ -2760,33 +3335,46 @@ function transformMarkdownOutsideCode(markdown, transform) {
     .join("");
 }
 
-function displayedReferencesForAnswer(text, references) {
+function displayedReferencesForAnswer(text, references, message = null) {
   const webReferences = references.filter(isWebReference);
+  const contextPageKey = pageFromMessageContext(message)?.key || "";
   const localReferences = references.filter(
-    (reference) => !isWebReference(reference) && !isActivePageReference(reference),
+    (reference) => !isWebReference(reference) && !isMessageContextPageReference(reference, contextPageKey),
   );
   const citationNumbers = extractCitationNumbers(text);
-  if (!citationNumbers.size) return webReferences;
-  return [...webReferences, ...localReferences.filter((reference) => {
-    const number = Number(reference.citationNumber);
-    return !Number.isFinite(number) || citationNumbers.has(number);
-  })];
+  const displayedLocalReferences =
+    citationNumbers.size && !webReferences.length
+      ? localReferences.filter((reference) => {
+          const number = Number(reference.citationNumber);
+          return !Number.isFinite(number) || citationNumbers.has(number);
+        })
+      : localReferences;
+  return [...webReferences, ...displayedLocalReferences];
 }
 
-function isActivePageReference(reference) {
-  return reference?.pageKey === state.activePageKey;
+function isMessageContextPageReference(reference, contextPageKey) {
+  return Boolean(contextPageKey) && reference?.pageKey === contextPageKey;
 }
 
 function removeUnavailableCitations(markdown, availableNumbers) {
-  return transformMarkdownOutsideCode(markdown, (segment) =>
-    segment.replace(/\[(\d+(?:\s*,\s*\d+)*)\]/g, (match, rawNumbers) => {
+  return transformMarkdownOutsideCode(markdown, (segment) => {
+    const withoutUnavailableNumbers = segment.replace(/\[(\d+(?:\s*,\s*\d+)*)\]/g, (match, rawNumbers) => {
       const keptNumbers = rawNumbers
         .split(/\s*,\s*/)
         .map((number) => Number(number))
         .filter((number) => Number.isInteger(number) && availableNumbers.has(number));
       return keptNumbers.length ? `[${keptNumbers.join(", ")}]` : "";
-    }),
-  );
+    });
+    return cleanRemovedCitationSpacing(
+      withoutUnavailableNumbers.replace(/\[(?:global|local|wiki)\s+context\](?!\()/gi, ""),
+    );
+  });
+}
+
+function cleanRemovedCitationSpacing(text) {
+  return String(text || "")
+    .replace(/[ \t]+([.,;:!?])/g, "$1")
+    .replace(/[ \t]{2,}/g, " ");
 }
 
 function extractCitationNumbers(text) {
