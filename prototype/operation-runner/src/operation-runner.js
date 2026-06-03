@@ -1031,14 +1031,9 @@ async function runBuildWiki(workspace, options = {}) {
   const completedAt = new Date().toISOString();
   const forbiddenCount = validatedChanges.filter((change) => !change.allowed).length;
   const allowedCount = validatedChanges.filter((change) => change.allowed).length;
-  const wikiContentChanged = userVisibleChangedFiles.some((c) => {
-    const p = c.path;
-    return (
-      p.startsWith("wiki/concepts/") ||
-      p.startsWith("wiki/summaries/") ||
-      p.startsWith("wiki/guides/")
-    );
-  });
+  const wikiContentChanged = userVisibleChangedFiles.some((c) =>
+    c.status !== "deleted" && isWikiContentPagePath(c.path)
+  );
   const indexOrLogTouched = validatedChanges.some(
     (c) =>
       c.allowed &&
@@ -1101,7 +1096,7 @@ async function runBuildWiki(workspace, options = {}) {
       indexOrLogTouched,
       removalOnlySourceChange,
       producedExpectedContent,
-      requiredCategories: ["wiki/concepts/", "wiki/summaries/", "wiki/guides/"],
+      requiredCategories: ["wiki/**/*.md excluding wiki/assets/**"],
       requiredBookkeeping: ["index.md", "log.md"],
     },
     sourceStatus,
@@ -1160,7 +1155,7 @@ async function runBuildWiki(workspace, options = {}) {
       "  This usually means the build did not finish (turn budget, sandbox issue, or unprepared sources).",
     );
     if (!wikiContentChanged) {
-      console.log("  - No new/updated files under wiki/concepts/, wiki/summaries/, or wiki/guides/.");
+      console.log("  - No new/updated Markdown pages under wiki/** outside wiki/assets/**.");
     }
     if (!indexOrLogTouched) {
       console.log("  - index.md or log.md was not updated.");
@@ -6682,6 +6677,14 @@ function isTrackedWikiPath(relPath) {
   return normalized === "wiki" || normalized.startsWith("wiki/");
 }
 
+function isWikiContentPagePath(relPath) {
+  const normalized = normalizeRelativePath(relPath);
+  if (!normalized) return false;
+  return normalized.startsWith("wiki/") &&
+    normalized.endsWith(".md") &&
+    !normalized.startsWith("wiki/assets/");
+}
+
 function sourceContentMatches(a, b) {
   return a?.sha256 === b?.sha256 && a?.size === b?.size && a?.kind === b?.kind;
 }
@@ -8011,6 +8014,7 @@ module.exports = {
   normalizeOperationId,
   resolveOperationId,
 	  isAllowedPath,
+  isWikiContentPagePath,
 	  isRunnerMetadataPath,
   hasPendingGeneratedChanges,
 	  getUserVisibleChangedFiles,

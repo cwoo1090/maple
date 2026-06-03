@@ -22,19 +22,21 @@ const CURRENT_PAGE_IMAGE_MAX_BYTES = 2 * 1024 * 1024;
 const CURRENT_PAGE_IMAGE_TOTAL_MAX_BYTES = 5 * 1024 * 1024;
 const CHAT_IMAGE_MIME_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
 const DEFAULT_CHAT_MODELS = [
+  "gemini-3.5-flash",
   "gemini-3.1-flash-lite",
-  "gemini-3.1-flash",
+  "gemini-2.5-flash-lite",
+  "gemini-2.0-flash-lite",
 ];
 const CHAT_SYSTEM_PROMPT =
   [
     "You are Ask Wiki, a read-only guide for a published Maple wiki.",
-    "Use the read-only wiki context gathered by the server-side wiki reader and cite numbered context references like [1] when useful.",
+    "Use the read-only wiki context gathered by the server-side wiki reader; the app renders local wiki references below your answer, so do not put local context markers like [1] or [2, 3] in the answer body.",
     "If context is insufficient, say what is missing instead of guessing.",
-    "If web search is enabled, use it only when the local published context is missing current or external facts, and keep web-derived claims clearly grounded.",
+    "If web search is enabled, use it only when the local published context is missing current or external facts, and use bracketed numeric citations only for web-derived claims.",
     "When current-page images are attached, treat them as visual evidence from the selected wiki page only.",
     "Do not claim you edited, built, or updated the wiki.",
     "Use concise technical prose. Format equations with Markdown math delimiters.",
-    "Use only citation numbers that appear in the retrieved context, such as [1] or [2, 3].",
+    "Do not invent citation numbers, URLs, or source names.",
     "Return clean Markdown for a narrow chat panel: short paragraphs, bullets for lists, sparse bold for key terms, and no raw HTML or code-fenced full answer.",
   ].join(" ");
 
@@ -109,8 +111,11 @@ export default async function handler(req, res) {
     });
   }
 
-  const localReferences = result.localReferences || contextReferences(chunks);
   const webReferences = result.references || [];
+  const localReferences = renumberLocalReferencesAfter(
+    result.localReferences || contextReferences(chunks),
+    webReferences.length,
+  );
   const references =
     webSearch && webReferences.length
       ? [...webReferences, ...localReferences]
@@ -259,6 +264,17 @@ async function answerWithGemini({
         webSearch,
       };
     } catch (error) {
+      if (lastCapacityError && isGeminiModelNotFoundError(error)) {
+        console.warn(
+          `Gemini fallback model ${candidateModel} is unavailable after a capacity error on an earlier model.`,
+        );
+        if (index < modelsToTry.length - 1) continue;
+        throw httpError(
+          503,
+          "Gemini is temporarily busy, and the configured fallback model is unavailable. Please try again shortly.",
+        );
+      }
+
       if (!isGeminiCapacityError(error) || index === modelsToTry.length - 1) {
         if (isGeminiCapacityError(error) && lastCapacityError) {
           throw httpError(503, "Gemini is temporarily busy across the available chat models. Please try again shortly.");
@@ -366,11 +382,12 @@ async function runReadOnlyWikiAgent({
     temperature: 0.2,
     webSearch,
   });
-  const answer = extractGeminiText(finalPayload);
+  const webReferences = extractGeminiWebReferences(finalPayload);
+  const answer = annotateWebCitations(extractGeminiText(finalPayload), finalPayload, webReferences);
 
   return {
     answer: answer.trim() || "Gemini returned no text for this question.",
-    webReferences: extractGeminiWebReferences(finalPayload),
+    webReferences,
     localReferences,
   };
 }
@@ -437,8 +454,15 @@ async function callGeminiPayload({
 
 function geminiModelFallbackOrder(model) {
   const primary = cleanEnv(model);
-  const models = [primary, ...chatModelOptions()].filter(isGeminiModel);
+  const fallbackOptions = isLiteGeminiModel(primary)
+    ? chatModelOptions().filter(isLiteGeminiModel)
+    : chatModelOptions();
+  const models = [primary, ...fallbackOptions].filter(isGeminiModel);
   return [...new Set(models)];
+}
+
+function isLiteGeminiModel(model) {
+  return isGeminiModel(model) && /-lite(?:-|$)/i.test(cleanEnv(model).replace(/^models\//, ""));
 }
 
 function geminiHttpStatus(statusCode) {
@@ -456,6 +480,13 @@ function isGeminiCapacityError(error) {
     status === "UNAVAILABLE" ||
     /high demand|overload|temporarily|try again later|resource exhausted|unavailable/i.test(message)
   );
+}
+
+function isGeminiModelNotFoundError(error) {
+  const statusCode = Number(error?.geminiStatusCode || error?.statusCode);
+  const status = cleanEnv(error?.geminiStatus);
+  const message = cleanEnv(error?.message);
+  return statusCode === 404 || status === "NOT_FOUND" || /model .*not found|is not found/i.test(message);
 }
 
 function buildGeminiParts({
@@ -1369,6 +1400,7 @@ function extractGeminiWebReferences(payload) {
       seen.add(uri);
       refs.push({
         kind: "web",
+        citationNumber: refs.length + 1,
         title: chunk.web?.title || hostnameForUrl(uri),
         path: uri,
       });
@@ -1376,6 +1408,74 @@ function extractGeminiWebReferences(payload) {
     }
   }
   return refs;
+}
+
+function annotateWebCitations(text, payload, webReferences) {
+  const answer = String(text || "");
+  if (!answer || !webReferences.length) return answer;
+
+  const candidate = payload.candidates?.[0];
+  const metadata = candidate?.groundingMetadata;
+  const supports = Array.isArray(metadata?.groundingSupports) ? metadata.groundingSupports : [];
+  const chunks = Array.isArray(metadata?.groundingChunks) ? metadata.groundingChunks : [];
+  if (!supports.length || !chunks.length) return answer;
+
+  const uriToCitationNumber = new Map(webReferences.map((reference) => [reference.path, reference.citationNumber]));
+  const insertions = [];
+  const seenInsertionKeys = new Set();
+
+  for (const support of supports) {
+    const numbers = [...new Set((support.groundingChunkIndices || [])
+      .map((index) => uriToCitationNumber.get(chunks[index]?.web?.uri))
+      .filter((number) => Number.isInteger(number) && number > 0))]
+      .sort((a, b) => a - b);
+    if (!numbers.length) continue;
+
+    const marker = `[${numbers.join(", ")}]`;
+    const endIndex = findGroundingSegmentEnd(answer, support.segment);
+    if (!Number.isInteger(endIndex) || endIndex < 0) continue;
+    if (hasCitationMarkerNear(answer, endIndex)) continue;
+
+    const key = `${endIndex}:${marker}`;
+    if (seenInsertionKeys.has(key)) continue;
+    seenInsertionKeys.add(key);
+    insertions.push({ index: endIndex, marker });
+  }
+
+  if (!insertions.length) return answer;
+  let annotated = answer;
+  for (const insertion of insertions.sort((a, b) => b.index - a.index)) {
+    annotated = `${annotated.slice(0, insertion.index)} ${insertion.marker}${annotated.slice(insertion.index)}`;
+  }
+  return annotated;
+}
+
+function hasCitationMarkerNear(text, index) {
+  const markerPattern = /\[\d+(?:\s*,\s*\d+)*\]/;
+  const after = text.slice(index, index + 18);
+  const before = text.slice(Math.max(0, index - 18), index);
+  return /^\s*\[\d+(?:\s*,\s*\d+)*\]/.test(after) || markerPattern.test(before);
+}
+
+function findGroundingSegmentEnd(text, segment) {
+  const segmentText = String(segment?.text || "").trim();
+  if (segmentText) {
+    const index = text.indexOf(segmentText);
+    if (index !== -1) return index + segmentText.length;
+  }
+
+  const endIndex = Number(segment?.endIndex);
+  if (Number.isInteger(endIndex) && endIndex >= 0 && endIndex <= text.length) return endIndex;
+  return -1;
+}
+
+function renumberLocalReferencesAfter(references, offset = 0) {
+  const start = Number.isInteger(offset) && offset > 0 ? offset : 0;
+  if (!start) return references;
+  return references.map((reference, index) => ({
+    ...reference,
+    citationNumber: start + index + 1,
+  }));
 }
 
 function hostnameForUrl(uri) {

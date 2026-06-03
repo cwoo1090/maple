@@ -5,6 +5,7 @@ import matter from "gray-matter";
 import MarkdownIt from "markdown-it";
 import anchor from "markdown-it-anchor";
 import sanitizeHtml from "sanitize-html";
+import { enableMathProtection } from "../src/markdown-math.js";
 
 const appRoot = path.resolve(new URL("..", import.meta.url).pathname);
 const workspaceRoot = path.resolve(
@@ -24,6 +25,7 @@ const md = new MarkdownIt({
   linkify: true,
   typographer: true,
 })
+  .use(enableMathProtection)
   .use(anchor, {
     level: [1, 2, 3, 4],
     slugify: slugifyHeading,

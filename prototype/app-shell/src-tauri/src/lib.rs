@@ -192,6 +192,8 @@ const LEGACY_SOURCE_DIR: &str = "raw";
 const METADATA_DIR: &str = ".aiwiki";
 const LEGACY_METADATA_DIR: &str = ".studywiki";
 const EXPLORE_CHAT_OPERATION: &str = "explore-chat";
+const MAX_CHAT_SELECTION_SNIPPETS: usize = 4;
+const MAX_CHAT_SELECTION_TEXT_CHARS: usize = 6000;
 const OPERATION_START_GRACE_MS: u128 = 15_000;
 const RUNNER_ROOT_ENV: &str = "MAPLE_RUNNER_ROOT";
 const REQUIRED_NODE_MAJOR: u32 = 20;
@@ -242,11 +244,23 @@ struct ThreadChangedFile {
 
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
+struct ChatSelectionSnippet {
+    id: String,
+    text: String,
+    source_label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_path: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
 struct ChatThreadMessage {
     id: String,
     role: String,
     text: String,
     context_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    selection_snippets: Vec<ChatSelectionSnippet>,
     provider: Option<String>,
     model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -335,6 +349,8 @@ struct ApplyChatMessagePayload {
     role: String,
     text: String,
     context_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    selection_snippets: Vec<ChatSelectionSnippet>,
     #[serde(default)]
     web_search_enabled: bool,
 }
@@ -2955,6 +2971,99 @@ fn extract_json_from_runner_stdout<T: for<'de> Deserialize<'de>>(
         .map_err(|error| format!("Failed to parse runner JSON: {error}"))
 }
 
+fn clip_chat_selection_text(text: &str) -> String {
+    let text = text.trim();
+    if text.chars().count() <= MAX_CHAT_SELECTION_TEXT_CHARS {
+        return text.to_string();
+    }
+    text.chars()
+        .take(MAX_CHAT_SELECTION_TEXT_CHARS)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+fn normalize_chat_selection_snippets(
+    snippets: Option<Vec<ChatSelectionSnippet>>,
+) -> Vec<ChatSelectionSnippet> {
+    snippets
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|snippet| {
+            let text = clip_chat_selection_text(&snippet.text);
+            if text.is_empty() {
+                return None;
+            }
+            let source_path = snippet
+                .source_path
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty());
+            let source_label = {
+                let trimmed = snippet.source_label.trim();
+                if trimmed.is_empty() {
+                    source_path
+                        .clone()
+                        .unwrap_or_else(|| "Selected text".to_string())
+                } else {
+                    trimmed.to_string()
+                }
+            };
+            let id = {
+                let trimmed = snippet.id.trim();
+                if trimmed.is_empty() {
+                    make_local_id("selection")
+                } else {
+                    trimmed.to_string()
+                }
+            };
+            Some(ChatSelectionSnippet {
+                id,
+                text,
+                source_label,
+                source_path,
+            })
+        })
+        .take(MAX_CHAT_SELECTION_SNIPPETS)
+        .collect()
+}
+
+fn render_chat_selection_snippets(snippets: &[ChatSelectionSnippet]) -> String {
+    snippets
+        .iter()
+        .enumerate()
+        .map(|(index, snippet)| {
+            let source = snippet
+                .source_path
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or(snippet.source_label.as_str());
+            format!(
+                "Selected text {}\nSource: {}\nText:\n{}",
+                index + 1,
+                source,
+                snippet.text.trim()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn chat_message_text_with_selection_snippets(message: &ChatThreadMessage) -> String {
+    let text = message.text.trim();
+    if message.selection_snippets.is_empty() {
+        return text.to_string();
+    }
+
+    let snippets = render_chat_selection_snippets(&message.selection_snippets);
+    if snippets.is_empty() {
+        return text.to_string();
+    }
+    if text.is_empty() {
+        return format!("Attached selected text snippets:\n{snippets}");
+    }
+    format!("{text}\n\nAttached selected text snippets:\n{snippets}")
+}
+
 fn build_history_json(thread: &ChatThread) -> Result<String, String> {
     let messages = thread
         .messages
@@ -2970,13 +3079,14 @@ fn build_history_json(thread: &ChatThread) -> Result<String, String> {
         .into_iter()
         .skip(start)
         .map(|message| {
-            let text = if message.text.chars().count() > 2000 {
+            let message_text = chat_message_text_with_selection_snippets(message);
+            let text = if message_text.chars().count() > 2000 {
                 format!(
                     "{}\n\n[truncated]",
-                    message.text.chars().take(2000).collect::<String>()
+                    message_text.chars().take(2000).collect::<String>()
                 )
             } else {
-                message.text.clone()
+                message_text
             };
             ExploreChatHistoryItem {
                 role: message.role.clone(),
@@ -6294,6 +6404,7 @@ async fn run_maintain_thread_operation(
         role: "user".to_string(),
         text: user_text,
         context_path: None,
+        selection_snippets: Vec::new(),
         provider: Some(provider.clone()),
         model: Some(model.clone()),
         reasoning_effort: Some(reasoning_effort.clone()),
@@ -6384,6 +6495,7 @@ async fn run_maintain_thread_operation(
                 role: "assistant".to_string(),
                 text: assistant_text,
                 context_path: None,
+                selection_snippets: Vec::new(),
                 provider: Some(provider),
                 model: Some(model),
                 reasoning_effort: Some(reasoning_effort),
@@ -6417,6 +6529,7 @@ async fn run_maintain_thread_operation(
                 role: "assistant".to_string(),
                 text: format!("{label} could not start: {error}"),
                 context_path: None,
+                selection_snippets: Vec::new(),
                 provider: Some(provider),
                 model: Some(model),
                 reasoning_effort: Some(reasoning_effort),
@@ -6487,6 +6600,7 @@ async fn start_explore_chat(
     question: String,
     selected_path: String,
     selection_context: Option<String>,
+    selection_snippets: Option<Vec<ChatSelectionSnippet>>,
     web_search_enabled: bool,
     state: State<'_, WorkspaceStore>,
     provider_cache: State<'_, ProviderStatusCache>,
@@ -6506,6 +6620,7 @@ async fn start_explore_chat(
     let selection_context = selection_context
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
+    let selection_snippets = normalize_chat_selection_snippets(selection_snippets);
     let context_path = if selected_path.is_empty() {
         None
     } else {
@@ -6533,6 +6648,7 @@ async fn start_explore_chat(
         role: "user".to_string(),
         text: question.clone(),
         context_path: context_path.clone(),
+        selection_snippets: selection_snippets.clone(),
         provider: Some(provider.clone()),
         model: Some(model.clone()),
         reasoning_effort: Some(reasoning_effort.clone()),
@@ -6547,6 +6663,7 @@ async fn start_explore_chat(
         role: "assistant".to_string(),
         text: String::new(),
         context_path: context_path.clone(),
+        selection_snippets: Vec::new(),
         provider: Some(provider.clone()),
         model: Some(model.clone()),
         reasoning_effort: Some(reasoning_effort.clone()),
@@ -6733,6 +6850,7 @@ async fn start_maintain_discussion(
         role: "user".to_string(),
         text: question.clone(),
         context_path: Some(selected_path.clone()),
+        selection_snippets: Vec::new(),
         provider: Some(provider.clone()),
         model: Some(model.clone()),
         reasoning_effort: Some(reasoning_effort.clone()),
@@ -6747,6 +6865,7 @@ async fn start_maintain_discussion(
         role: "assistant".to_string(),
         text: String::new(),
         context_path: Some(selected_path.clone()),
+        selection_snippets: Vec::new(),
         provider: Some(provider.clone()),
         model: Some(model.clone()),
         reasoning_effort: Some(reasoning_effort.clone()),
@@ -6838,8 +6957,9 @@ async fn apply_chat_to_wiki(
         .map(|message| ApplyChatMessagePayload {
             id: message.id.clone(),
             role: message.role.clone(),
-            text: message.text.clone(),
+            text: chat_message_text_with_selection_snippets(message),
             context_path: message.context_path.clone(),
+            selection_snippets: message.selection_snippets.clone(),
             web_search_enabled: message.web_search_enabled.unwrap_or(false),
         })
         .collect();
@@ -6910,6 +7030,7 @@ async fn apply_chat_to_wiki(
                 role: "system".to_string(),
                 text: format!("Wiki update could not start: {error}"),
                 context_path: None,
+                selection_snippets: Vec::new(),
                 provider: Some(provider),
                 model: Some(model),
                 reasoning_effort: Some(reasoning_effort),
@@ -6991,6 +7112,7 @@ async fn apply_chat_to_wiki(
         role: "system".to_string(),
         text: summary,
         context_path: None,
+        selection_snippets: Vec::new(),
         provider: Some(provider),
         model: Some(model),
         reasoning_effort: Some(reasoning_effort),
@@ -8424,9 +8546,12 @@ fn import_source_file(source_dir: &Path, source_path: &str) -> Result<String, St
         )
     })?;
 
-    let imported_file_name = destination
-        .file_name()
-        .ok_or_else(|| format!("Imported source has no file name: {}", destination.display()))?;
+    let imported_file_name = destination.file_name().ok_or_else(|| {
+        format!(
+            "Imported source has no file name: {}",
+            destination.display()
+        )
+    })?;
     Ok(format!(
         "{}/{}",
         SOURCE_DIR,
@@ -8740,28 +8865,28 @@ fn should_hide_workspace_file(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        backup_schema_before_update, chat_thread_summary, chat_threads_dir,
+        backup_schema_before_update, build_history_json, chat_thread_summary, chat_threads_dir,
         compose_maintain_operation_instruction, dedupe_node_path_candidates,
         default_workspace_schema, delete_wiki_image_asset_from_workspace,
         ensure_asset_master_file_for_edit, ensure_maintain_thread_task_matches,
         ensure_no_pending_generated_changes, extract_partial_answer_from_events,
         finalize_provider_check_report, html_to_text_preview, import_source_file,
-        initialize_workspace_files,
-        is_readable_workspace_preview_path, is_supported_source_extension,
-        is_valid_asset_relative_path, load_state_at, login_command_for_settings,
-        maintain_operation_assistant_text, maintain_operation_user_text, make_chat_thread,
-        make_maintain_thread, node_version_supported, normalize_operation_events,
-        normalize_settings, parse_node_major, parse_provider_ready, provider_choice_required,
-        provider_ready_candidate_count, provider_simulation_value_matches,
-        read_requested_or_new_chat_thread, read_text_tail, read_thread_file,
-        read_wiki_image_asset_registry, refresh_maintain_operation_messages,
+        initialize_workspace_files, is_readable_workspace_preview_path,
+        is_supported_source_extension, is_valid_asset_relative_path, load_state_at,
+        login_command_for_settings, maintain_operation_assistant_text,
+        maintain_operation_user_text, make_chat_thread, make_maintain_thread,
+        node_version_supported, normalize_operation_events, normalize_settings, parse_node_major,
+        parse_provider_ready, provider_choice_required, provider_ready_candidate_count,
+        provider_simulation_value_matches, read_requested_or_new_chat_thread, read_text_tail,
+        read_thread_file, read_wiki_image_asset_registry, refresh_maintain_operation_messages,
         refresh_streaming_messages, register_existing_wiki_asset_references,
         resolve_editable_workspace_file, run_command_probe, runner_path_env,
         schema_update_prompt_for_workspace, select_node_candidate, shell_single_quote,
         terminal_command_script, thread_activity_context, validate_provider_candidate,
         validate_provider_path, write_schema_update_marker, write_wiki_image_asset_registry,
-        AppSettings, ChatThreadMessage, NodeCandidate, NodePathCandidate, ProviderCandidate,
-        ProviderPathCandidate, ThreadFileKind, WikiImageAsset, WikiImageAssetRegistry,
+        AppSettings, ChatSelectionSnippet, ChatThreadMessage, NodeCandidate, NodePathCandidate,
+        ProviderCandidate, ProviderPathCandidate, ThreadFileKind, WikiImageAsset,
+        WikiImageAssetRegistry,
     };
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -8902,8 +9027,8 @@ mod tests {
         let source = outside.join("notes.md");
         fs::write(&source, "# Notes\n").unwrap();
 
-        let imported = import_source_file(&workspace.join("sources"), source.to_str().unwrap())
-            .unwrap();
+        let imported =
+            import_source_file(&workspace.join("sources"), source.to_str().unwrap()).unwrap();
 
         assert_eq!(imported, "sources/notes.md");
         assert_eq!(
@@ -8911,8 +9036,8 @@ mod tests {
             "# Notes\n"
         );
 
-        let duplicate = import_source_file(&workspace.join("sources"), source.to_str().unwrap())
-            .unwrap();
+        let duplicate =
+            import_source_file(&workspace.join("sources"), source.to_str().unwrap()).unwrap();
         assert_eq!(duplicate, "sources/notes-2.md");
         assert!(workspace.join("sources").join("notes-2.md").is_file());
 
@@ -9786,6 +9911,7 @@ exit 1
             role: "system".to_string(),
             text: text.to_string(),
             context_path: None,
+            selection_snippets: Vec::new(),
             provider: None,
             model: None,
             reasoning_effort: None,
@@ -9846,6 +9972,7 @@ exit 1
             role: role.to_string(),
             text: text.to_string(),
             context_path: Some("index.md".to_string()),
+            selection_snippets: Vec::new(),
             provider: Some("codex".to_string()),
             model: Some("gpt-5.5".to_string()),
             reasoning_effort: Some("xhigh".to_string()),
@@ -9855,6 +9982,37 @@ exit 1
             created_at: "1000".to_string(),
             completed_at: Some("1000".to_string()),
         }
+    }
+
+    #[test]
+    fn chat_history_includes_user_selection_snippets() {
+        let mut thread = make_chat_thread(Some("wiki/page.md".to_string()));
+        thread.messages.push(ChatThreadMessage {
+            id: "msg-user".to_string(),
+            role: "user".to_string(),
+            text: "Explain this part.".to_string(),
+            context_path: Some("wiki/page.md".to_string()),
+            selection_snippets: vec![ChatSelectionSnippet {
+                id: "selection-test".to_string(),
+                text: "Torque constant depends on winding turns.".to_string(),
+                source_label: "Motor notes".to_string(),
+                source_path: Some("sources/motor-notes.md".to_string()),
+            }],
+            provider: Some("codex".to_string()),
+            model: Some("gpt-5.5".to_string()),
+            reasoning_effort: Some("xhigh".to_string()),
+            web_search_enabled: Some(false),
+            run_id: None,
+            status: Some("completed".to_string()),
+            created_at: "1000".to_string(),
+            completed_at: Some("1000".to_string()),
+        });
+
+        let history = build_history_json(&thread).unwrap();
+
+        assert!(history.contains("Explain this part."));
+        assert!(history.contains("Selected text 1"));
+        assert!(history.contains("Torque constant depends on winding turns."));
     }
 
     #[test]
@@ -9944,12 +10102,12 @@ not-json
     #[test]
     fn terminal_command_script_runs_exact_provider_command() {
         let script = terminal_command_script("npm i -g @openai/codex").unwrap();
+        assert!(script.contains(
+            "printf '\\nMaple opened this setup window to finish AI connection setup.\\n'"
+        ));
         assert!(
-            script.contains(
-                "printf '\\nMaple opened this setup window to finish AI connection setup.\\n'"
-            )
+            script.contains("printf 'Technical command:\\n  %s\\n\\n' 'npm i -g @openai/codex'")
         );
-        assert!(script.contains("printf 'Technical command:\\n  %s\\n\\n' 'npm i -g @openai/codex'"));
         assert!(script.contains("\nnpm i -g @openai/codex\n"));
         assert!(script.contains("exec \"${SHELL:-/bin/zsh}\" -l"));
     }
@@ -10222,6 +10380,7 @@ not-json
             role: "assistant".to_string(),
             text: String::new(),
             context_path: Some("wiki/page.md".to_string()),
+            selection_snippets: Vec::new(),
             provider: None,
             model: None,
             reasoning_effort: None,
@@ -10261,6 +10420,7 @@ not-json
             role: "assistant".to_string(),
             text: String::new(),
             context_path: Some("wiki/page.md".to_string()),
+            selection_snippets: Vec::new(),
             provider: None,
             model: None,
             reasoning_effort: None,
@@ -10296,6 +10456,7 @@ not-json
             role: "assistant".to_string(),
             text: String::new(),
             context_path: Some("wiki/page.md".to_string()),
+            selection_snippets: Vec::new(),
             provider: None,
             model: None,
             reasoning_effort: None,

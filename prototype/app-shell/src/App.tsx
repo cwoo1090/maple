@@ -358,6 +358,7 @@ type ExploreChatMessage = {
   role: "user" | "assistant" | "system";
   text: string;
   contextPath?: string;
+  selectionSnippets?: ChatSelectionSnippet[];
   provider?: string;
   model?: string;
   reasoningEffort?: string;
@@ -575,6 +576,8 @@ type CenterTab =
       kind: "graph";
       title: string;
     };
+
+type CenterScrollRestoreMode = "restore" | "top" | "anchor";
 
 const WIKI_UPDATE_STEPS = [
   "Collecting selected chat",
@@ -1102,6 +1105,77 @@ function makeOptimisticChatId(prefix: string): string {
   return `${prefix}-optimistic-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+function elementFromNode(node: Node | null): Element | null {
+  if (!node) return null;
+  return node instanceof Element ? node : node.parentElement;
+}
+
+function rangeIntersectsNode(range: Range, node: Node): boolean {
+  try {
+    return range.intersectsNode(node);
+  } catch (_error) {
+    return false;
+  }
+}
+
+function selectedKatexText(element: Element): string | null {
+  const tex = element
+    .querySelector('annotation[encoding="application/x-tex"]')
+    ?.textContent?.trim();
+  if (!tex) return null;
+  return element.closest(".katex-display") ? `\n$$\n${tex}\n$$\n` : `$${tex}$`;
+}
+
+function textNodeRangeText(range: Range, node: Text): string {
+  let text = node.textContent ?? "";
+  if (node === range.startContainer) text = text.slice(range.startOffset);
+  if (node === range.endContainer) text = text.slice(0, range.endOffset);
+  return text;
+}
+
+function selectedTextFromRange(range: Range, fallback: string): string {
+  const startElement = elementFromNode(range.startContainer);
+  const endElement = elementFromNode(range.endContainer);
+  const commonElement = elementFromNode(range.commonAncestorContainer);
+  const root =
+    startElement?.closest(".katex") ??
+    endElement?.closest(".katex") ??
+    commonElement;
+  if (!root) return fallback;
+
+  const parts: string[] = [];
+  const appendNode = (node: Node) => {
+    if (!rangeIntersectsNode(range, node)) return;
+
+    if (node instanceof Text) {
+      if (node.parentElement?.closest(".katex")) return;
+      parts.push(textNodeRangeText(range, node));
+      return;
+    }
+
+    if (!(node instanceof Element)) return;
+    if (node.classList.contains("katex")) {
+      const tex = selectedKatexText(node);
+      if (tex) parts.push(tex);
+      return;
+    }
+    if (node.closest(".katex")) return;
+    if (node.tagName === "BR") {
+      parts.push("\n");
+      return;
+    }
+
+    node.childNodes.forEach(appendNode);
+    if (/^(DIV|P|LI|TR|H[1-6]|BLOCKQUOTE|PRE)$/i.test(node.tagName)) {
+      parts.push("\n");
+    }
+  };
+
+  appendNode(root);
+  const selectedText = parts.join("");
+  return selectedText.trim() ? selectedText : fallback;
+}
+
 function normalizeChatSelectionText(text: string): string {
   return text
     .replace(/\u00a0/g, " ")
@@ -1114,6 +1188,10 @@ function chatSelectionCharLabel(count: number, language: UiLanguage): string {
   return language === "ko" ? `${count.toLocaleString()}자` : `${count.toLocaleString()} chars`;
 }
 
+function chatSelectionPreviewText(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
+}
+
 function renderChatSelectionContext(snippets: ChatSelectionSnippet[]): string {
   return snippets
     .map((snippet, index) => {
@@ -1121,6 +1199,48 @@ function renderChatSelectionContext(snippets: ChatSelectionSnippet[]): string {
       return [`Selected text ${index + 1}`, `Source: ${source}`, "Text:", snippet.text].join("\n");
     })
     .join("\n\n");
+}
+
+function ChatAttachedSelectionSnippets({
+  snippets,
+  language,
+}: {
+  snippets?: ChatSelectionSnippet[];
+  language: UiLanguage;
+}) {
+  const visibleSnippets = (snippets ?? []).filter((snippet) => snippet.text.trim());
+  if (visibleSnippets.length === 0) return null;
+
+  return (
+    <div className="chat-attached-selections">
+      <div className="chat-attached-selections-title">
+        <Quote size={13} strokeWidth={2.2} aria-hidden="true" />
+        <span>
+          {language === "ko"
+            ? `첨부한 선택 텍스트 ${visibleSnippets.length}개`
+            : `${visibleSnippets.length} attached selected ${
+                visibleSnippets.length === 1 ? "text" : "texts"
+              }`}
+        </span>
+      </div>
+      <div className="chat-attached-selection-list">
+        {visibleSnippets.map((snippet, index) => {
+          const source = snippet.sourcePath || snippet.sourceLabel;
+          const previewText = chatSelectionPreviewText(snippet.text);
+          return (
+            <div key={snippet.id || `${source}-${index}`} className="chat-attached-selection">
+              <div className="chat-attached-selection-source" title={source}>
+                {snippet.sourceLabel}
+              </div>
+              <div className="chat-attached-selection-text" title={previewText}>
+                {previewText}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
 }
 
 function optimisticChatTitle(question: string): string {
@@ -1597,7 +1717,10 @@ function App() {
   const chatHistoryPopoverRef = useRef<HTMLDivElement | null>(null);
   const maintainHistoryButtonRef = useRef<HTMLButtonElement | null>(null);
   const maintainHistoryPopoverRef = useRef<HTMLDivElement | null>(null);
+  const centerBodyRef = useRef<HTMLDivElement | null>(null);
   const centerConnectionsRef = useRef<HTMLDivElement | null>(null);
+  const centerScrollPositionsRef = useRef<Map<string, number>>(new Map());
+  const centerScrollRestoreModeRef = useRef<CenterScrollRestoreMode>("top");
   const [workspace, setWorkspace] = useState<WorkspaceState>(emptyState);
   const [runner, setRunner] = useState<RunnerOutput | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
@@ -2324,6 +2447,48 @@ function App() {
   );
   const activeReportContent =
     activeCenterTab?.kind === "report" ? activeCenterTab.content : null;
+  function saveActiveCenterScroll(tabId = activeCenterTabId) {
+    const centerBody = centerBodyRef.current;
+    if (!centerBody || !tabId) return;
+    centerScrollPositionsRef.current.set(tabId, centerBody.scrollTop);
+  }
+
+  function restoreCenterScrollPosition(tabId: string, mode: CenterScrollRestoreMode) {
+    const centerBody = centerBodyRef.current;
+    if (!centerBody) return;
+    if (mode === "anchor") return;
+
+    const rawTop =
+      mode === "top" ? 0 : centerScrollPositionsRef.current.get(tabId) ?? 0;
+    const maxTop = Math.max(0, centerBody.scrollHeight - centerBody.clientHeight);
+    centerBody.scrollTop = Math.max(0, Math.min(rawTop, maxTop));
+  }
+
+  useLayoutEffect(() => {
+    const mode = centerScrollRestoreModeRef.current;
+    centerScrollRestoreModeRef.current = "restore";
+    if (mode === "anchor") return;
+
+    restoreCenterScrollPosition(activeCenterTabId, mode);
+    const raf = requestAnimationFrame(() => {
+      restoreCenterScrollPosition(activeCenterTabId, mode);
+    });
+    const timeout = window.setTimeout(() => {
+      restoreCenterScrollPosition(activeCenterTabId, mode);
+    }, 80);
+    return () => {
+      cancelAnimationFrame(raf);
+      window.clearTimeout(timeout);
+    };
+    // selectedDocument.content is included so restoring still works after async file reads.
+  }, [
+    activeCenterTabId,
+    activeReportContent,
+    selectedDocument.content,
+    selectedDocument.path,
+    selectedPath,
+    viewMode,
+  ]);
   const editDirty = Boolean(editBuffer && editBuffer.draft !== editBuffer.original);
   const editActiveForSelectedPath = Boolean(
     editBuffer && editBuffer.path === selectedPath && viewMode === "page" && !activeReportContent,
@@ -3458,6 +3623,9 @@ function App() {
 
   function performOpenWorkspaceFile(path: string, anchor: string | null = null) {
     const tab = workspaceCenterTab(path);
+    const existingTab = centerTabs.some((item) => item.id === tab.id);
+    saveActiveCenterScroll();
+    centerScrollRestoreModeRef.current = anchor ? "anchor" : existingTab ? "restore" : "top";
     if (!wikiExploredTrackedRef.current && isWikiExplorationPath(path)) {
       wikiExploredTrackedRef.current = true;
       track("wiki explored");
@@ -3520,6 +3688,9 @@ function App() {
     const canLeave = await resolveDirtyEditBefore("open Graph");
     if (!canLeave) return;
     const tab = graphCenterTab();
+    const existingTab = centerTabs.some((item) => item.id === tab.id);
+    saveActiveCenterScroll();
+    centerScrollRestoreModeRef.current = existingTab ? "restore" : "top";
     setViewMode("graph");
     setActiveCenterTabId(tab.id);
     setCenterTabs((prev) => {
@@ -3537,6 +3708,9 @@ function App() {
       workspace.changedMarker?.operationId ??
       `report-${Date.now()}`;
     const tab = reportCenterTab(operationId, workspace.reportMd);
+    const existingTab = centerTabs.some((item) => item.id === tab.id);
+    saveActiveCenterScroll();
+    centerScrollRestoreModeRef.current = existingTab ? "restore" : "top";
     setViewMode("page");
     setActiveCenterTabId(tab.id);
     setCenterTabs((prev) => {
@@ -3585,6 +3759,8 @@ function App() {
         if (!canLeave) return;
       }
     }
+    saveActiveCenterScroll();
+    centerScrollRestoreModeRef.current = "restore";
     setActiveCenterTabId(tab.id);
     if (tab.kind === "workspace") {
       setSelectedPath(tab.path);
@@ -3602,6 +3778,9 @@ function App() {
       const canClose = await resolveDirtyEditBefore(`close ${closingTab.title}`);
       if (!canClose) return;
     }
+    saveActiveCenterScroll();
+    centerScrollPositionsRef.current.delete(tabId);
+    centerScrollRestoreModeRef.current = "restore";
     setCenterTabs((prev) => {
       const index = prev.findIndex((tab) => tab.id === tabId);
       if (index === -1) return prev;
@@ -3611,6 +3790,7 @@ function App() {
         setActiveCenterTabId(fallback.id);
         setSelectedPath("index.md");
         setViewMode("page");
+        centerScrollRestoreModeRef.current = "top";
         return [fallback];
       }
       if (activeCenterTabId === tabId) {
@@ -3879,6 +4059,8 @@ function App() {
 
   useEffect(() => {
     if (!workspace.workspacePath) {
+      centerScrollPositionsRef.current.clear();
+      centerScrollRestoreModeRef.current = "top";
       setEditBuffer(null);
       setUnsavedPrompt(null);
       unsavedPromptResolverRef.current?.("cancel");
@@ -3901,6 +4083,8 @@ function App() {
     setBackgroundBuildActive(false);
     setBackgroundBuildStartedAt(null);
     handledBuildOperationIdRef.current = null;
+    centerScrollPositionsRef.current.clear();
+    centerScrollRestoreModeRef.current = "top";
     setCenterTabs([workspaceCenterTab("index.md")]);
     setActiveCenterTabId("workspace:index.md");
     setSelectedPath("index.md");
@@ -5510,7 +5694,9 @@ function App() {
 
     const range = selection.getRangeAt(0);
     const source = selectionSourceFromNode(range.commonAncestorContainer);
-    const text = normalizeChatSelectionText(selection.toString());
+    const text = normalizeChatSelectionText(
+      selectedTextFromRange(range, selection.toString()),
+    );
     if (!source || text.length < 2) {
       setChatSelectionAction(null);
       return;
@@ -5614,8 +5800,9 @@ function App() {
     }
     const question = (questionOverride ?? exploreQuestion).trim();
     if (!question) return false;
-    const selectionContext = renderChatSelectionContext(chatSelectionSnippets);
-    const selectionSnippetCount = chatSelectionSnippets.length;
+    const selectionSnippets = chatSelectionSnippets.map((snippet) => ({ ...snippet }));
+    const selectionContext = renderChatSelectionContext(selectionSnippets);
+    const selectionSnippetCount = selectionSnippets.length;
     const contextPath =
       askWikiContextScope === "current"
         ? exploreContextPathForQuestion(
@@ -5637,6 +5824,7 @@ function App() {
       role: "user",
       text: question,
       contextPath: contextPath || undefined,
+      selectionSnippets: selectionSnippets.length > 0 ? selectionSnippets : undefined,
       provider: activeProvider?.name,
       model: activeModelId || undefined,
       reasoningEffort: activeReasoningEffort || undefined,
@@ -5714,6 +5902,7 @@ function App() {
         question,
         selectedPath: contextPath,
         selectionContext,
+        selectionSnippets,
         webSearchEnabled: exploreWebSearchEnabled,
       });
       startReturnedThread = true;
@@ -5746,6 +5935,7 @@ function App() {
           question,
           selectedPath: contextPath,
           selectionContext,
+          selectionSnippets,
           webSearchEnabled: exploreWebSearchEnabled,
         });
         startReturnedThread = true;
@@ -7757,7 +7947,11 @@ function App() {
               ) : null}
             </div>
           ) : null}
-          <div className="center-body">
+          <div
+            ref={centerBodyRef}
+            className="center-body"
+            onScroll={() => saveActiveCenterScroll()}
+          >
             {activeReportContent ? (
               <MarkdownDocument
                 content={activeReportContent}
@@ -8156,6 +8350,12 @@ function App() {
                               canOpenDocumentReference(path, message.contextPath ?? selectedPath)
                             }
                             compact
+                          />
+                        ) : null}
+                        {message.role === "user" ? (
+                          <ChatAttachedSelectionSnippets
+                            snippets={message.selectionSnippets}
+                            language={language}
                           />
                         ) : null}
                         {message.role === "assistant" ? (
@@ -9732,30 +9932,16 @@ function MaintainUserMessage({
   availableDocuments: string[];
   onOpenDocument: (path: string, anchor?: string | null) => void;
 }) {
-  const parts = text
-    .split(/\n+/)
-    .map((part) => part.trim())
-    .filter(Boolean);
-  const context = parts.length > 1 ? parts[0] : null;
-  const body = context ? parts.slice(1).join("\n") : text.trim();
-
   return (
-    <>
-      {context ? (
-        <div className="maintain-message-context" title={context}>
-          {context}
-        </div>
-      ) : null}
-      <div className="maintain-message-body">
-        <WorkspaceAwareMarkdown
-          content={body}
-          currentPath={currentPath}
-          workspacePath={workspacePath}
-          availableDocuments={availableDocuments}
-          onOpenDocument={onOpenDocument}
-        />
-      </div>
-    </>
+    <div className="maintain-message-body">
+      <WorkspaceAwareMarkdown
+        content={text.trim()}
+        currentPath={currentPath}
+        workspacePath={workspacePath}
+        availableDocuments={availableDocuments}
+        onOpenDocument={onOpenDocument}
+      />
+    </div>
   );
 }
 

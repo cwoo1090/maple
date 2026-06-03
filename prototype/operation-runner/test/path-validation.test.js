@@ -32,6 +32,7 @@ const {
   getOutsideWikiChanges,
   initializeWorkspace,
   isAllowedPath,
+  isWikiContentPagePath,
   isRunnerMetadataPath,
   hasPendingGeneratedChanges,
   getReviewableChangedFiles,
@@ -93,6 +94,19 @@ test("parseArgs preserves empty flag values", () => {
 
   assert.equal(parsed.flags["selected-path"], "");
   assert.equal(parsed.flags["history-json"], "[]");
+});
+
+test("Build Wiki content detection accepts any non-asset wiki markdown page", () => {
+  assert.equal(isWikiContentPagePath("wiki/concepts/memory.md"), true);
+  assert.equal(isWikiContentPagePath("wiki/summaries/lecture-01.md"), true);
+  assert.equal(isWikiContentPagePath("wiki/guides/study-path.md"), true);
+  assert.equal(isWikiContentPagePath("wiki/units/chemistry/classification-of-matter.md"), true);
+  assert.equal(isWikiContentPagePath("wiki/problems/chemistry/patterns.md"), true);
+  assert.equal(isWikiContentPagePath("wiki/assets/README.md"), false);
+  assert.equal(isWikiContentPagePath("wiki/assets/diagram.png"), false);
+  assert.equal(isWikiContentPagePath("index.md"), false);
+  assert.equal(isWikiContentPagePath("schema.md"), false);
+  assert.equal(isWikiContentPagePath("../wiki/units/escape.md"), false);
 });
 
 test("normalizes safe relative paths", () => {
