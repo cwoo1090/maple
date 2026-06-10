@@ -610,7 +610,9 @@ function applyCommon(language) {
 
   document.querySelectorAll(".site-nav a").forEach((link) => {
     const href = link.getAttribute("href") || "";
-    if (href.includes("download-macos.html")) link.textContent = copy.nav.download;
+    if (href.includes("download-macos.html") || href.includes("/releases/download/")) {
+      link.textContent = copy.nav.download;
+    }
     if (href.includes("#hero-demo")) link.textContent = copy.nav.demo;
     if (href.includes("#workflow")) link.textContent = copy.nav.workflow;
     if (href.includes("guide.html")) link.textContent = copy.nav.guide;

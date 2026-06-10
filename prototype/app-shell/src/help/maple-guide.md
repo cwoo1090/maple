@@ -69,7 +69,7 @@ Important meanings:
 - `log.md` records important build and maintenance notes.
 - `schema.md` contains durable rules for how this workspace's wiki should be structured and maintained.
 - `AGENTS.md` contains workspace instructions for AI agents.
-- `.aiwiki/` contains Maple metadata, snapshots, baselines, operation reports, chat records, and review state.
+- `.aiwiki/` contains Maple metadata, snapshots, baselines, operation reports, chat records, review state, and prepared source artifacts.
 
 Users normally do not need to open or edit `.aiwiki/`.
 
@@ -81,7 +81,9 @@ When Maple opens without a workspace:
 - They can choose the app interface language with the `Korean` / `English` buttons.
 - They can click `Create new workspace` to start a new local wiki folder.
 - They can click `Open existing folder` to use an existing Maple workspace.
-- They can open Maple Guide from the small chat button in the lower-left corner.
+- They can open Maple Guide from the lower-left chat button.
+- On first entry, Maple may show a speech bubble above the chat button labeled `Maple Guide` with the text `Ask me how to use Maple.`
+- If the user clicks the small `×` on that speech bubble, the bubble hides, but the lower-left Maple Guide button remains available.
 
 Recommended guidance:
 
@@ -96,7 +98,13 @@ If the user is unsure where to put the workspace, suggest a simple folder such a
 
 ## Maple Guide
 
-Maple Guide is the small help chat in the lower-left corner of the app.
+Maple Guide is the help chat in the lower-left corner of the app.
+
+When the guide panel is closed, users may see:
+
+- A round lower-left chat button that opens Maple Guide.
+- A speech bubble above the button that introduces it as `Maple Guide`.
+- A small `×` on the speech bubble. Clicking `×` hides only the speech bubble, not Maple Guide itself.
 
 Use Maple Guide for:
 
@@ -197,8 +205,56 @@ Explain sources this way:
 
 - Sources are the original reference files.
 - Maple should not rewrite sources.
-- Maple reads sources and writes wiki pages.
+- Maple prepares readable copies of some sources, reads those prepared copies, and writes wiki pages.
 - If a source changes, Maple can detect pending source changes.
+- Prepared source artifacts are generated under `.aiwiki/`, not written back into `sources/`.
+
+## Source Preparation
+
+Maple converts some source files into readable Markdown artifacts before Build wiki, Ask Wiki, or source-grounded Maintain uses them.
+
+Explain source preparation this way:
+
+- The original source file stays unchanged in `sources/`.
+- Maple creates generated reading artifacts in `.aiwiki/`, such as extracted Markdown, manifests, page images, and cache records.
+- The main registry is `.aiwiki/source-artifacts.json`; users normally should not edit it.
+- Text-like sources such as `.md`, `.txt`, structured data, HTML, and images may be ready immediately.
+- PDFs and `.docx` files can be prepared automatically after import.
+- Other Office files such as `.ppt`, `.pptx`, `.doc`, `.xls`, and `.xlsx` may require LibreOffice so Maple can convert or render them before extraction.
+
+Common preparation states:
+
+- `Ready`: Maple has a readable source or prepared artifact.
+- `Preparing`: Maple is converting the source into a readable form.
+- `Needs prep`: Maple has not prepared that source yet, or the prepared artifact is stale or missing.
+- `Failed`: Maple tried to prepare the source but could not finish.
+
+PDF preparation:
+
+- Maple extracts structured Markdown when possible.
+- Maple may also render page images for visual grounding.
+- In the Build wiki modal, PDFs can show a `Reading mode` control:
+  - `Mostly text`: use this for articles, textbooks, notes, and text-heavy PDFs.
+  - `Text with diagrams`: use this for PDFs where diagrams, tables, formulas, or figures matter.
+  - `Mostly visual`: use this for slides, scanned pages, image-heavy PDFs, or layouts where the page visuals carry meaning.
+
+DOCX preparation:
+
+- Maple uses a document converter to turn `.docx` files into Markdown.
+- Images embedded in the document can be copied into the prepared artifact folder and referenced from the generated Markdown.
+
+Office and preview behavior:
+
+- Maple can render Office files as PDF previews in the center reading area when LibreOffice is available.
+- Preview rendering is for viewing the source in Maple.
+- Source preparation is for giving Build wiki, Ask Wiki, or Maintain a readable artifact.
+- Both are derived from the source; neither should rewrite the original source file.
+
+If the user sees `Rendering preview...`, explain that Maple is making a temporary PDF preview for the selected Office file.
+
+If the user sees a LibreOffice requirement, explain:
+
+"Maple needs LibreOffice to preview or prepare Office files such as PowerPoint, Word, or Excel documents. Install LibreOffice from the visible setup action, then reopen or retry the source."
 
 Good first source set:
 
@@ -215,7 +271,9 @@ Answer:
 
 ## Source Status
 
-Maple tracks whether sources are new, modified, removed, or already ingested.
+Maple tracks both source change status and source readiness.
+
+Source change status tells whether the original files changed since Maple last ingested them.
 
 Common states:
 
@@ -224,6 +282,22 @@ Common states:
 - Removed source files mean a previously tracked source is gone.
 - No pending source changes means Build wiki may not need to run unless the user wants to rebuild.
 
+Source readiness tells whether the files are readable for Build wiki.
+
+In the Build wiki modal, Maple may show a source list with readiness badges such as `Ready`, `Preparing`, `Needs prep`, or `Failed`. It may also show a count like `2/3 ready`.
+
+If some sources are still preparing:
+
+- Tell the user to wait for preparation to finish.
+- If the build button says `Build when ready`, it will queue the build until preparation completes.
+- If Maple offers `Build ready sources`, that builds only the sources already prepared.
+
+If preparation failed:
+
+- Ask the user to read the visible error on that source row.
+- For Office files, check whether LibreOffice is installed.
+- Suggest retrying with fewer sources or converting the problematic file to PDF if needed.
+
 If the user asks why Build wiki is disabled:
 
 Possible reasons:
@@ -231,6 +305,7 @@ Possible reasons:
 - No workspace is open.
 - No supported source files are present.
 - No pending source changes are detected.
+- Sources are still preparing.
 - A workspace-changing operation is already running.
 - AI connection is not ready.
 - Generated changes are waiting for review.
@@ -254,11 +329,14 @@ For a first build:
 
 1. Add one or more source files.
 2. Click `Build wiki`.
-3. If Maple asks "What are you building?", describe the goal in plain language.
-4. Example: "This is for my robotics class. Make beginner-friendly summaries, explain formulas step by step, and create exam review guides."
-5. Choose the AI account/model if needed.
-6. Start the build.
-7. Wait until Maple reports changes ready to review.
+3. Check the changed source list and readiness badges.
+4. For PDFs, choose the best `Reading mode` if Maple shows that control.
+5. If Maple asks "What are you building?", describe the goal in plain language.
+6. Example: "This is for my robotics class. Make beginner-friendly summaries, explain formulas step by step, and create exam review guides."
+7. Choose the AI account/model if needed.
+8. Start the build.
+9. If sources still need preparation, use `Build when ready` and wait.
+10. Wait until Maple reports changes ready to review.
 
 When the build prompt asks what the wiki is for, the user should explain:
 
@@ -283,9 +361,21 @@ Poor build instructions:
 
 If a build takes a while:
 
-- Explain that AI is reading sources and writing local wiki files.
-- For large PDFs or slides, it can take several minutes.
+- Explain that Maple may first prepare sources, then AI reads them and writes local wiki files.
+- For large PDFs, slides, or Office files, preparation and build can take several minutes.
 - The user should avoid starting another workspace-changing action while Build wiki is running.
+
+If the Build wiki modal shows `Build when ready`:
+
+Explain:
+
+"Maple still needs to prepare one or more sources. Click `Build when ready` to let Maple finish preparation first, then start the build automatically."
+
+If the Build wiki modal shows `Build ready sources`:
+
+Explain:
+
+"Some sources are already ready and some are not. `Build ready sources` builds only the ready files. Use it when you do not want to wait for the remaining source preparation."
 
 ## Reviewing AI-Generated Changes
 
@@ -307,7 +397,7 @@ If the user asks "Did AI change my source PDF?":
 
 Answer:
 
-"No. Sources are treated as original reference files. Maple should write wiki pages and metadata, not rewrite your source files."
+"No. Sources are treated as original reference files. Maple may create prepared Markdown, page images, or cache metadata under `.aiwiki/`, but it should not rewrite your source files."
 
 If the user asks "What should I review?":
 
@@ -392,6 +482,7 @@ The right-side `Maintain` panel is for improving the wiki as a workspace.
 Use Maintain when the user wants to:
 
 - Improve wiki structure.
+- Create or refine the wiki folder structure.
 - Run a wiki healthcheck.
 - Add guides or improve existing guides.
 - Organize sources.
@@ -406,9 +497,17 @@ Maintain differs from Ask Wiki:
 Common Maintain tasks:
 
 - `Wiki healthcheck`: find weak spots, missing links, stale pages, or structure issues.
-- `Improve wiki`: write better explanations, add guides, connect pages.
+- `Improve wiki`: write better explanations, add guides, connect pages, and reorganize wiki pages into clearer folders.
 - `Organize sources`: move or rename source files without changing their contents.
 - `Update rules`: save durable instructions for future operations.
+
+Folder structure guidance:
+
+- Users can ask `Improve wiki` to create a clearer folder structure inside `wiki/`.
+- This is useful when the wiki is growing and pages need to be grouped by topic, course unit, project area, concept type, or workflow.
+- Good requests include: "Organize this wiki into folders by topic", "Move concept pages under `wiki/concepts/` and study guides under `wiki/guides/`", or "Create a cleaner folder structure for this course wiki."
+- Maple should keep the wiki easy to browse and update links when it moves pages.
+- Source files remain original references in `sources/`; use `Organize sources` only when the user specifically wants to move or rename source files.
 
 If the user says "I want every future guide to include practice questions":
 
@@ -458,7 +557,8 @@ Users can:
 - Read generated Markdown pages.
 - Open tabs for multiple files.
 - Edit Markdown pages directly when needed.
-- View images, PDFs, and slides when supported.
+- View images and PDFs.
+- View Office files through rendered PDF previews when LibreOffice is available.
 - Switch to graph view if available.
 
 If the user asks "Where is my wiki?":
@@ -497,8 +597,10 @@ Maple shows operation status in the top bar, side panels, or bottom status bar.
 Common statuses:
 
 - Building wiki.
+- Preparing sources.
 - Updating wiki.
 - Importing sources.
+- Rendering preview.
 - Changes ready.
 - Clean.
 - Undoing operation.
@@ -566,7 +668,37 @@ Yes. Maple stores wiki pages as local Markdown files. Users can make manual edit
 
 ### "Can Maple change my original PDFs or sources?"
 
-No. The intended workflow treats sources as original inputs. Maple writes wiki content and metadata, not source files.
+No. The intended workflow treats sources as original inputs. Maple writes wiki content, prepared source artifacts, cache files, and metadata, not source files.
+
+### "What does Preparing sources mean?"
+
+Maple is converting source files into readable artifacts before AI uses them. For example, it may extract Markdown from a PDF or DOCX, render page images, or prepare metadata. The original file in `sources/` stays unchanged.
+
+### "What is the PDF Reading mode?"
+
+It tells Maple how much to rely on PDF visuals during Build wiki:
+
+- `Mostly text`: text-heavy PDFs.
+- `Text with diagrams`: PDFs with important diagrams, tables, formulas, or figures.
+- `Mostly visual`: slides, scans, or image-heavy PDFs.
+
+If unsure, use `Text with diagrams` for lecture PDFs and `Mostly visual` for slide decks.
+
+### "Why does Maple need LibreOffice?"
+
+LibreOffice lets Maple preview or prepare Office files such as PowerPoint, Word, and Excel documents. If Maple asks for LibreOffice, use the visible install/setup action, then reopen or retry the file.
+
+### "What is Build when ready?"
+
+`Build when ready` means Maple will prepare the needed sources first, then start Build wiki automatically.
+
+### "What is Build ready sources?"
+
+`Build ready sources` means Maple will build only the sources that are already prepared and skip the ones still preparing or failed.
+
+### "Can I edit the prepared Markdown in `.aiwiki/`?"
+
+No. Treat `.aiwiki/` prepared artifacts as Maple-generated cache and metadata. Edit wiki pages under `wiki/` or source files intentionally, not the prepared artifacts.
 
 ### "Can I use this without paying Maple?"
 
@@ -627,6 +759,7 @@ Maple Guide can:
 - Help choose between Build wiki, Ask Wiki, Maintain, and Settings.
 - Suggest better build instructions.
 - Explain the workspace folder model.
+- Explain source preparation, source readiness, and PDF reading modes.
 - Explain review and undo.
 - Explain AI connection steps.
 
@@ -634,6 +767,7 @@ Maple Guide cannot:
 
 - Directly edit the user's wiki.
 - Directly import files.
+- Directly prepare or convert sources.
 - Directly run Build wiki.
 - Directly sign in to AI accounts.
 - Click setup buttons for the user.
@@ -646,6 +780,7 @@ If the user asks Maple Guide to perform an action, guide them to the UI action:
 - "Use the right-side `Maintain` tab for that."
 - "Use `Undo last operation` from the top-right menu."
 - "Click the lower-left Maple Guide button whenever you need app help."
+- "If the speech bubble is in the way, click its small `×`. The Maple Guide button will stay available."
 
 ## Current App State
 
@@ -656,6 +791,8 @@ Examples:
 
 - If no workspace is open, start with creating or opening a workspace.
 - If sources are pending, suggest Build wiki.
+- If sources are preparing, suggest waiting for preparation to finish or using `Build when ready` if visible.
+- If source preparation failed, suggest checking the visible source-row error and LibreOffice status for Office files.
 - If generated changes are waiting for review, suggest reviewing or undoing before starting another write operation.
 - If the AI connection is not ready, suggest using the visible `Connect AI` button, connection card, or Settings.
 - If a workspace operation is running, suggest waiting or using Stop if appropriate.

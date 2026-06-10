@@ -1,7 +1,7 @@
 use base64::{engine::general_purpose, Engine as _};
 use image::GenericImageView;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::{
@@ -34,6 +34,7 @@ struct WorkspaceState {
     workspace_path: String,
     status: Option<Value>,
     source_status: Option<Value>,
+    source_readiness: Option<Value>,
     wiki_status: Option<Value>,
     outside_wiki_changes: Option<Value>,
     changed_marker: Option<Value>,
@@ -54,6 +55,7 @@ impl WorkspaceState {
             workspace_path: String::new(),
             status: None,
             source_status: None,
+            source_readiness: None,
             wiki_status: None,
             outside_wiki_changes: None,
             changed_marker: None,
@@ -200,6 +202,9 @@ const REQUIRED_NODE_MAJOR: u32 = 20;
 const PROVIDER_COMMAND_TIMEOUT_MS: u64 = 8_000;
 const SCHEMA_UPDATE_METADATA_FILE: &str = "schema-update.json";
 const ASSET_REGISTRY_PATH: &str = "wiki/assets/assets.json";
+const SOURCE_ARTIFACTS_PATH: &str = ".aiwiki/source-artifacts.json";
+const RUNNER_STARTUP_ERROR_PATH: &str = ".aiwiki/running/startup-error.json";
+const PDF_USE_AS_TYPES: &[&str] = &["mostly-text", "text-with-diagrams", "mostly-visual"];
 const MAPLE_GUIDE_KNOWLEDGE: &str = include_str!("../../src/help/maple-guide.md");
 
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
@@ -3636,6 +3641,10 @@ fn read_operation_marker(path: &Path) -> Result<Option<Value>, String> {
         .map_err(|error| format!("Failed to parse operation marker: {error}"))
 }
 
+fn read_runner_startup_error(workspace: &Path) -> Option<Value> {
+    read_json_if_exists_normalized(&workspace.join(RUNNER_STARTUP_ERROR_PATH))
+}
+
 fn marker_string(marker: Option<&Value>, key: &str) -> Option<String> {
     marker
         .and_then(|value| value.get(key))
@@ -4269,6 +4278,33 @@ async fn read_workspace_operation_progress(
             )
         }
     };
+    if marker.is_none() {
+        if let Some(startup_error) = read_runner_startup_error(&workspace) {
+            let operation_type = startup_error
+                .get("operationType")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let started_at = startup_error
+                .get("startedAt")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let error = startup_error
+                .get("error")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| Some("Operation stopped before reporting progress.".to_string()));
+            return progress_from_event_paths(
+                &workspace,
+                false,
+                None,
+                operation_type,
+                started_at,
+                None,
+                None,
+                error,
+            );
+        }
+    }
     let operation_id = marker_string(marker.as_ref(), "operationId");
     let operation_type = normalized_operation_type(marker.as_ref(), None);
     let started_at = marker_string(marker.as_ref(), "startedAt");
@@ -6088,6 +6124,8 @@ async fn build_wiki(
     instruction: Option<String>,
     workspace_context: Option<String>,
     force: Option<bool>,
+    source_paths: Option<Vec<String>>,
+    pdf_use_as: Option<HashMap<String, String>>,
     provider: Option<String>,
     model: Option<String>,
     reasoning_effort: Option<String>,
@@ -6096,6 +6134,9 @@ async fn build_wiki(
 ) -> Result<AppCommandResult, String> {
     let workspace = current_workspace(&state)?;
     ensure_no_pending_generated_changes(&workspace)?;
+    ensure_no_workspace_operation_running(&workspace)?;
+    let selected_source_paths = normalize_selected_source_paths(&workspace, source_paths)?;
+    let pdf_use_as = normalize_pdf_use_as_map(&workspace, pdf_use_as)?;
     let settings = read_settings(&app);
     let provider = provider
         .map(|value| value.trim().to_string())
@@ -6137,19 +6178,75 @@ async fn build_wiki(
     if force.unwrap_or(false) {
         args.push("--force".to_string());
     }
+    if !selected_source_paths.is_empty() {
+        let source_paths_json = serde_json::to_string(&selected_source_paths)
+            .map_err(|error| format!("Failed to serialize selected source paths: {error}"))?;
+        args.push("--source-paths-json".to_string());
+        args.push(source_paths_json);
+    }
+    if !pdf_use_as.is_empty() {
+        let pdf_use_as_json = serde_json::to_string(&pdf_use_as)
+            .map_err(|error| format!("Failed to serialize PDF source roles: {error}"))?;
+        args.push("--pdf-use-as-json".to_string());
+        args.push(pdf_use_as_json);
+    }
 
     runner_root()?;
     node_executable()?;
-    let runner_args = args.clone();
-    thread::spawn(move || {
-        let _ = run_runner_with_args(&runner_args);
-    });
+    spawn_background_runner(workspace.clone(), "build-wiki", args.clone());
 
     Ok(AppCommandResult {
         runner: Some(RunnerOutput {
             success: true,
             code: Some(0),
             stdout: "Build wiki started in background.\n".to_string(),
+            stderr: String::new(),
+        }),
+        state: load_state_at(&workspace)?,
+    })
+}
+
+#[tauri::command]
+async fn prepare_sources(
+    source_paths: Option<Vec<String>>,
+    pdf_use_as: Option<HashMap<String, String>>,
+    force: Option<bool>,
+    state: State<'_, WorkspaceStore>,
+) -> Result<AppCommandResult, String> {
+    let workspace = current_workspace(&state)?;
+    ensure_no_workspace_operation_running(&workspace)?;
+    let selected_source_paths = normalize_selected_source_paths(&workspace, source_paths)?;
+    let pdf_use_as = normalize_pdf_use_as_map(&workspace, pdf_use_as)?;
+    let mut args = vec![
+        "prepare-sources".to_string(),
+        workspace.to_string_lossy().to_string(),
+    ];
+
+    if !selected_source_paths.is_empty() {
+        let source_paths_json = serde_json::to_string(&selected_source_paths)
+            .map_err(|error| format!("Failed to serialize selected source paths: {error}"))?;
+        args.push("--source-paths-json".to_string());
+        args.push(source_paths_json);
+    }
+    if !pdf_use_as.is_empty() {
+        let pdf_use_as_json = serde_json::to_string(&pdf_use_as)
+            .map_err(|error| format!("Failed to serialize PDF source roles: {error}"))?;
+        args.push("--pdf-use-as-json".to_string());
+        args.push(pdf_use_as_json);
+    }
+    if force.unwrap_or(false) {
+        args.push("--force".to_string());
+    }
+
+    runner_root()?;
+    node_executable()?;
+    spawn_background_runner(workspace.clone(), "prepare-sources", args.clone());
+
+    Ok(AppCommandResult {
+        runner: Some(RunnerOutput {
+            success: true,
+            code: Some(0),
+            stdout: "Source preparation started in background.\n".to_string(),
             stderr: String::new(),
         }),
         state: load_state_at(&workspace)?,
@@ -7632,6 +7729,96 @@ fn run_runner_with_args(args: &[String]) -> Result<RunnerOutput, String> {
     })
 }
 
+fn clear_runner_startup_error(workspace: &Path) {
+    let _ = fs::remove_file(workspace.join(RUNNER_STARTUP_ERROR_PATH));
+}
+
+fn operation_artifact_exists_after(workspace: &Path, started_ms: u128) -> bool {
+    let operations_dir = workspace.join(METADATA_DIR).join("operations");
+    let Ok(entries) = fs::read_dir(operations_dir) else {
+        return false;
+    };
+
+    entries.filter_map(Result::ok).any(|entry| {
+        entry
+            .metadata()
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_millis().saturating_add(1000) >= started_ms)
+            .unwrap_or(false)
+    })
+}
+
+fn runner_output_detail(output: &RunnerOutput) -> String {
+    let stderr = output.stderr.trim();
+    if !stderr.is_empty() {
+        return truncate_for_feed(stderr, 2_000);
+    }
+    let stdout = output.stdout.trim();
+    if !stdout.is_empty() {
+        return truncate_for_feed(stdout, 2_000);
+    }
+    output
+        .code
+        .map(|code| format!("runner exited with code {code}"))
+        .unwrap_or_else(|| "runner exited before reporting progress".to_string())
+}
+
+fn write_runner_startup_error(
+    workspace: &Path,
+    operation_type: &str,
+    started_at: &str,
+    detail: String,
+) {
+    let error_path = workspace.join(RUNNER_STARTUP_ERROR_PATH);
+    if let Some(parent) = error_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let message = if detail.trim().is_empty() {
+        format!("{operation_type} stopped before reporting progress.")
+    } else {
+        format!("{operation_type} stopped before reporting progress: {detail}")
+    };
+    let payload = json!({
+        "operationType": operation_type,
+        "startedAt": started_at,
+        "completedAt": now_string(),
+        "error": message,
+    });
+    let _ = fs::write(
+        error_path,
+        serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string()),
+    );
+}
+
+fn spawn_background_runner(workspace: PathBuf, operation_type: &str, args: Vec<String>) {
+    let operation_type = operation_type.to_string();
+    let started_ms = now_millis();
+    let started_at = now_string();
+    clear_runner_startup_error(&workspace);
+    thread::spawn(move || {
+        let result = run_runner_with_args(&args);
+        if operation_artifact_exists_after(&workspace, started_ms) {
+            return;
+        }
+        match result {
+            Ok(output) if !output.success => {
+                write_runner_startup_error(
+                    &workspace,
+                    &operation_type,
+                    &started_at,
+                    runner_output_detail(&output),
+                );
+            }
+            Err(error) => {
+                write_runner_startup_error(&workspace, &operation_type, &started_at, error);
+            }
+            _ => {}
+        }
+    });
+}
+
 fn ensure_runner_success(runner: &RunnerOutput, action: &str) -> Result<(), String> {
     if runner.success {
         return Ok(());
@@ -8366,7 +8553,18 @@ fn load_state_at(workspace: &Path) -> Result<WorkspaceState, String> {
     }
     let status = run_runner(workspace, "status", &[])
         .ok()
-        .and_then(|output| serde_json::from_str::<Value>(&output.stdout).ok());
+        .and_then(|output| extract_json_from_runner_stdout::<Value>(&output.stdout).ok());
+    let source_files = list_source_files(workspace)?;
+    let source_status = status
+        .as_ref()
+        .and_then(|value| value.get("sourceStatus"))
+        .cloned()
+        .unwrap_or_else(|| local_source_status(workspace, &source_files));
+    let source_readiness = status
+        .as_ref()
+        .and_then(|value| value.get("sourceReadiness"))
+        .cloned()
+        .unwrap_or_else(|| local_source_readiness(workspace, &source_status));
     let changed_marker_path = first_existing_path(&[
         workspace
             .join(METADATA_DIR)
@@ -8392,10 +8590,8 @@ fn load_state_at(workspace: &Path) -> Result<WorkspaceState, String> {
 
     Ok(WorkspaceState {
         workspace_path: workspace.display().to_string(),
-        source_status: status
-            .as_ref()
-            .and_then(|value| value.get("sourceStatus"))
-            .cloned(),
+        source_status: Some(source_status),
+        source_readiness: Some(source_readiness),
         wiki_status: status
             .as_ref()
             .and_then(|value| value.get("wikiStatus"))
@@ -8413,7 +8609,7 @@ fn load_state_at(workspace: &Path) -> Result<WorkspaceState, String> {
         last_operation_message,
         asset_registry: read_json_if_exists_normalized(&workspace.join(ASSET_REGISTRY_PATH)),
         root_files: list_root_markdown_files(workspace)?,
-        source_files: list_source_files(workspace)?,
+        source_files,
         wiki_files: list_wiki_files(workspace)?,
     })
 }
@@ -8426,17 +8622,22 @@ fn runner_root() -> Result<PathBuf, String> {
         }
     }
 
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let prototype_dir = manifest_dir
-        .parent()
-        .and_then(Path::parent)
-        .ok_or_else(|| "Could not resolve prototype directory".to_string())?;
-    let runner_root = prototype_dir.join("operation-runner");
-    if is_runner_root(&runner_root) {
+    if let Some(runner_root) = development_runner_root() {
         return Ok(runner_root);
     }
 
     Err("Could not find bundled or development operation runner".to_string())
+}
+
+fn development_runner_root() -> Option<PathBuf> {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let prototype_dir = manifest_dir.parent().and_then(Path::parent)?;
+    let runner_root = prototype_dir.join("operation-runner");
+    if is_runner_root(&runner_root) {
+        return Some(runner_root);
+    }
+
+    None
 }
 
 fn is_runner_root(path: &Path) -> bool {
@@ -8450,6 +8651,206 @@ fn read_text_if_exists(path: &Path) -> Option<String> {
 fn read_json_if_exists_normalized(path: &Path) -> Option<Value> {
     let text = fs::read_to_string(path).ok()?;
     serde_json::from_str(&normalize_legacy_workspace_references(&text)).ok()
+}
+
+fn file_mtime_ms(metadata: &fs::Metadata) -> u128 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0)
+}
+
+fn local_source_status(workspace: &Path, source_files: &[String]) -> Value {
+    let files = source_files
+        .iter()
+        .map(|path| {
+            let absolute = workspace.join(path);
+            let metadata = fs::metadata(&absolute).ok();
+            json!({
+                "path": path,
+                "kind": "file",
+                "size": metadata.as_ref().map(fs::Metadata::len).unwrap_or(0),
+                "mtimeMs": metadata.as_ref().map(file_mtime_ms).unwrap_or(0),
+                "sha256": "",
+                "state": "new",
+            })
+        })
+        .collect::<Vec<_>>();
+
+    json!({
+        "lastBuiltAt": null,
+        "manifestPath": ".aiwiki/source-manifest.json",
+        "manifestExists": workspace.join(METADATA_DIR).join("source-manifest.json").is_file(),
+        "inferredManifest": false,
+        "pendingCount": files.len(),
+        "files": files,
+    })
+}
+
+fn source_format_for_path(path: &str) -> String {
+    Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .unwrap_or_else(|| "file".to_string())
+}
+
+fn is_plain_ready_source(path: &str) -> bool {
+    matches!(
+        source_format_for_path(path).as_str(),
+        "md" | "txt"
+            | "json"
+            | "jsonl"
+            | "csv"
+            | "tsv"
+            | "html"
+            | "htm"
+            | "png"
+            | "jpg"
+            | "jpeg"
+            | "webp"
+            | "gif"
+    )
+}
+
+fn value_u64(value: Option<&Value>) -> Option<u64> {
+    value.and_then(|value| {
+        value
+            .as_u64()
+            .or_else(|| value.as_f64().map(|number| number.round() as u64))
+    })
+}
+
+fn source_artifact_matches_file(record: &Value, file: &Value) -> bool {
+    let record_size = value_u64(record.get("sourceSize"));
+    let file_size = value_u64(file.get("size"));
+    let record_mtime = value_u64(record.get("sourceMtimeMs"));
+    let file_mtime = value_u64(file.get("mtimeMs"));
+
+    match (record_size, file_size, record_mtime, file_mtime) {
+        (Some(record_size), Some(file_size), Some(record_mtime), Some(file_mtime)) => {
+            record_size == file_size && record_mtime == file_mtime
+        }
+        (Some(record_size), Some(file_size), _, _) => record_size == file_size,
+        _ => false,
+    }
+}
+
+fn local_source_readiness(workspace: &Path, source_status: &Value) -> Value {
+    let registry = read_json_if_exists_normalized(&workspace.join(SOURCE_ARTIFACTS_PATH));
+    let registry_sources = registry
+        .as_ref()
+        .and_then(|value| value.get("sources"))
+        .and_then(Value::as_object);
+    let mut files = Vec::new();
+
+    for file in source_status
+        .get("files")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if file.get("state").and_then(Value::as_str) == Some("removed") {
+            continue;
+        }
+
+        let path = file.get("path").and_then(Value::as_str).unwrap_or("");
+        if path.is_empty() {
+            continue;
+        }
+
+        let format = source_format_for_path(path);
+        let mut row = json!({
+            "path": path,
+            "format": format,
+            "status": "not-prepared",
+            "preparedAt": null,
+            "preparedPath": null,
+            "manifestPath": null,
+            "error": null,
+        });
+
+        if is_plain_ready_source(path) {
+            row["status"] = json!("ready");
+            row["preparedPath"] = json!(path);
+        } else if let Some(record) = registry_sources
+            .and_then(|sources| sources.get(path))
+            .filter(|record| source_artifact_matches_file(record, file))
+        {
+            let prepared_path = record
+                .get("structuredMarkdown")
+                .or_else(|| record.get("preparedPath"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let prepared_exists =
+                !prepared_path.is_empty() && workspace.join(prepared_path).is_file();
+            let record_status = record
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("ready");
+
+            if record_status == "ready" && prepared_exists {
+                row["status"] = json!("ready");
+                row["preparedPath"] = json!(prepared_path);
+                row["manifestPath"] = record.get("manifestPath").cloned().unwrap_or(Value::Null);
+                row["preparedAt"] = record
+                    .get("preparedAt")
+                    .or_else(|| record.get("updatedAt"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                row["health"] = json!({
+                    "ok": true,
+                    "reason": null,
+                });
+            } else {
+                row["status"] = json!(record_status);
+                row["error"] = record.get("error").cloned().unwrap_or(Value::Null);
+            }
+
+            if format == "pdf" {
+                if let Some(value) = record.get("detectedUseAs").and_then(Value::as_str) {
+                    row["detectedUseAs"] = json!(value);
+                }
+                if let Some(value) = record.get("useAs").and_then(Value::as_str) {
+                    row["useAs"] = json!(value);
+                }
+            }
+        }
+
+        files.push(row);
+    }
+
+    let ready = files
+        .iter()
+        .filter(|file| file.get("status").and_then(Value::as_str) == Some("ready"))
+        .count();
+    let preparing = files
+        .iter()
+        .filter(|file| file.get("status").and_then(Value::as_str) == Some("preparing"))
+        .count();
+    let failed = files
+        .iter()
+        .filter(|file| file.get("status").and_then(Value::as_str) == Some("failed"))
+        .count();
+    let not_prepared = files
+        .iter()
+        .filter(|file| file.get("status").and_then(Value::as_str) == Some("not-prepared"))
+        .count();
+
+    json!({
+        "registryPath": SOURCE_ARTIFACTS_PATH,
+        "message": "Maple is converting source files into readable artifacts for Build Wiki.",
+        "summary": {
+            "total": files.len(),
+            "ready": ready,
+            "preparing": preparing,
+            "failed": failed,
+            "notPrepared": not_prepared,
+        },
+        "files": files,
+    })
 }
 
 fn normalize_legacy_workspace_references(text: &str) -> String {
@@ -8754,6 +9155,48 @@ fn normalize_selected_source_paths(
 
     selected.sort();
     Ok(selected)
+}
+
+fn normalize_pdf_use_as_map(
+    workspace: &Path,
+    pdf_use_as: Option<HashMap<String, String>>,
+) -> Result<HashMap<String, String>, String> {
+    let Some(pdf_use_as) = pdf_use_as else {
+        return Ok(HashMap::new());
+    };
+
+    let available = list_source_files(workspace)?
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let mut normalized_map = HashMap::new();
+
+    for (source_path, role) in pdf_use_as {
+        let normalized_path = normalize_workspace_relative_path(&source_path)?;
+        let normalized = normalized_path.to_string_lossy().replace('\\', "/");
+        if !available.contains(&normalized) {
+            return Err(format!(
+                "PDF source role path is not available in this workspace: {normalized}"
+            ));
+        }
+        let is_pdf = Path::new(&normalized)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.eq_ignore_ascii_case("pdf"))
+            .unwrap_or(false);
+        if !is_pdf {
+            return Err(format!(
+                "PDF source role can only be set for PDF sources: {normalized}"
+            ));
+        }
+
+        let normalized_role = role.trim().to_string();
+        if !PDF_USE_AS_TYPES.contains(&normalized_role.as_str()) {
+            return Err(format!("Unsupported PDF source role: {normalized_role}"));
+        }
+        normalized_map.insert(normalized, normalized_role);
+    }
+
+    Ok(normalized_map)
 }
 
 fn list_source_files(workspace: &Path) -> Result<Vec<String>, String> {
@@ -10512,7 +10955,11 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
-            if let Ok(resource_dir) = app.path().resource_dir() {
+            if cfg!(debug_assertions) {
+                if let Some(runner_root) = development_runner_root() {
+                    env::set_var(RUNNER_ROOT_ENV, runner_root);
+                }
+            } else if let Ok(resource_dir) = app.path().resource_dir() {
                 let runner_root = resource_dir.join("operation-runner");
                 if is_runner_root(&runner_root) {
                     env::set_var(RUNNER_ROOT_ENV, runner_root);
@@ -10569,6 +11016,7 @@ pub fn run() {
             accept_outside_wiki_changes,
             undo_outside_wiki_changes,
             build_wiki,
+            prepare_sources,
             wiki_healthcheck,
             improve_wiki,
             organize_sources,

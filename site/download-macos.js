@@ -1,6 +1,6 @@
-const latestReleaseApi = "https://api.github.com/repos/cwoo1090/maple/releases/latest";
-const latestReleasePage = "https://github.com/cwoo1090/maple/releases/latest";
-const dmgNamePattern = /^Maple_[0-9]+\.[0-9]+\.[0-9]+_aarch64\.dmg$/;
+const macosDownloadUrl =
+  "https://github.com/cwoo1090/maple/releases/download/v0.1.18/Maple_0.1.18_aarch64.dmg";
+const macosDownloadName = "Maple_0.1.18_aarch64.dmg";
 
 const statusElement = document.querySelector("#download-status");
 const fallbackLink = document.querySelector("#download-fallback");
@@ -9,13 +9,13 @@ const downloadMessages = {
     starting: (assetName) => `Starting ${assetName}...`,
     didNotStart: "Download did not start? Click here.",
     failed: "Could not start the direct download automatically.",
-    latestRelease: "Open latest release",
+    latestRelease: "Download directly",
   },
   ko: {
     starting: (assetName) => `${assetName} 다운로드를 시작합니다.`,
     didNotStart: "다운로드가 시작되지 않으면 여기를 클릭하세요.",
     failed: "자동 다운로드를 시작하지 못했습니다.",
-    latestRelease: "GitHub 릴리스 열기",
+    latestRelease: "직접 다운로드",
   },
 };
 
@@ -33,38 +33,21 @@ function setStatus(message) {
   }
 }
 
-async function redirectToLatestDmg() {
+function redirectToMacosDownload() {
   try {
-    const response = await fetch(latestReleaseApi, {
-      headers: { Accept: "application/vnd.github+json" },
-    });
-
-    if (!response.ok) {
-      throw new Error(`GitHub returned ${response.status}`);
-    }
-
-    const release = await response.json();
-    const asset = release.assets?.find((candidate) =>
-      dmgNamePattern.test(candidate.name),
-    );
-
-    if (!asset?.browser_download_url) {
-      throw new Error("No Apple silicon DMG asset found in the latest release.");
-    }
-
-    setStatus(messageSet().starting(asset.name));
+    setStatus(messageSet().starting(macosDownloadName));
     if (fallbackLink) {
-      fallbackLink.href = asset.browser_download_url;
+      fallbackLink.href = macosDownloadUrl;
       fallbackLink.textContent = messageSet().didNotStart;
     }
-    window.location.replace(asset.browser_download_url);
+    window.location.replace(macosDownloadUrl);
   } catch (_error) {
     setStatus(messageSet().failed);
     if (fallbackLink) {
-      fallbackLink.href = latestReleasePage;
+      fallbackLink.href = macosDownloadUrl;
       fallbackLink.textContent = messageSet().latestRelease;
     }
   }
 }
 
-redirectToLatestDmg();
+redirectToMacosDownload();

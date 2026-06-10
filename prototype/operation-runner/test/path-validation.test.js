@@ -1,15 +1,18 @@
 const assert = require("node:assert/strict");
+const crypto = require("node:crypto");
 const fs = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
 
 const {
+  EXTRACTOR_VERSION,
   IMPROVE_WIKI_ALLOWED_PATHS,
   IMPROVE_WIKI_FORBIDDEN_PATHS,
   ORGANIZE_SOURCES_ALLOWED_PATHS,
   ASSET_REGISTRY_PATH,
   SOURCE_MANIFEST_PATH,
+  SOURCE_ARTIFACTS_PATH,
   WIKI_MANIFEST_PATH,
   WIKI_HEALTHCHECK_ALLOWED_PATHS,
   WIKI_WRITE_ALLOWED_PATHS,
@@ -20,6 +23,7 @@ const {
   buildMaintenancePrompt,
   buildWikiPrompt,
   calculateFullSlideBudget,
+  classifySourceMaterial,
   contactSheetRanges,
   collectExploreSourceVisualContext,
   collectReferencedWikiAssetImages,
@@ -27,6 +31,7 @@ const {
   createSnapshot,
   diffSnapshot,
   fallbackSelectPageNumbers,
+  getSourceReadiness,
   getSourceStatus,
   getWikiStatus,
   getOutsideWikiChanges,
@@ -47,11 +52,18 @@ const {
   normalizeMarkdownMathDelimiters,
   normalizeRelativePath,
   parseExplorePageReferences,
+  parsePdfUseAsJson,
   parseSourcePathsJson,
   parseSlideSelectionJson,
   parseVisualInspectionPlanJson,
   readAssetRegistry,
+  readLatestPreparedSourceText,
   readRenderedPdfResult,
+  findLatestExtractedSourceForChat,
+  normalizeConvertedMarkdownAssets,
+  resolveSourceArtifact,
+  validatePreparedOutputDir,
+  validatePreparedSourceArtifact,
   renderPreparedSourcesForPrompt,
   renderSourceStatusForPrompt,
   loadAskWikiKeywordIndex,
@@ -59,12 +71,16 @@ const {
   retrieveAskWikiIndexChunks,
   resolveOperationId,
   selectBuildWikiVisualInputs,
+  selectSourcePathsForBuild,
   sourcePathsForBuild,
+  collectAlwaysCheckSourcePaths,
+  extractAlwaysCheckSourcePathsFromSchema,
   autoRegisterReferencedWikiAssets,
   validateAndRestoreProtectedAssets,
   validateAndRestoreChanges,
   workspaceAgentInstructions,
   writeSourceManifest,
+  writeSourceArtifactsRegistry,
   writeWikiManifest,
   undoLastOperation,
   wikiSchemaTemplate,
@@ -155,6 +171,83 @@ test("allows source move targets during Build Wiki", () => {
   assert.equal(isAllowedPath("sources/new-source.md"), true);
 });
 
+test("extracts always-check source paths only from the dedicated schema section", () => {
+  const schema = `
+## Source Citations
+
+- Example only: \`sources/example.md\`
+
+## Core Curriculum Sources
+
+- Always treat \`sources/_core/syllabus.docx\` as canonical.
+- Always treat \`sources/_core/key-concepts.docx\` as canonical.
+
+## Page Types
+
+- Not a required source: \`sources/not-required.md\`
+`;
+
+  assert.deepEqual(extractAlwaysCheckSourcePathsFromSchema(schema), [
+    "sources/_core/key-concepts.docx",
+    "sources/_core/syllabus.docx",
+  ]);
+});
+
+test("Build Wiki source selection includes schema-required sources", () => {
+  const sourceStatus = {
+    files: [
+      { path: "sources/new.md", state: "new" },
+      { path: "sources/_core/syllabus.docx", state: "unchanged" },
+      { path: "sources/_core/key-concepts.docx", state: "unchanged" },
+    ],
+  };
+
+  assert.deepEqual(sourcePathsForBuild(sourceStatus, {
+    requiredSourcePaths: [
+      "sources/_core/syllabus.docx",
+      "sources/_core/key-concepts.docx",
+    ],
+  }), [
+    "sources/_core/key-concepts.docx",
+    "sources/_core/syllabus.docx",
+    "sources/new.md",
+  ]);
+});
+
+test("selected Build Wiki source paths include schema-required sources", () => {
+  const sourceStatus = {
+    files: [
+      { path: "sources/selected.md", state: "unchanged" },
+      { path: "sources/_core/syllabus.docx", state: "unchanged" },
+    ],
+  };
+
+  assert.deepEqual(selectSourcePathsForBuild(sourceStatus, {
+    sourcePaths: ["sources/selected.md"],
+    requiredSourcePaths: ["sources/_core/syllabus.docx"],
+  }), [
+    "sources/_core/syllabus.docx",
+    "sources/selected.md",
+  ]);
+});
+
+test("collects always-check source paths that exist in the workspace", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "maple-required-sources-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  await fs.mkdir(path.join(workspace, "sources", "_core"), { recursive: true });
+  await fs.writeFile(path.join(workspace, "sources", "_core", "syllabus.docx"), "source\n");
+  await fs.writeFile(path.join(workspace, "schema.md"), `
+## Core Curriculum Sources
+
+- Always treat \`sources/_core/syllabus.docx\` as canonical.
+- Always treat \`sources/_core/missing.docx\` as canonical.
+`);
+
+  assert.deepEqual(await collectAlwaysCheckSourcePaths(workspace), [
+    "sources/_core/syllabus.docx",
+  ]);
+});
+
 test("Build Wiki restores source content edits", async (t) => {
   const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "maple-build-source-guard-"));
   t.after(() => fs.rm(workspace, { recursive: true, force: true }));
@@ -219,6 +312,40 @@ test("restores provider edits to the source manifest", async (t) => {
   assert.equal(manifestChange?.allowed, false);
   assert.equal(manifestChange?.restored, true);
   assert.match(await fs.readFile(path.join(workspace, SOURCE_MANIFEST_PATH), "utf8"), /"before"/);
+});
+
+test("source readiness recovers stale preparing records", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "maple-stale-source-prep-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+
+  const sourcePath = "sources/sample.pdf";
+  const sourceBody = Buffer.from("%PDF-1.4\nstale test\n");
+  await fs.mkdir(path.join(workspace, "sources"), { recursive: true });
+  await fs.writeFile(path.join(workspace, sourcePath), sourceBody);
+
+  await writeSourceArtifactsRegistry(workspace, {
+    sources: {
+      [sourcePath]: {
+        sourcePath,
+        sourceSlug: "sample",
+        sourceFormat: "pdf",
+        status: "preparing",
+        operationId: "prepare-stale",
+        startedAt: new Date(Date.now() - 30 * 60 * 1000).toISOString(),
+        sourceSha256: crypto.createHash("sha256").update(sourceBody).digest("hex"),
+        sourceSize: sourceBody.length,
+        sourceMtimeMs: 1,
+        extractorVersion: EXTRACTOR_VERSION,
+      },
+    },
+  });
+
+  const readiness = await getSourceReadiness(workspace);
+  const file = readiness.files.find((entry) => entry.path === sourcePath);
+
+  assert.equal(file?.status, "not-prepared");
+  assert.equal(file?.health?.reason, "stale-preparation");
+  assert.match(file?.error ?? "", /did not finish/i);
 });
 
 test("uses per-operation allowlists", () => {
@@ -325,7 +452,684 @@ test("identifies runner-owned metadata paths", () => {
   assert.equal(isRunnerMetadataPath(".aiwiki/operations/123/report.json"), true);
   assert.equal(isRunnerMetadataPath(".aiwiki/changed/last-operation.json"), true);
   assert.equal(isRunnerMetadataPath(".aiwiki/cache/extracted/source/manifest.json"), true);
-  assert.equal(isRunnerMetadataPath(".aiwiki/extracted/sample.json"), false);
+  assert.equal(isRunnerMetadataPath(".aiwiki/extracted/sample.json"), true);
+  assert.equal(isRunnerMetadataPath(SOURCE_ARTIFACTS_PATH), true);
+});
+
+test("classifies textbook-like Markdown as markdown-primary with on-demand visuals", () => {
+  const classification = classifySourceMaterial(
+    "sources/1. Classification of Matter.pdf",
+    [
+      "# The particulate nature of matter",
+      "",
+      "## LEARNING OBJECTIVES",
+      "In this chapter you will understand elements, compounds, and mixtures.",
+      "",
+      "## GUIDING QUESTIONS",
+      "How can matter be classified?",
+      "",
+      "## KEY POINT",
+      "Elements are primary constituents of matter.",
+      "",
+    ].join("\n"),
+    { pageCount: 1 },
+  );
+
+  assert.equal(classification.materialType, "textbook");
+  assert.equal(classification.textPolicy, "markdown-primary");
+  assert.equal(classification.visualPolicy, "on-demand");
+});
+
+test("normalizes converted Markdown images with parentheses in source paths", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "maple-md-assets-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+
+  const converterOutput = path.join(workspace, "converter-output");
+  const outputDir = path.join(workspace, "extracted-output");
+  const artifactDir = path.join(converterOutput, "1. Atomic structure (QS)_artifacts");
+  await fs.mkdir(artifactDir, { recursive: true });
+  await fs.mkdir(outputDir, { recursive: true });
+  const imagePath = path.join(artifactDir, "image_000001.png");
+  await fs.writeFile(imagePath, "image-bytes");
+  const markdownPath = path.join(converterOutput, "text.md");
+  await fs.writeFile(
+    markdownPath,
+    [
+      "# Converted",
+      "",
+      `![Image](${imagePath})`,
+      "before\0after",
+      "",
+    ].join("\n"),
+  );
+
+  const normalized = await normalizeConvertedMarkdownAssets(markdownPath, outputDir);
+  assert.match(normalized, /!\[Image]\(<artifacts\/image_000001\.png>\)/);
+  assert.doesNotMatch(normalized, /maple-md-assets/);
+  assert.doesNotMatch(normalized, /\0/);
+  assert.equal(
+    await fs.readFile(path.join(outputDir, "artifacts", "image_000001.png"), "utf8"),
+    "image-bytes",
+  );
+});
+
+test("Build Wiki attaches inline Markdown figures for learning material", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "maple-inline-figures-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+
+  const sourceRoot = path.join(workspace, ".aiwiki", "extracted", "latest", "textbook");
+  const artifactsRoot = path.join(sourceRoot, "artifacts");
+  await fs.mkdir(artifactsRoot, { recursive: true });
+  await fs.writeFile(path.join(artifactsRoot, "diagram.png"), "diagram-bytes");
+  await fs.writeFile(
+    path.join(sourceRoot, "text.md"),
+    [
+      "# Atomic Structure",
+      "",
+      "The diagram shows particles in the atom.",
+      "",
+      "![Diagram](<artifacts/diagram.png>)",
+      "",
+    ].join("\n"),
+  );
+
+  const preparedSources = {
+    sources: [{
+      sourcePath: "sources/textbook.pdf",
+      sourceSlug: "textbook",
+      sourceFormat: "pdf",
+      textPath: ".aiwiki/extracted/latest/textbook/text.md",
+      pageImages: ["unused/page-01.png"],
+      promptPageImages: ["unused/page-01.jpg"],
+      contactSheets: [],
+      pageCount: 12,
+      materialType: "textbook",
+      textPolicy: "markdown-primary",
+      visualPolicy: "on-demand",
+      pdfUseAs: "text-with-diagrams",
+      selectedPromptImages: [],
+    }],
+    imageAttachments: [],
+    visualInput: {},
+  };
+
+  await selectBuildWikiVisualInputs(
+    workspace,
+    {
+      name: "codex",
+      supportsImageAttachments: true,
+      supportsImagePathReferences: false,
+    },
+    {
+      operationId: "op",
+      operationDir: path.join(workspace, ".aiwiki", "operations", "op"),
+      dryRun: true,
+    },
+    preparedSources,
+  );
+
+  assert.deepEqual(preparedSources.imageAttachments, [
+    path.join(artifactsRoot, "diagram.png"),
+  ]);
+  assert.equal(preparedSources.sources[0].inlineMarkdownFigures.length, 1);
+  assert.equal(preparedSources.sources[0].pagesToInspect, undefined);
+  assert.equal(preparedSources.visualInput.inlineMarkdownFigureCount, 1);
+  assert.equal(preparedSources.visualInput.selectedFullSlideCount, 0);
+
+  const prompt = await buildWikiPrompt(
+    workspace,
+    {
+      sourceStatus: {
+        files: [{ path: "sources/textbook.pdf", state: "new" }],
+      },
+    },
+    preparedSources,
+  );
+  assert.match(prompt, /Inline Markdown figures inspected as image attachments/);
+  assert.match(prompt, /artifacts\/diagram\.png/);
+  assert.match(prompt, /copy the listed figure PNG into wiki\/assets/);
+  assert.match(prompt, /Never embed \.aiwiki paths directly/);
+  assert.match(prompt, /Prefer 1-3 high-value images per substantial wiki page/);
+});
+
+test("Build Wiki keeps useful inline figures when mostly-text source is detected as diagram-heavy", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "maple-mostly-text-diagrams-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+
+  const sourceRoot = path.join(workspace, ".aiwiki", "extracted", "latest", "worksheet");
+  const artifactsRoot = path.join(sourceRoot, "artifacts");
+  await fs.mkdir(artifactsRoot, { recursive: true });
+  await fs.writeFile(path.join(artifactsRoot, "heating-curve.png"), "diagram-bytes");
+  await fs.writeFile(
+    path.join(sourceRoot, "text.md"),
+    [
+      "# Heating Curves",
+      "",
+      "A plateau shows a change of state.",
+      "",
+      "![Heating curve](<artifacts/heating-curve.png>)",
+      "",
+    ].join("\n"),
+  );
+
+  const preparedSources = {
+    sources: [{
+      sourcePath: "sources/worksheet.pdf",
+      sourceSlug: "worksheet",
+      sourceFormat: "pdf",
+      textPath: ".aiwiki/extracted/latest/worksheet/text.md",
+      pageImages: ["unused/page-01.png"],
+      promptPageImages: ["unused/page-01.jpg"],
+      contactSheets: [],
+      pageCount: 6,
+      materialType: "worksheet",
+      textPolicy: "markdown-and-visual",
+      visualPolicy: "selected-pages",
+      pdfUseAs: "mostly-text",
+      detectedUseAs: "text-with-diagrams",
+      selectedPromptImages: [],
+    }],
+    imageAttachments: [],
+    visualInput: {},
+  };
+
+  await selectBuildWikiVisualInputs(
+    workspace,
+    {
+      name: "codex",
+      supportsImageAttachments: true,
+      supportsImagePathReferences: false,
+    },
+    {
+      operationId: "op",
+      operationDir: path.join(workspace, ".aiwiki", "operations", "op"),
+      dryRun: true,
+    },
+    preparedSources,
+  );
+
+  assert.deepEqual(preparedSources.imageAttachments, [
+    path.join(artifactsRoot, "heating-curve.png"),
+  ]);
+  assert.equal(preparedSources.sources[0].inlineMarkdownFigures.length, 1);
+  assert.equal(preparedSources.visualInput.inlineMarkdownFigureCount, 1);
+});
+
+test("Build Wiki lists cropped inline figures even after the image attachment budget is exhausted", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "maple-inline-budget-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+
+  async function writeFigureSource(slug, figureCount) {
+    const sourceRoot = path.join(workspace, ".aiwiki", "extracted", "latest", slug);
+    const artifactsRoot = path.join(sourceRoot, "artifacts");
+    await fs.mkdir(artifactsRoot, { recursive: true });
+    const lines = [`# ${slug}`];
+    for (let index = 1; index <= figureCount; index += 1) {
+      const fileName = `figure-${index}.png`;
+      await fs.writeFile(path.join(artifactsRoot, fileName), `figure-${index}`);
+      lines.push("", `## Figure ${index}`, `![Figure ${index}](<artifacts/${fileName}>)`);
+    }
+    await fs.writeFile(path.join(sourceRoot, "text.md"), `${lines.join("\n")}\n`);
+  }
+
+  await writeFigureSource("atomic", 8);
+  await writeFigureSource("classification", 8);
+  await writeFigureSource("s1-1", 10);
+
+  const preparedSources = {
+    sources: [
+      {
+        sourcePath: "sources/atomic.pdf",
+        sourceSlug: "atomic",
+        sourceFormat: "pdf",
+        textPath: ".aiwiki/extracted/latest/atomic/text.md",
+        pageImages: [],
+        promptPageImages: [],
+        contactSheets: [],
+        pageCount: 8,
+        materialType: "worksheet",
+        textPolicy: "markdown-and-visual",
+        visualPolicy: "selected-pages",
+        pdfUseAs: "text-with-diagrams",
+      },
+      {
+        sourcePath: "sources/classification.pdf",
+        sourceSlug: "classification",
+        sourceFormat: "pdf",
+        textPath: ".aiwiki/extracted/latest/classification/text.md",
+        pageImages: [],
+        promptPageImages: [],
+        contactSheets: [],
+        pageCount: 8,
+        materialType: "worksheet",
+        textPolicy: "markdown-and-visual",
+        visualPolicy: "selected-pages",
+        pdfUseAs: "text-with-diagrams",
+      },
+      {
+        sourcePath: "sources/S1.1.pdf",
+        sourceSlug: "s1-1",
+        sourceFormat: "pdf",
+        textPath: ".aiwiki/extracted/latest/s1-1/text.md",
+        pageImages: [".aiwiki/extracted/latest/s1-1/pages/page-01.png"],
+        promptPageImages: [".aiwiki/extracted/latest/s1-1/prompt-images/page-01.jpg"],
+        contactSheets: [],
+        pageCount: 1,
+        materialType: "worksheet",
+        textPolicy: "markdown-and-visual",
+        visualPolicy: "selected-pages",
+        pdfUseAs: "text-with-diagrams",
+      },
+    ],
+    imageAttachments: [],
+    visualInput: {},
+  };
+
+  await selectBuildWikiVisualInputs(
+    workspace,
+    {
+      name: "codex",
+      supportsImageAttachments: true,
+      supportsImagePathReferences: false,
+    },
+    {
+      operationId: "op",
+      operationDir: path.join(workspace, ".aiwiki", "operations", "op"),
+      dryRun: true,
+    },
+    preparedSources,
+  );
+
+  const s11 = preparedSources.sources[2];
+  assert.equal(preparedSources.visualInput.inlineMarkdownFigureCount, 16);
+  assert.equal(preparedSources.imageAttachments.length, 17);
+  assert.equal(s11.inlineMarkdownFigures.length, 10);
+  assert.equal(s11.inlineMarkdownFigureAttachmentCount, 0);
+  assert.equal(s11.pagesToInspect.length, 1);
+  assert.equal(s11.assetCandidates.length, 0);
+
+  const prompt = await buildWikiPrompt(
+    workspace,
+    {
+      sourceStatus: {
+        files: [
+          { path: "sources/atomic.pdf", state: "new" },
+          { path: "sources/classification.pdf", state: "new" },
+          { path: "sources/S1.1.pdf", state: "new" },
+        ],
+      },
+    },
+    preparedSources,
+  );
+  const s11Prompt = prompt.slice(prompt.indexOf("- sources/S1.1.pdf"));
+  assert.match(s11Prompt, /Inline Markdown figures selected for inspection but not attached/);
+  assert.match(s11Prompt, /\.aiwiki\/extracted\/latest\/s1-1\/artifacts\/figure-1\.png/);
+  assert.match(s11Prompt, /\.aiwiki\/extracted\/latest\/s1-1\/artifacts\/figure-10\.png/);
+  assert.match(s11Prompt, /Pages inspected as image attachments/);
+  assert.match(s11Prompt, /rendered page images are inspection context only/);
+  assert.match(s11Prompt, /full PNG: \.aiwiki\/extracted\/latest\/s1-1\/pages\/page-01\.png/);
+  assert.doesNotMatch(s11Prompt, /Fallback wiki image candidate full-resolution page PNGs/);
+});
+
+test("Build Wiki keeps detected mostly-visual PDFs on page visual planning", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "maple-mostly-visual-pages-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+
+  const sourceRoot = path.join(workspace, ".aiwiki", "extracted", "latest", "slides");
+  const artifactsRoot = path.join(sourceRoot, "artifacts");
+  await fs.mkdir(artifactsRoot, { recursive: true });
+  await fs.writeFile(path.join(artifactsRoot, "decorative.png"), "image-bytes");
+  await fs.writeFile(
+    path.join(sourceRoot, "text.md"),
+    [
+      "# Slide Deck",
+      "",
+      "![Decorative](<artifacts/decorative.png>)",
+      "",
+    ].join("\n"),
+  );
+
+  const preparedSources = {
+    sources: [{
+      sourcePath: "sources/slides.pdf",
+      sourceSlug: "slides",
+      sourceFormat: "pdf",
+      textPath: ".aiwiki/extracted/latest/slides/text.md",
+      pageImages: [".aiwiki/extracted/latest/slides/pages/page-01.png"],
+      promptPageImages: [".aiwiki/extracted/latest/slides/prompt-images/page-01.jpg"],
+      contactSheets: [],
+      pageCount: 1,
+      materialType: "worksheet",
+      textPolicy: "markdown-and-visual",
+      visualPolicy: "selected-pages",
+      pdfUseAs: "text-with-diagrams",
+      detectedUseAs: "mostly-visual",
+    }],
+    imageAttachments: [],
+    visualInput: {},
+  };
+
+  await selectBuildWikiVisualInputs(
+    workspace,
+    {
+      name: "codex",
+      supportsImageAttachments: true,
+      supportsImagePathReferences: false,
+    },
+    {
+      operationId: "op",
+      operationDir: path.join(workspace, ".aiwiki", "operations", "op"),
+      dryRun: true,
+    },
+    preparedSources,
+  );
+
+  assert.equal(preparedSources.sources[0].inlineMarkdownFigures, undefined);
+  assert.equal(preparedSources.sources[0].pagesToInspect.length, 1);
+  assert.deepEqual(preparedSources.imageAttachments, [
+    path.join(workspace, ".aiwiki/extracted/latest/slides/prompt-images/page-01.jpg"),
+  ]);
+
+  const prompt = await buildWikiPrompt(
+    workspace,
+    {
+      sourceStatus: {
+        files: [{ path: "sources/slides.pdf", state: "new" }],
+      },
+    },
+    preparedSources,
+  );
+  assert.match(prompt, /For mostly-visual PDFs, read prepared Markdown first as an orientation\/outline layer/);
+  assert.match(prompt, /rendered page images as the authoritative representation/);
+  assert.match(prompt, /Prepared Markdown orientation\/outline: \.aiwiki\/extracted\/latest\/slides\/text\.md/);
+  assert.doesNotMatch(prompt, /For PDF and Office-derived sources, read the prepared structured Markdown first/);
+});
+
+test("source artifact registry resolves only current source hashes", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "maple-source-artifacts-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  await fs.mkdir(path.join(workspace, "sources"), { recursive: true });
+  await fs.mkdir(path.join(workspace, ".aiwiki", "extracted", "latest", "foo"), { recursive: true });
+  await fs.writeFile(path.join(workspace, "sources", "foo.pdf"), "pdf-v1");
+  await fs.writeFile(path.join(workspace, ".aiwiki", "extracted", "latest", "foo", "text.md"), "# Foo\n");
+  await fs.writeFile(
+    path.join(workspace, ".aiwiki", "extracted", "latest", "foo", "manifest.json"),
+    `${JSON.stringify({ pageCount: 1, textPath: "text.md" }, null, 2)}\n`,
+  );
+
+  const sourceSha256 = crypto.createHash("sha256").update("pdf-v1").digest("hex");
+  await writeSourceArtifactsRegistry(workspace, {
+    sources: {
+      "sources/foo.pdf": {
+        sourcePath: "sources/foo.pdf",
+        sourceSlug: "foo",
+        sourceSha256,
+        extractorVersion: EXTRACTOR_VERSION,
+        structuredMarkdown: ".aiwiki/extracted/latest/foo/text.md",
+        manifestPath: ".aiwiki/extracted/latest/foo/manifest.json",
+        latestPath: ".aiwiki/extracted/latest/foo",
+      },
+    },
+  });
+
+  const current = await resolveSourceArtifact(workspace, "sources/foo.pdf");
+  assert.equal(current.structuredMarkdown, ".aiwiki/extracted/latest/foo/text.md");
+
+  await fs.writeFile(path.join(workspace, "sources", "foo.pdf"), "pdf-v2");
+  assert.equal(await resolveSourceArtifact(workspace, "sources/foo.pdf"), null);
+
+  const stale = await resolveSourceArtifact(workspace, "sources/foo.pdf", { allowStale: true });
+  assert.equal(stale.structuredMarkdown, ".aiwiki/extracted/latest/foo/text.md");
+});
+
+test("prepared source health rejects broken Markdown artifacts", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "maple-source-health-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  const latestDir = path.join(workspace, ".aiwiki", "extracted", "latest", "foo");
+  await fs.mkdir(path.join(workspace, "sources"), { recursive: true });
+  await fs.mkdir(latestDir, { recursive: true });
+  await fs.writeFile(path.join(workspace, "sources", "foo.pdf"), "pdf-v1");
+  await fs.writeFile(
+    path.join(latestDir, "manifest.json"),
+    `${JSON.stringify({ pageCount: 1, textPath: "text.md" }, null, 2)}\n`,
+  );
+  await fs.writeFile(path.join(latestDir, "text.md"), "# Foo\n![Missing](<artifacts/missing.png>)\n");
+
+  const sourceSha256 = crypto.createHash("sha256").update("pdf-v1").digest("hex");
+  const entry = {
+    sourcePath: "sources/foo.pdf",
+    sourceSlug: "foo",
+    sourceSha256,
+    status: "ready",
+    extractorVersion: EXTRACTOR_VERSION,
+    structuredMarkdown: ".aiwiki/extracted/latest/foo/text.md",
+    manifestPath: ".aiwiki/extracted/latest/foo/manifest.json",
+    latestPath: ".aiwiki/extracted/latest/foo",
+  };
+  await writeSourceArtifactsRegistry(workspace, {
+    sources: {
+      "sources/foo.pdf": entry,
+    },
+  });
+
+  let health = await validatePreparedSourceArtifact(workspace, entry);
+  assert.equal(health.ok, false);
+  assert.equal(health.reason, "missing-image-file");
+  assert.equal(await resolveSourceArtifact(workspace, "sources/foo.pdf"), null);
+
+  let readiness = await getSourceReadiness(workspace);
+  let pdf = readiness.files.find((file) => file.path === "sources/foo.pdf");
+  assert.equal(pdf.status, "not-prepared");
+  assert.equal(pdf.health.reason, "missing-image-file");
+  assert.equal(pdf.preparedPath, null);
+
+  await fs.writeFile(path.join(latestDir, "text.md"), Buffer.from("# Foo\nbefore\0after\n", "utf8"));
+  health = await validatePreparedSourceArtifact(workspace, entry);
+  assert.equal(health.ok, false);
+  assert.equal(health.reason, "nul-byte-in-markdown");
+
+  await fs.writeFile(path.join(latestDir, "text.md"), "# Foo\n![Image](/var/folders/tmp/maple-docling-x/image.png)\n");
+  health = await validatePreparedSourceArtifact(workspace, entry);
+  assert.equal(health.ok, false);
+  assert.equal(health.reason, "unstable-image-path");
+
+  await writeSourceArtifactsRegistry(workspace, {
+    sources: {
+      "sources/foo.pdf": {
+        ...entry,
+        extractorVersion: EXTRACTOR_VERSION - 1,
+      },
+    },
+  });
+  await fs.writeFile(path.join(latestDir, "text.md"), "# Foo\n");
+  readiness = await getSourceReadiness(workspace);
+  pdf = readiness.files.find((file) => file.path === "sources/foo.pdf");
+  assert.equal(pdf.status, "not-prepared");
+  assert.equal(pdf.health.reason, "stale-extractor-version");
+});
+
+test("prepared output health accepts normalized Markdown image artifacts", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "maple-output-health-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  const outputDir = path.join(workspace, ".aiwiki", "cache", "extracted", "abc");
+  await fs.mkdir(path.join(outputDir, "artifacts"), { recursive: true });
+  await fs.writeFile(path.join(outputDir, "artifacts", "diagram (1).png"), "image");
+  await fs.writeFile(
+    path.join(outputDir, "text.md"),
+    "# Foo\n![Diagram](<artifacts/diagram (1).png>)\n",
+  );
+  await fs.writeFile(
+    path.join(outputDir, "manifest.json"),
+    `${JSON.stringify({ pageCount: 1, textPath: "text.md" }, null, 2)}\n`,
+  );
+
+  const health = await validatePreparedOutputDir(workspace, outputDir, {
+    sourcePath: "sources/foo.pdf",
+  });
+  assert.equal(health.ok, true);
+  assert.equal(health.imageCount, 1);
+});
+
+test("stale latest source artifacts are not used as legacy extraction fallback", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "maple-stale-latest-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  const latestDir = path.join(workspace, ".aiwiki", "extracted", "latest", "foo");
+  await fs.mkdir(path.join(workspace, "sources"), { recursive: true });
+  await fs.mkdir(path.join(latestDir, "pages"), { recursive: true });
+  await fs.mkdir(path.join(latestDir, "prompt-images"), { recursive: true });
+  await fs.writeFile(path.join(workspace, "sources", "foo.pdf"), "pdf-v1");
+  await fs.writeFile(path.join(latestDir, "text.md"), "OLD EXTRACTED TEXT SHOULD NOT BE USED\n");
+  await fs.writeFile(path.join(latestDir, "pages", "page-01.png"), "png");
+  await fs.writeFile(path.join(latestDir, "prompt-images", "page-01.jpg"), "jpg");
+  await fs.writeFile(
+    path.join(latestDir, "manifest.json"),
+    `${JSON.stringify({
+      pageCount: 1,
+      textPath: "text.md",
+      pages: [{ page: 1, image: "pages/page-01.png", promptImage: "prompt-images/page-01.jpg" }],
+    }, null, 2)}\n`,
+  );
+
+  const sourceSha256 = crypto.createHash("sha256").update("pdf-v1").digest("hex");
+  await writeSourceArtifactsRegistry(workspace, {
+    sources: {
+      "sources/foo.pdf": {
+        sourcePath: "sources/foo.pdf",
+        sourceSlug: "foo",
+        sourceSha256,
+        extractorVersion: EXTRACTOR_VERSION,
+        structuredMarkdown: ".aiwiki/extracted/latest/foo/text.md",
+        manifestPath: ".aiwiki/extracted/latest/foo/manifest.json",
+        latestPath: ".aiwiki/extracted/latest/foo",
+      },
+    },
+  });
+
+  await fs.writeFile(path.join(workspace, "sources", "foo.pdf"), "pdf-v2");
+
+  assert.equal(await readLatestPreparedSourceText(workspace, "sources/foo.pdf", 1000), null);
+  assert.equal(await findLatestExtractedSourceForChat(workspace, "sources/foo.pdf"), null);
+});
+
+test("parses PDF use-as role overrides for PDF source paths only", () => {
+  assert.deepEqual(
+    parsePdfUseAsJson(JSON.stringify({
+      "sources/notes.pdf": "mostly-text",
+      "sources/diagrams.pdf": "text-with-diagrams",
+      "sources/slides.pdf": "mostly-visual",
+    })),
+    {
+      "sources/notes.pdf": "mostly-text",
+      "sources/diagrams.pdf": "text-with-diagrams",
+      "sources/slides.pdf": "mostly-visual",
+    },
+  );
+  assert.throws(
+    () => parsePdfUseAsJson(JSON.stringify({ "sources/notes.md": "mostly-text" })),
+    /must target PDF source paths/,
+  );
+  assert.throws(
+    () => parsePdfUseAsJson(JSON.stringify({ "sources/notes.pdf": "worksheet" })),
+    /Invalid PDF use-as role/,
+  );
+});
+
+test("source readiness reports current registry state and ignores stale hashes", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "maple-source-readiness-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  await fs.mkdir(path.join(workspace, "sources"), { recursive: true });
+  await fs.mkdir(path.join(workspace, ".aiwiki", "extracted", "latest", "foo"), { recursive: true });
+  await fs.writeFile(path.join(workspace, "sources", "foo.pdf"), "pdf-v1");
+  await fs.writeFile(path.join(workspace, "sources", "notes.md"), "# Notes\n");
+  await fs.writeFile(path.join(workspace, ".aiwiki", "extracted", "latest", "foo", "text.md"), "# Foo\n");
+  await fs.writeFile(
+    path.join(workspace, ".aiwiki", "extracted", "latest", "foo", "manifest.json"),
+    `${JSON.stringify({ pageCount: 1, textPath: "text.md" }, null, 2)}\n`,
+  );
+
+  const sourceSha256 = crypto.createHash("sha256").update("pdf-v1").digest("hex");
+  await writeSourceArtifactsRegistry(workspace, {
+    sources: {
+      "sources/foo.pdf": {
+        sourcePath: "sources/foo.pdf",
+        sourceSlug: "foo",
+        sourceSha256,
+        status: "ready",
+        extractorVersion: EXTRACTOR_VERSION,
+        useAs: "text-with-diagrams",
+        detectedUseAs: "text-with-diagrams",
+        structuredMarkdown: ".aiwiki/extracted/latest/foo/text.md",
+        manifestPath: ".aiwiki/extracted/latest/foo/manifest.json",
+        latestPath: ".aiwiki/extracted/latest/foo",
+      },
+    },
+  });
+
+  let readiness = await getSourceReadiness(workspace);
+  const readyPdf = readiness.files.find((file) => file.path === "sources/foo.pdf");
+  assert.equal(readyPdf.status, "ready");
+  assert.equal(readyPdf.useAs, "text-with-diagrams");
+  assert.equal(readyPdf.preparedPath, ".aiwiki/extracted/latest/foo/text.md");
+  assert.equal(readiness.files.find((file) => file.path === "sources/notes.md")?.status, "ready");
+
+  await fs.writeFile(path.join(workspace, "sources", "foo.pdf"), "pdf-v2");
+  readiness = await getSourceReadiness(workspace);
+  const stalePdf = readiness.files.find((file) => file.path === "sources/foo.pdf");
+  assert.equal(stalePdf.status, "not-prepared");
+  assert.equal(stalePdf.preparedPath, null);
+});
+
+test("selects only requested Build Wiki source paths", () => {
+  const sourceStatus = {
+    files: [
+      { path: "sources/a.md", state: "new" },
+      { path: "sources/b.md", state: "modified" },
+      { path: "sources/old.md", state: "removed" },
+    ],
+  };
+
+  assert.deepEqual(
+    selectSourcePathsForBuild(sourceStatus, { sourcePaths: ["sources/b.md"] }),
+    ["sources/b.md"],
+  );
+  assert.throws(
+    () => selectSourcePathsForBuild(sourceStatus, { sourcePaths: ["sources/old.md"] }),
+    /not available/,
+  );
+});
+
+test("Build Wiki prompt scopes selected sources and renders PDF role guidance", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "maple-selected-build-prompt-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+
+  const sourceStatus = {
+    files: [
+      { path: "sources/qs.pdf", state: "new" },
+      { path: "sources/skip.pdf", state: "new" },
+    ],
+  };
+  const prompt = await buildWikiPrompt(
+    workspace,
+    {
+      sourceStatus,
+      sourcePaths: ["sources/qs.pdf"],
+      buildSourcePaths: ["sources/qs.pdf"],
+    },
+    {
+      sources: [{
+        sourcePath: "sources/qs.pdf",
+        sourceFormat: "pdf",
+        textPath: ".aiwiki/extracted/op/qs/text.md",
+        pdfUseAs: "text-with-diagrams",
+        detectedUseAs: "mostly-text",
+      }],
+    },
+  );
+
+  assert.match(prompt, /sources\/qs\.pdf/);
+  assert.doesNotMatch(prompt, /sources\/skip\.pdf/);
+  assert.match(prompt, /PDF reading mode: text-with-diagrams/);
+  assert.match(prompt, /important extracted figures/);
 });
 
 test("reviews root files while excluding sources, metadata, assets, and deleted paths", () => {
@@ -2496,7 +3300,7 @@ test("Improve Wiki source grounding is opt-in and does not allow source edits", 
   assert.match(prompt, /Do not edit, create, rename, move, or delete files under sources\/\*\*/);
   assert.match(prompt, /sources\/lecture-01\.md \(unchanged\)/);
   assert.match(prompt, /sources\/lecture-02\.pdf \(new\)/);
-  assert.match(prompt, /Extracted text: \.aiwiki\/extracted\/op\/lecture-02\/text\.md/);
+  assert.match(prompt, /Prepared structured Markdown: \.aiwiki\/extracted\/op\/lecture-02\/text\.md/);
   assert.doesNotMatch(prompt, /runner updates it only after a successful build/);
 });
 

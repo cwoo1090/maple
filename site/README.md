@@ -10,29 +10,28 @@ Production URL:
 https://maple-taupe.vercel.app
 ```
 
-## Latest Release Download
+## macOS Download
 
-The main download CTA links to `download-macos.html`. That page reads the latest
-GitHub Release and redirects to the first Apple silicon DMG asset matching:
+The main download CTA links directly to the current Apple silicon DMG on the
+GitHub Release:
 
 ```text
-Maple_<version>_aarch64.dmg
+https://github.com/cwoo1090/maple/releases/download/v0.1.18/Maple_0.1.18_aarch64.dmg
 ```
 
-This keeps the public CTA stable while still downloading the newest versioned
-DMG file directly.
+The legacy `download-macos.html` page also redirects to that DMG so old links
+still start the download.
 
 The DMG is not committed to git. To refresh checksum notes after a new macOS
 release build:
 
 ```bash
 LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8 \
-  shasum -a 256 ../prototype/app-shell/src-tauri/target/release/bundle/dmg/Maple_0.1.1_aarch64.dmg \
+  shasum -a 256 ../prototype/app-shell/src-tauri/target/release/bundle/dmg/Maple_0.1.18_aarch64.dmg \
   > downloads/checksums.txt
 ```
 
-The site download link does not need to change when a new release is published
-with the same DMG naming pattern.
+Update the CTA links when a new versioned DMG is published.
 
 ## Launch Demo Video
 

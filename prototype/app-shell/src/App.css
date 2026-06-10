@@ -672,9 +672,11 @@ body.panel-resizing * {
 }
 
 .app-center {
+  position: relative;
   background: var(--bg);
   display: flex;
   flex-direction: column;
+  overflow: hidden;
 }
 
 .app-right {
@@ -1118,6 +1120,115 @@ body.panel-resizing * {
 .review-actions button.danger:hover:not(:disabled) {
   border-color: var(--danger-border);
   background: var(--danger-bg);
+}
+
+.post-build-next-panel {
+  flex-shrink: 0;
+  display: grid;
+  gap: 9px;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  margin: 8px 4px 0;
+  padding: 10px;
+  border: 1px solid var(--success-border);
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.62);
+  color: var(--text);
+}
+
+.center-post-build-next-panel {
+  position: absolute;
+  left: 18px;
+  bottom: 18px;
+  z-index: 8;
+  width: min(360px, calc(100% - 36px));
+  max-height: min(360px, calc(100% - 36px));
+  margin: 0;
+  overflow: auto;
+  border-color: var(--success-border);
+  background: rgba(255, 255, 255, 0.9);
+  box-shadow: 0 14px 38px rgba(31, 26, 18, 0.14);
+  backdrop-filter: blur(12px);
+}
+
+.center-post-build-next-panel.review-pending {
+  border-color: var(--accent-border);
+}
+
+.center-post-build-next-panel.review-pending .post-build-next-header strong {
+  color: var(--accent);
+}
+
+.post-build-next-header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 8px;
+  min-width: 0;
+}
+
+.post-build-next-header strong {
+  display: block;
+  color: var(--success);
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.post-build-next-header p {
+  margin: 2px 0 0;
+  color: var(--text-muted);
+  font-size: 11.5px;
+  line-height: 1.35;
+}
+
+.post-build-next-intro {
+  margin: -2px 0 0;
+  color: var(--text-faint);
+  font-size: 11.5px;
+  line-height: 1.35;
+}
+
+.post-build-next-dismiss {
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: var(--text-muted);
+}
+
+.post-build-next-dismiss:hover {
+  border-color: var(--border);
+  background: var(--bg-elevated);
+  color: var(--text);
+}
+
+.post-build-next-guide {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.post-build-next-guide li {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+}
+
+.post-build-next-guide strong {
+  color: var(--text);
+  font-size: 11.5px;
+  font-weight: 750;
+}
+
+.post-build-next-guide span {
+  color: var(--text-muted);
+  font-size: 11.5px;
+  line-height: 1.35;
 }
 
 .tree {
@@ -6076,6 +6187,115 @@ button.tree-name-clickable {
   -webkit-app-region: no-drag;
 }
 
+.maple-guide-callout {
+  pointer-events: auto;
+  position: relative;
+  width: 188px;
+  border: 1px solid var(--accent-border);
+  border-radius: 10px;
+  background: rgba(255, 250, 243, 0.98);
+  color: var(--text);
+  box-shadow: 0 12px 30px rgba(93, 48, 24, 0.15);
+  text-align: left;
+}
+
+.maple-guide-callout::after {
+  content: "";
+  position: absolute;
+  left: 18px;
+  bottom: -7px;
+  width: 12px;
+  height: 12px;
+  border-right: 1px solid var(--accent-border);
+  border-bottom: 1px solid var(--accent-border);
+  background: rgba(255, 250, 243, 0.98);
+  transform: rotate(45deg);
+}
+
+.maple-guide-callout-body {
+  display: block;
+  width: 100%;
+  min-height: 100%;
+  padding: 10px 34px 10px 12px;
+  border-radius: 10px;
+  text-align: left;
+}
+
+.maple-guide-callout-body strong,
+.maple-guide-callout-body span {
+  position: relative;
+  z-index: 1;
+  display: block;
+}
+
+.maple-guide-callout-body strong {
+  color: var(--accent);
+  font-size: 12.5px;
+  font-weight: 800;
+  letter-spacing: 0;
+}
+
+.maple-guide-callout-body span {
+  margin-top: 2px;
+  color: var(--text-muted);
+  font-size: 11.5px;
+  line-height: 1.35;
+}
+
+.maple-guide-callout:has(.maple-guide-callout-body:hover) {
+  background: #fff5ec;
+  box-shadow: 0 14px 34px rgba(93, 48, 24, 0.18);
+}
+
+.maple-guide-callout-dismiss {
+  position: absolute;
+  top: 7px;
+  right: 7px;
+  z-index: 2;
+  display: grid;
+  place-items: center;
+  width: 19px;
+  height: 19px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  color: var(--text-dim);
+  font-size: 15px;
+  line-height: 1;
+}
+
+.maple-guide-callout-dismiss:hover,
+.maple-guide-callout-dismiss:focus-visible {
+  border-color: var(--border);
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.maple-guide-widget.first-run {
+  left: 22px;
+  bottom: 24px;
+  gap: 12px;
+}
+
+.maple-guide-widget.first-run .maple-guide-callout {
+  width: 236px;
+  border-color: rgba(224, 78, 26, 0.46);
+  box-shadow:
+    0 0 0 5px rgba(224, 78, 26, 0.08),
+    0 18px 44px rgba(93, 48, 24, 0.2);
+}
+
+.maple-guide-widget.first-run .maple-guide-callout-body {
+  padding: 12px 38px 12px 14px;
+}
+
+.maple-guide-widget.first-run .maple-guide-callout-body strong {
+  font-size: 13.5px;
+}
+
+.maple-guide-widget.first-run .maple-guide-callout-body span {
+  font-size: 12px;
+}
+
 .maple-guide-launch {
   pointer-events: auto;
   position: relative;
@@ -6232,10 +6452,33 @@ button.tree-name-clickable {
   text-align: left;
 }
 
+.maple-guide-suggestions .maple-guide-suggestion-primary {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 36px;
+  border-color: var(--accent-border);
+  background: var(--accent-bg);
+  color: var(--accent);
+  font-weight: 750;
+}
+
+.maple-guide-suggestion-primary svg {
+  flex: 0 0 auto;
+}
+
+.maple-guide-suggestion-primary span {
+  min-width: 0;
+}
+
 .maple-guide-suggestions button:hover:not(:disabled) {
   border-color: var(--accent-border);
   background: var(--accent-bg);
   color: var(--accent);
+}
+
+.maple-guide-suggestions .maple-guide-suggestion-primary:hover:not(:disabled) {
+  background: var(--accent-bg-strong);
 }
 
 .maple-guide-message {
@@ -6266,6 +6509,44 @@ button.tree-name-clickable {
 .maple-guide-message-assistant.status-failed {
   border-color: var(--danger-border);
   background: var(--danger-bg);
+}
+
+.maple-guide-followups {
+  display: grid;
+  gap: 7px;
+  margin-top: 12px;
+}
+
+.maple-guide-followups > span {
+  color: var(--text-faint);
+  font-size: 11.5px;
+  font-weight: 700;
+}
+
+.maple-guide-followup-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.maple-guide-followup-chips button {
+  max-width: 100%;
+  min-height: 28px;
+  padding: 5px 9px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-elevated);
+  color: var(--text-muted);
+  font-size: 11.5px;
+  font-weight: 650;
+  line-height: 1.3;
+  text-align: left;
+}
+
+.maple-guide-followup-chips button:hover:not(:disabled) {
+  border-color: var(--accent-border);
+  background: var(--accent-bg);
+  color: var(--accent);
 }
 
 .maple-guide-message p,
@@ -6743,6 +7024,122 @@ button.tree-name-clickable {
   color: var(--text-dim);
 }
 
+.maple-wiki-inline-marker {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.32rem;
+  width: fit-content;
+  max-width: 100%;
+  margin: 0.45rem 0 0.15rem;
+  border: 1px solid var(--info-border);
+  border-radius: 999px;
+  padding: 0.16rem 0.5rem;
+  background: var(--info-bg);
+  color: var(--info);
+  font-size: 0.78em;
+  font-weight: 700;
+  line-height: 1.35;
+}
+
+.maple-wiki-inline-marker svg {
+  flex: 0 0 auto;
+}
+
+.maple-wiki-marker {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 0.7rem;
+  margin: 0.85rem 0;
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 7px;
+  padding: 0.75rem 0.85rem;
+  background: var(--bg-elevated);
+  color: var(--text);
+}
+
+.maple-wiki-marker-icon {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border: 1px solid var(--accent-border);
+  border-radius: 7px;
+  background: var(--accent-bg);
+  color: var(--accent);
+}
+
+.maple-wiki-marker-body {
+  min-width: 0;
+}
+
+.maple-wiki-marker-eyebrow,
+.maple-wiki-marker-meta,
+.maple-wiki-marker-chips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.maple-wiki-marker-eyebrow {
+  margin-bottom: 0.22rem;
+}
+
+.maple-wiki-marker-eyebrow span,
+.maple-wiki-marker-chips span {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0.08rem 0.48rem;
+  background: var(--bg);
+  color: var(--text-muted);
+  font-size: 0.78em;
+  font-weight: 650;
+  line-height: 1.35;
+}
+
+.maple-wiki-marker-eyebrow span:first-child {
+  border-color: var(--accent-border);
+  background: var(--accent-bg);
+  color: var(--accent);
+}
+
+.maple-wiki-marker-title {
+  color: var(--text);
+  font-size: 0.98em;
+  font-weight: 700;
+  line-height: 1.35;
+}
+
+.maple-wiki-marker p {
+  margin: 0.18rem 0 0;
+  color: var(--text-muted);
+}
+
+.maple-wiki-marker-meta {
+  margin-top: 0.4rem;
+  color: var(--text-dim);
+  font-size: 0.84em;
+}
+
+.maple-wiki-marker-meta span {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.28rem;
+}
+
+.maple-wiki-marker-chips {
+  margin-top: 0.55rem;
+  color: var(--text-faint);
+}
+
+.maple-wiki-marker-chips svg {
+  flex: 0 0 auto;
+}
+
 .wiki-document table {
   width: 100%;
   border-collapse: collapse;
@@ -7206,7 +7603,7 @@ button.tree-name-clickable {
 }
 
 .apply-modal.build-modal {
-  width: min(600px, 100%);
+  width: min(680px, 100%);
 }
 
 .apply-modal.schema-update-modal {
@@ -7453,18 +7850,56 @@ button.tree-name-clickable {
 }
 
 .build-source-summary {
-  max-height: 240px;
+  max-height: 300px;
   overflow: auto;
+  display: grid;
+  gap: 8px;
   padding: 10px;
   border: 1px solid var(--border);
   border-radius: 8px;
   background: var(--bg);
 }
 
+.build-source-summary-header,
+.build-source-row-main,
+.build-source-role {
+  display: grid;
+  align-items: center;
+  gap: 8px;
+}
+
+.build-source-summary-header {
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.build-source-summary-header strong {
+  color: var(--text);
+  font-size: 12.5px;
+  font-weight: 650;
+}
+
+.build-source-summary-header span {
+  color: var(--text-faint);
+  font-size: 12px;
+}
+
 .build-source-summary p {
   margin: 0;
   color: var(--text-faint);
   font-size: 12.5px;
+}
+
+.build-source-prep-note {
+  padding: 8px 9px;
+  border: 1px solid var(--info-border);
+  border-radius: 7px;
+  background: var(--info-bg);
+  color: var(--text-muted) !important;
+}
+
+.build-source-prep-note.warning {
+  border-color: var(--warn-border);
+  background: var(--warn-bg);
 }
 
 .build-source-summary ul {
@@ -7483,6 +7918,114 @@ button.tree-name-clickable {
 
 .source-group + .source-group {
   margin-top: 10px;
+}
+
+.build-source-list {
+  display: grid;
+  gap: 6px;
+}
+
+.build-source-row {
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+  padding: 8px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 7px;
+  background: var(--bg-elevated);
+}
+
+.build-source-row.removed {
+  background: var(--bg);
+}
+
+.build-source-row-main {
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.build-source-path {
+  min-width: 0;
+  color: var(--text-muted);
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  font-size: 11.5px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.build-source-readiness {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  padding: 0 7px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text-dim);
+  font-size: 11.5px;
+  font-weight: 650;
+  white-space: nowrap;
+}
+
+.build-source-readiness.ready {
+  border-color: var(--success-border);
+  background: var(--success-bg);
+  color: var(--success);
+}
+
+.build-source-readiness.preparing {
+  border-color: var(--info-border);
+  background: var(--info-bg);
+  color: var(--info);
+}
+
+.build-source-readiness.failed {
+  border-color: var(--danger-border);
+  background: var(--danger-bg);
+  color: var(--danger);
+}
+
+.build-source-readiness.removed {
+  border-color: var(--warn-border);
+  background: var(--warn-bg);
+  color: var(--warn);
+}
+
+.build-source-role {
+  grid-template-columns: auto minmax(170px, 220px);
+  justify-content: end;
+}
+
+.build-source-role span {
+  color: var(--text-faint);
+  font-size: 11.5px;
+  font-weight: 650;
+}
+
+.build-source-role select {
+  width: 100%;
+  height: 30px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+}
+
+.build-source-role select:focus {
+  outline: none;
+  border-color: var(--accent-border);
+  box-shadow: 0 0 0 2px var(--accent-bg);
+}
+
+.build-source-error {
+  padding: 7px 8px;
+  border: 1px solid var(--danger-border);
+  border-radius: 6px;
+  background: var(--danger-bg);
+  color: var(--danger) !important;
+  overflow-wrap: anywhere;
 }
 
 .build-model-field {
@@ -7619,6 +8162,13 @@ button.tree-name-clickable {
 
   .existing-wiki-choice-btn {
     justify-self: start;
+  }
+
+  .build-source-summary-header,
+  .build-source-row-main,
+  .build-source-role {
+    grid-template-columns: 1fr;
+    justify-content: stretch;
   }
 }
 

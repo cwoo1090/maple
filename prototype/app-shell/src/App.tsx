@@ -39,9 +39,11 @@ import ForceGraph2D from "react-force-graph-2d";
 import { forceCollide } from "d3-force";
 import {
   AlertTriangle,
+  BookOpen,
   CheckCircle2,
   Crop,
   HelpCircle,
+  Image as ImageIcon,
   Info,
   Link as LinkIcon,
   Lightbulb,
@@ -50,6 +52,7 @@ import {
   Quote,
   RotateCcw,
   ShieldCheck,
+  Tags,
   Trash2,
   Upload,
   X,
@@ -97,6 +100,7 @@ type WorkspaceState = {
   workspacePath: string;
   status: unknown | null;
   sourceStatus: SourceStatus | null;
+  sourceReadiness: SourceReadiness | null;
   wikiStatus: WikiStatus | null;
   outsideWikiChanges: OutsideWikiChanges | null;
   changedMarker: {
@@ -217,6 +221,42 @@ type SourceStatus = {
   manifestExists?: boolean;
   inferredManifest?: boolean;
   files: SourceStatusFile[];
+};
+
+type PdfUseAsRole =
+  | "mostly-text"
+  | "text-with-diagrams"
+  | "mostly-visual";
+
+type SourceReadinessState = "ready" | "preparing" | "failed" | "not-prepared";
+
+type SourceReadinessFile = {
+  path: string;
+  sha256?: string;
+  format?: string;
+  status: SourceReadinessState;
+  sourceArtifact?: string;
+  sourceArtifactPath?: string;
+  preparedAt?: string;
+  error?: string | null;
+  useAs?: PdfUseAsRole | null;
+  pdfUseAs?: PdfUseAsRole | null;
+  detectedUseAs?: PdfUseAsRole | null;
+};
+
+type SourceReadiness = {
+  readyCount?: number;
+  preparingCount?: number;
+  failedCount?: number;
+  notPreparedCount?: number;
+  summary?: {
+    total: number;
+    ready: number;
+    preparing: number;
+    failed: number;
+    notPrepared: number;
+  };
+  files: SourceReadinessFile[];
 };
 
 type WikiChangeState = "added" | "modified" | "deleted" | "unchanged";
@@ -389,12 +429,27 @@ type MapleGuideMessage = {
   role: "user" | "assistant";
   text: string;
   status: "completed" | "streaming" | "failed";
+  topic?: MapleGuideTopic;
   provider?: string;
   model?: string;
   reasoningEffort?: string;
   createdAt: string;
   completedAt?: string;
 };
+
+type MapleGuideTopic =
+  | "start-guide"
+  | "first-step"
+  | "source-import"
+  | "source-prep"
+  | "build"
+  | "review"
+  | "ask-wiki"
+  | "maintain"
+  | "ask-maintain"
+  | "ai-setup"
+  | "troubleshooting"
+  | "fallback";
 
 type MapleGuideAnswer = {
   answer: string;
@@ -493,6 +548,7 @@ type BuildDraft = {
   workspaceContext: string;
   requiresWorkspaceContext: boolean;
   force: boolean;
+  pdfUseAs: Record<string, PdfUseAsRole>;
   provider: string;
   model: string;
   reasoningEffort: string;
@@ -634,6 +690,11 @@ const TABULAR_TEXT_EXT_REGEX = /\.(csv|tsv)$/i;
 const HTML_EXT_REGEX = /\.html?$/i;
 const SOURCE_TEXT_EXT_REGEX = /\.(txt|jsonl?|csv|tsv|html?)$/i;
 const MARKDOWN_EXT_REGEX = /\.md$/i;
+const PDF_USE_AS_OPTIONS: { value: PdfUseAsRole; label: string }[] = [
+  { value: "mostly-text", label: "Mostly text" },
+  { value: "text-with-diagrams", label: "Text with diagrams" },
+  { value: "mostly-visual", label: "Mostly visual" },
+];
 const CHAT_PROGRESS_ERROR_PREFIX = "Failed to read chat progress:";
 const MAINTAIN_DISCUSSION_PROGRESS_ERROR_PREFIX = "Failed to read maintain discussion progress:";
 const OPERATION_PROGRESS_ERROR_PREFIX = "Failed to read operation progress:";
@@ -664,6 +725,7 @@ const RIGHT_PANEL_COLLAPSED_KEY = "maple.rightPanelCollapsed";
 const SEEN_CHAT_THREADS_KEY = "maple.seenChatThreads";
 const SEEN_MAINTAIN_THREADS_KEY = "maple.seenMaintainThreads";
 const READING_TEXT_SIZE_KEY = "maple.readingTextSizePx";
+const MAPLE_GUIDE_CALLOUT_DISMISSED_KEY = "maple.guideCalloutDismissed";
 const LEGACY_LEFT_PANEL_WIDTH_KEY = "studywiki.leftPanelWidth";
 const LEGACY_RIGHT_PANEL_WIDTH_KEY = "studywiki.rightPanelWidth";
 const LEGACY_LEFT_PANEL_COLLAPSED_KEY = "studywiki.leftPanelCollapsed";
@@ -1260,6 +1322,59 @@ function aiProviderHint(provider: ProviderInfo, language: UiLanguage = "en"): st
   return translate(language, "app.ai.otherProviderHint");
 }
 
+function isPdfUseAsRole(value: unknown): value is PdfUseAsRole {
+  return normalizePdfUseAsRole(value) !== null;
+}
+
+function normalizePdfUseAsRole(value: unknown): PdfUseAsRole | null {
+  if (typeof value !== "string") return null;
+  if (PDF_USE_AS_OPTIONS.some((option) => option.value === value)) return value as PdfUseAsRole;
+  switch (value) {
+    case "learning-material":
+    case "syllabus":
+      return "mostly-text";
+    case "questions":
+    case "answers-markscheme":
+    case "other":
+      return "text-with-diagrams";
+    case "slides-visuals":
+      return "mostly-visual";
+    default:
+      return null;
+  }
+}
+
+function isPdfSourcePath(path: string): boolean {
+  return PDF_EXT_REGEX.test(path);
+}
+
+function isAutoPreparableSourcePath(path: string): boolean {
+  return isPdfSourcePath(path) || OFFICE_PDF_PREVIEW_EXT_REGEX.test(path);
+}
+
+function defaultPdfUseAsForSource(readiness?: SourceReadinessFile): PdfUseAsRole {
+  return (
+    normalizePdfUseAsRole(readiness?.useAs) ??
+    normalizePdfUseAsRole(readiness?.pdfUseAs) ??
+    normalizePdfUseAsRole(readiness?.detectedUseAs) ??
+    "mostly-text"
+  );
+}
+
+function pdfUseAsLabel(role: PdfUseAsRole, language: UiLanguage = "en"): string {
+  if (language === "ko") {
+    switch (role) {
+      case "mostly-text":
+        return "대부분 텍스트";
+      case "text-with-diagrams":
+        return "텍스트 + 그림";
+      case "mostly-visual":
+        return "대부분 이미지";
+    }
+  }
+  return PDF_USE_AS_OPTIONS.find((option) => option.value === role)?.label ?? role;
+}
+
 function sourceStateLabel(state: SourceState, language: UiLanguage = "en"): string {
   switch (state) {
     case "new":
@@ -1271,6 +1386,27 @@ function sourceStateLabel(state: SourceState, language: UiLanguage = "en"): stri
     default:
       return language === "ko" ? "변경 없음" : "Unchanged";
   }
+}
+
+function sourceReadinessLabel(
+  status: SourceReadinessState | undefined,
+  language: UiLanguage = "en",
+): string {
+  switch (status) {
+    case "ready":
+      return language === "ko" ? "준비됨" : "Ready";
+    case "preparing":
+      return language === "ko" ? "준비 중" : "Preparing";
+    case "failed":
+      return language === "ko" ? "실패" : "Failed";
+    case "not-prepared":
+    default:
+      return language === "ko" ? "준비 필요" : "Needs prep";
+  }
+}
+
+function sourceReadinessPreparingCount(readiness: SourceReadiness | null | undefined): number {
+  return readiness?.summary?.preparing ?? readiness?.preparingCount ?? 0;
 }
 
 function wikiChangeStateLabel(state: WikiChangeState | undefined, language: UiLanguage = "en"): string {
@@ -1552,6 +1688,7 @@ const emptyState: WorkspaceState = {
   workspacePath: "",
   status: null,
   sourceStatus: null,
+  sourceReadiness: null,
   wikiStatus: null,
   outsideWikiChanges: null,
   changedMarker: null,
@@ -1777,6 +1914,11 @@ function App() {
   const [seenMaintainThreadUpdates, setSeenMaintainThreadUpdates] = useState<SeenThreadMap>({});
   const [applyDraft, setApplyDraft] = useState<ApplyDraft>(null);
   const [buildDraft, setBuildDraft] = useState<BuildDraft>(null);
+  const [sourcePreparationStartedAt, setSourcePreparationStartedAt] = useState<number | null>(null);
+  const autoPreparedSourceSignatureRef = useRef<string | null>(null);
+  const [queuedBuildWhenReady, setQueuedBuildWhenReady] = useState<{
+    sourcePaths?: string[];
+  } | null>(null);
   const [schemaUpdatePrompt, setSchemaUpdatePrompt] = useState<SchemaUpdatePrompt | null>(null);
   const [schemaUpdateAvailability, setSchemaUpdateAvailability] =
     useState<SchemaUpdateAvailability>("unknown");
@@ -1815,6 +1957,11 @@ function App() {
   const [dismissedBuildSummaryOperationId, setDismissedBuildSummaryOperationId] = useState<
     string | null
   >(null);
+  const [postBuildNextStepsOperationId, setPostBuildNextStepsOperationId] = useState<
+    string | null
+  >(null);
+  const [dismissedPostBuildNextStepsOperationId, setDismissedPostBuildNextStepsOperationId] =
+    useState<string | null>(null);
   const handledBuildOperationIdRef = useRef<string | null>(null);
   const autoFinishedReviewOperationIdRef = useRef<string | null>(null);
   const appOpenedTrackedRef = useRef(false);
@@ -1859,6 +2006,9 @@ function App() {
   const [activeCenterTabId, setActiveCenterTabId] = useState("workspace:index.md");
   const [showSettings, setShowSettings] = useState(false);
   const [mapleGuideOpen, setMapleGuideOpen] = useState(false);
+  const [mapleGuideCalloutDismissed, setMapleGuideCalloutDismissed] = useState(
+    () => window.localStorage.getItem(MAPLE_GUIDE_CALLOUT_DISMISSED_KEY) === "true",
+  );
   const [mapleGuideQuestion, setMapleGuideQuestion] = useState("");
   const [mapleGuideMessages, setMapleGuideMessages] = useState<MapleGuideMessage[]>([]);
   const [mapleGuideBusy, setMapleGuideBusy] = useState(false);
@@ -1942,6 +2092,7 @@ function App() {
     workspaceOperationProgress?.running && workspaceOperationProgress.operationType === "build-wiki",
   );
   const isStartingBuild = busy === "Starting wiki build";
+  const isPreparingBuildSources = busy === "Preparing sources" || busy === "Waiting for sources";
   const isBuilding = isStartingBuild || backgroundBuildActive || buildOperationRunning;
   const workspaceBuildProgressActive =
     workspaceOperationProgress?.operationType === "build-wiki" &&
@@ -2060,9 +2211,25 @@ function App() {
   const reviewableChangedFiles = changedFiles.filter(isPendingReviewChange);
   const hasPendingGeneratedChanges =
     reviewableChangedFiles.length > 0 && !workspace.changedMarker?.undoneAt;
+  const generatedChangesReviewKey =
+    workspace.changedMarker?.operationId ??
+    workspace.changedMarker?.completedAt ??
+    (reviewableChangedFiles.length > 0
+      ? reviewableChangedFiles.map((file) => file.path).join("|")
+      : null);
+  const buildReviewOperationKey =
+    workspace.changedMarker?.operationType === "build-wiki"
+      ? (workspace.changedMarker.operationId ?? workspace.changedMarker.completedAt ?? null)
+      : null;
   const buildCompletionSummaryOperationId =
     workspace.changedMarker?.operationType === "build-wiki"
       ? workspace.changedMarker.operationId ?? null
+      : null;
+  const reviewedBuildOperationKey =
+    workspace.changedMarker?.operationType === "build-wiki" &&
+    workspace.changedMarker.reviewedAt &&
+    !workspace.changedMarker.undoneAt
+      ? (workspace.changedMarker.operationId ?? workspace.changedMarker.completedAt ?? null)
       : null;
   const buildCompletionSummaryStatus = workspace.changedMarker?.status ?? "";
   const buildCompletionSummaryText = workspace.lastOperationMessage?.trim() ?? "";
@@ -2075,6 +2242,12 @@ function App() {
       dismissedBuildSummaryOperationId !== buildCompletionSummaryOperationId &&
       (buildCompletionSummaryStatus === "completed" ||
         buildCompletionSummaryStatus === "completed_with_forbidden_edits_restored"),
+  );
+  const showPostBuildNextSteps = Boolean(
+    reviewedBuildOperationKey &&
+      postBuildNextStepsOperationId === reviewedBuildOperationKey &&
+      dismissedPostBuildNextStepsOperationId !== reviewedBuildOperationKey &&
+      !hasPendingGeneratedChanges,
   );
 
   function actionPhrase(action: BlockedAction): string {
@@ -2315,18 +2488,131 @@ function App() {
     : selectedMaintainTask
     ? maintainTaskUiCopy(selectedMaintainTask.id, language).label
     : t("app.common.new");
-  const sourceStatus = workspace.sourceStatus;
-  const outsideWikiChanges = workspace.outsideWikiChanges;
+  const workspaceStatus = workspace.status as {
+    sourceStatus?: SourceStatus | null;
+    sourceReadiness?: SourceReadiness | null;
+    outsideWikiChanges?: OutsideWikiChanges | null;
+  } | null;
+  const sourceStatus = workspace.sourceStatus ?? workspaceStatus?.sourceStatus ?? null;
+  const outsideWikiChanges =
+    workspace.outsideWikiChanges ?? workspaceStatus?.outsideWikiChanges ?? null;
+  const rootFiles = workspace.rootFiles ?? [];
+  const sourceFiles = workspace.sourceFiles ?? [];
+  const wikiPages = useMemo(
+    () =>
+      workspace.wikiFiles.filter(
+        (file) => file.endsWith(".md") && shouldShowWikiFileInSidebar(file),
+      ),
+    [workspace.wikiFiles],
+  );
   const pendingSourceFiles = useMemo(
-    () => (sourceStatus?.files ?? []).filter((file) => file.state !== "unchanged"),
-    [sourceStatus?.files],
+    () => {
+      if (sourceStatus?.files) {
+        return sourceStatus.files.filter((file) => file.state !== "unchanged");
+      }
+      if (sourceFiles.length > 0 && wikiPages.length === 0) {
+        return sourceFiles.map((path) => ({
+          path,
+          kind: "file",
+          size: 0,
+          mtimeMs: 0,
+          sha256: "",
+          state: "new" as const,
+        }));
+      }
+      return [];
+    },
+    [sourceFiles, sourceStatus?.files, wikiPages.length],
   );
   const pendingSourceCount = sourceStatus?.pendingCount ?? pendingSourceFiles.length;
   const outsideWikiChangedFiles = outsideWikiChanges?.files ?? [];
   const outsideWikiChangeCount = outsideWikiChanges?.changedCount ?? outsideWikiChangedFiles.length;
   const hasOutsideWikiChanges = outsideWikiChangeCount > 0;
-  const rootFiles = workspace.rootFiles ?? [];
-  const sourceFiles = workspace.sourceFiles ?? [];
+  const sourceReadiness = workspace.sourceReadiness ?? workspaceStatus?.sourceReadiness ?? null;
+  const sourceReadinessByPath = useMemo(() => {
+    const map = new Map<string, SourceReadinessFile>();
+    for (const file of sourceReadiness?.files ?? []) {
+      map.set(file.path, file);
+    }
+    return map;
+  }, [sourceReadiness?.files]);
+  const pendingBuildSourceFiles = useMemo(
+    () =>
+      pendingSourceFiles.filter(
+        (file) => file.state === "new" || file.state === "modified",
+      ),
+    [pendingSourceFiles],
+  );
+  const buildModalCandidatePaths = useMemo(() => {
+    if (!buildDraft) return [];
+    if (buildDraft.force) return sourceFiles;
+    return pendingBuildSourceFiles.map((file) => file.path);
+  }, [buildDraft, pendingBuildSourceFiles, sourceFiles]);
+  const buildModalCandidateRows = useMemo(
+    () =>
+      buildModalCandidatePaths.map((path) => {
+        const sourceFile = sourceStatus?.files.find((file) => file.path === path);
+        return {
+          path,
+          state: sourceFile?.state ?? "unchanged",
+          readiness: sourceReadinessByPath.get(path),
+          isPdf: isPdfSourcePath(path),
+        };
+      }),
+    [buildModalCandidatePaths, sourceReadinessByPath, sourceStatus?.files],
+  );
+  const buildModalRemovedRows = useMemo(
+    () =>
+      buildDraft?.force
+        ? []
+        : pendingSourceFiles.filter((file) => file.state === "removed"),
+    [buildDraft?.force, pendingSourceFiles],
+  );
+  const buildModalReadySourcePaths = useMemo(
+    () =>
+      buildModalCandidateRows
+        .filter((row) => row.readiness?.status === "ready")
+        .map((row) => row.path),
+    [buildModalCandidateRows],
+  );
+  const buildModalFailedCount = buildModalCandidateRows.filter(
+    (row) => row.readiness?.status === "failed",
+  ).length;
+  const buildModalNeedsPrepCount = buildModalCandidateRows.filter((row) => {
+    const status = row.readiness?.status ?? "not-prepared";
+    return status === "not-prepared" || status === "preparing" || status === "failed";
+  }).length;
+  const buildModalNeedsPreparation = buildModalNeedsPrepCount > 0;
+  const buildReadySourcesAvailable = Boolean(
+    buildModalReadySourcePaths.length > 0 &&
+      buildModalReadySourcePaths.length < buildModalCandidateRows.length,
+  );
+  const buildModalHasPdfCandidates = buildModalCandidateRows.some((row) => row.isPdf);
+  const sourcePreparationActive = Boolean(
+    sourcePreparationStartedAt || sourceReadinessPreparingCount(sourceReadiness) > 0,
+  );
+  useEffect(() => {
+    if (!workspace.workspacePath || sourcePreparationActive) return;
+    const preparableSourcePaths = pendingBuildSourceFiles
+      .map((file) => file.path)
+      .filter(isAutoPreparableSourcePath)
+      .filter((path) => {
+        const status = sourceReadinessByPath.get(path)?.status ?? "not-prepared";
+        return status === "not-prepared";
+      })
+      .sort();
+    if (preparableSourcePaths.length === 0) return;
+
+    const signature = `${workspace.workspacePath}\n${preparableSourcePaths.join("\n")}`;
+    if (autoPreparedSourceSignatureRef.current === signature) return;
+    autoPreparedSourceSignatureRef.current = signature;
+    void autoPrepareImportedSources(preparableSourcePaths, "workspace_sources");
+  }, [
+    pendingBuildSourceFiles,
+    sourcePreparationActive,
+    sourceReadinessByPath,
+    workspace.workspacePath,
+  ]);
   useEffect(() => {
     setLastImportedSourcePath((current) =>
       current && sourceFiles.includes(current) ? current : null,
@@ -2357,13 +2643,6 @@ function App() {
       return next.size === previous.size ? previous : next;
     });
   }, [sourceFiles]);
-  const wikiPages = useMemo(
-    () =>
-      workspace.wikiFiles.filter(
-        (file) => file.endsWith(".md") && shouldShowWikiFileInSidebar(file),
-      ),
-    [workspace.wikiFiles],
-  );
   const imagesAndFiles = useMemo(
     () => workspace.wikiFiles.filter(shouldShowImagesAndFilesInSidebar),
     [workspace.wikiFiles],
@@ -2921,6 +3200,7 @@ function App() {
     ],
     [t],
   );
+  const mapleGuideTourLabel = t("app.guide.suggestion.tour");
   const chatRunningSteps = useMemo(() => {
     const providerName = activeProvider ? displayProviderName(activeProvider) : "AI";
     return language === "ko"
@@ -3240,6 +3520,13 @@ function App() {
       });
     }
     setRightPanelMode(mode);
+  }
+
+  function dismissPostBuildNextSteps(operationId?: string | null) {
+    const nextOperationId = operationId ?? postBuildNextStepsOperationId;
+    if (nextOperationId) {
+      setDismissedPostBuildNextStepsOperationId(nextOperationId);
+    }
   }
 
   function toggleWindowMaximize() {
@@ -4414,6 +4701,12 @@ function App() {
         setWorkspaceOperationProgress((previous) => mergeOperationProgress(previous, progress));
         clearErrorMatching([BACKGROUND_BUILD_PROGRESS_ERROR_PREFIX]);
         if (progress.operationId || progress.running) return;
+        if (progress.error) {
+          setError(progress.error);
+          setBackgroundBuildActive(false);
+          setBackgroundBuildStartedAt(null);
+          return;
+        }
         const state = await invoke<WorkspaceState>("load_workspace_state");
         if (!cancelled) {
           setWorkspace(state);
@@ -5077,6 +5370,7 @@ function App() {
       setError(finishReviewBlockedReason);
       return;
     }
+    const nextStepsOperationId = buildReviewOperationKey;
     if (!silent) {
       setBusy(label);
     }
@@ -5087,6 +5381,10 @@ function App() {
       setRunner(result.runner);
       setWorkspace(result.state);
       setOpenedChangedFiles(new Set());
+      if (nextStepsOperationId) {
+        setPostBuildNextStepsOperationId(nextStepsOperationId);
+        setDismissedPostBuildNextStepsOperationId(null);
+      }
       await refreshChatThreadSummaries();
       track("changes accepted", {
         changed_file_count: reviewableChangedFiles.length,
@@ -5133,16 +5431,23 @@ function App() {
 	      });
 	      setError(buildBlockedReason);
 	      return;
-	    }
+    }
     showAiSetupPrompt("build");
+    setQueuedBuildWhenReady(null);
     const provider = activeProvider ?? providers[0];
     const modelId = provider ? appSettings?.models[provider.name] || provider.defaultModel : "";
     const model = provider?.supportedModels.find((item) => item.id === modelId);
+    const pdfUseAs = Object.fromEntries(
+      sourceFiles
+        .filter(isPdfSourcePath)
+        .map((path) => [path, defaultPdfUseAsForSource(sourceReadinessByPath.get(path))]),
+    ) as Record<string, PdfUseAsRole>;
 	    setBuildDraft({
       instruction: "",
       workspaceContext: "",
       requiresWorkspaceContext: !force && shouldAskFirstBuildContext,
       force,
+      pdfUseAs,
       provider: provider?.name ?? "",
       model: modelId,
 	      reasoningEffort: modelEffort(appSettings, provider, model),
@@ -5155,7 +5460,13 @@ function App() {
 	    });
 	  }
 
-  async function startBuildWiki() {
+  async function startBuildWiki(
+    options: {
+      sourcePaths?: string[];
+      prepareFirst?: boolean;
+      skipPreparationCheck?: boolean;
+    } = {},
+  ) {
     if (!buildDraft) return;
     if (buildBlockedReason) {
       setError(buildBlockedReason);
@@ -5197,6 +5508,41 @@ function App() {
       void draftProviderSetup.refresh("build_blocked");
       return;
     }
+    const pdfUseAs = Object.fromEntries(
+      Object.entries(draft.pdfUseAs).filter(
+        ([path, role]) => isPdfSourcePath(path) && isPdfUseAsRole(role),
+      ),
+    ) as Record<string, PdfUseAsRole>;
+    if (options.prepareFirst && !options.skipPreparationCheck && buildModalCandidatePaths.length > 0) {
+      setBusy(sourcePreparationActive ? "Waiting for sources" : "Preparing sources");
+      setError(null);
+      setQueuedBuildWhenReady({ sourcePaths: undefined });
+      if (sourcePreparationActive) {
+        setSourcePreparationStartedAt((current) => current ?? Date.now());
+        setBusy(null);
+        return;
+      }
+      try {
+        const result = await invoke<AppCommandResult>("prepare_sources", {
+          sourcePaths: buildModalCandidatePaths,
+          pdfUseAs,
+        });
+        setRunner(result.runner);
+        setWorkspace(result.state);
+        setSourcePreparationStartedAt(Date.now());
+        track("source preparation started", {
+          source_count: buildModalCandidatePaths.length,
+          pdf_role_count: Object.keys(pdfUseAs).length,
+          reason: "build_when_ready",
+        });
+      } catch (err) {
+        setQueuedBuildWhenReady(null);
+        setError(String(err));
+      } finally {
+        setBusy(null);
+      }
+      return;
+    }
     setBusy("Starting wiki build");
     setError(null);
     setWorkspaceOperationProgress(null);
@@ -5204,7 +5550,9 @@ function App() {
     setDismissedBuildSummaryOperationId(null);
     setBuildFeedOpen(true);
     setBuildDraft(null);
+    setQueuedBuildWhenReady(null);
     clearAiSetupPrompt("build");
+    const selectedSourcePaths = options.sourcePaths?.length ? options.sourcePaths : null;
 
     try {
       track("wiki build started", {
@@ -5214,11 +5562,14 @@ function App() {
         ...buildWikiTopicProperties(draft),
         pending_source_count: pendingSourceCount,
         source_count: sourceFiles.length,
+        selected_source_count: selectedSourcePaths?.length ?? null,
       });
       const result = await invoke<AppCommandResult>("build_wiki", {
         instruction: draft.instruction,
         workspaceContext: draft.requiresWorkspaceContext ? draft.workspaceContext.trim() : null,
         force: draft.force,
+        sourcePaths: selectedSourcePaths,
+        pdfUseAs,
         provider: draftProvider.name,
         model: draftModel,
         reasoningEffort: draftReasoningEffort,
@@ -5251,6 +5602,74 @@ function App() {
       setBusy(null);
     }
   }
+
+  useEffect(() => {
+    if (!workspace.workspacePath || !sourcePreparationActive) return;
+
+    let cancelled = false;
+    const startedAt = sourcePreparationStartedAt ?? Date.now();
+    const minimumPollUntil = startedAt + 1800;
+    const refresh = async () => {
+      try {
+        const state = await invoke<WorkspaceState>("load_workspace_state");
+        if (cancelled) return;
+        setWorkspace(state);
+        const stillPreparing = sourceReadinessPreparingCount(state.sourceReadiness) > 0;
+        if (!stillPreparing && Date.now() >= minimumPollUntil) {
+          setSourcePreparationStartedAt(null);
+        }
+      } catch (err) {
+        if (!cancelled) setError(`Failed to refresh source preparation: ${String(err)}`);
+      }
+    };
+
+    void refresh();
+    const intervalId = window.setInterval(refresh, 1000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+    };
+  }, [
+    sourcePreparationActive,
+    sourcePreparationStartedAt,
+    workspace.workspacePath,
+  ]);
+
+  useEffect(() => {
+    if (!queuedBuildWhenReady || !buildDraft || sourcePreparationActive) return;
+
+    const failedRows = buildModalCandidateRows.filter(
+      (row) => row.readiness?.status === "failed",
+    );
+    if (failedRows.length > 0) {
+      setQueuedBuildWhenReady(null);
+      setError(
+        failedRows.length === 1
+          ? `Source preparation failed for ${failedRows[0].path}.`
+          : `Source preparation failed for ${failedRows.length} sources.`,
+      );
+      return;
+    }
+
+    const notReadyRows = buildModalCandidateRows.filter(
+      (row) => (row.readiness?.status ?? "not-prepared") !== "ready",
+    );
+    if (notReadyRows.length > 0) return;
+
+    const queued = queuedBuildWhenReady;
+    setQueuedBuildWhenReady(null);
+    void startBuildWiki({
+      sourcePaths: queued.sourcePaths,
+      skipPreparationCheck: true,
+    });
+    // startBuildWiki intentionally reads the current modal draft and provider state.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    buildDraft,
+    buildModalCandidateRows,
+    queuedBuildWhenReady,
+    sourcePreparationActive,
+  ]);
 
   async function keepExistingWikiAsBaseline() {
     if (!workspace.workspacePath || anyOperationBusy) return;
@@ -6395,6 +6814,7 @@ function App() {
         setLastImportedSourcePath(importedSourcePath);
         setPendingImportedSourceOpenPath(importedSourcePath);
       }
+      void autoPrepareImportedSources(result.importedSourcePaths);
       track("source import completed", {
         ...sourceAnalyticsProperties(supported),
         result: result.runner?.success === false ? "failed" : "success",
@@ -6463,6 +6883,7 @@ function App() {
         setLastImportedSourcePath(importedSourcePath);
         setPendingImportedSourceOpenPath(importedSourcePath);
       }
+      void autoPrepareImportedSources(result.importedSourcePaths);
       track("source import completed", {
         ...sourceAnalyticsProperties(sourcePaths),
         result: result.runner?.success === false ? "failed" : "success",
@@ -6476,6 +6897,31 @@ function App() {
       setError(String(err));
     } finally {
       setBusy(null);
+    }
+  }
+
+  async function autoPrepareImportedSources(
+    importedSourcePaths: string[],
+    reason: "source_import" | "workspace_sources" = "source_import",
+  ) {
+    const preparableSourcePaths = importedSourcePaths.filter(isAutoPreparableSourcePath);
+    if (preparableSourcePaths.length === 0) return;
+
+    setSourcePreparationStartedAt(Date.now());
+    try {
+      const result = await invoke<AppCommandResult>("prepare_sources", {
+        sourcePaths: preparableSourcePaths,
+      });
+      setRunner(result.runner);
+      setWorkspace(result.state);
+      track("source preparation started", {
+        source_count: preparableSourcePaths.length,
+        pdf_role_count: 0,
+        reason,
+      });
+    } catch (err) {
+      setSourcePreparationStartedAt(null);
+      setError(`Failed to prepare imported sources: ${String(err)}`);
     }
   }
 
@@ -6770,16 +7216,300 @@ function App() {
     return normalized || t("app.guide.couldNotAnswer");
   }
 
+  function detectMapleGuideTopic(question: string): MapleGuideTopic {
+    const normalized = question.toLowerCase();
+    if (question === mapleGuideTourLabel) return "start-guide";
+    if (isMapleGuideTourRequest(question)) return "start-guide";
+    if (/pdf|피디에프/.test(normalized)) return "source-import";
+    if (/준비|prepare|preparing|변환|convert|markdown|md\b/.test(normalized)) return "source-prep";
+    if (/build|빌드|위키 빌드|rebuild/.test(normalized)) return "build";
+    if (/review|검토|변경|되돌|undo|accept/.test(normalized)) return "review";
+    if (/maintain|관리|다듬|개선|정리|스타일|구조/.test(normalized)) return "maintain";
+    if (/ask wiki|대화|질문|chat|물어|헷갈/.test(normalized)) return "ask-maintain";
+    if (/ai|chatgpt|claude|연결|connect|로그인|login|설정/.test(normalized)) return "ai-setup";
+    if (/실패|오류|error|failed|안 돼|안되|trouble|문제/.test(normalized)) {
+      return "troubleshooting";
+    }
+    if (/first|처음|무엇부터|start|시작/.test(normalized)) return "first-step";
+    return "fallback";
+  }
+
+  function isMapleGuideTourRequest(question: string): boolean {
+    const normalized = question.toLowerCase();
+    return (
+      question === mapleGuideTourLabel ||
+      question.includes("시작 가이드") ||
+      normalized.includes("maple start guide") ||
+      normalized.includes("start guide again")
+    );
+  }
+
+  function mapleGuideFollowUpSuggestions(topic: MapleGuideTopic): string[] {
+    const suggestions =
+      language === "ko"
+        ? {
+            "start-guide": [
+              "소스 준비는 정확히 무엇을 하나요?",
+              "Build wiki와 Maintain 차이를 예시로 알려주세요.",
+              "Ask Wiki는 어떤 질문에 쓰면 좋나요?",
+              "처음에는 소스를 얼마나 넣는 게 좋나요?",
+              "AI 변경 검토는 왜 필요한가요?",
+            ],
+            "first-step": [
+              "처음 워크스페이스는 어디에 만들면 좋나요?",
+              "첫 빌드에는 소스를 몇 개만 넣어야 하나요?",
+              "소스를 추가한 뒤 자동으로 무엇이 진행되나요?",
+              "AI 연결은 언제 필요한가요?",
+            ],
+            "source-import": [
+              "PDF를 추가하면 바로 무엇이 진행되나요?",
+              "이미지 위주 PDF는 어떻게 다뤄지나요?",
+              "소스 준비가 끝났는지 어디서 확인하나요?",
+              "한 번에 많은 PDF를 넣어도 되나요?",
+            ],
+            "source-prep": [
+              "소스 준비는 자동인가요?",
+              "PDF를 Markdown처럼 준비한다는 뜻이 뭔가요?",
+              "소스 준비가 실패하면 어떻게 하나요?",
+              "준비 중에도 Build wiki를 눌러도 되나요?",
+            ],
+            build: [
+              "Build wiki가 실제로 만드는 것은 무엇인가요?",
+              "빌드 후 바로 해야 할 일은 무엇인가요?",
+              "새 소스를 추가할 때마다 빌드해야 하나요?",
+              "Build wiki와 Maintain은 어떻게 다르죠?",
+            ],
+            review: [
+              "검토 완료를 누르면 무엇이 저장되나요?",
+              "마음에 안 드는 변경은 어떻게 되돌리나요?",
+              "변경 파일을 어떤 기준으로 확인해야 하나요?",
+              "검토 후 다음에는 무엇을 하면 좋나요?",
+            ],
+            "ask-wiki": [
+              "Ask Wiki에는 어떤 질문을 하면 좋나요?",
+              "전체 위키와 현재 문서 범위는 어떻게 다르죠?",
+              "답변을 위키에 반영하려면 어떻게 하나요?",
+              "근거를 찾는 질문 예시를 보여주세요.",
+            ],
+            maintain: [
+              "Maintain으로 어떤 개선을 할 수 있나요?",
+              "위키 구조를 다시 정리하려면 어떻게 말하나요?",
+              "내 스타일 규칙을 만들 수 있나요?",
+              "소스를 더 넣기 전에 Maintain을 언제 쓰면 좋나요?",
+            ],
+            "ask-maintain": [
+              "Ask Wiki와 Maintain 차이를 예시로 알려주세요.",
+              "질문만 하고 싶을 때는 어디를 쓰나요?",
+              "위키를 실제로 바꾸려면 어디를 쓰나요?",
+              "Ask Wiki 답변을 위키에 반영할 수 있나요?",
+            ],
+            "ai-setup": [
+              "ChatGPT 연결은 왜 필요한가요?",
+              "AI 연결 없이 할 수 있는 일은 무엇인가요?",
+              "Claude와 ChatGPT 중 무엇을 고르면 좋나요?",
+              "터미널 창이 열리면 어떻게 해야 하나요?",
+            ],
+            troubleshooting: [
+              "소스 준비가 실패하면 어떻게 하나요?",
+              "빌드가 오래 걸릴 때 무엇을 확인하나요?",
+              "AI 연결 문제가 생기면 어떻게 하나요?",
+              "결과가 마음에 들지 않으면 어떻게 되돌리나요?",
+            ],
+            fallback: [
+              "Maple 시작 가이드를 다시 보여주세요.",
+              "소스 추가부터 빌드까지 흐름을 알려주세요.",
+              "Ask Wiki와 Maintain 차이를 알려주세요.",
+              "위키를 내 스타일로 다듬는 방법을 알려주세요.",
+            ],
+          }
+        : {
+            "start-guide": [
+              "What exactly happens during source preparation?",
+              "Show examples of Build wiki vs Maintain.",
+              "What should I ask Ask Wiki?",
+              "How many sources should I start with?",
+              "Why do I need to review AI changes?",
+            ],
+            "first-step": [
+              "Where should I create my first workspace?",
+              "How many sources should I use for the first build?",
+              "What happens automatically after I add sources?",
+              "When do I need to connect AI?",
+            ],
+            "source-import": [
+              "What happens right after I add a PDF?",
+              "How are image-heavy PDFs handled?",
+              "Where can I see if source prep is done?",
+              "Is it okay to add many PDFs at once?",
+            ],
+            "source-prep": [
+              "Is source preparation automatic?",
+              "What does PDF to Markdown-style material mean?",
+              "What should I do if preparation fails?",
+              "Can I click Build wiki while sources are preparing?",
+            ],
+            build: [
+              "What does Build wiki actually create?",
+              "What should I do right after a build?",
+              "Should I build every time I add sources?",
+              "How is Build wiki different from Maintain?",
+            ],
+            review: [
+              "What is saved when I mark review done?",
+              "How do I undo changes I do not like?",
+              "How should I inspect changed files?",
+              "What should I do after review?",
+            ],
+            "ask-wiki": [
+              "What kinds of questions work well in Ask Wiki?",
+              "What is the difference between whole wiki and current document scope?",
+              "How do I apply an answer back to the wiki?",
+              "Show examples of evidence lookup questions.",
+            ],
+            maintain: [
+              "What improvements can Maintain make?",
+              "How do I ask Maple to reorganize the wiki?",
+              "Can I create style rules for my wiki?",
+              "When should I use Maintain before adding more sources?",
+            ],
+            "ask-maintain": [
+              "Show examples of Ask Wiki vs Maintain.",
+              "Where do I ask without changing files?",
+              "Where do I go to actually change the wiki?",
+              "Can I apply an Ask Wiki answer to the wiki?",
+            ],
+            "ai-setup": [
+              "Why does Maple need ChatGPT or Claude?",
+              "What can I do without AI connected?",
+              "Should I choose Claude or ChatGPT?",
+              "What should I do if a terminal window opens?",
+            ],
+            troubleshooting: [
+              "What if source preparation fails?",
+              "What should I check if build takes too long?",
+              "How do I fix AI connection problems?",
+              "How do I undo a result I do not like?",
+            ],
+            fallback: [
+              "Show the Maple Start Guide again.",
+              "Explain source import to build flow.",
+              "Explain Ask Wiki vs Maintain.",
+              "How do I shape the wiki for my style?",
+            ],
+          };
+
+    return suggestions[topic].slice(0, 5);
+  }
+
+  function mapleGuideTourAnswer() {
+    if (language === "ko") {
+      return [
+        "## Maple 시작 가이드",
+        "",
+        "1. **소스 추가**",
+        "PDF, 문서, 이미지, 노트 같은 자료를 추가합니다. 처음에는 한 주제나 한 프로젝트처럼 서로 관련 있는 자료를 작게 넣는 것이 좋습니다.",
+        "",
+        "2. **소스 준비는 자동으로 시작됩니다**",
+        "소스를 추가하면 Maple이 바로 준비 작업을 시작합니다. PDF나 문서의 내용을 읽고, AI가 다루기 쉬운 Markdown 형태의 자료로 정리합니다. 이 단계는 사용자가 따로 누르는 버튼이 아니라, 가져오기 직후 백그라운드에서 진행됩니다.",
+        "",
+        "3. **위키 빌드**",
+        "소스 준비가 끝나면 Build wiki로 새 소스를 위키 지식으로 정리합니다. Maple은 개념 설명, 요약, 가이드, 링크, 이미지 참조 같은 위키 페이지를 만들거나 업데이트합니다.",
+        "",
+        "4. **변경 검토**",
+        "빌드가 끝나면 AI가 만든 변경사항이 검토 대상으로 표시됩니다. 변경된 파일을 열어보고, 괜찮으면 검토 완료를 누릅니다. 마음에 들지 않으면 되돌릴 수 있습니다.",
+        "",
+        "5. **Ask Wiki로 질문하기**",
+        "Ask Wiki는 아카이브한 자료에 대해 질문하는 곳입니다. 개념 설명, 비교, 요약, 근거 찾기, 실무 질문, 공부 질문처럼 자료를 이해하고 활용하는 데 필요한 질문을 할 수 있습니다.",
+        "",
+        "6. **Maintain으로 위키 다듬기**",
+        "Build wiki는 지식을 쌓는 단계에 가깝고, Maintain은 위키를 내 목적에 맞게 다듬는 단계입니다. 구조를 다시 정리하거나, 설명 난이도를 바꾸거나, 문서를 짧게 만들거나, 링크를 늘리거나, 가이드 형식을 바꿀 수 있습니다.",
+        "",
+        "7. **반복하기**",
+        "새 소스를 계속 추가하고 Build wiki만 반복하면 위키가 쌓이기만 할 수 있습니다. 중간중간 Ask Wiki로 필요한 내용을 확인하고, Maintain으로 구조와 설명 방식을 다듬어야 내 목적과 스타일에 맞는 위키가 됩니다.",
+        "",
+        "**Build wiki**는 소스를 위키 지식으로 정리하는 단계이고, **Ask Wiki**는 아카이브한 자료에 대해 질문하는 단계이며, **Maintain**은 위키를 내 목적과 스타일에 맞게 다듬는 단계입니다.",
+      ].join("\n");
+    }
+
+    return [
+      "## Maple Start Guide",
+      "",
+      "1. **Add sources**",
+      "Add PDFs, documents, images, notes, or other material. Start with a small related set, like one topic or one project.",
+      "",
+      "2. **Source preparation starts automatically**",
+      "After you add sources, Maple starts preparing them in the background. For PDFs and documents, it extracts readable content and turns it into Markdown-style material that AI can use well. This is not a separate button you need to click.",
+      "",
+      "3. **Build wiki**",
+      "When sources are ready, Build wiki turns new sources into organized wiki knowledge. Maple may create or update concept pages, summaries, guides, links, and image references.",
+      "",
+      "4. **Review changes**",
+      "After the build finishes, Maple shows AI-generated changes for review. Open changed files, inspect the result, then mark them reviewed if you want to keep them. You can undo the operation if the result is not useful.",
+      "",
+      "5. **Ask questions with Ask Wiki**",
+      "Ask Wiki is where you ask questions about archived material. Use it for explanations, comparisons, summaries, evidence lookup, work questions, or study questions.",
+      "",
+      "6. **Improve with Maintain**",
+      "Build wiki mainly adds knowledge. Maintain shapes the wiki for your purpose. Use it to reorganize structure, change explanation difficulty, shorten long pages, add links, or adjust guide format.",
+      "",
+      "7. **Repeat intentionally**",
+      "If you only keep adding sources and building, the wiki may grow without becoming useful in your style. Check things with Ask Wiki and refine regularly with Maintain.",
+      "",
+      "**Build wiki** organizes sources into wiki knowledge. **Ask Wiki** lets you ask questions about archived material. **Maintain** shapes the wiki for your purpose and style.",
+    ].join("\n");
+  }
+
+  function showMapleGuideTour() {
+    if (mapleGuideBusy) return;
+
+    const now = new Date().toISOString();
+    const topic: MapleGuideTopic = "start-guide";
+    setMapleGuideOpen(true);
+    setMapleGuideQuestion("");
+    setMapleGuideMessages((messages) => [
+      ...messages,
+      {
+        id: makeMapleGuideMessageId("guide-user"),
+        role: "user",
+        text: mapleGuideTourLabel,
+        status: "completed",
+        topic,
+        createdAt: now,
+        completedAt: now,
+      },
+      {
+        id: makeMapleGuideMessageId("guide-tour"),
+        role: "assistant",
+        text: mapleGuideTourAnswer(),
+        status: "completed",
+        topic,
+        createdAt: now,
+        completedAt: now,
+      },
+    ]);
+    track("maple guide tour opened", {
+      workspace_open: Boolean(workspace.workspacePath),
+      source_count: sourceFiles.length,
+      wiki_page_count: wikiPages.length,
+    });
+  }
+
   async function submitMapleGuideQuestionText(rawQuestion: string) {
     const question = rawQuestion.trim();
     if (!question || mapleGuideBusy) return;
+    if (isMapleGuideTourRequest(question)) {
+      showMapleGuideTour();
+      return;
+    }
 
     const now = new Date().toISOString();
+    const topic = detectMapleGuideTopic(question);
     const userMessage: MapleGuideMessage = {
       id: makeMapleGuideMessageId("guide-user"),
       role: "user",
       text: question,
       status: "completed",
+      topic,
       createdAt: now,
       completedAt: now,
     };
@@ -6788,6 +7518,7 @@ function App() {
       role: "assistant",
       text: "",
       status: "streaming",
+      topic,
       createdAt: now,
     };
     const historyJson = mapleGuideHistoryJson(mapleGuideMessages);
@@ -6839,6 +7570,7 @@ function App() {
                 ...message,
                 text: mapleGuideErrorMessage(detail),
                 status: "failed",
+                topic: "troubleshooting",
                 completedAt: new Date().toISOString(),
               }
             : message,
@@ -6858,10 +7590,37 @@ function App() {
     void submitMapleGuideQuestionText(mapleGuideQuestion);
   }
 
+  function dismissMapleGuideCallout() {
+    setMapleGuideCalloutDismissed(true);
+    window.localStorage.setItem(MAPLE_GUIDE_CALLOUT_DISMISSED_KEY, "true");
+    track("maple guide callout dismissed", {
+      workspace_open: Boolean(workspace.workspacePath),
+    });
+  }
+
   function renderMapleGuideWidget() {
     const showIntro = mapleGuideMessages.length === 0;
+    const showGuideCallout = !mapleGuideOpen && !mapleGuideCalloutDismissed;
+    const isFirstRunGuide = !workspace.workspacePath;
+    const latestCompletedGuideAnswer = mapleGuideMessages
+      .slice()
+      .reverse()
+      .find(
+        (message) =>
+          message.role === "assistant" &&
+          message.status !== "streaming" &&
+          Boolean(message.text.trim()),
+      );
+    const mapleGuideFollowUps =
+      !showIntro && latestCompletedGuideAnswer
+        ? mapleGuideFollowUpSuggestions(latestCompletedGuideAnswer.topic ?? "fallback")
+        : [];
     return (
-      <div className={`maple-guide-widget${mapleGuideOpen ? " open" : ""}`}>
+      <div
+        className={`maple-guide-widget${mapleGuideOpen ? " open" : ""}${
+          isFirstRunGuide ? " first-run" : ""
+        }`}
+      >
         {mapleGuideOpen ? (
           <section className="maple-guide-panel" aria-label={t("app.guide.title")}>
             <header className="maple-guide-header">
@@ -6883,6 +7642,15 @@ function App() {
                 <div className="maple-guide-intro">
                   <p>{t("app.guide.intro")}</p>
                   <div className="maple-guide-suggestions">
+                    <button
+                      type="button"
+                      className="maple-guide-suggestion-primary"
+                      disabled={mapleGuideBusy}
+                      onClick={showMapleGuideTour}
+                    >
+                      <BookOpen size={14} strokeWidth={2.2} aria-hidden="true" />
+                      <span>{mapleGuideTourLabel}</span>
+                    </button>
                     {mapleGuideSuggestions.map((suggestion) => (
                       <button
                         key={suggestion}
@@ -6910,6 +7678,27 @@ function App() {
                   )}
                 </div>
               ))}
+              {mapleGuideFollowUps.length > 0 ? (
+                <div className="maple-guide-followups" aria-label={t("app.guide.followups")}>
+                  <span>{t("app.guide.followups")}</span>
+                  <div className="maple-guide-followup-chips">
+                    {mapleGuideFollowUps.map((suggestion) => (
+                      <button
+                        key={suggestion}
+                        type="button"
+                        disabled={mapleGuideBusy}
+                        onClick={() =>
+                          suggestion === mapleGuideTourLabel
+                            ? showMapleGuideTour()
+                            : void submitMapleGuideQuestionText(suggestion)
+                        }
+                      >
+                        {suggestion}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
             </div>
             <form className="maple-guide-composer" onSubmit={submitMapleGuideQuestion}>
               <textarea
@@ -6935,6 +7724,27 @@ function App() {
               </button>
             </form>
           </section>
+        ) : null}
+        {showGuideCallout ? (
+          <div className="maple-guide-callout">
+            <button
+              type="button"
+              className="maple-guide-callout-body"
+              onClick={() => setMapleGuideOpen(true)}
+            >
+              <strong>{t("app.guide.calloutTitle")}</strong>
+              <span>{t("app.guide.calloutBody")}</span>
+            </button>
+            <button
+              type="button"
+              className="maple-guide-callout-dismiss"
+              aria-label={t("app.guide.dismissCallout")}
+              title={t("app.guide.dismissCallout")}
+              onClick={dismissMapleGuideCallout}
+            >
+              ×
+            </button>
+          </div>
         ) : null}
         <button
           type="button"
@@ -7242,6 +8052,38 @@ function App() {
   function resetReadingTextSize() {
     setReadingTextSize(DEFAULT_READING_TEXT_SIZE);
   }
+
+  function renderPostBuildNextStepGuide() {
+    return (
+      <ul className="post-build-next-guide">
+        <li>
+          <strong>{t("app.postBuild.askLabel")}</strong>
+          <span>{t("app.postBuild.askGuide")}</span>
+        </li>
+        <li>
+          <strong>{t("app.postBuild.maintainLabel")}</strong>
+          <span>{t("app.postBuild.maintainGuide")}</span>
+        </li>
+        <li>
+          <strong>{t("app.postBuild.addSourcesLabel")}</strong>
+          <span>{t("app.postBuild.addSourcesGuide")}</span>
+        </li>
+      </ul>
+    );
+  }
+
+  const showReviewPendingNextSteps = Boolean(
+    hasPendingGeneratedChanges &&
+      unreviewedChangedFiles.length > 0 &&
+      generatedChangesReviewKey &&
+      dismissedPostBuildNextStepsOperationId !== generatedChangesReviewKey,
+  );
+  const showCenterPostBuildNextSteps = showReviewPendingNextSteps || showPostBuildNextSteps;
+  const centerPostBuildNextStepsDismissalKey = showReviewPendingNextSteps
+    ? generatedChangesReviewKey
+    : showPostBuildNextSteps
+      ? reviewedBuildOperationKey
+      : null;
 
   const centerHeaderPathParts = activeCenterTab?.kind === "report"
     ? [t("app.center.operationReport")]
@@ -8169,6 +9011,40 @@ function App() {
               </div>
             ) : null}
           </div>
+          {showCenterPostBuildNextSteps ? (
+            <section
+              className={`post-build-next-panel center-post-build-next-panel ${
+                showReviewPendingNextSteps ? "review-pending" : ""
+              }`}
+              aria-label={t("app.postBuild.title")}
+            >
+              <div className="post-build-next-header">
+                <div>
+                  <strong>{t("app.postBuild.title")}</strong>
+                  <p>
+                    {showReviewPendingNextSteps
+                      ? t("app.postBuild.reviewFirst")
+                      : t("app.postBuild.next")}
+                  </p>
+                </div>
+                {centerPostBuildNextStepsDismissalKey ? (
+                  <button
+                    type="button"
+                    className="post-build-next-dismiss"
+                    aria-label={t("app.postBuild.dismiss")}
+                    title={t("app.postBuild.dismiss")}
+                    onClick={() => dismissPostBuildNextSteps(centerPostBuildNextStepsDismissalKey)}
+                  >
+                    <X size={14} strokeWidth={2.2} aria-hidden="true" />
+                  </button>
+                ) : null}
+              </div>
+              {showReviewPendingNextSteps ? (
+                <p className="post-build-next-intro">{t("app.postBuild.next")}</p>
+              ) : null}
+              {renderPostBuildNextStepGuide()}
+            </section>
+          ) : null}
         </section>
 
         <button
@@ -9239,6 +10115,7 @@ function App() {
             onMouseDown={() => {
               if (!isStartingBuild) {
                 setBuildDraft(null);
+                setQueuedBuildWhenReady(null);
                 clearAiSetupPrompt("build");
               }
             }}
@@ -9266,6 +10143,7 @@ function App() {
                   className="apply-modal-close"
                   onClick={() => {
                     setBuildDraft(null);
+                    setQueuedBuildWhenReady(null);
                     clearAiSetupPrompt("build");
                   }}
                   disabled={isStartingBuild}
@@ -9275,34 +10153,115 @@ function App() {
               </header>
 
               <div className="build-source-summary">
-                {buildDraft.force ? (
-                  sourceFiles.length > 0 ? (
-                    <ul>
-                      {sourceFiles.slice(0, 12).map((path) => (
-                        <li key={path}>{path}</li>
-                      ))}
-                      {sourceFiles.length > 12 ? (
-                        <li>{t("app.build.moreSources", { count: sourceFiles.length - 12 })}</li>
-                      ) : null}
-                    </ul>
-                  ) : (
-                    <p>{t("app.build.noSources")}</p>
-                  )
-                ) : pendingSourceFiles.length > 0 ? (
-                  (["new", "modified", "removed"] as SourceState[]).map((state) => {
-                    const files = pendingSourceFiles.filter((file) => file.state === state);
-                    if (!files.length) return null;
-                    return (
-                      <div key={state} className="source-group">
-                        <strong>{sourceStateLabel(state, language)}</strong>
-                        <ul>
-                          {files.map((file) => (
-                            <li key={`${state}-${file.path}`}>{file.path}</li>
-                          ))}
-                        </ul>
+                <div className="build-source-summary-header">
+                  <strong>
+                    {buildDraft.force
+                      ? language === "ko"
+                        ? "빌드할 소스"
+                        : "Sources to build"
+                      : language === "ko"
+                        ? "변경된 소스"
+                        : "Changed sources"}
+                  </strong>
+                  {buildModalCandidateRows.length > 0 ? (
+                    <span>
+                      {buildModalReadySourcePaths.length}/{buildModalCandidateRows.length}{" "}
+                      {language === "ko" ? "준비됨" : "ready"}
+                    </span>
+                  ) : null}
+                </div>
+                {sourcePreparationActive || queuedBuildWhenReady ? (
+                  <p className="build-source-prep-note">
+                    {buildModalHasPdfCandidates
+                      ? language === "ko"
+                        ? "Maple이 PDF를 Build Wiki가 읽기 좋은 소스로 변환하고 있습니다. 파일에 따라 준비에 몇 분 이상 걸릴 수 있습니다."
+                        : "Maple is converting this PDF into a readable source for Build Wiki. Preparation can take several minutes or longer depending on the file."
+                      : language === "ko"
+                        ? "Maple이 소스를 Build Wiki가 읽기 좋은 형태로 준비하고 있습니다. 파일에 따라 준비에 몇 분 이상 걸릴 수 있습니다."
+                        : "Maple is preparing these sources for Build Wiki. Preparation can take several minutes or longer depending on the file."}
+                  </p>
+                ) : null}
+                {buildModalFailedCount > 0 ? (
+                  <p className="build-source-prep-note warning">
+                    {language === "ko"
+                      ? `${buildModalFailedCount}개 소스 준비에 실패했습니다. 준비된 소스만 빌드하거나 다시 시도할 수 있습니다.`
+                      : `${buildModalFailedCount} source${
+                          buildModalFailedCount === 1 ? "" : "s"
+                        } failed preparation. You can build ready sources or retry.`}
+                  </p>
+                ) : null}
+                {buildModalCandidateRows.length > 0 || buildModalRemovedRows.length > 0 ? (
+                  <div className="build-source-list">
+                    {buildModalCandidateRows.map((row) => {
+                      const readiness = row.readiness?.status ?? "not-prepared";
+                      const selectedRole = isPdfUseAsRole(buildDraft.pdfUseAs[row.path])
+                        ? buildDraft.pdfUseAs[row.path]
+                        : defaultPdfUseAsForSource(row.readiness);
+                      return (
+                        <div key={row.path} className="build-source-row">
+                          <div className="build-source-row-main">
+                            <span className="build-source-path" title={row.path}>
+                              {row.path}
+                            </span>
+                            <span className={`build-source-readiness ${readiness}`}>
+                              {sourceReadinessLabel(readiness, language)}
+                            </span>
+                          </div>
+                          {row.isPdf ? (
+                            <label className="build-source-role">
+                              <span>{language === "ko" ? "읽는 방식" : "Reading mode"}</span>
+                              <select
+                                value={selectedRole}
+                                disabled={
+                                  isStartingBuild ||
+                                  isPreparingBuildSources ||
+                                  Boolean(queuedBuildWhenReady)
+                                }
+                                onChange={(event) => {
+                                  const role = event.target.value;
+                                  if (!isPdfUseAsRole(role)) return;
+                                  setBuildDraft((prev) =>
+                                    prev
+                                      ? {
+                                          ...prev,
+                                          pdfUseAs: {
+                                            ...prev.pdfUseAs,
+                                            [row.path]: role,
+                                          },
+                                        }
+                                      : prev,
+                                  );
+                                }}
+                              >
+                                {PDF_USE_AS_OPTIONS.map((option) => (
+                                  <option key={option.value} value={option.value}>
+                                    {pdfUseAsLabel(option.value, language)}
+                                  </option>
+                                ))}
+                              </select>
+                            </label>
+                          ) : null}
+                          {row.readiness?.error ? (
+                            <p className="build-source-error">{row.readiness.error}</p>
+                          ) : null}
+                        </div>
+                      );
+                    })}
+                    {buildModalRemovedRows.map((file) => (
+                      <div key={`removed-${file.path}`} className="build-source-row removed">
+                        <div className="build-source-row-main">
+                          <span className="build-source-path" title={file.path}>
+                            {file.path}
+                          </span>
+                          <span className="build-source-readiness removed">
+                            {sourceStateLabel("removed", language)}
+                          </span>
+                        </div>
                       </div>
-                    );
-                  })
+                    ))}
+                  </div>
+                ) : buildDraft.force ? (
+                  <p>{t("app.build.noSources")}</p>
                 ) : (
                   <p>{t("app.build.noPending")}</p>
                 )}
@@ -9411,18 +10370,54 @@ function App() {
                   className="apply-modal-secondary"
                   onClick={() => {
                     setBuildDraft(null);
+                    setQueuedBuildWhenReady(null);
                     clearAiSetupPrompt("build");
                   }}
                   disabled={isStartingBuild}
                 >
                   {t("app.common.cancel")}
                 </button>
+                {buildReadySourcesAvailable ? (
+                  <button
+                    type="button"
+                    className="apply-modal-secondary"
+                    onClick={() =>
+                      void startBuildWiki({ sourcePaths: buildModalReadySourcePaths })
+                    }
+                    disabled={
+                      Boolean(buildBlockedReason) ||
+                      Boolean(queuedBuildWhenReady) ||
+                      isStartingBuild ||
+                      isPreparingBuildSources ||
+                      !buildDraftProvider ||
+                      !buildDraftModelId ||
+                      !selectedBuildProviderReady ||
+                      buildModalReadySourcePaths.length === 0 ||
+                      (buildDraft.requiresWorkspaceContext && !buildDraft.workspaceContext.trim())
+                    }
+                    title={
+                      buildModalReadySourcePaths.length > 0
+                        ? undefined
+                        : language === "ko"
+                          ? "준비된 소스가 없습니다."
+                          : "No ready sources."
+                    }
+                  >
+                    {language === "ko" ? "준비된 소스 빌드" : "Build ready sources"}
+                  </button>
+                ) : null}
                 <button
                   type="button"
                   className="apply-modal-primary"
-                  onClick={() => void startBuildWiki()}
+                  onClick={() =>
+                    void startBuildWiki({
+                      prepareFirst: buildModalNeedsPreparation && buildModalCandidateRows.length > 0,
+                    })
+                  }
                   disabled={
                     Boolean(buildBlockedReason) ||
+                    Boolean(queuedBuildWhenReady) ||
+                    isPreparingBuildSources ||
                     !buildDraftProvider ||
                     !buildDraftModelId ||
                     !selectedBuildProviderReady ||
@@ -9431,9 +10426,17 @@ function App() {
                   }
                   title={buildBlockedReason ?? undefined}
                 >
-                  {looksLikeExistingWikiImport && !buildDraft.force
-                    ? t("app.build.rebuild")
-                    : t("app.build.title")}
+                  {queuedBuildWhenReady
+                    ? language === "ko"
+                      ? "준비되면 빌드"
+                      : "Build queued"
+                    : buildModalNeedsPreparation && buildModalCandidateRows.length > 0
+                      ? language === "ko"
+                        ? "준비되면 빌드"
+                        : "Build when ready"
+                      : looksLikeExistingWikiImport && !buildDraft.force
+                        ? t("app.build.rebuild")
+                        : t("app.build.title")}
                 </button>
               </footer>
             </div>
@@ -9785,15 +10788,15 @@ function OperationFeedPanel({
   const latestInProgress = [...events].reverse().find((event) => event.status === "in_progress");
   const stateLabel = progress?.error
     ? t("app.operation.error")
-    : running
-      ? latest?.status === "in_progress"
-        ? latest.title
-        : runningLabel ||
-          latestInProgress?.title ||
-          latest?.title ||
-          fallbackSteps[fallbackActiveIndex] ||
-          t("app.operation.running")
-      : latest?.title || t("app.operation.finished");
+      : running
+        ? latest?.status === "in_progress"
+          ? latest.title
+          : runningLabel ||
+            latestInProgress?.title ||
+            latest?.title ||
+            fallbackSteps[fallbackActiveIndex] ||
+            t("app.operation.running")
+      : t("app.operation.finished");
   const showHeaderState = Boolean(stateLabel) && (!running || !runningLabel);
   const visibleEvents = events.slice(-80);
   const feedBodyRef = useRef<HTMLDivElement>(null);
@@ -10900,9 +11903,27 @@ type MarkdownCalloutMarkerState = {
   title: string | null;
 };
 
+type MapleWikiMarker = {
+  namespace: "ibwiki";
+  type: string;
+  payload: unknown;
+  raw: string;
+};
+
+type IbwikiKnowledgeComponent = {
+  kc_code?: number | string;
+  kc_title?: string;
+  kc_sl_hl?: string;
+  linked_bullet_ids?: string[];
+  linked_formula_group_ids?: string[];
+  keywords?: string[];
+};
+
 const MARKDOWN_CALLOUT_MARKER_REGEX = /^\s*\[!([A-Za-z][\w-]*)\][+-]?(?:[ \t]*([^\r\n]*)(\r?\n[ \t]*))?/;
 const MARKDOWN_DIRECTIVE_CALLOUT_REGEX =
   /(^|\n):::(note|abstract|summary|tldr|info|todo|tip|hint|important|success|check|done|question|help|faq|warning|caution|attention|failure|fail|missing|danger|error|bug|example|quote|cite)([^\n]*)\n([\s\S]*?)\n:::[ \t]*(?=\n|$)/gi;
+const MAPLE_WIKI_MARKER_LANGUAGE = "maple-wiki-marker";
+const IBWIKI_COMMENT_REGEX = /<!--\s*(\/?)ibwiki:([A-Za-z][\w-]*)([\s\S]*?)-->/g;
 
 const MARKDOWN_CALLOUT_CONFIGS: Record<string, MarkdownCalloutConfig> = {
   note: { label: "Note", tone: "info", Icon: Info },
@@ -10959,6 +11980,11 @@ const MarkdownCalloutBlockquote: Components["blockquote"] = ({ children, classNa
 };
 
 const MarkdownPreBlock: Components["pre"] = ({ children, ...props }) => {
+  const marker = extractMapleWikiMarkerCodeBlock(children);
+  if (marker) {
+    return <MapleWikiMarkerBlock marker={marker} />;
+  }
+
   const mermaidSource = extractMermaidCodeBlock(children);
   if (mermaidSource !== null) {
     return <MarkdownMermaidDiagram chart={mermaidSource} />;
@@ -10966,6 +11992,97 @@ const MarkdownPreBlock: Components["pre"] = ({ children, ...props }) => {
 
   return <pre {...props}>{children}</pre>;
 };
+
+function MapleWikiMarkerBlock({ marker }: { marker: MapleWikiMarker }) {
+  if (marker.namespace === "ibwiki" && marker.type === "diagram") {
+    return <IbwikiDiagramMarker />;
+  }
+
+  if (marker.namespace === "ibwiki" && marker.type === "kc") {
+    return <IbwikiKnowledgeComponentMarker payload={marker.payload} raw={marker.raw} />;
+  }
+
+  return null;
+}
+
+function IbwikiDiagramMarker() {
+  return (
+    <div className="maple-wiki-inline-marker" aria-label="Diagram marker">
+      <ImageIcon aria-hidden="true" size={13} strokeWidth={2.2} />
+      <span>Diagram marker</span>
+    </div>
+  );
+}
+
+function IbwikiKnowledgeComponentMarker({
+  payload,
+  raw,
+}: {
+  payload: unknown;
+  raw: string;
+}) {
+  const component = normalizeIbwikiKnowledgeComponent(payload);
+
+  if (!component) {
+    return (
+      <aside className="maple-wiki-marker maple-wiki-marker-kc" aria-label="Knowledge component">
+        <div className="maple-wiki-marker-icon">
+          <BookOpen aria-hidden="true" size={17} strokeWidth={2.1} />
+        </div>
+        <div className="maple-wiki-marker-body">
+          <div className="maple-wiki-marker-title">Knowledge Component</div>
+          <p>{raw.trim() || "Metadata is present but could not be read."}</p>
+        </div>
+      </aside>
+    );
+  }
+
+  const code = component.kc_code === undefined ? null : String(component.kc_code);
+  const title = component.kc_title?.trim() || "Untitled knowledge component";
+  const level = component.kc_sl_hl?.trim();
+  const linkedBullets = normalizeStringList(component.linked_bullet_ids);
+  const formulaGroups = normalizeStringList(component.linked_formula_group_ids);
+  const keywords = normalizeStringList(component.keywords);
+
+  return (
+    <aside className="maple-wiki-marker maple-wiki-marker-kc" aria-label="Knowledge component">
+      <div className="maple-wiki-marker-icon">
+        <BookOpen aria-hidden="true" size={17} strokeWidth={2.1} />
+      </div>
+      <div className="maple-wiki-marker-body">
+        <div className="maple-wiki-marker-eyebrow">
+          <span>{code ? `KC ${code}` : "Knowledge Component"}</span>
+          {level ? <span>{level}</span> : null}
+        </div>
+        <div className="maple-wiki-marker-title">{title}</div>
+        {linkedBullets.length || formulaGroups.length ? (
+          <div className="maple-wiki-marker-meta">
+            {linkedBullets.length ? (
+              <span>
+                <LinkIcon aria-hidden="true" size={13} />
+                Syllabus {linkedBullets.join(", ")}
+              </span>
+            ) : null}
+            {formulaGroups.length ? (
+              <span>
+                <LinkIcon aria-hidden="true" size={13} />
+                Formula groups {formulaGroups.join(", ")}
+              </span>
+            ) : null}
+          </div>
+        ) : null}
+        {keywords.length ? (
+          <div className="maple-wiki-marker-chips" aria-label="Keywords">
+            <Tags aria-hidden="true" size={13} />
+            {keywords.map((keyword) => (
+              <span key={keyword}>{keyword}</span>
+            ))}
+          </div>
+        ) : null}
+      </div>
+    </aside>
+  );
+}
 
 function MarkdownMermaidDiagram({ chart }: { chart: string }) {
   const [expanded, setExpanded] = useState(false);
@@ -11102,6 +12219,43 @@ function extractMermaidCodeBlock(children: ReactNode): string | null {
   if (!/\blanguage-mermaid\b/i.test(child.props.className ?? "")) return null;
 
   return renderedLinkLabel(child.props.children).trim();
+}
+
+function extractMapleWikiMarkerCodeBlock(children: ReactNode): MapleWikiMarker | null {
+  const childNodes = Children.toArray(children);
+  if (childNodes.length !== 1) return null;
+
+  const child = childNodes[0];
+  if (!isValidElement<{ className?: string; children?: ReactNode }>(child)) return null;
+  if (!new RegExp(`\\blanguage-${MAPLE_WIKI_MARKER_LANGUAGE}\\b`, "i").test(child.props.className ?? "")) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(renderedLinkLabel(child.props.children));
+    if (!isMapleWikiMarker(parsed)) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function isMapleWikiMarker(value: unknown): value is MapleWikiMarker {
+  if (!value || typeof value !== "object") return false;
+  const marker = value as Partial<MapleWikiMarker>;
+  return marker.namespace === "ibwiki" && typeof marker.type === "string";
+}
+
+function normalizeIbwikiKnowledgeComponent(value: unknown): IbwikiKnowledgeComponent | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  return value as IbwikiKnowledgeComponent;
+}
+
+function normalizeStringList(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => (typeof item === "string" || typeof item === "number" ? String(item).trim() : ""))
+    .filter(Boolean);
 }
 
 function sizeReadableMermaidSvg(container: HTMLElement, chart: string, scale: number) {
@@ -13696,13 +14850,73 @@ function normalizeMarkdownForDisplay(
     convertWikiLinks(
       normalizeLooseMarkdownLinkDestinations(
         convertEscapedMathDelimiters(
-          normalizeEscapedWikiLinkDelimiters(convertMarkdownDirectiveCallouts(segment)),
+          normalizeEscapedWikiLinkDelimiters(
+            convertIbwikiCommentsToMapleMarkers(convertMarkdownDirectiveCallouts(segment)),
+          ),
         ),
       ),
       currentPath,
       availableDocuments,
     ),
   );
+}
+
+function convertIbwikiCommentsToMapleMarkers(content: string) {
+  let openDiagramMarkers = 0;
+
+  return content.replace(
+    IBWIKI_COMMENT_REGEX,
+    (match: string, closingSlash: string, rawType: string, rawPayload: string) => {
+      const type = rawType.toLowerCase();
+      const payloadText = rawPayload.trim();
+
+      if (closingSlash && type !== "diagram") {
+        return "";
+      }
+
+      if (type === "diagram") {
+        if (closingSlash && openDiagramMarkers > 0) {
+          openDiagramMarkers -= 1;
+          return "";
+        }
+
+        if (!closingSlash) {
+          openDiagramMarkers += 1;
+          if (!payloadText) return "";
+        }
+
+        return formatMapleWikiMarkerBlock({
+          namespace: "ibwiki",
+          type,
+          payload: null,
+          raw: match,
+        });
+      }
+
+      if (type === "kc" && payloadText) {
+        return formatMapleWikiMarkerBlock({
+          namespace: "ibwiki",
+          type,
+          payload: parseIbwikiMarkerPayload(payloadText),
+          raw: payloadText,
+        });
+      }
+
+      return "";
+    },
+  );
+}
+
+function parseIbwikiMarkerPayload(payloadText: string): unknown {
+  try {
+    return JSON.parse(payloadText);
+  } catch {
+    return null;
+  }
+}
+
+function formatMapleWikiMarkerBlock(marker: MapleWikiMarker) {
+  return `\n\n\`\`\`${MAPLE_WIKI_MARKER_LANGUAGE}\n${JSON.stringify(marker)}\n\`\`\`\n\n`;
 }
 
 function convertMarkdownDirectiveCallouts(content: string) {

@@ -5,9 +5,11 @@ const fs = require("node:fs");
 const fsp = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
+const { pathToFileURL } = require("node:url");
 const { spawn, spawnSync } = require("node:child_process");
 
 const { selectProvider } = require("./providers");
+const mammoth = require("mammoth");
 
 const PROTOTYPE_ROOT = path.resolve(__dirname, "..");
 const APP_SHELL_ROOT = path.resolve(PROTOTYPE_ROOT, "..", "app-shell");
@@ -25,9 +27,11 @@ const RUNNER_METADATA_PREFIXES = [
   ".aiwiki/changed/",
   ".aiwiki/running/",
   ".aiwiki/cache/",
+  ".aiwiki/extracted/",
   ".aiwiki/chat/",
   ".aiwiki/chat-threads/",
   ".aiwiki/maintain-threads/",
+  ".aiwiki/source-artifacts.json",
 ];
 const LEGACY_RUNNER_METADATA_PREFIXES = [
   ".studywiki/snapshots/",
@@ -41,7 +45,14 @@ const LEGACY_RUNNER_METADATA_PREFIXES = [
 const DEFAULT_CODEX_TIMEOUT_MS = 30 * 60 * 1000;
 const RUNNING_MARKER_PATH = ".aiwiki/running/operation.json";
 const LEGACY_RUNNING_MARKER_PATH = ".studywiki/running/operation.json";
-const EXTRACTOR_VERSION = 3;
+const EXTRACTOR_VERSION = 6;
+const PREPARED_SOURCE_HEALTH_VERSION = 1;
+const SOURCE_PREPARATION_STALE_AFTER_MS = 10 * 60 * 1000;
+const SOURCE_ARTIFACTS_PATH = ".aiwiki/source-artifacts.json";
+const EXTRACTED_LATEST_DIR = ".aiwiki/extracted/latest";
+const EXTRACTED_LATEST_DIR_NAME = "latest";
+const PDF_MARKDOWN_CONVERTER_TIMEOUT_MS = 10 * 60 * 1000;
+const PREPARE_SOURCE_CONCURRENCY = 2;
 const FULL_PAGE_RENDER_WIDTH = 1600;
 const PROMPT_PAGE_RENDER_WIDTH = 1000;
 const PROMPT_PAGE_JPEG_QUALITY = 0.82;
@@ -55,6 +66,7 @@ const FULL_SLIDE_SELECTION_RATIO = 0.2;
 const MIN_FULL_SLIDE_ATTACHMENTS = 3;
 const MAX_FULL_SLIDE_ATTACHMENTS_PER_SOURCE = 10;
 const MAX_FULL_SLIDE_ATTACHMENTS_TOTAL = 20;
+const MAX_INLINE_MARKDOWN_FIGURE_ATTACHMENTS_TOTAL = 16;
 const SLIDE_SELECTION_TIMEOUT_MS = 2 * 60 * 1000;
 const EXPLORE_CHAT_HISTORY_LIMIT = 6;
 const EXPLORE_CHAT_HISTORY_TEXT_LIMIT = 2000;
@@ -127,12 +139,31 @@ const UPDATE_RULES_ALLOWED_PATHS = [
   "log.md",
   ".aiwiki/**",
 ];
+const asyncKeyLocks = new Map();
 const SOURCE_MANIFEST_PATH = ".aiwiki/source-manifest.json";
 const LEGACY_SOURCE_MANIFEST_PATH = ".studywiki/source-manifest.json";
 const WIKI_MANIFEST_PATH = ".aiwiki/wiki-manifest.json";
 const WIKI_BASELINE_DIR = ".aiwiki/wiki-baseline";
 const ASSET_REGISTRY_PATH = "wiki/assets/assets.json";
 const WIKI_TRACKED_ROOT_FILES = ["index.md", "log.md", "schema.md"];
+const ALWAYS_CHECK_SOURCE_SECTION_HEADINGS = new Set([
+  "core curriculum sources",
+  "always check sources",
+  "required source context",
+]);
+const PDF_USE_AS_TYPES = new Set([
+  "mostly-text",
+  "text-with-diagrams",
+  "mostly-visual",
+]);
+const LEGACY_PDF_USE_AS_ALIASES = new Map([
+  ["learning-material", "mostly-text"],
+  ["syllabus", "mostly-text"],
+  ["questions", "text-with-diagrams"],
+  ["answers-markscheme", "text-with-diagrams"],
+  ["slides-visuals", "mostly-visual"],
+  ["other", "text-with-diagrams"],
+]);
 const WORKSPACE_DIRECTORIES = [
   "sources",
   "wiki/concepts",
@@ -210,6 +241,15 @@ async function main(argv = process.argv.slice(2)) {
           strictValidation: Boolean(flags["strict-validation"]),
           timeoutMs: parsePositiveInteger(flags["timeout-ms"], 0),
           skipProviderCheck: Boolean(flags["skip-provider-check"]),
+          sourcePaths: parseSourcePathsJson(flags["source-paths-json"]),
+          pdfUseAs: parsePdfUseAsJson(flags["pdf-use-as-json"]),
+        });
+        break;
+      case "prepare-sources":
+        await runPrepareSources(resolveWorkspace(args[0]), {
+          sourcePaths: parseSourcePathsJson(flags["source-paths-json"]),
+          pdfUseAs: parsePdfUseAsJson(flags["pdf-use-as-json"]),
+          force: Boolean(flags.force),
         });
         break;
       case "baseline-sources":
@@ -361,7 +401,8 @@ Usage:
   node src/operation-runner.js create-sample [workspace] [--force]
   node src/operation-runner.js init-workspace [workspace]
   node src/operation-runner.js check [--provider codex|claude]
-  node src/operation-runner.js build [workspace] [--provider codex|claude] [--model <id>] [--reasoning-effort low|medium|high|xhigh|max] [--instruction "..."] [--workspace-context "..."] [--force] [--strict-validation] [--timeout-ms 600000] [--skip-provider-check]
+  node src/operation-runner.js prepare-sources [workspace] [--source-paths-json '["sources/a.pdf"]'] [--pdf-use-as-json '{"sources/a.pdf":"text-with-diagrams"}'] [--force]
+  node src/operation-runner.js build [workspace] [--provider codex|claude] [--model <id>] [--reasoning-effort low|medium|high|xhigh|max] [--instruction "..."] [--workspace-context "..."] [--source-paths-json '["sources/a.pdf"]'] [--pdf-use-as-json '{"sources/a.pdf":"text-with-diagrams"}'] [--force] [--strict-validation] [--timeout-ms 600000] [--skip-provider-check]
   node src/operation-runner.js baseline-sources [workspace]
   node src/operation-runner.js trust-wiki [workspace] [--source maple]
   node src/operation-runner.js accept-outside-wiki-changes [workspace]
@@ -426,6 +467,46 @@ function parseSourcePathsJson(value) {
   }
   sourcePaths.sort();
   return sourcePaths;
+}
+
+function parsePdfUseAsJson(value) {
+  if (value === undefined || value === null || value === false || value === "") return null;
+  if (value === true) {
+    throw new Error("--pdf-use-as-json requires a JSON object mapping PDF source paths to roles.");
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(String(value));
+  } catch (error) {
+    throw new Error(`Invalid --pdf-use-as-json: ${error.message}`);
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("--pdf-use-as-json must be a JSON object.");
+  }
+
+  const normalized = {};
+  for (const [rawPath, rawUseAs] of Object.entries(parsed)) {
+    const sourcePath = normalizeRelativePath(String(rawPath || "").trim());
+    const useAs = normalizePdfUseAs(rawUseAs);
+    if (!sourcePath || !sourcePath.startsWith("sources/") || !isPdfSource(sourcePath)) {
+      throw new Error(`PDF role overrides must target PDF source paths: ${rawPath}`);
+    }
+    if (!useAs) {
+      throw new Error(
+        `Invalid PDF use-as role for ${sourcePath}: ${rawUseAs}. ` +
+          `Choose one of: ${Array.from(PDF_USE_AS_TYPES).join(", ")}`,
+      );
+    }
+    normalized[sourcePath] = useAs;
+  }
+  return normalized;
+}
+
+function normalizePdfUseAs(value) {
+  const normalized = String(value || "").trim();
+  if (PDF_USE_AS_TYPES.has(normalized)) return normalized;
+  return LEGACY_PDF_USE_AS_ALIASES.get(normalized) || "";
 }
 
 function parseArgs(argv) {
@@ -901,7 +982,7 @@ async function runBuildWiki(workspace, options = {}) {
   const timeoutMs = options.timeoutMs && options.timeoutMs > 0
     ? options.timeoutMs
     : provider.defaultTimeoutMs;
-  await writeRunningMarker(runningMarkerPath, {
+  await acquireRunningMarker(runningMarkerPath, {
     operationId,
     operationType: "build-wiki",
     pid: process.pid,
@@ -913,10 +994,15 @@ async function runBuildWiki(workspace, options = {}) {
 
   try {
     const sourceStatus = await measure("sourceStatus", () => getSourceStatus(workspace));
-    const buildSourcePaths = sourcePathsForBuild(sourceStatus, { force: options.force });
-    const sourcePreview = options.force
-      ? sourceStatus.files.filter((file) => file.state !== "removed").map((file) => file.path)
-      : buildSourcePaths;
+    const requiredSourcePaths = await measure("requiredSources", () =>
+      collectAlwaysCheckSourcePaths(workspace, sourceStatus),
+    );
+    const buildSourcePaths = selectSourcePathsForBuild(sourceStatus, {
+      force: options.force,
+      sourcePaths: options.sourcePaths,
+      requiredSourcePaths,
+    });
+    const sourcePreview = buildSourcePaths;
     const hasLibreOfficeSources = sourcePreview.some(requiresLibreOfficeExtraction);
     if (hasLibreOfficeSources) {
       const soffice = checkSoffice();
@@ -931,7 +1017,9 @@ async function runBuildWiki(workspace, options = {}) {
 
     const snapshot = await measure("snapshot", () => createSnapshot(workspace, operationId));
     const preparedSources = await measure("sourceExtraction", () =>
-      prepareSourceArtifacts(workspace, operationId, buildSourcePaths),
+      prepareSourceArtifacts(workspace, operationId, buildSourcePaths, {
+        pdfUseAs: options.pdfUseAs,
+      }),
     );
     await measure("visualInspectionPlanning", () =>
       selectBuildWikiVisualInputs(workspace, provider, {
@@ -949,6 +1037,7 @@ async function runBuildWiki(workspace, options = {}) {
       reasoningEffort,
       sourceStatus,
       buildSourcePaths,
+      requiredSourcePaths,
     }, preparedSources));
 
     await fsp.writeFile(promptPath, prompt);
@@ -1102,7 +1191,10 @@ async function runBuildWiki(workspace, options = {}) {
     sourceStatus,
     sourceScope: {
       force: Boolean(options.force),
+      selectedSourcePaths: Array.isArray(options.sourcePaths) ? buildSourcePaths : null,
+      requiredSourcePaths,
       preparedSourcePaths: buildSourcePaths,
+      pdfUseAs: options.pdfUseAs || null,
     },
     summary: {
       totalChangedFiles: validatedChanges.length,
@@ -1221,6 +1313,77 @@ async function runBuildWiki(workspace, options = {}) {
     await writeChangedMarkers(workspace, report, reportPath, reportMarkdownPath);
     console.error(detail);
     process.exitCode = 1;
+  } finally {
+    await clearRunningMarker(runningMarkerPath);
+  }
+}
+
+async function runPrepareSources(workspace, options = {}) {
+  await assertWorkspace(workspace);
+
+  const operationId = `prepare-${createOperationId()}`;
+  const startedAt = new Date().toISOString();
+  const runningMarkerPath = path.join(workspace, RUNNING_MARKER_PATH);
+  await acquireRunningMarker(runningMarkerPath, {
+    operationId,
+    operationType: "prepare-sources",
+    pid: process.pid,
+    startedAt,
+    timeoutMs: 0,
+    workspace,
+  });
+  installRunningMarkerSignalCleanup(runningMarkerPath);
+
+  try {
+    const sourceStatus = await getSourceStatus(workspace);
+    const sourcePaths = Array.isArray(options.sourcePaths)
+      ? selectSourcePathsForBuild(sourceStatus, { sourcePaths: options.sourcePaths })
+      : sourceStatus.files
+        .filter((file) => file.state !== "removed")
+        .map((file) => file.path)
+        .sort();
+
+    const hasLibreOfficeSources = sourcePaths.some(requiresLibreOfficeExtraction);
+    if (hasLibreOfficeSources) {
+      const soffice = checkSoffice();
+      if (!soffice.installed) {
+        throw new Error(
+          "LibreOffice (soffice) is required to prepare Office sources but was not found.\n" +
+            `Install with: ${soffice.installCommand}\n` +
+            "Or convert your Office files to PDF and re-add them to sources/.",
+        );
+      }
+    }
+
+    const preparedSources = await prepareSourceArtifacts(workspace, operationId, sourcePaths, {
+      pdfUseAs: options.pdfUseAs,
+      continueOnError: true,
+      forcePreparation: Boolean(options.force),
+    });
+    const completedAt = new Date().toISOString();
+    const sourceReadiness = await getSourceReadiness(workspace, sourceStatus);
+
+    console.log(
+      JSON.stringify(
+        {
+          type: "prepare-sources",
+          operationId,
+          startedAt,
+          completedAt,
+          sourceCount: sourcePaths.length,
+          preparedSourcePaths: sourcePaths,
+          errors: preparedSources.errors || [],
+          registryPath: SOURCE_ARTIFACTS_PATH,
+          sourceReadiness,
+        },
+        null,
+        2,
+      ),
+    );
+
+    if ((preparedSources.errors || []).length > 0) {
+      process.exitCode = 2;
+    }
   } finally {
     await clearRunningMarker(runningMarkerPath);
   }
@@ -1804,12 +1967,19 @@ async function runMaintenanceOperation(workspace, options = {}) {
 
   const startedAt = new Date().toISOString();
   const snapshot = await createSnapshot(workspace, operationId);
-  const sourceGroundingEnabled = Boolean(options.useSources && config.supportsSourceGrounding);
   const sourceStatus =
-    config.includeSourceStatus || sourceGroundingEnabled ? await getSourceStatus(workspace) : null;
+    config.includeSourceStatus || config.supportsSourceGrounding ? await getSourceStatus(workspace) : null;
+  const requiredSourcePaths = config.supportsSourceGrounding
+    ? await collectAlwaysCheckSourcePaths(workspace, sourceStatus)
+    : [];
+  const sourceGroundingEnabled = Boolean(
+    config.supportsSourceGrounding && (options.useSources || requiredSourcePaths.length > 0),
+  );
   const sourceGrounding = sourceGroundingEnabled
     ? await prepareMaintenanceSourceGrounding(workspace, operationId, sourceStatus, {
         sourcePaths: options.sourcePaths,
+        requiredSourcePaths,
+        useAllSources: Boolean(options.useSources),
       })
     : null;
   if (sourceGrounding) {
@@ -1938,6 +2108,7 @@ async function runMaintenanceOperation(workspace, options = {}) {
       ? {
           enabled: true,
           sourcePaths: sourceGrounding.sourcePaths,
+          requiredSourcePaths: sourceGrounding.requiredSourcePaths,
           preparedSourcePaths: sourceGrounding.preparedSources.sources.map((source) => source.sourcePath),
         }
       : { enabled: false },
@@ -2052,6 +2223,35 @@ async function writeRunningMarker(
       2,
     )}\n`,
   );
+}
+
+async function acquireRunningMarker(runningMarkerPath, marker, attempt = 0) {
+  await ensureDir(path.dirname(runningMarkerPath));
+  let handle = null;
+  try {
+    handle = await fsp.open(runningMarkerPath, "wx");
+    await handle.writeFile(`${JSON.stringify(marker, null, 2)}\n`);
+    return;
+  } catch (error) {
+    if (error.code !== "EEXIST") throw error;
+    const existing = await fsp.readFile(runningMarkerPath, "utf8")
+      .then((text) => JSON.parse(text))
+      .catch(() => null);
+    const existingPid = Number(existing?.pid) || 0;
+    if (existingPid > 0 && processIsRunning(existingPid)) {
+      const type = existing?.type || "workspace operation";
+      throw new Error(
+        `A ${type} operation is already running. Wait for it to finish before starting another operation.`,
+      );
+    }
+    if (attempt >= 2) {
+      throw new Error("A workspace operation is already starting. Wait a moment and try again.");
+    }
+    await fsp.rm(runningMarkerPath, { force: true }).catch(() => {});
+    return acquireRunningMarker(runningMarkerPath, marker, attempt + 1);
+  } finally {
+    if (handle) await handle.close().catch(() => {});
+  }
 }
 
 async function clearRunningMarker(runningMarkerPath) {
@@ -2224,8 +2424,10 @@ async function selectBuildWikiVisualInputs(workspace, provider, options, prepare
   let renderedImageCount = 0;
   let contactSheetCount = 0;
   let visionInputCount = 0;
+  let pageImageVisionInputCount = 0;
   let assetCandidateCount = 0;
   let promptImageBytes = 0;
+  let inlineMarkdownFigureCount = 0;
   const visualDocumentSources = [];
 
   for (const source of preparedSources.sources) {
@@ -2260,6 +2462,7 @@ async function selectBuildWikiVisualInputs(workspace, provider, options, prepare
       }
       if (supportsVisionInputs) {
         visionInputCount += 1;
+        pageImageVisionInputCount += 1;
       }
       visualSources.push({
         sourcePath: source.sourcePath,
@@ -2285,6 +2488,120 @@ async function selectBuildWikiVisualInputs(workspace, provider, options, prepare
     totalPages += pageCount;
     renderedImageCount += source.pageImages?.length || 0;
     contactSheetCount += getSourceContactSheets(source).length;
+    if (supportsVisionInputs && shouldUseInlineMarkdownFiguresForBuild(source)) {
+      const remainingInlineBudget = Math.max(
+        0,
+        MAX_INLINE_MARKDOWN_FIGURE_ATTACHMENTS_TOTAL - inlineMarkdownFigureCount,
+      );
+      const inlineFigures = await collectInlineMarkdownFiguresForBuild(
+        workspace,
+        source,
+        imageInputMode,
+      );
+      if (inlineFigures.length > 0) {
+        const attachedInlineFigures = inlineFigures.slice(0, remainingInlineBudget);
+        const attachedInlineFigurePaths = new Set(attachedInlineFigures.map((figure) => figure.absolutePath));
+        source.inlineMarkdownFigures = inlineFigures.map((figure) => ({
+          ...figure,
+          attachedToPrompt: attachedInlineFigurePaths.has(figure.absolutePath),
+        }));
+        source.inlineMarkdownFiguresAttached = supportsImages && attachedInlineFigures.length > 0;
+        source.inlineMarkdownFigureAttachmentCount = attachedInlineFigures.length;
+        source.visualInspectionMode = imageInputMode;
+        source.visualInspectionPlan = {
+          materialType: source.materialType || source.sourceArtifact?.materialType || "unknown",
+          inspectionPolicy: "markdown-inline-figures",
+          pagesToInspect: [],
+          assetCandidates: inlineFigures.map((figure) => ({
+            figure: figure.index,
+            reason: figure.context || figure.alt || "",
+          })),
+          notes: "Using extracted figures referenced directly from the prepared Markdown.",
+          error: null,
+        };
+
+        for (const figure of attachedInlineFigures) {
+          if (supportsImages) {
+            imageAttachments.push(figure.absolutePath);
+          }
+          promptImageBytes += await fileSizeOrZero(figure.absolutePath);
+        }
+        inlineMarkdownFigureCount += attachedInlineFigures.length;
+        visionInputCount += attachedInlineFigures.length;
+        if (attachedInlineFigures.length <= 0) {
+          source.visualInspectionPlan = null;
+        } else {
+          assetCandidateCount += inlineFigures.length;
+          visualSources.push({
+            sourcePath: source.sourcePath,
+            pageCount,
+            renderedImageCount: source.pageImages?.length || 0,
+            contactSheetCount: getSourceContactSheets(source).length,
+            contactSheets: getSourceContactSheets(source),
+            contactSheet: source.contactSheetPath || getSourceContactSheets(source)[0]?.path || null,
+            visualInspectionMode: imageInputMode,
+            materialType: source.visualInspectionPlan.materialType,
+            inspectionPolicy: "markdown-inline-figures",
+            pagesToInspect: [],
+            assetCandidates: inlineFigures.map((figure) => ({
+              figure: figure.index,
+              reason: figure.context || figure.alt || "",
+              image: figure.path,
+              imageInputPath: figure.imageInputPath || "",
+            })),
+            inlineFigures: source.inlineMarkdownFigures.map((figure) => ({
+              index: figure.index,
+              alt: figure.alt,
+              path: figure.path,
+              imageInputPath: figure.imageInputPath || "",
+              context: figure.context,
+              markdownLine: figure.markdownLine,
+              attachedToPrompt: figure.attachedToPrompt === true,
+            })),
+            inlineFigureCount: inlineFigures.length,
+            inlineFigureAttachmentCount: attachedInlineFigures.length,
+            visionInputCount: attachedInlineFigures.length,
+            pathReferencedImageCount: supportsImagePathReferences ? attachedInlineFigures.length : 0,
+            assetCandidateCount: inlineFigures.length,
+            finalWikiAssetCount: 0,
+            providerSupportsImageAttachments: supportsImages,
+            providerSupportsImagePathReferences: supportsImagePathReferences,
+            error: null,
+          });
+        }
+        if (attachedInlineFigures.length <= 0) {
+          // Keep the cropped Markdown artifacts in the prompt as wiki image candidates,
+          // then fall through to page planning for visual inspection context.
+        } else {
+          continue;
+        }
+      }
+    }
+    if (shouldSkipPageVisualPlanningForBuild(source)) {
+      visualSources.push({
+        sourcePath: source.sourcePath,
+        pageCount,
+        renderedImageCount: source.pageImages?.length || 0,
+        contactSheetCount: getSourceContactSheets(source).length,
+        contactSheets: getSourceContactSheets(source),
+        contactSheet: source.contactSheetPath || getSourceContactSheets(source)[0]?.path || null,
+        visualInspectionMode: "markdown-only",
+        materialType: source.materialType || source.sourceArtifact?.materialType || "unknown",
+        inspectionPolicy: "markdown-only",
+        pagesToInspect: [],
+        assetCandidates: [],
+        inlineFigures: [],
+        inlineFigureCount: 0,
+        visionInputCount: 0,
+        pathReferencedImageCount: 0,
+        assetCandidateCount: 0,
+        finalWikiAssetCount: 0,
+        providerSupportsImageAttachments: supportsImages,
+        providerSupportsImagePathReferences: supportsImagePathReferences,
+        error: null,
+      });
+      continue;
+    }
     if (pageCount <= 0) continue;
     visualDocumentSources.push(source);
   }
@@ -2351,9 +2668,11 @@ async function selectBuildWikiVisualInputs(workspace, provider, options, prepare
         normalizedPlan.assetCandidates.filter((entry) => inspectedPageNumbers.has(entry.page)),
         imageInputMode,
       );
+      const inlineFigureCandidates = source.inlineMarkdownFigures || [];
+      const pageAssetCandidates = inlineFigureCandidates.length > 0 ? [] : assetCandidates;
 
       source.pagesToInspect = pagesToInspect;
-      source.assetCandidates = assetCandidates;
+      source.assetCandidates = pageAssetCandidates;
       source.selectedPromptImages = pagesToInspect;
       source.selectedPromptImagesAttached = supportsImages;
       source.contactSheetAttached = false;
@@ -2367,7 +2686,7 @@ async function selectBuildWikiVisualInputs(workspace, provider, options, prepare
           page: entry.page,
           reason: entry.reason || "",
         })),
-        assetCandidates: assetCandidates.map((entry) => ({
+        assetCandidates: pageAssetCandidates.map((entry) => ({
           page: entry.page,
           reason: entry.reason || "",
         })),
@@ -2414,16 +2733,27 @@ async function selectBuildWikiVisualInputs(workspace, provider, options, prepare
             fullImage: entry.fullImage,
             imageInputPath: entry.imageInputPath || "",
           })),
-          assetCandidates: assetCandidates.map((entry) => ({
+          assetCandidates: pageAssetCandidates.map((entry) => ({
             page: entry.page,
             reason: entry.reason || "",
             promptImage: entry.promptImage,
             fullImage: entry.fullImage,
             imageInputPath: entry.imageInputPath || "",
           })),
+          inlineFigures: (source.inlineMarkdownFigures || []).map((figure) => ({
+            index: figure.index,
+            alt: figure.alt,
+            path: figure.path,
+            imageInputPath: figure.imageInputPath || "",
+            context: figure.context,
+            markdownLine: figure.markdownLine,
+            attachedToPrompt: figure.attachedToPrompt === true,
+          })),
+          inlineFigureCount: source.inlineMarkdownFigures?.length || 0,
+          inlineFigureAttachmentCount: source.inlineMarkdownFigureAttachmentCount || 0,
           visionInputCount: supportsVisionInputs ? pagesToInspect.length : 0,
           pathReferencedImageCount: supportsImagePathReferences ? pagesToInspect.length : 0,
-          assetCandidateCount: assetCandidates.length,
+          assetCandidateCount: pageAssetCandidates.length + inlineFigureCandidates.length,
           finalWikiAssetCount: 0,
           providerSupportsImageAttachments: supportsImages,
           providerSupportsImagePathReferences: supportsImagePathReferences,
@@ -2437,6 +2767,7 @@ async function selectBuildWikiVisualInputs(workspace, provider, options, prepare
     imageAttachments.push(...planned.attachments);
     promptImageBytes += planned.promptImageBytes;
     visionInputCount += planned.report.visionInputCount;
+    pageImageVisionInputCount += planned.report.visionInputCount;
     assetCandidateCount += planned.report.assetCandidateCount;
     visualSources.push(planned.report);
   }
@@ -2451,8 +2782,8 @@ async function selectBuildWikiVisualInputs(workspace, provider, options, prepare
     renderedImageCount,
     contactSheetCount,
     visionInputCount,
-    selectedFullSlideCount: visionInputCount,
-    skippedFullSlideCount: Math.max(0, totalPages - visionInputCount),
+    selectedFullSlideCount: pageImageVisionInputCount,
+    skippedFullSlideCount: Math.max(0, totalPages - pageImageVisionInputCount),
     assetCandidateCount,
     promptImageBytes,
     fullImageBudget: Math.min(MAX_FULL_SLIDE_ATTACHMENTS_TOTAL, visualSources.reduce(
@@ -2470,6 +2801,7 @@ async function selectBuildWikiVisualInputs(workspace, provider, options, prepare
     },
     imageAttachmentCount: imageAttachments.length,
     pathReferencedImageCount: supportsImagePathReferences ? visionInputCount : 0,
+    inlineMarkdownFigureCount,
     visualPlanningConcurrency: VISUAL_PLANNING_CONCURRENCY,
     finalWikiAssetCount: 0,
     sources: visualSources,
@@ -2515,6 +2847,128 @@ function getSourceContactSheets(source) {
     }];
   }
   return [];
+}
+
+function shouldUseInlineMarkdownFiguresForBuild(source) {
+  const useAs = source.pdfUseAs || "";
+  const detectedUseAs = source.detectedUseAs || source.sourceArtifact?.detectedUseAs || "";
+  const materialType = source.materialType || source.sourceArtifact?.materialType || "";
+  const textPolicy = source.textPolicy || source.sourceArtifact?.textPolicy || "";
+  const visualPolicy = source.visualPolicy || source.sourceArtifact?.visualPolicy || "";
+
+  if (useAs === "mostly-visual") return false;
+  if (detectedUseAs === "mostly-visual") return false;
+  if (useAs === "text-with-diagrams") return true;
+  if (
+    useAs === "mostly-text" &&
+    detectedUseAs === "text-with-diagrams" &&
+    materialType !== "syllabus"
+  ) {
+    return true;
+  }
+  if (materialType === "textbook" || materialType === "article") return true;
+  return (
+    textPolicy === "markdown-primary" &&
+    visualPolicy === "on-demand" &&
+    useAs !== "mostly-text"
+  );
+}
+
+function shouldSkipPageVisualPlanningForBuild(source) {
+  const useAs = source.pdfUseAs || "";
+  const detectedUseAs = source.detectedUseAs || source.sourceArtifact?.detectedUseAs || "";
+  const materialType = source.materialType || source.sourceArtifact?.materialType || "";
+  return (
+    materialType === "syllabus" ||
+    (useAs === "mostly-text" && detectedUseAs !== "text-with-diagrams")
+  );
+}
+
+async function collectInlineMarkdownFiguresForBuild(
+  workspace,
+  source,
+  imageInputMode = "attached-images",
+  maxFigures = Number.POSITIVE_INFINITY,
+) {
+  if (!source.textPath) return [];
+  const numericLimit = Number(maxFigures);
+  const limit = Number.isFinite(numericLimit)
+    ? Math.max(0, Math.trunc(numericLimit))
+    : Number.POSITIVE_INFINITY;
+  if (limit <= 0) return [];
+
+  const markdownPath = safeJoin(workspace, source.textPath);
+  if (!(await exists(markdownPath))) return [];
+  const markdownDir = path.dirname(markdownPath);
+  const workspaceRoot = path.resolve(workspace);
+  const markdown = await fsp.readFile(markdownPath, "utf8");
+  const figures = [];
+  const seen = new Set();
+  let searchIndex = 0;
+  let figureIndex = 1;
+
+  while (figures.length < limit) {
+    const image = findNextInlineMarkdownImage(markdown, searchIndex);
+    if (!image) break;
+    searchIndex = image.end;
+
+    const destination = parseLooseMarkdownDestination(image.rawDestination);
+    if (!destination || /^(?:[a-z][a-z0-9+.-]*:|\/\/)/i.test(destination)) {
+      continue;
+    }
+
+    const absolutePath = path.isAbsolute(destination)
+      ? path.resolve(destination)
+      : path.resolve(markdownDir, destination);
+    if (absolutePath !== workspaceRoot && !absolutePath.startsWith(`${workspaceRoot}${path.sep}`)) {
+      continue;
+    }
+    if (!(await exists(absolutePath))) continue;
+    if (seen.has(absolutePath)) continue;
+    seen.add(absolutePath);
+
+    figures.push({
+      index: figureIndex,
+      alt: image.alt || "Image",
+      path: toPosixRelative(workspace, absolutePath),
+      absolutePath,
+      imageInputPath: imageInputMode === "path-referenced-images" ? absolutePath : "",
+      context: markdownImageNearbyContext(markdown, image.start),
+      markdownLine: markdownLineNumberAtIndex(markdown, image.start),
+    });
+    figureIndex += 1;
+  }
+
+  return figures;
+}
+
+function markdownLineNumberAtIndex(markdown, index) {
+  return String(markdown || "").slice(0, index).split(/\r?\n/).length;
+}
+
+function markdownImageNearbyContext(markdown, imageStart) {
+  const lines = String(markdown || "").split(/\r?\n/);
+  const imageLineIndex = Math.max(0, markdownLineNumberAtIndex(markdown, imageStart) - 1);
+  let heading = "";
+  for (let index = imageLineIndex; index >= 0 && index >= imageLineIndex - 40; index -= 1) {
+    const match = /^(#{1,6})\s+(.+?)\s*#*\s*$/.exec(lines[index]?.trim() || "");
+    if (match) {
+      heading = cleanAskWikiHeading(match[2]);
+      break;
+    }
+  }
+
+  const nearby = [];
+  const start = Math.max(0, imageLineIndex - 4);
+  const end = Math.min(lines.length - 1, imageLineIndex + 4);
+  for (let index = start; index <= end; index += 1) {
+    const line = (lines[index] || "").trim();
+    if (!line || /^!\[/.test(line)) continue;
+    nearby.push(line.replace(/\s+/g, " "));
+  }
+
+  const context = [heading, ...nearby].filter(Boolean).join(" | ");
+  return clipText(context, 260);
 }
 
 function mapVisualPlanPagesToImages(workspace, source, entries, imageInputMode = "attached-images") {
@@ -2608,6 +3062,13 @@ async function buildVisualInspectionPlanningPrompt(workspace, source, imageInput
   const imageInputInstruction = imageInputMode === "path-referenced-images"
     ? "Inspect the contact sheet image files from the listed absolute paths before choosing pages."
     : "Inspect the attached contact sheet images before choosing pages.";
+  const pdfUseAsBlock = source.pdfUseAs
+    ? [
+        `PDF reading mode: ${source.pdfUseAs}`,
+        `PDF handling: ${pdfUseAsInstruction(source.pdfUseAs)}`,
+        "",
+      ].join("\n")
+    : "";
 
   return `You are planning visual inspection for a Maple Build Wiki operation.
 
@@ -2615,6 +3076,7 @@ Return strict JSON only. Do not write files. Do not run shell commands.
 
 Source: ${source.sourcePath}
 Page count: ${source.pageCount}
+${pdfUseAsBlock}
 ${contactSheetModeText}
 ${contactSheetList}
 
@@ -2623,8 +3085,11 @@ ${imageInputInstruction}
 Choose the smallest sufficient set of rendered page or slide images that the final Build Wiki pass should inspect as actual vision inputs.
 Do not use a fixed percentage cap. Pick based on material type:
 - text-heavy sources may need few or no page images;
-- worked solutions, derivations, homework, screenshots, visual explanations, or diagram-heavy lectures may need more;
+- visual-heavy sources, derivations, screenshots, visual explanations, or diagram-heavy pages may need more;
 - inspect all pages only when that is genuinely useful for understanding the source.
+- for PDF reading mode mostly-text, prefer zero or very few page images unless OCR uncertainty needs verification;
+- for PDF reading mode text-with-diagrams, inspect important figures, diagrams, tables, equations, or ambiguous layout;
+- for PDF reading mode mostly-visual, inspect rendered page images more actively.
 
 Distinguish images inspected for understanding from images worth embedding in the final wiki.
 assetCandidates must be a subset of pagesToInspect.
@@ -2905,6 +3370,627 @@ function buildSourceExtractionCacheReport(preparedSources) {
   };
 }
 
+async function readSourceArtifactsRegistry(workspace) {
+  const registryPath = path.join(workspace, SOURCE_ARTIFACTS_PATH);
+  if (!(await exists(registryPath))) {
+    return {
+      schemaVersion: 1,
+      updatedAt: "",
+      sources: {},
+    };
+  }
+
+  try {
+    const parsed = JSON.parse(await fsp.readFile(registryPath, "utf8"));
+    const rawSources = parsed?.sources && typeof parsed.sources === "object"
+      ? parsed.sources
+      : parsed?.artifacts && typeof parsed.artifacts === "object"
+        ? parsed.artifacts
+        : {};
+    const sources = {};
+    for (const [rawPath, rawEntry] of Object.entries(rawSources)) {
+      const sourcePath = normalizeRelativePath(rawEntry?.sourcePath || rawPath);
+      if (!sourcePath || !sourcePath.startsWith("sources/")) continue;
+      sources[sourcePath] = {
+        ...rawEntry,
+        sourcePath,
+      };
+    }
+    return {
+      schemaVersion: 1,
+      updatedAt: parsed?.updatedAt || "",
+      sources,
+    };
+  } catch (_error) {
+    return {
+      schemaVersion: 1,
+      updatedAt: "",
+      sources: {},
+    };
+  }
+}
+
+async function writeSourceArtifactsRegistry(workspace, registry) {
+  const registryPath = path.join(workspace, SOURCE_ARTIFACTS_PATH);
+  const sortedSources = {};
+  for (const sourcePath of Object.keys(registry.sources || {}).sort()) {
+    sortedSources[sourcePath] = registry.sources[sourcePath];
+  }
+  await ensureDir(path.dirname(registryPath));
+  await fsp.writeFile(
+    registryPath,
+    `${JSON.stringify({
+      schemaVersion: 1,
+      updatedAt: new Date().toISOString(),
+      sources: sortedSources,
+    }, null, 2)}\n`,
+  );
+}
+
+async function withAsyncKeyLock(key, fn) {
+  const previous = asyncKeyLocks.get(key) || Promise.resolve();
+  let release;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  const current = previous.catch(() => {}).then(() => gate);
+  asyncKeyLocks.set(key, current);
+  await previous.catch(() => {});
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (asyncKeyLocks.get(key) === current) {
+      asyncKeyLocks.delete(key);
+    }
+  }
+}
+
+function sourceArtifactsRegistryLockKey(workspace) {
+  return `source-artifacts:${path.resolve(workspace)}`;
+}
+
+function sourceExtractionCacheLockKey(cacheDir) {
+  return `source-cache:${path.resolve(cacheDir)}`;
+}
+
+function preparedSourceHealthResult(ok, reason = "", details = {}) {
+  return {
+    ok: Boolean(ok),
+    reason: reason || "",
+    version: PREPARED_SOURCE_HEALTH_VERSION,
+    ...details,
+  };
+}
+
+async function validatePreparedOutputDir(workspace, outputDir, options = {}) {
+  const manifestPath = path.join(outputDir, "manifest.json");
+  if (!(await exists(manifestPath))) {
+    return preparedSourceHealthResult(false, "missing-manifest");
+  }
+
+  let manifest;
+  try {
+    manifest = JSON.parse(await fsp.readFile(manifestPath, "utf8"));
+  } catch (_error) {
+    return preparedSourceHealthResult(false, "invalid-manifest-json");
+  }
+
+  const textPath = path.join(outputDir, manifest.textPath || "text.md");
+  return validatePreparedMarkdownFile(workspace, textPath, {
+    ...options,
+    manifest,
+    manifestPath,
+  });
+}
+
+async function validatePreparedSourceArtifact(workspace, entry, options = {}) {
+  if (!entry || typeof entry !== "object") {
+    return preparedSourceHealthResult(false, "missing-registry-entry");
+  }
+  if (entry.status && entry.status !== "ready") {
+    return preparedSourceHealthResult(false, `source-${entry.status}`);
+  }
+  if (Number(entry.extractorVersion) !== EXTRACTOR_VERSION) {
+    return preparedSourceHealthResult(false, "stale-extractor-version", {
+      expectedExtractorVersion: EXTRACTOR_VERSION,
+      actualExtractorVersion: Number(entry.extractorVersion) || null,
+    });
+  }
+
+  const markdownRelPath = normalizeRelativePath(entry.structuredMarkdown || entry.preparedPath || "");
+  const manifestRelPath = normalizeRelativePath(entry.manifestPath || "");
+  if (!markdownRelPath) return preparedSourceHealthResult(false, "missing-markdown-path");
+  if (!manifestRelPath) return preparedSourceHealthResult(false, "missing-manifest-path");
+
+  let markdownPath;
+  let manifestPath;
+  try {
+    markdownPath = safeJoin(workspace, markdownRelPath);
+    manifestPath = safeJoin(workspace, manifestRelPath);
+  } catch (_error) {
+    return preparedSourceHealthResult(false, "unsafe-artifact-path");
+  }
+
+  if (!(await exists(markdownPath))) {
+    return preparedSourceHealthResult(false, "missing-markdown-file");
+  }
+  if (!(await exists(manifestPath))) {
+    return preparedSourceHealthResult(false, "missing-manifest-file");
+  }
+
+  let manifest;
+  try {
+    manifest = JSON.parse(await fsp.readFile(manifestPath, "utf8"));
+  } catch (_error) {
+    return preparedSourceHealthResult(false, "invalid-manifest-json");
+  }
+
+  return validatePreparedMarkdownFile(workspace, markdownPath, {
+    ...options,
+    manifest,
+    manifestPath,
+  });
+}
+
+async function validatePreparedMarkdownFile(workspace, markdownPath, options = {}) {
+  let buffer;
+  try {
+    buffer = await fsp.readFile(markdownPath);
+  } catch (_error) {
+    return preparedSourceHealthResult(false, "missing-markdown-file");
+  }
+
+  if (buffer.length === 0) {
+    return preparedSourceHealthResult(false, "empty-markdown");
+  }
+  if (buffer.includes(0)) {
+    return preparedSourceHealthResult(false, "nul-byte-in-markdown");
+  }
+
+  const markdown = buffer.toString("utf8");
+  if (!markdown.trim()) {
+    return preparedSourceHealthResult(false, "blank-markdown");
+  }
+  if (hasUnstablePreparedImagePath(markdown)) {
+    return preparedSourceHealthResult(false, "unstable-image-path");
+  }
+
+  const markdownDir = path.dirname(markdownPath);
+  const workspaceRoot = path.resolve(workspace);
+  const targets = extractPreparedMarkdownImageTargets(markdown);
+  const missingImages = [];
+  const outsideWorkspaceImages = [];
+  const unstableImages = [];
+
+  for (const target of targets) {
+    if (!target || isExternalMarkdownTarget(target)) continue;
+    if (hasUnstablePreparedImagePath(target)) {
+      unstableImages.push(target);
+      continue;
+    }
+
+    const targetWithoutFragment = target.split(/[?#]/, 1)[0];
+    let absolutePath;
+    try {
+      absolutePath = path.isAbsolute(targetWithoutFragment)
+        ? path.resolve(targetWithoutFragment)
+        : path.resolve(markdownDir, targetWithoutFragment);
+    } catch (_error) {
+      missingImages.push(target);
+      continue;
+    }
+
+    if (absolutePath !== workspaceRoot && !absolutePath.startsWith(`${workspaceRoot}${path.sep}`)) {
+      outsideWorkspaceImages.push(target);
+      continue;
+    }
+    if (!(await exists(absolutePath))) {
+      missingImages.push(target);
+    }
+  }
+
+  if (unstableImages.length > 0) {
+    return preparedSourceHealthResult(false, "unstable-image-path", {
+      imageTarget: unstableImages[0],
+      imageCount: targets.length,
+    });
+  }
+  if (outsideWorkspaceImages.length > 0) {
+    return preparedSourceHealthResult(false, "image-outside-workspace", {
+      imageTarget: outsideWorkspaceImages[0],
+      imageCount: targets.length,
+    });
+  }
+  if (missingImages.length > 0) {
+    return preparedSourceHealthResult(false, "missing-image-file", {
+      imageTarget: missingImages[0],
+      missingImageCount: missingImages.length,
+      imageCount: targets.length,
+    });
+  }
+
+  return preparedSourceHealthResult(true, "", {
+    checkedAt: new Date().toISOString(),
+    markdownBytes: buffer.length,
+    imageCount: targets.length,
+    manifestPageCount: Number(options.manifest?.pageCount) || 0,
+  });
+}
+
+function extractPreparedMarkdownImageTargets(markdown) {
+  const targets = [];
+  const seen = new Set();
+  const addTarget = (target) => {
+    const normalized = String(target || "").trim();
+    if (!normalized || seen.has(normalized)) return;
+    seen.add(normalized);
+    targets.push(normalized);
+  };
+
+  let searchIndex = 0;
+  while (true) {
+    const image = findNextInlineMarkdownImage(markdown, searchIndex);
+    if (!image) break;
+    searchIndex = image.end;
+    addTarget(parseMarkdownImageDestination(image.rawDestination));
+  }
+
+  for (const target of extractMarkdownImageTargets(markdown)) {
+    addTarget(target);
+  }
+
+  return targets;
+}
+
+function isExternalMarkdownTarget(target) {
+  return /^(?:[a-z][a-z0-9+.-]*:|\/\/)/i.test(String(target || "").trim());
+}
+
+function hasUnstablePreparedImagePath(value) {
+  const text = String(value || "");
+  return /(?:^|[/\\])var[/\\]folders[/\\]/i.test(text) ||
+    /maple-(?:docling|mineru)-/i.test(text) ||
+    /_artifacts[/\\]/i.test(text);
+}
+
+async function resolveSourceArtifact(workspace, sourcePath, options = {}) {
+  const normalized = normalizeRelativePath(sourcePath);
+  if (!normalized || !normalized.startsWith("sources/")) return null;
+
+  const registry = await readSourceArtifactsRegistry(workspace);
+  const entry = registry.sources[normalized];
+  if (!entry) return null;
+
+  let markdownPath = null;
+  let manifestPath = null;
+  try {
+    markdownPath = entry.structuredMarkdown
+      ? safeJoin(workspace, entry.structuredMarkdown)
+      : null;
+    manifestPath = entry.manifestPath
+      ? safeJoin(workspace, entry.manifestPath)
+      : null;
+  } catch (_error) {
+    return null;
+  }
+  if (!markdownPath || !(await exists(markdownPath))) return null;
+  if (!manifestPath || !(await exists(manifestPath))) return null;
+
+  if (!options.allowStale) {
+    const fingerprint = await sourceFingerprint(workspace, normalized).catch(() => null);
+    if (!fingerprint || fingerprint.sha256 !== entry.sourceSha256) return null;
+  }
+
+  const health = await validatePreparedSourceArtifact(workspace, entry);
+  if (!health.ok) return null;
+
+  return entry;
+}
+
+async function sourceFingerprint(workspace, sourcePath) {
+  const absolutePath = safeJoin(workspace, sourcePath);
+  const stat = await fsp.stat(absolutePath);
+  const buffer = await fsp.readFile(absolutePath);
+  return {
+    sha256: sha256(buffer),
+    size: stat.size,
+    mtimeMs: Math.trunc(stat.mtimeMs),
+    buffer,
+  };
+}
+
+async function writeSourcePreparationRecord(workspace, sourcePath, patch) {
+  const normalized = normalizeRelativePath(sourcePath);
+  if (!normalized || !normalized.startsWith("sources/")) return null;
+  return withAsyncKeyLock(sourceArtifactsRegistryLockKey(workspace), async () => {
+    const registry = await readSourceArtifactsRegistry(workspace);
+    const existing = registry.sources[normalized] || {};
+    registry.sources[normalized] = {
+      ...existing,
+      sourcePath: normalized,
+      sourceSlug: existing.sourceSlug || slugFromSourcePath(normalized),
+      sourceFormat: sourceFormatForPath(normalized),
+      updatedAt: new Date().toISOString(),
+      ...patch,
+    };
+    await writeSourceArtifactsRegistry(workspace, registry);
+    return registry.sources[normalized];
+  });
+}
+
+async function markSourcePreparationStarted(workspace, sourcePath, operationId, options = {}) {
+  const file = await sourceFingerprint(workspace, sourcePath);
+  const patch = {
+    status: "preparing",
+    operationId,
+    preparingPid: process.pid,
+    startedAt: new Date().toISOString(),
+    sourceSha256: file.sha256,
+    sourceSize: file.size,
+    sourceMtimeMs: file.mtimeMs,
+    extractorVersion: EXTRACTOR_VERSION,
+    error: "",
+  };
+  if (options.sourceSlug) {
+    patch.sourceSlug = options.sourceSlug;
+  }
+  if (isPdfSource(sourcePath)) {
+    const existing = (await readSourceArtifactsRegistry(workspace)).sources[sourcePath] || {};
+    const detectedUseAs = normalizePdfUseAs(existing.detectedUseAs) ||
+      detectPdfUseAsFromSignals(sourcePath);
+    patch.detectedUseAs = detectedUseAs;
+    patch.useAs = normalizePdfUseAs(options.pdfUseAs?.[sourcePath]) ||
+      normalizePdfUseAs(existing.useAs) ||
+      detectedUseAs;
+  }
+  return writeSourcePreparationRecord(workspace, sourcePath, patch);
+}
+
+async function markSourcePreparationReady(workspace, sourcePath, operationId, details = {}) {
+  const file = await sourceFingerprint(workspace, sourcePath);
+  const patch = {
+    status: "ready",
+    operationId,
+    preparingPid: null,
+    preparedAt: new Date().toISOString(),
+    sourceSha256: file.sha256,
+    sourceSize: file.size,
+    sourceMtimeMs: file.mtimeMs,
+    extractorVersion: details.extractorVersion || EXTRACTOR_VERSION,
+    structuredMarkdown: details.structuredMarkdown || details.preparedPath || "",
+    manifestPath: details.manifestPath || "",
+    cachePath: details.cachePath || "",
+    error: "",
+  };
+  if (details.sourceSlug) {
+    patch.sourceSlug = details.sourceSlug;
+  }
+  if (isPdfSource(sourcePath)) {
+    const detectedUseAs = normalizePdfUseAs(details.detectedUseAs) ||
+      detectPdfUseAsFromSignals(sourcePath);
+    patch.detectedUseAs = detectedUseAs;
+    patch.useAs = normalizePdfUseAs(details.useAs) || detectedUseAs;
+  }
+  return writeSourcePreparationRecord(workspace, sourcePath, patch);
+}
+
+async function markSourcePreparationFailed(workspace, sourcePath, operationId, error) {
+  const file = await sourceFingerprint(workspace, sourcePath).catch(() => null);
+  const patch = {
+    status: "failed",
+    operationId,
+    preparingPid: null,
+    failedAt: new Date().toISOString(),
+    sourceSha256: file?.sha256 || "",
+    sourceSize: file?.size || 0,
+    sourceMtimeMs: file?.mtimeMs || 0,
+    extractorVersion: EXTRACTOR_VERSION,
+    error: cleanCommandText(error?.message || String(error || "Source preparation failed.")),
+  };
+  return writeSourcePreparationRecord(workspace, sourcePath, patch);
+}
+
+async function syncLatestSourceArtifact(workspace, options) {
+  const {
+    sourcePath,
+    sourceSlug,
+    sourceSha256,
+    sourceSize,
+    sourceMtimeMs,
+    outputDir,
+    cacheKey,
+    cacheDir,
+    extractorVersion,
+  } = options;
+  const latestRelPath = `${EXTRACTED_LATEST_DIR}/${sourceSlug}`;
+  const latestDir = safeJoin(workspace, latestRelPath);
+
+  await fsp.rm(latestDir, { recursive: true, force: true });
+  await ensureDir(path.dirname(latestDir));
+  await copyPath(outputDir, latestDir);
+
+  const manifestPath = path.join(latestDir, "manifest.json");
+  const manifest = JSON.parse(await fsp.readFile(manifestPath, "utf8"));
+  const textPath = path.join(latestDir, manifest.textPath || "text.md");
+  const health = await validatePreparedOutputDir(workspace, latestDir, {
+    sourcePath,
+  });
+  if (!health.ok) {
+    throw new Error(`Prepared Markdown health check failed: ${health.reason}`);
+  }
+  const text = await fsp.readFile(textPath, "utf8").catch(() => "");
+  const classification = manifest.materialClassification ||
+    classifySourceMaterial(sourcePath, text, manifest);
+  return withAsyncKeyLock(sourceArtifactsRegistryLockKey(workspace), async () => {
+    const registry = await readSourceArtifactsRegistry(workspace);
+    const existing = registry.sources[sourcePath] || {};
+    const detectedUseAs = isPdfSource(sourcePath)
+      ? normalizePdfUseAs(options.detectedUseAs) || detectPdfUseAsFromSignals(sourcePath, text)
+      : "";
+    const pdfUseAs = isPdfSource(sourcePath)
+      ? normalizePdfUseAs(options.useAs) ||
+        normalizePdfUseAs(options.pdfUseAs?.[sourcePath]) ||
+        normalizePdfUseAs(existing.useAs) ||
+        detectedUseAs ||
+        "mostly-text"
+      : "";
+
+    const entry = {
+      ...existing,
+      sourcePath,
+      sourceSlug,
+      sourceFormat: sourceFormatForPath(sourcePath),
+      status: "ready",
+      operationId: options.operationId || existing.operationId || "",
+      preparingPid: null,
+      sourceSha256,
+      sourceSize,
+      sourceMtimeMs,
+      extractorVersion,
+      cacheKey,
+      cachePath: toPosixRelative(workspace, cacheDir),
+      latestPath: latestRelPath,
+      manifestPath: toPosixRelative(workspace, manifestPath),
+      structuredMarkdown: toPosixRelative(workspace, textPath),
+      pageCount: Number(manifest.pageCount) || 0,
+      textExtractor: manifest.textExtractor || "unknown",
+      fallbackExtractorsTried: Array.isArray(manifest.textExtractorAttempts)
+        ? manifest.textExtractorAttempts.map((attempt) => ({
+            extractor: attempt.extractor || "",
+            status: attempt.status || "",
+            reason: attempt.reason || "",
+          }))
+        : [],
+      materialType: classification.materialType,
+      textPolicy: classification.textPolicy,
+      visualPolicy: classification.visualPolicy,
+      confidence: classification.confidence,
+      quality: classification.quality,
+      preparedHealth: {
+        version: PREPARED_SOURCE_HEALTH_VERSION,
+        status: "healthy",
+        checkedAt: health.checkedAt,
+        markdownBytes: health.markdownBytes,
+        imageCount: health.imageCount,
+      },
+      error: "",
+      startedAt: existing.startedAt || "",
+      preparedAt: new Date().toISOString(),
+      ...(detectedUseAs ? { detectedUseAs, useAs: pdfUseAs } : {}),
+      updatedAt: new Date().toISOString(),
+    };
+
+    registry.sources[sourcePath] = entry;
+    await writeSourceArtifactsRegistry(workspace, registry);
+    return entry;
+  });
+}
+
+function classifySourceMaterial(sourcePath, text, manifest = {}) {
+  const lowerPath = String(sourcePath || "").toLowerCase();
+  const lowerText = String(text || "").toLowerCase();
+  const pageCount = Math.max(1, Number(manifest.pageCount) || 1);
+  const headingCount = (text.match(/^#{1,6}\s+/gm) || []).length;
+  const imageCount = extractMarkdownImageTargets(text).length;
+  const tableLineCount = text.split(/\r?\n/).filter((line) => line.includes("|")).length;
+  const textChars = String(text || "").replace(/\s+/g, "").length;
+  const textCharsPerPage = Math.round(textChars / pageCount);
+  const questionKeywordCount = countMatches(
+    `${lowerPath}\n${lowerText.slice(0, 30000)}`,
+    /\b(qs|question|questions|worksheet|homework|exercise|exercises|practice|frq|mcq|paper|marks?)\b/g,
+  );
+  const questionPathSignal = /\b(qs|frq|mcq)\b|question|worksheet|homework|practice|exam|paper/i
+    .test(sourcePath || "");
+  const markSchemeKeywordCount = countMatches(
+    `${lowerPath}\n${lowerText.slice(0, 12000)}`,
+    /\b(mark scheme|markscheme|answer key|examiner report)\b/g,
+  );
+  const markSchemePathSignal = /\bms\b|mark[- ]?scheme/i.test(sourcePath || "");
+  const slideKeywordCount = countMatches(
+    `${lowerPath}\n${lowerText.slice(0, 30000)}`,
+    /\b(slide|slides|lecture|deck|presentation|ppt|pptx)\b/g,
+  );
+  const textbookKeywordCount = countMatches(
+    lowerText.slice(0, 30000),
+    /\b(chapter|learning objectives|guiding questions|in this chapter|key point|worked example)\b/g,
+  );
+  const syllabusKeywordCount = countMatches(
+    `${lowerPath}\n${lowerText.slice(0, 20000)}`,
+    /\b(syllabus|specification|curriculum|bullet points|assessment objective)\b/g,
+  );
+
+  let materialType = "unknown";
+  let confidence = 0.45;
+  const signals = [];
+
+  if (markSchemePathSignal || (markSchemeKeywordCount >= 1 && questionPathSignal)) {
+    materialType = "mark-scheme";
+    confidence = 0.82;
+    signals.push("mark scheme keywords");
+  } else if (questionPathSignal || (questionKeywordCount >= 5 && textbookKeywordCount < 2)) {
+    materialType = "worksheet";
+    confidence = 0.78;
+    signals.push("question paper keywords");
+  } else if (syllabusKeywordCount >= 2) {
+    materialType = "syllabus";
+    confidence = 0.78;
+    signals.push("syllabus keywords");
+  } else if (slideKeywordCount >= 2 && textCharsPerPage < 1200) {
+    materialType = "slides";
+    confidence = 0.72;
+    signals.push("slide keywords with low text density");
+  } else if (textbookKeywordCount >= 2 || (headingCount >= 8 && textCharsPerPage >= 1200)) {
+    materialType = "textbook";
+    confidence = 0.82;
+    signals.push("chapter-style headings");
+  } else if (textCharsPerPage >= 1800 && headingCount >= 3) {
+    materialType = "article";
+    confidence = 0.68;
+    signals.push("dense prose with headings");
+  }
+
+  if (headingCount > 0) signals.push(`${headingCount} markdown headings`);
+  if (imageCount > 0) signals.push(`${imageCount} linked images`);
+  if (tableLineCount > 0) signals.push(`${tableLineCount} table-like lines`);
+
+  const policy = sourcePolicyForMaterial(materialType);
+  return {
+    materialType,
+    textPolicy: policy.textPolicy,
+    visualPolicy: policy.visualPolicy,
+    confidence,
+    signals,
+    quality: {
+      headingCount,
+      imageCount,
+      tableLineCount,
+      textCharsPerPage,
+      pageCount,
+    },
+  };
+}
+
+function sourcePolicyForMaterial(materialType) {
+  switch (materialType) {
+    case "textbook":
+    case "article":
+    case "syllabus":
+      return { textPolicy: "markdown-primary", visualPolicy: "on-demand" };
+    case "slides":
+      return { textPolicy: "markdown-secondary", visualPolicy: "visual-primary" };
+    case "worksheet":
+    case "mark-scheme":
+      return { textPolicy: "markdown-and-visual", visualPolicy: "selected-pages" };
+    default:
+      return { textPolicy: "markdown-first", visualPolicy: "selective" };
+  }
+}
+
+function countMatches(text, regex) {
+  return (String(text || "").match(regex) || []).length;
+}
+
 function renderAllowedPathRulesForPrompt(rules) {
   return rules
     .map((rule) => (rule === "**" ? "- all workspace paths" : `- ${rule}`))
@@ -2912,12 +3998,16 @@ function renderAllowedPathRulesForPrompt(rules) {
 }
 
 async function buildWikiPrompt(workspace, options, preparedSources = { sources: [] }) {
-  const sourceStatus = options.sourceStatus || await getSourceStatus(workspace);
+  const sourceStatus = filteredSourceStatusForPrompt(
+    options.sourceStatus || await getSourceStatus(workspace),
+    Array.isArray(options.sourcePaths) ? options.buildSourcePaths : null,
+  );
   const today = new Date().toISOString().slice(0, 10);
   const workspaceContext = cleanCommandText(options.workspaceContext);
   const pendingSourceList = renderSourceStatusForPrompt(sourceStatus, {
     force: Boolean(options.force),
   });
+  const alwaysCheckSourceList = renderAlwaysCheckSourcePathsForPrompt(options.requiredSourcePaths);
   const preparedSourceList = renderPreparedSourcesForPrompt(preparedSources);
   const protectedAssetContext = await renderProtectedAssetsForPrompt(workspace);
   let prompt = `You are running a Build Wiki operation for Maple.
@@ -2931,10 +4021,26 @@ Operation goal:
 
 Operation scope:
 ${pendingSourceList}
+${alwaysCheckSourceList}
 ${preparedSourceList}
 
 Operation-local context:
 - Current date: ${today}
+
+Prepared source reading policy:
+- For mostly-text and text-with-diagrams PDFs, read the prepared structured Markdown first.
+- For mostly-visual PDFs, read prepared Markdown first as an orientation/outline layer, then inspect rendered page images as the authoritative representation for details, layout, diagrams, tables, relationships, and other visual content.
+- Treat sources/** as the canonical source for citations and verification; do not cite .aiwiki/extracted paths as source files.
+- For text-with-diagrams sources, prefer listed inline Markdown figures when visuals, diagrams, tables, or equations are needed.
+- Use rendered page images or the original source when question wording, answer options, table structure, slide sequence, page-specific citations, or incomplete Markdown require verification.
+- Do not re-extract raw PDF text when a prepared Markdown artifact is listed unless that artifact is clearly insufficient.
+
+Wiki image policy:
+- Build concept pages as visual learning pages, not text-only notes, when the scoped sources include useful diagrams, figures, tables, graphs, spectra, apparatus, particle models, equations, or annotated screenshots.
+- Prefer 1-3 high-value images per substantial wiki page when relevant visual candidates are available; use fewer or none only when the candidates are decorative, duplicate, unreadable, answer-key clutter, or not useful for learning the page topic.
+- To use an image, copy the listed full-resolution PNG from .aiwiki/extracted/... into a stable path under wiki/assets/<topic-slug>/, then embed that wiki/assets path in Markdown. Never embed .aiwiki paths directly in wiki pages.
+- Add specific alt text and a short caption or surrounding sentence explaining why the image matters. Keep source citations pointing to sources/**, not to .aiwiki.
+- Use the listed image candidates as suggestions. Choose only images that materially improve understanding, and do not dump every available image.
 
 Permission boundary:
 Allowed write paths:
@@ -2942,6 +4048,7 @@ ${renderAllowedPathRulesForPrompt(BUILD_WIKI_ALLOWED_PATHS)}
 
 - Source files under sources/** may be moved or renamed, but source file contents must not be edited.
 - Do not edit .aiwiki/source-manifest.json; the runner updates it only after a successful build.
+- Do not edit ${SOURCE_ARTIFACTS_PATH}; the runner owns prepared source metadata.
 - Do not edit ${ASSET_REGISTRY_PATH}; Maple updates image asset metadata after the operation.
 - When copying a visual into wiki/assets, copy from the listed full-resolution PNG path, not the prompt JPEG path.
 - Update schema.md only when the user explicitly asks for a durable rule or workspace preference.
@@ -2950,6 +4057,7 @@ ${protectedAssetContext}
 
 Finish protocol:
 - The Maple runner validates paths, changed files, and report state after you exit.
+- This workspace may not be a Git repository. Do not use git status, git diff, or other Git commands for final verification unless you have first confirmed that .git exists.
 - Provide a short final summary naming the main sources handled, major files created or updated, and anything the user should review.
 `;
 
@@ -2982,6 +4090,17 @@ Use this as durable workspace context:
   return prompt;
 }
 
+function filteredSourceStatusForPrompt(sourceStatus, sourcePaths = null) {
+  if (!Array.isArray(sourcePaths)) return sourceStatus;
+  const selected = new Set(sourcePaths);
+  const files = (sourceStatus?.files || []).filter((file) => selected.has(file.path));
+  return {
+    ...sourceStatus,
+    files,
+    pendingCount: files.filter((file) => file.state !== "unchanged").length,
+  };
+}
+
 async function prepareMaintenanceSourceGrounding(workspace, operationId, sourceStatus, options = {}) {
   const availableSourcePaths = (sourceStatus?.files || [])
     .filter((file) => file.state !== "removed")
@@ -2989,15 +4108,20 @@ async function prepareMaintenanceSourceGrounding(workspace, operationId, sourceS
     .sort();
   const available = new Set(availableSourcePaths);
   const requestedSourcePaths = Array.isArray(options.sourcePaths) ? options.sourcePaths : null;
+  const requiredSourcePaths = Array.isArray(options.requiredSourcePaths)
+    ? options.requiredSourcePaths
+    : [];
   const sourcePaths = requestedSourcePaths
     ? Array.from(
         new Set(
-          requestedSourcePaths
+          [...requestedSourcePaths, ...requiredSourcePaths]
             .map((sourcePath) => normalizeRelativePath(sourcePath))
             .filter(Boolean),
         ),
       ).sort()
-    : availableSourcePaths;
+    : options.useAllSources
+      ? Array.from(new Set([...availableSourcePaths, ...requiredSourcePaths])).sort()
+      : Array.from(new Set(requiredSourcePaths)).sort();
 
   if (requestedSourcePaths && sourcePaths.length === 0) {
     throw new Error("Choose at least one source for source-grounded Improve Wiki.");
@@ -3022,6 +4146,7 @@ async function prepareMaintenanceSourceGrounding(workspace, operationId, sourceS
 
   return {
     sourcePaths,
+    requiredSourcePaths,
     preparedSources: await prepareSourceArtifacts(workspace, operationId, sourcePaths),
   };
 }
@@ -3037,12 +4162,17 @@ function renderSourceGroundingForPrompt(sourceGrounding, sourceStatus) {
   const lines = [
     "",
     "Source-grounded improvement context:",
-    "- The user explicitly asked this Improve Wiki operation to use sources.",
-    "- Re-read relevant source files and compare them against the current wiki before editing.",
+    sourceGrounding.requiredSourcePaths?.length > 0
+      ? "- schema.md declares always-check source files for this workspace."
+      : "- The user explicitly asked this Improve Wiki operation to use sources.",
+    "- Re-read prepared structured Markdown for relevant source files and compare it against the current wiki before editing.",
+    "- Treat sources/** as canonical for citations; use .aiwiki/extracted artifacts as prepared reading context, not cited source files.",
+    "- Use rendered page images or original source files only when visuals, tables, equations, layout, or incomplete Markdown require verification.",
     "- Use source evidence to strengthen summaries, concept pages, guides, citations, and wikilinks.",
     "- Do not rebuild the wiki from scratch; preserve useful existing structure and improve it in place.",
     "- Do not modify, move, rename, create, or delete files under sources/**.",
     "- Do not edit .aiwiki/source-manifest.json; this is not a Build Wiki ingestion operation.",
+    `- Do not edit ${SOURCE_ARTIFACTS_PATH}; the runner owns prepared source metadata.`,
     "",
     "Selected source files for this run:",
   ];
@@ -3051,7 +4181,10 @@ function renderSourceGroundingForPrompt(sourceGrounding, sourceStatus) {
     lines.push("- No source files were found under sources/.");
   } else {
     for (const sourcePath of sourceGrounding.sourcePaths) {
-      lines.push(`- ${sourcePath} (${stateByPath.get(sourcePath) || "current"})`);
+      const required = sourceGrounding.requiredSourcePaths?.includes(sourcePath)
+        ? ", always-check"
+        : "";
+      lines.push(`- ${sourcePath} (${stateByPath.get(sourcePath) || "current"}${required})`);
     }
   }
 
@@ -3126,6 +4259,7 @@ ${forbiddenPathBlock}
 
 ${sourceBoundary}
 - Do not edit .aiwiki/source-manifest.json; the runner owns source ingestion state.
+- Do not edit ${SOURCE_ARTIFACTS_PATH}; the runner owns prepared source metadata.
 - Do not edit ${ASSET_REGISTRY_PATH}; Maple owns image asset metadata.
 - Update schema.md only when the user explicitly asks for a durable rule or workspace preference, except when running Update Rules.
 ${agentBoundary}
@@ -4033,6 +5167,7 @@ ${renderAllowedPathRulesForPrompt(WIKI_WRITE_ALLOWED_PATHS)}
 - Never edit, rename, delete, or create files under sources/**.
 - Do not edit AGENTS.md or CLAUDE.md.
 - Do not edit .aiwiki/source-manifest.json; the runner owns source ingestion state.
+- Do not edit ${SOURCE_ARTIFACTS_PATH}; the runner owns prepared source metadata.
 - Update schema.md only when the user explicitly asks for a durable rule or workspace preference.
 - The Maple runner validates paths, changed files, and report state after you exit.
 ${webReferenceRules}
@@ -4466,6 +5601,20 @@ async function collectExploreSourceVisualContext(workspace, provider, options = 
 }
 
 async function findLatestExtractedSourceForChat(workspace, sourcePath) {
+  const artifact = await resolveSourceArtifact(workspace, sourcePath).catch(() => null);
+  if (artifact?.latestPath) {
+    try {
+      const result = await readRenderedPdfResult(safeJoin(workspace, artifact.latestPath));
+      return normalizeExploreSourceArtifacts(workspace, {
+        sourcePath,
+        sourceSlug: artifact.sourceSlug || slugFromSourcePath(sourcePath),
+        operationId: "latest",
+        result,
+        sourceArtifact: artifact,
+      });
+    } catch (_error) {}
+  }
+
   const extractedRoot = path.join(workspace, ".aiwiki", "extracted");
   let operationDirs;
   try {
@@ -4476,7 +5625,7 @@ async function findLatestExtractedSourceForChat(workspace, sourcePath) {
 
   const sourceSlug = slugFromSourcePath(sourcePath);
   const operationIds = operationDirs
-    .filter((entry) => entry.isDirectory())
+    .filter(isHistoricalExtractedOperationDir)
     .map((entry) => entry.name)
     .sort()
     .reverse();
@@ -4525,6 +5674,7 @@ function normalizeExploreSourceArtifacts(workspace, options) {
     sourcePath: options.sourcePath,
     sourceSlug: options.sourceSlug,
     operationId: options.operationId,
+    sourceArtifact: options.sourceArtifact || null,
     pageCount: Number(result.pageCount) || result.promptPageImages.length,
     textPath: result.textPath ? toPosixRelative(workspace, result.textPath) : "",
     contactSheetPath: result.contactSheetPath ? toPosixRelative(workspace, result.contactSheetPath) : "",
@@ -5005,11 +6155,18 @@ function renderExploreSourceVisualContextForPrompt(context) {
 }
 
 function isExtractableSource(sourcePath) {
-  return isPdfSource(sourcePath) || isHtmlSource(sourcePath) || requiresLibreOfficeExtraction(sourcePath);
+  return isPdfSource(sourcePath) ||
+    isDocxSource(sourcePath) ||
+    isHtmlSource(sourcePath) ||
+    requiresLibreOfficeExtraction(sourcePath);
 }
 
 function isPdfSource(sourcePath) {
   return /\.pdf$/i.test(sourcePath);
+}
+
+function isDocxSource(sourcePath) {
+  return /\.docx$/i.test(sourcePath);
 }
 
 function isHtmlSource(sourcePath) {
@@ -5017,7 +6174,7 @@ function isHtmlSource(sourcePath) {
 }
 
 function requiresLibreOfficeExtraction(sourcePath) {
-  return /\.(pptx?|docx?|xlsx?)$/i.test(sourcePath);
+  return /\.(pptx?|doc|xlsx?)$/i.test(sourcePath);
 }
 
 async function prepareSelectedSourceTextForChat(workspace, sourcePath, operationId, maxChars) {
@@ -5039,7 +6196,65 @@ function renderContextBlock(label, content) {
   return `<${label}>\n${content}\n</${label}>`;
 }
 
+function isPlainTextSource(sourcePath) {
+  return /\.(md|txt)$/i.test(sourcePath);
+}
+
+function sourceFormatForPath(sourcePath) {
+  const ext = path.extname(sourcePath).toLowerCase().replace(/^\./, "");
+  if (!ext) return "unknown";
+  if (ext === "htm") return "html";
+  if (ext === "jpeg") return "jpg";
+  return ext;
+}
+
+function detectPdfUseAsFromSignals(sourcePath, text = "") {
+  const name = path.basename(sourcePath).toLowerCase();
+  const lowerText = String(text || "").toLowerCase();
+  const haystack = `${name}\n${lowerText.slice(0, 30000)}`;
+  const imageCount = extractMarkdownImageTargets(text).length;
+  const tableLineCount = String(text || "").split(/\r?\n/).filter((line) => line.includes("|")).length;
+  const headingCount = (String(text || "").match(/^#{1,6}\s+/gm) || []).length;
+  const textChars = String(text || "").replace(/\s+/g, "").length;
+
+  if (/\b(slide(?:s)?|lecture deck|deck|presentation)\b/.test(haystack)) {
+    return "mostly-visual";
+  }
+  if (textChars < 2500 && imageCount >= 3) {
+    return "mostly-visual";
+  }
+  if (imageCount >= 3 || tableLineCount >= 8 || /\b(diagram|figure|graph|table|equation)\b/.test(haystack)) {
+    return "text-with-diagrams";
+  }
+  if (headingCount >= 8 && imageCount > 0) {
+    return "text-with-diagrams";
+  }
+  return "mostly-text";
+}
+
+function pdfUseAsInstruction(useAs) {
+  switch (useAs) {
+    case "mostly-text":
+      return "Use prepared Markdown as the primary reading material; use images only if Markdown is clearly insufficient.";
+    case "text-with-diagrams":
+      return "Use prepared Markdown plus important extracted figures, diagrams, tables, and equations when they carry meaning.";
+    case "mostly-visual":
+      return "Inspect rendered page images more actively because page visuals, slide sequence, or scan layout may carry meaning.";
+    default:
+      return "Use prepared Markdown first, then inspect visuals when needed to avoid unsupported claims.";
+  }
+}
+
 async function readLatestPreparedSourceText(workspace, sourcePath, maxChars) {
+  const artifact = await resolveSourceArtifact(workspace, sourcePath).catch(() => null);
+  if (artifact?.structuredMarkdown) {
+    try {
+      const content = await fsp.readFile(safeJoin(workspace, artifact.structuredMarkdown), "utf8");
+      if (content.length <= maxChars) return content;
+      return `${content.slice(0, maxChars)}\n\n[truncated after ${maxChars} characters]`;
+    } catch (_error) {}
+  }
+
   const extractedRoot = path.join(workspace, ".aiwiki", "extracted");
   let operationDirs;
   try {
@@ -5050,7 +6265,7 @@ async function readLatestPreparedSourceText(workspace, sourcePath, maxChars) {
 
   const sourceSlug = slugFromSourcePath(sourcePath);
   const candidates = operationDirs
-    .filter((entry) => entry.isDirectory())
+    .filter(isHistoricalExtractedOperationDir)
     .map((entry) => entry.name)
     .sort()
     .reverse()
@@ -5069,13 +6284,41 @@ async function readLatestPreparedSourceText(workspace, sourcePath, maxChars) {
   return null;
 }
 
+function isHistoricalExtractedOperationDir(entry) {
+  return entry.isDirectory() && entry.name !== EXTRACTED_LATEST_DIR_NAME;
+}
+
 function renderPreparedSourcesForPrompt(preparedSources) {
   if (!preparedSources.sources.length) return "";
 
   const lines = ["", "Prepared source artifacts:"];
   for (const source of preparedSources.sources) {
     lines.push(`- ${source.sourcePath}`);
-    if (source.textPath) lines.push(`  - Extracted text: ${source.textPath}`);
+    if (source.sourceFormat) lines.push(`  - Source format: ${source.sourceFormat}`);
+    if (source.pdfUseAs) {
+      lines.push(`  - PDF reading mode: ${source.pdfUseAs}`);
+      if (source.detectedUseAs && source.detectedUseAs !== source.pdfUseAs) {
+        lines.push(`  - Detected PDF reading mode: ${source.detectedUseAs}`);
+      }
+      lines.push(`  - PDF handling: ${pdfUseAsInstruction(source.pdfUseAs)}`);
+    }
+    if (source.textPath) {
+      const markdownLabel = source.pdfUseAs === "mostly-visual" || source.detectedUseAs === "mostly-visual"
+        ? "Prepared Markdown orientation/outline"
+        : "Prepared structured Markdown";
+      lines.push(`  - ${markdownLabel}: ${source.textPath}`);
+    }
+    if (source.sourceArtifact) {
+      const extractor = source.sourceArtifact.textExtractor || "unknown";
+      const materialType = source.sourceArtifact.materialType || source.materialType || "unknown";
+      const textPolicy = source.sourceArtifact.textPolicy || source.textPolicy || "markdown-first";
+      const visualPolicy = source.sourceArtifact.visualPolicy || source.visualPolicy || "selective";
+      lines.push(`  - Text extractor: ${extractor}`);
+      lines.push(`  - Material policy: ${materialType}; text=${textPolicy}; visual=${visualPolicy}`);
+      if (source.sourceArtifact.structuredMarkdown && source.sourceArtifact.structuredMarkdown !== source.textPath) {
+        lines.push(`  - Latest Markdown artifact: ${source.sourceArtifact.structuredMarkdown}`);
+      }
+    }
     if (source.sourceImage) {
       if (source.visualInspectionMode === "path-referenced-images" && source.pagesToInspect?.[0]?.imageInputPath) {
         lines.push(`  - Source image path for inspection: ${source.pagesToInspect[0].imageInputPath}`);
@@ -5104,6 +6347,32 @@ function renderPreparedSourcesForPrompt(preparedSources) {
         lines.push(`    - fallbackReason: ${source.visualInspectionPlan.error}`);
       }
     }
+    if (source.inlineMarkdownFigures?.length) {
+      const hasPathReferences = source.inlineMarkdownFigures.some((figure) => figure.imageInputPath);
+      lines.push(
+        source.inlineMarkdownFiguresAttached
+          ? "  - Inline Markdown figures inspected as image attachments in this prompt:"
+          : hasPathReferences
+            ? "  - Inline Markdown figures inspected through path-referenced images in this prompt:"
+            : "  - Inline Markdown figures selected for inspection but not attached by this provider:",
+      );
+      for (const figure of source.inlineMarkdownFigures) {
+        const context = figure.context ? `; context: ${figure.context}` : "";
+        const line = figure.markdownLine ? `; Markdown line ${figure.markdownLine}` : "";
+        if (figure.imageInputPath) {
+          lines.push(
+            `    - Figure ${figure.index}: path-referenced image ${figure.imageInputPath}; ` +
+              `copy source: ${figure.path}${line}${context}`,
+          );
+        } else {
+          lines.push(`    - Figure ${figure.index}: ${figure.path}${line}${context}`);
+        }
+      }
+      lines.push(
+        "  - Wiki image candidates: prefer these full-resolution inline figures over full-page screenshots when they improve a concept page. " +
+          "If used, copy the listed figure PNG into wiki/assets/<topic-slug>/ and embed the copied wiki asset path.",
+      );
+    }
     const pagesToInspect = source.pagesToInspect?.length
       ? source.pagesToInspect
       : source.selectedPromptImages || [];
@@ -5127,14 +6396,23 @@ function renderPreparedSourcesForPrompt(preparedSources) {
           lines.push(`    - Page ${image.page}: ${image.promptImage}; full PNG: ${image.fullImage}${reason}`);
         }
       }
+      if (source.inlineMarkdownFigures?.length) {
+        lines.push(
+          "  - These rendered page images are inspection context only because cropped Markdown figure candidates exist for this source. " +
+            "Do not copy full-page screenshots into wiki/assets unless the complete page layout is itself the learning object.",
+        );
+      }
     }
     if (source.assetCandidates?.length) {
-      lines.push("  - Asset candidate full-resolution PNGs:");
+      lines.push("  - Fallback wiki image candidate full-resolution page PNGs:");
       for (const image of source.assetCandidates) {
         const reason = image.reason ? ` (${image.reason})` : "";
         lines.push(`    - Page ${image.page}: ${image.fullImage}${reason}`);
       }
-      lines.push("  - Treat asset candidates as suggestions, not a requirement to embed every image.");
+      lines.push(
+        "  - Use full-page PNGs as wiki assets only when no suitable cropped Markdown figure exists, " +
+          "or when the full page layout is the intended visual explanation.",
+      );
     }
     if (source.pageImages?.length && !pagesToInspect.length) {
       lines.push("  - Rendered page images exist locally, but none are attached to this Build Wiki prompt.");
@@ -5143,10 +6421,12 @@ function renderPreparedSourcesForPrompt(preparedSources) {
   return lines.join("\n");
 }
 
-async function prepareSourceArtifacts(workspace, operationId, sourcePaths = null) {
+async function prepareSourceArtifacts(workspace, operationId, sourcePaths = null, options = {}) {
   const sourceFiles = Array.isArray(sourcePaths) ? sourcePaths : await listSourceFiles(workspace);
+  const sourceSlugByPath = createPrepareSourceSlugMap(sourceFiles);
   const prepared = {
     sources: [],
+    errors: [],
     imageAttachments: [],
     visualInput: {
       mode: "visual-inspection-planning",
@@ -5169,42 +6449,137 @@ async function prepareSourceArtifacts(workspace, operationId, sourcePaths = null
     },
   };
 
+  const results = await mapWithConcurrency(
+    sourceFiles,
+    options.prepareConcurrency || PREPARE_SOURCE_CONCURRENCY,
+    (sourceFile) => prepareOneSourceArtifact(workspace, operationId, sourceFile, {
+      ...options,
+      sourceSlug: sourceSlugByPath.get(sourceFile) || slugFromSourcePath(sourceFile),
+    }),
+  );
+
+  for (const result of results) {
+    if (!result) continue;
+    if (result.error) {
+      prepared.errors.push(result.error);
+      continue;
+    }
+    if (result.source) prepared.sources.push(result.source);
+    if (result.imageAttachment) prepared.imageAttachments.push(result.imageAttachment);
+    if (result.cacheEntry) prepared.sourceExtractionCache.entries.push(result.cacheEntry);
+  }
+
+  return prepared;
+}
+
+function createPrepareSourceSlugMap(sourceFiles) {
+  const baseCounts = new Map();
   for (const sourceFile of sourceFiles) {
+    const baseSlug = slugFromSourcePath(sourceFile);
+    baseCounts.set(baseSlug, (baseCounts.get(baseSlug) || 0) + 1);
+  }
+
+  const slugs = new Map();
+  for (const sourceFile of sourceFiles) {
+    const baseSlug = slugFromSourcePath(sourceFile);
+    const slug = baseCounts.get(baseSlug) > 1
+      ? `${baseSlug}-${sha256(sourceFile).slice(0, 8)}`
+      : baseSlug;
+    slugs.set(sourceFile, slug);
+  }
+  return slugs;
+}
+
+async function prepareOneSourceArtifact(workspace, operationId, sourceFile, options = {}) {
+  try {
+    await markSourcePreparationStarted(workspace, sourceFile, operationId, options);
+
     if (isPromptImageSource(sourceFile)) {
       const imagePath = safeJoin(workspace, sourceFile);
-      prepared.sources.push({
+      const source = {
         sourcePath: sourceFile,
-        sourceSlug: slugFromSourcePath(sourceFile),
+        sourceSlug: options.sourceSlug || slugFromSourcePath(sourceFile),
+        sourceFormat: sourceFormatForPath(sourceFile),
         textPath: "",
         manifestPath: "",
         sourceImage: sourceFile,
         pageImages: [],
         promptPageImages: [],
         selectedPromptImages: [],
+      };
+      await markSourcePreparationReady(workspace, sourceFile, operationId, {
+        preparedPath: sourceFile,
+        sourceSlug: source.sourceSlug,
+        sourceFormat: source.sourceFormat,
       });
-      prepared.imageAttachments.push(imagePath);
-      continue;
+      return { source, imageAttachment: imagePath };
     }
 
+    if (isPlainTextSource(sourceFile)) {
+      const source = {
+        sourcePath: sourceFile,
+        sourceSlug: options.sourceSlug || slugFromSourcePath(sourceFile),
+        sourceFormat: sourceFormatForPath(sourceFile),
+        textPath: sourceFile,
+        manifestPath: "",
+        pageImages: [],
+        promptPageImages: [],
+        contactSheetPath: "",
+        contactSheets: [],
+        selectedPromptImages: [],
+        pageCount: 0,
+        pages: [],
+      };
+      await markSourcePreparationReady(workspace, sourceFile, operationId, {
+        preparedPath: sourceFile,
+        sourceSlug: source.sourceSlug,
+        sourceFormat: source.sourceFormat,
+      });
+      return { source };
+    }
+
+    const isDocx = isDocxSource(sourceFile);
     const isPdf = isPdfSource(sourceFile);
     const isHtml = isHtmlSource(sourceFile);
     const isLibreOfficeSource = requiresLibreOfficeExtraction(sourceFile);
-    if (!isPdf && !isHtml && !isLibreOfficeSource) continue;
+    if (!isDocx && !isPdf && !isHtml && !isLibreOfficeSource) {
+      await markSourcePreparationReady(workspace, sourceFile, operationId, {
+        preparedPath: sourceFile,
+        sourceSlug: options.sourceSlug || slugFromSourcePath(sourceFile),
+        sourceFormat: sourceFormatForPath(sourceFile),
+      });
+      return {};
+    }
 
-    const sourceSlug = slugFromSourcePath(sourceFile);
+    const sourceSlug = options.sourceSlug || slugFromSourcePath(sourceFile);
     const outputDir = path.join(workspace, ".aiwiki", "extracted", operationId, sourceSlug);
     await ensureDir(outputDir);
 
-    const extraction = isHtml
+    const extraction = isDocx
+      ? await extractDocxSourceArtifactsWithCache(workspace, {
+          sourceFile,
+          sourceSlug,
+          outputDir,
+          force: Boolean(options.forcePreparation),
+          operationId,
+        })
+      : isHtml
       ? await extractHtmlSourceArtifactsWithCache(workspace, {
           sourceFile,
+          sourceSlug,
           outputDir,
+          force: Boolean(options.forcePreparation),
+          operationId,
         })
       : await extractSourceArtifactsWithCache(workspace, {
           sourceFile,
+          sourceSlug,
           outputDir,
           isPdf,
           isLibreOfficeSource,
+          force: Boolean(options.forcePreparation),
+          pdfUseAs: options.pdfUseAs,
+          operationId,
         });
     const result = extraction.result;
     const pageImages = result.pageImages.map((imagePath) => toPosixRelative(workspace, imagePath));
@@ -5225,36 +6600,54 @@ async function prepareSourceArtifacts(workspace, operationId, sourcePaths = null
       sourcePath: sourceFile,
       cachePath: toPosixRelative(workspace, cacheDir),
     };
+    const sourceArtifact = cacheMetadata.sourceArtifact || null;
 
-    prepared.sources.push({
-      sourcePath: sourceFile,
-      sourceSlug,
-      textPath: toPosixRelative(workspace, result.textPath),
-      manifestPath: toPosixRelative(workspace, result.manifestPath),
-      pageImages,
-      promptPageImages,
-      contactSheetPath,
-      contactSheets,
-      selectedPromptImages: [],
-      pageCount: result.pageCount,
-      pages: result.pages,
-      convertedFromPptx: extraction.convertedFromPptx,
-      convertedFromOffice: extraction.convertedFromOffice,
-      extractionCache: cacheEntry,
-    });
-    prepared.sourceExtractionCache.entries.push(cacheEntry);
+    return {
+      source: {
+        sourcePath: sourceFile,
+        sourceSlug,
+        sourceFormat: sourceFormatForPath(sourceFile),
+        textPath: toPosixRelative(workspace, result.textPath),
+        manifestPath: toPosixRelative(workspace, result.manifestPath),
+        pageImages,
+        promptPageImages,
+        contactSheetPath,
+        contactSheets,
+        selectedPromptImages: [],
+        pageCount: result.pageCount,
+        pages: result.pages,
+        convertedFromPptx: extraction.convertedFromPptx,
+        convertedFromOffice: extraction.convertedFromOffice,
+        extractionCache: cacheEntry,
+        sourceArtifact,
+        materialType: sourceArtifact?.materialType || "",
+        textPolicy: sourceArtifact?.textPolicy || "",
+        visualPolicy: sourceArtifact?.visualPolicy || "",
+        pdfUseAs: sourceArtifact?.useAs || "",
+        detectedUseAs: sourceArtifact?.detectedUseAs || "",
+      },
+      cacheEntry,
+    };
+  } catch (error) {
+    await markSourcePreparationFailed(workspace, sourceFile, operationId, error).catch(() => {});
+    if (!options.continueOnError) throw error;
+    return {
+      error: {
+        sourcePath: sourceFile,
+        error: error.message,
+      },
+    };
   }
-
-  return prepared;
 }
 
 async function extractSourceArtifactsWithCache(workspace, options) {
   const sourceAbsolutePath = safeJoin(workspace, options.sourceFile);
-  const sourceBuffer = await fsp.readFile(sourceAbsolutePath);
-  const sourceSha256 = sha256(sourceBuffer);
+  const sourceInfo = await sourceFingerprint(workspace, options.sourceFile);
+  const sourceSha256 = sourceInfo.sha256;
   const sourceExtension = path.extname(options.sourceFile).toLowerCase();
   const cacheSettings = {
     extractorVersion: EXTRACTOR_VERSION,
+    structuredMarkdown: "docling-mineru-pdfkit",
     fullPageRenderWidth: FULL_PAGE_RENDER_WIDTH,
     promptPageRenderWidth: PROMPT_PAGE_RENDER_WIDTH,
     promptPageJpegQuality: PROMPT_PAGE_JPEG_QUALITY,
@@ -5266,10 +6659,32 @@ async function extractSourceArtifactsWithCache(workspace, options) {
   const cacheKey = sha256(JSON.stringify({ sourceSha256, sourceExtension, cacheSettings }));
   const cacheDir = path.join(workspace, ".aiwiki", "cache", "extracted", cacheKey);
   const manifestPath = path.join(cacheDir, "manifest.json");
+  const sourceSlug = options.sourceSlug || slugFromSourcePath(options.sourceFile);
 
-  if (await exists(manifestPath)) {
+  return withAsyncKeyLock(sourceExtractionCacheLockKey(cacheDir), async () => {
+  let cacheHealth = null;
+  if (!options.force && await exists(manifestPath)) {
+    cacheHealth = await validatePreparedOutputDir(workspace, cacheDir, {
+      sourcePath: options.sourceFile,
+    });
+  }
+
+  if (!options.force && cacheHealth?.ok) {
     await fsp.rm(options.outputDir, { recursive: true, force: true });
     await copyPath(cacheDir, options.outputDir);
+    const sourceArtifact = await syncLatestSourceArtifact(workspace, {
+      sourcePath: options.sourceFile,
+      sourceSlug,
+      sourceSha256,
+      sourceSize: sourceInfo.size,
+      sourceMtimeMs: sourceInfo.mtimeMs,
+      outputDir: options.outputDir,
+      cacheKey,
+      cacheDir,
+      extractorVersion: EXTRACTOR_VERSION,
+      operationId: options.operationId,
+      pdfUseAs: options.pdfUseAs,
+    });
     return {
       result: await readRenderedPdfResult(options.outputDir),
       convertedFromPptx: !options.isPdf,
@@ -5280,8 +6695,12 @@ async function extractSourceArtifactsWithCache(workspace, options) {
         cacheDir,
         sourceSha256,
         extractorVersion: EXTRACTOR_VERSION,
+        sourceArtifact,
       },
     };
+  }
+  if (!options.force && cacheHealth && !cacheHealth.ok) {
+    await fsp.rm(cacheDir, { recursive: true, force: true });
   }
 
   let pdfPath;
@@ -5295,12 +6714,34 @@ async function extractSourceArtifactsWithCache(workspace, options) {
   }
 
   const result = await renderPdfWithPdfKit(pdfPath, options.outputDir);
+  await augmentRenderedPdfWithStructuredMarkdown(pdfPath, options.outputDir, {
+    sourceFile: options.sourceFile,
+  });
+  const outputHealth = await validatePreparedOutputDir(workspace, options.outputDir, {
+    sourcePath: options.sourceFile,
+  });
+  if (!outputHealth.ok) {
+    throw new Error(`Prepared Markdown health check failed: ${outputHealth.reason}`);
+  }
   await fsp.rm(cacheDir, { recursive: true, force: true });
   await ensureDir(path.dirname(cacheDir));
   await copyPath(options.outputDir, cacheDir);
+  const sourceArtifact = await syncLatestSourceArtifact(workspace, {
+    sourcePath: options.sourceFile,
+    sourceSlug,
+    sourceSha256,
+    sourceSize: sourceInfo.size,
+    sourceMtimeMs: sourceInfo.mtimeMs,
+    outputDir: options.outputDir,
+    cacheKey,
+    cacheDir,
+    extractorVersion: EXTRACTOR_VERSION,
+    operationId: options.operationId,
+    pdfUseAs: options.pdfUseAs,
+  });
 
   return {
-    result,
+    result: await readRenderedPdfResult(options.outputDir),
     convertedFromPptx,
     convertedFromOffice: convertedFromPptx,
     cache: {
@@ -5309,14 +6750,180 @@ async function extractSourceArtifactsWithCache(workspace, options) {
       cacheDir,
       sourceSha256,
       extractorVersion: EXTRACTOR_VERSION,
+      sourceArtifact,
     },
   };
+  });
+}
+
+async function extractDocxSourceArtifactsWithCache(workspace, options) {
+  const sourceAbsolutePath = safeJoin(workspace, options.sourceFile);
+  const sourceInfo = await sourceFingerprint(workspace, options.sourceFile);
+  const sourceSha256 = sourceInfo.sha256;
+  const sourceExtension = path.extname(options.sourceFile).toLowerCase();
+  const cacheSettings = {
+    extractorVersion: EXTRACTOR_VERSION,
+    kind: "mammoth-docx-markdown",
+  };
+  const cacheKey = sha256(JSON.stringify({ sourceSha256, sourceExtension, cacheSettings }));
+  const cacheDir = path.join(workspace, ".aiwiki", "cache", "extracted", cacheKey);
+  const manifestPath = path.join(cacheDir, "manifest.json");
+  const sourceSlug = options.sourceSlug || slugFromSourcePath(options.sourceFile);
+
+  return withAsyncKeyLock(sourceExtractionCacheLockKey(cacheDir), async () => {
+  let cacheHealth = null;
+  if (!options.force && await exists(manifestPath)) {
+    cacheHealth = await validatePreparedOutputDir(workspace, cacheDir, {
+      sourcePath: options.sourceFile,
+    });
+  }
+
+  if (!options.force && cacheHealth?.ok) {
+    await fsp.rm(options.outputDir, { recursive: true, force: true });
+    await copyPath(cacheDir, options.outputDir);
+    const sourceArtifact = await syncLatestSourceArtifact(workspace, {
+      sourcePath: options.sourceFile,
+      sourceSlug,
+      sourceSha256,
+      sourceSize: sourceInfo.size,
+      sourceMtimeMs: sourceInfo.mtimeMs,
+      outputDir: options.outputDir,
+      cacheKey,
+      cacheDir,
+      extractorVersion: EXTRACTOR_VERSION,
+      operationId: options.operationId,
+    });
+    return {
+      result: await readTextSourceExtractionResult(options.outputDir),
+      convertedFromPptx: false,
+      convertedFromOffice: false,
+      cache: {
+        hit: true,
+        cacheKey,
+        cacheDir,
+        sourceSha256,
+        extractorVersion: EXTRACTOR_VERSION,
+        kind: "mammoth-docx-markdown",
+        sourceArtifact,
+      },
+    };
+  }
+  if (!options.force && cacheHealth && !cacheHealth.ok) {
+    await fsp.rm(cacheDir, { recursive: true, force: true });
+  }
+
+  const result = await extractDocxSourceArtifacts(sourceAbsolutePath, options.outputDir, {
+    sourceFile: options.sourceFile,
+  });
+  const outputHealth = await validatePreparedOutputDir(workspace, options.outputDir, {
+    sourcePath: options.sourceFile,
+  });
+  if (!outputHealth.ok) {
+    throw new Error(`Prepared Markdown health check failed: ${outputHealth.reason}`);
+  }
+  await fsp.rm(cacheDir, { recursive: true, force: true });
+  await ensureDir(path.dirname(cacheDir));
+  await copyPath(options.outputDir, cacheDir);
+  const sourceArtifact = await syncLatestSourceArtifact(workspace, {
+    sourcePath: options.sourceFile,
+    sourceSlug,
+    sourceSha256,
+    sourceSize: sourceInfo.size,
+    sourceMtimeMs: sourceInfo.mtimeMs,
+    outputDir: options.outputDir,
+    cacheKey,
+    cacheDir,
+    extractorVersion: EXTRACTOR_VERSION,
+    operationId: options.operationId,
+  });
+
+  return {
+    result,
+    convertedFromPptx: false,
+    convertedFromOffice: false,
+    cache: {
+      hit: false,
+      cacheKey,
+      cacheDir,
+      sourceSha256,
+      extractorVersion: EXTRACTOR_VERSION,
+      kind: "mammoth-docx-markdown",
+      sourceArtifact,
+    },
+  };
+  });
+}
+
+async function extractDocxSourceArtifacts(sourceAbsolutePath, outputDir, options = {}) {
+  await ensureDir(outputDir);
+  const artifactsDir = path.join(outputDir, "artifacts");
+  let imageIndex = 0;
+  const messages = [];
+  const htmlResult = await mammoth.convertToHtml({ path: sourceAbsolutePath }, {
+    convertImage: mammoth.images.imgElement(async (image) => {
+      await ensureDir(artifactsDir);
+      imageIndex += 1;
+      const extension = extensionForMimeType(image.contentType) || "bin";
+      const fileName = `image-${String(imageIndex).padStart(3, "0")}.${extension}`;
+      const imagePath = path.join(artifactsDir, fileName);
+      const base64 = await image.read("base64");
+      await fsp.writeFile(imagePath, Buffer.from(base64, "base64"));
+      return { src: `artifacts/${fileName}` };
+    }),
+  });
+  messages.push(...(htmlResult.messages || []));
+
+  const markdown = docxHtmlToMarkdown(htmlResult.value, {
+    sourceFile: options.sourceFile || sourceAbsolutePath,
+  });
+  const textPath = path.join(outputDir, "text.md");
+  const manifestPath = path.join(outputDir, "manifest.json");
+  const imageTargets = extractPreparedMarkdownImageTargets(markdown);
+  const materialClassification = classifySourceMaterial(
+    options.sourceFile || sourceAbsolutePath,
+    markdown,
+    { sourceType: "docx", pageCount: 0, textExtractor: "mammoth" },
+  );
+
+  await fsp.writeFile(textPath, markdown.endsWith("\n") ? markdown : `${markdown}\n`);
+  await fsp.writeFile(
+    manifestPath,
+    `${JSON.stringify(
+      {
+        source: sourceAbsolutePath,
+        sourceType: "docx",
+        pageCount: 0,
+        textPath: "text.md",
+        contactSheets: [],
+        pages: [],
+        textExtractor: "mammoth",
+        textExtractorAttempts: [
+          {
+            extractor: "mammoth",
+            status: "succeeded",
+            reason: "",
+          },
+        ],
+        structuredMarkdown: true,
+        messageCount: messages.length,
+        messages: messages.map((message) => ({
+          type: message.type || "",
+          message: cleanCommandText(message.message || "").slice(0, 500),
+        })),
+        imageCount: imageTargets.length,
+        materialClassification,
+      },
+      null,
+      2,
+    )}\n`,
+  );
+  return readTextSourceExtractionResult(outputDir);
 }
 
 async function extractHtmlSourceArtifactsWithCache(workspace, options) {
   const sourceAbsolutePath = safeJoin(workspace, options.sourceFile);
-  const sourceBuffer = await fsp.readFile(sourceAbsolutePath);
-  const sourceSha256 = sha256(sourceBuffer);
+  const sourceInfo = await sourceFingerprint(workspace, options.sourceFile);
+  const sourceSha256 = sourceInfo.sha256;
   const sourceExtension = path.extname(options.sourceFile).toLowerCase();
   const cacheSettings = {
     extractorVersion: EXTRACTOR_VERSION,
@@ -5325,10 +6932,31 @@ async function extractHtmlSourceArtifactsWithCache(workspace, options) {
   const cacheKey = sha256(JSON.stringify({ sourceSha256, sourceExtension, cacheSettings }));
   const cacheDir = path.join(workspace, ".aiwiki", "cache", "extracted", cacheKey);
   const manifestPath = path.join(cacheDir, "manifest.json");
+  const sourceSlug = options.sourceSlug || slugFromSourcePath(options.sourceFile);
 
-  if (await exists(manifestPath)) {
+  return withAsyncKeyLock(sourceExtractionCacheLockKey(cacheDir), async () => {
+  let cacheHealth = null;
+  if (!options.force && await exists(manifestPath)) {
+    cacheHealth = await validatePreparedOutputDir(workspace, cacheDir, {
+      sourcePath: options.sourceFile,
+    });
+  }
+
+  if (!options.force && cacheHealth?.ok) {
     await fsp.rm(options.outputDir, { recursive: true, force: true });
     await copyPath(cacheDir, options.outputDir);
+    const sourceArtifact = await syncLatestSourceArtifact(workspace, {
+      sourcePath: options.sourceFile,
+      sourceSlug,
+      sourceSha256,
+      sourceSize: sourceInfo.size,
+      sourceMtimeMs: sourceInfo.mtimeMs,
+      outputDir: options.outputDir,
+      cacheKey,
+      cacheDir,
+      extractorVersion: EXTRACTOR_VERSION,
+      operationId: options.operationId,
+    });
     return {
       result: await readTextSourceExtractionResult(options.outputDir),
       convertedFromPptx: false,
@@ -5340,16 +6968,38 @@ async function extractHtmlSourceArtifactsWithCache(workspace, options) {
         sourceSha256,
         extractorVersion: EXTRACTOR_VERSION,
         kind: "html-text",
+        sourceArtifact,
       },
     };
+  }
+  if (!options.force && cacheHealth && !cacheHealth.ok) {
+    await fsp.rm(cacheDir, { recursive: true, force: true });
   }
 
   const result = await extractHtmlSourceArtifacts(sourceAbsolutePath, options.outputDir, {
     sourceFile: options.sourceFile,
   });
+  const outputHealth = await validatePreparedOutputDir(workspace, options.outputDir, {
+    sourcePath: options.sourceFile,
+  });
+  if (!outputHealth.ok) {
+    throw new Error(`Prepared Markdown health check failed: ${outputHealth.reason}`);
+  }
   await fsp.rm(cacheDir, { recursive: true, force: true });
   await ensureDir(path.dirname(cacheDir));
   await copyPath(options.outputDir, cacheDir);
+  const sourceArtifact = await syncLatestSourceArtifact(workspace, {
+    sourcePath: options.sourceFile,
+    sourceSlug,
+    sourceSha256,
+    sourceSize: sourceInfo.size,
+    sourceMtimeMs: sourceInfo.mtimeMs,
+    outputDir: options.outputDir,
+    cacheKey,
+    cacheDir,
+    extractorVersion: EXTRACTOR_VERSION,
+    operationId: options.operationId,
+  });
 
   return {
     result,
@@ -5362,8 +7012,10 @@ async function extractHtmlSourceArtifactsWithCache(workspace, options) {
       sourceSha256,
       extractorVersion: EXTRACTOR_VERSION,
       kind: "html-text",
+      sourceArtifact,
     },
   };
+  });
 }
 
 async function extractHtmlSourceArtifacts(sourceAbsolutePath, outputDir, options = {}) {
@@ -5414,6 +7066,563 @@ async function readTextSourceExtractionResult(outputDir) {
     pageCount: 0,
     pages: [],
   };
+}
+
+async function augmentRenderedPdfWithStructuredMarkdown(pdfPath, outputDir, options = {}) {
+  const attempts = [];
+  const pdfKitTextPath = path.join(outputDir, "text.md");
+  const pdfKitFallbackPath = path.join(outputDir, "pdfkit-text.md");
+  if (await exists(pdfKitTextPath)) {
+    await fsp.copyFile(pdfKitTextPath, pdfKitFallbackPath).catch(() => {});
+  }
+
+  for (const converter of [convertPdfWithDocling, convertPdfWithMineru]) {
+    const extractor = converter.extractorName;
+    try {
+      const converted = await converter(pdfPath);
+      const markdown = await normalizeConvertedMarkdownAssets(converted.markdownPath, outputDir);
+      await fsp.rm(converted.outputDir, { recursive: true, force: true }).catch(() => {});
+      if (markdown.trim().length < 100) {
+        throw new Error("converter returned too little Markdown");
+      }
+      await fsp.writeFile(pdfKitTextPath, markdown.endsWith("\n") ? markdown : `${markdown}\n`);
+      attempts.push({
+        extractor,
+        status: "succeeded",
+        reason: "",
+      });
+      await updateRenderedManifest(outputDir, {
+        sourceType: "pdf",
+        textPath: "text.md",
+        rawTextPath: await exists(pdfKitFallbackPath) ? "pdfkit-text.md" : "",
+        textExtractor: extractor,
+        textExtractorAttempts: attempts,
+        structuredMarkdown: true,
+      }, options);
+      return {
+        extractor,
+        attempts,
+      };
+    } catch (error) {
+      attempts.push({
+        extractor,
+        status: "failed",
+        reason: cleanCommandText(error.message).slice(0, 500),
+      });
+    }
+  }
+
+  await updateRenderedManifest(outputDir, {
+    sourceType: "pdf",
+    textPath: "text.md",
+    rawTextPath: await exists(pdfKitFallbackPath) ? "pdfkit-text.md" : "",
+    textExtractor: "pdfkit",
+    textExtractorAttempts: attempts.concat([{
+      extractor: "pdfkit",
+      status: "fallback",
+      reason: "structured Markdown converters unavailable or failed",
+    }]),
+    structuredMarkdown: false,
+  }, options);
+  return {
+    extractor: "pdfkit",
+    attempts,
+  };
+}
+
+async function updateRenderedManifest(outputDir, patch, options = {}) {
+  const manifestPath = path.join(outputDir, "manifest.json");
+  const manifest = JSON.parse(await fsp.readFile(manifestPath, "utf8"));
+  const textPath = path.join(outputDir, patch.textPath || manifest.textPath || "text.md");
+  const text = await fsp.readFile(textPath, "utf8").catch(() => "");
+  const materialClassification = classifySourceMaterial(options.sourceFile || manifest.source || "", text, {
+    ...manifest,
+    ...patch,
+  });
+  await fsp.writeFile(
+    manifestPath,
+    `${JSON.stringify({
+      ...manifest,
+      ...patch,
+      materialClassification,
+    }, null, 2)}\n`,
+  );
+}
+
+async function normalizeConvertedMarkdownAssets(markdownPath, outputDir) {
+  const markdownDir = path.dirname(markdownPath);
+  const artifactsDir = path.join(outputDir, "artifacts");
+  const copiedBySource = new Map();
+  const usedNames = new Set();
+  const markdown = await fsp.readFile(markdownPath, "utf8");
+
+  let result = "";
+  let lastIndex = 0;
+  let searchIndex = 0;
+  while (searchIndex < markdown.length) {
+    const image = findNextInlineMarkdownImage(markdown, searchIndex);
+    if (!image) break;
+
+    result += markdown.slice(lastIndex, image.start);
+    lastIndex = image.end;
+    searchIndex = image.end;
+
+    const destination = parseLooseMarkdownDestination(image.rawDestination);
+    if (!destination || /^(?:[a-z][a-z0-9+.-]*:|\/\/)/i.test(destination)) {
+      result += image.raw;
+      continue;
+    }
+
+    const sourceImagePath = path.isAbsolute(destination)
+      ? destination
+      : path.resolve(markdownDir, destination);
+    if (!(await exists(sourceImagePath))) {
+      result += image.raw;
+      continue;
+    }
+
+    let relArtifact = copiedBySource.get(sourceImagePath);
+    if (!relArtifact) {
+      await ensureDir(artifactsDir);
+      const targetName = uniqueArtifactFileName(path.basename(sourceImagePath), usedNames);
+      const targetPath = path.join(artifactsDir, targetName);
+      await fsp.copyFile(sourceImagePath, targetPath);
+      relArtifact = `artifacts/${targetName}`;
+      copiedBySource.set(sourceImagePath, relArtifact);
+    }
+
+    result += `![${image.alt}](<${relArtifact}>)`;
+  }
+  result += markdown.slice(lastIndex);
+  return result.replace(/\0/g, "");
+}
+
+function findNextInlineMarkdownImage(markdown, startIndex = 0) {
+  let start = markdown.indexOf("![", startIndex);
+  while (start !== -1) {
+    const altStart = start + 2;
+    const altEnd = markdown.indexOf("]", altStart);
+    if (altEnd === -1) return null;
+    if (markdown[altEnd + 1] !== "(") {
+      start = markdown.indexOf("![", altEnd + 1);
+      continue;
+    }
+
+    const destinationStart = altEnd + 2;
+    let destinationEnd = -1;
+    if (markdown[destinationStart] === "<") {
+      const closeAngle = markdown.indexOf(">", destinationStart + 1);
+      if (closeAngle !== -1 && markdown[closeAngle + 1] === ")") {
+        destinationEnd = closeAngle + 1;
+      }
+    } else {
+      let depth = 0;
+      let escaped = false;
+      for (let index = destinationStart; index < markdown.length; index += 1) {
+        const char = markdown[index];
+        if (char === "\n" || char === "\r") break;
+        if (escaped) {
+          escaped = false;
+          continue;
+        }
+        if (char === "\\") {
+          escaped = true;
+          continue;
+        }
+        if (char === "(") {
+          depth += 1;
+          continue;
+        }
+        if (char === ")") {
+          if (depth > 0) {
+            depth -= 1;
+            continue;
+          }
+          destinationEnd = index;
+          break;
+        }
+      }
+    }
+
+    if (destinationEnd === -1) {
+      start = markdown.indexOf("![", altEnd + 1);
+      continue;
+    }
+
+    return {
+      start,
+      end: destinationEnd + 1,
+      raw: markdown.slice(start, destinationEnd + 1),
+      alt: markdown.slice(altStart, altEnd),
+      rawDestination: markdown.slice(destinationStart, destinationEnd),
+    };
+  }
+  return null;
+}
+
+function parseLooseMarkdownDestination(rawDestination) {
+  const raw = String(rawDestination || "").trim();
+  if (!raw) return "";
+  if (raw.startsWith("<")) {
+    const closeIndex = raw.indexOf(">");
+    return closeIndex === -1 ? "" : raw.slice(1, closeIndex).trim();
+  }
+  return raw.trim();
+}
+
+function docxHtmlToMarkdown(html, options = {}) {
+  const blocks = extractSimpleHtmlBlocks(html);
+  const lines = [];
+  let wroteTitle = false;
+
+  for (const block of blocks) {
+    const text = htmlInlineToMarkdown(block.inner).replace(/\s+/g, " ").trim();
+    if (!text) continue;
+
+    if (!wroteTitle) {
+      lines.push(`# ${stripMarkdownEmphasis(text)}`);
+      wroteTitle = true;
+      continue;
+    }
+
+    if (block.tag === "li") {
+      lines.push(`- ${text}`);
+      continue;
+    }
+
+    if (/^h[1-6]$/i.test(block.tag)) {
+      const level = Math.min(Number(block.tag.slice(1)) + 1, 6);
+      lines.push(`${"#".repeat(level)} ${stripMarkdownEmphasis(text)}`);
+      continue;
+    }
+
+    if (looksLikeSyllabusCodeLine(stripMarkdownEmphasis(text))) {
+      lines.push(`- ${stripMarkdownEmphasis(text)}`);
+      continue;
+    }
+
+    if (looksLikeDocxSectionHeading(block.inner, text)) {
+      lines.push(`## ${stripMarkdownEmphasis(text)}`);
+      continue;
+    }
+
+    lines.push(text);
+  }
+
+  const fallback = htmlToPlainText(html);
+  const markdown = (lines.length ? lines.join("\n\n") : fallback)
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  const sourceLine = options.sourceFile ? `\n\nSource: ${options.sourceFile}` : "";
+  return `${markdown || "(No readable text extracted.)"}${sourceLine}\n`;
+}
+
+function extractSimpleHtmlBlocks(html) {
+  const blocks = [];
+  const pattern = /<(p|h[1-6]|li)\b[^>]*>([\s\S]*?)<\/\1>/gi;
+  let match;
+  while ((match = pattern.exec(String(html || "")))) {
+    blocks.push({
+      tag: match[1].toLowerCase(),
+      inner: match[2],
+    });
+  }
+  return blocks;
+}
+
+function htmlInlineToMarkdown(html) {
+  let value = String(html || "")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<img\b([^>]*?)>/gi, (_match, attrs) => {
+      const src = htmlAttributeValue(attrs, "src");
+      const alt = htmlAttributeValue(attrs, "alt");
+      if (!src) return "";
+      return `![${escapeMarkdownAltText(alt)}](<${src}>)`;
+    })
+    .replace(/<strong\b[^>]*>([\s\S]*?)<\/strong>/gi, (_match, content) => {
+      const text = htmlInlineToMarkdown(content).trim();
+      return text ? `**${text}**` : "";
+    })
+    .replace(/<b\b[^>]*>([\s\S]*?)<\/b>/gi, (_match, content) => {
+      const text = htmlInlineToMarkdown(content).trim();
+      return text ? `**${text}**` : "";
+    })
+    .replace(/<em\b[^>]*>([\s\S]*?)<\/em>/gi, (_match, content) => {
+      const text = htmlInlineToMarkdown(content).trim();
+      return text ? `_${text}_` : "";
+    })
+    .replace(/<i\b[^>]*>([\s\S]*?)<\/i>/gi, (_match, content) => {
+      const text = htmlInlineToMarkdown(content).trim();
+      return text ? `_${text}_` : "";
+    })
+    .replace(/<a\b([^>]*?)>([\s\S]*?)<\/a>/gi, (_match, attrs, content) => {
+      const href = htmlAttributeValue(attrs, "href");
+      const text = htmlInlineToMarkdown(content).trim();
+      return href && text ? `[${text}](${href})` : text;
+    })
+    .replace(/<[^>]+>/g, " ");
+  value = decodeHtmlEntities(value).replace(/\u00a0/g, " ");
+  return value.replace(/[ \t]+/g, " ").trim();
+}
+
+function htmlAttributeValue(attrs, name) {
+  const pattern = new RegExp(`\\b${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s>]+))`, "i");
+  const match = String(attrs || "").match(pattern);
+  return decodeHtmlEntities(match?.[1] || match?.[2] || match?.[3] || "");
+}
+
+function looksLikeDocxSectionHeading(innerHtml, markdownText) {
+  const plain = stripMarkdownEmphasis(markdownText);
+  if (!plain || plain.length > 100) return false;
+  if (/[.!?]$/.test(plain)) return false;
+  if (looksLikeSyllabusCodeLine(plain)) return false;
+  const strongText = Array.from(String(innerHtml || "").matchAll(/<strong\b[^>]*>([\s\S]*?)<\/strong>/gi))
+    .map((match) => stripMarkdownEmphasis(htmlInlineToMarkdown(match[1])))
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (strongText && strongText.length >= Math.max(3, plain.length * 0.8)) return true;
+  return plain.length <= 80 && !plain.includes(":");
+}
+
+function looksLikeSyllabusCodeLine(text) {
+  return /^[A-Z]\d+(?:\.\d+)+\b/.test(String(text || "").trim());
+}
+
+function stripMarkdownEmphasis(text) {
+  return String(text || "")
+    .replace(/^\*\*(.*)\*\*$/s, "$1")
+    .replace(/^_(.*)_$/s, "$1")
+    .trim();
+}
+
+function escapeMarkdownAltText(text) {
+  return String(text || "").replace(/[\]\n\r]/g, " ").trim();
+}
+
+function extensionForMimeType(contentType) {
+  const normalized = String(contentType || "").toLowerCase();
+  if (normalized === "image/jpeg") return "jpg";
+  if (normalized === "image/png") return "png";
+  if (normalized === "image/gif") return "gif";
+  if (normalized === "image/webp") return "webp";
+  if (normalized === "image/svg+xml") return "svg";
+  return normalized.startsWith("image/") ? normalized.slice("image/".length).replace(/[^a-z0-9]+/g, "") : "";
+}
+
+function uniqueArtifactFileName(fileName, usedNames) {
+  const parsed = path.parse(fileName || "image");
+  const safeStem = (parsed.name || "image")
+    .replace(/[^A-Za-z0-9._-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 120) || "image";
+  const safeExt = (parsed.ext || "").replace(/[^A-Za-z0-9.]+/g, "").slice(0, 16);
+  let candidate = `${safeStem}${safeExt}`;
+  let index = 2;
+  while (usedNames.has(candidate)) {
+    candidate = `${safeStem}-${index}${safeExt}`;
+    index += 1;
+  }
+  usedNames.add(candidate);
+  return candidate;
+}
+
+async function convertPdfWithDocling(pdfPath) {
+  const outputDir = await fsp.mkdtemp(path.join(os.tmpdir(), "maple-docling-"));
+  const command = pdfMarkdownCommandCandidate("docling");
+  if (!command) {
+    throw new Error("docling command not found and uvx is unavailable");
+  }
+
+  const args = command.kind === "direct"
+    ? ["--to", "md", "--image-export-mode", "referenced", "--device", "cpu", "--output", outputDir, pdfPath]
+    : ["--python", "3.12", "--from", "docling", "docling", "--to", "md", "--image-export-mode", "referenced", "--device", "cpu", "--output", outputDir, pdfPath];
+  await runPdfMarkdownCommand(command.binary, args, { env: { PYTORCH_ENABLE_MPS_FALLBACK: "1" } });
+  const markdownPath = await findFirstMarkdownFile(outputDir);
+  if (!markdownPath) throw new Error("docling did not produce a Markdown file");
+  return { markdownPath, outputDir };
+}
+convertPdfWithDocling.extractorName = "docling";
+
+async function convertPdfWithMineru(pdfPath) {
+  const outputDir = await fsp.mkdtemp(path.join(os.tmpdir(), "maple-mineru-"));
+  const command = pdfMarkdownCommandCandidate("mineru");
+  if (!command) {
+    throw new Error("mineru command not found and uvx is unavailable");
+  }
+
+  const args = command.kind === "direct"
+    ? ["-p", pdfPath, "-o", outputDir, "-b", "pipeline", "-m", "txt", "-l", "en"]
+    : ["--python", "3.12", "--from", "mineru[core]", "mineru", "-p", pdfPath, "-o", outputDir, "-b", "pipeline", "-m", "txt", "-l", "en"];
+  await runPdfMarkdownCommand(command.binary, args, {
+    env: {
+      MINERU_DEVICE_MODE: "cpu",
+      PYTORCH_ENABLE_MPS_FALLBACK: "1",
+    },
+  });
+  const markdownPath = await findFirstMarkdownFile(outputDir);
+  if (!markdownPath) throw new Error("MinerU did not produce a Markdown file");
+  return { markdownPath, outputDir };
+}
+convertPdfWithMineru.extractorName = "mineru";
+
+function pdfMarkdownCommandCandidate(tool) {
+  const direct = findExecutable(tool);
+  if (direct) return { kind: "direct", binary: direct };
+  const uvx = findExecutable("uvx");
+  if (uvx) return { kind: "uvx", binary: uvx };
+  return null;
+}
+
+function findExecutable(command) {
+  const candidates = [command];
+  if (!path.isAbsolute(command)) {
+    candidates.push(path.join(os.homedir(), ".local", "bin", command));
+  }
+  for (const candidate of candidates) {
+    if (path.isAbsolute(candidate)) {
+      if (fs.existsSync(candidate)) return candidate;
+      continue;
+    }
+    const check = spawnSync("sh", ["-lc", `command -v ${shellQuote(candidate)}`], {
+      encoding: "utf8",
+      maxBuffer: 1024 * 1024,
+    });
+    if (check.status === 0 && check.stdout.trim()) {
+      return check.stdout.trim().split(/\r?\n/)[0];
+    }
+  }
+  return "";
+}
+
+function runCommandCapture(binary, args, options = {}) {
+  return new Promise((resolve) => {
+    const child = spawn(binary, args, {
+      env: options.env || process.env,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    const stdout = [];
+    const stderr = [];
+    const maxBuffer = Math.max(1, Number(options.maxBuffer) || 1024 * 1024 * 20);
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let timedOut = false;
+    let bufferExceeded = false;
+    let settled = false;
+
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      if (timeoutHandle) clearTimeout(timeoutHandle);
+      resolve({
+        ...result,
+        stdout: Buffer.concat(stdout).toString("utf8"),
+        stderr: Buffer.concat(stderr).toString("utf8"),
+        timedOut,
+      });
+    };
+    const append = (chunks, chunk, bytes) => {
+      const nextBytes = bytes + chunk.length;
+      if (nextBytes > maxBuffer) {
+        bufferExceeded = true;
+        try {
+          child.kill("SIGTERM");
+        } catch (_error) {}
+        return bytes;
+      }
+      chunks.push(chunk);
+      return nextBytes;
+    };
+    const timeoutHandle = options.timeout
+      ? setTimeout(() => {
+          timedOut = true;
+          try {
+            child.kill("SIGTERM");
+          } catch (_error) {}
+          setTimeout(() => {
+            try {
+              child.kill("SIGKILL");
+            } catch (_error) {}
+          }, 3000);
+        }, options.timeout)
+      : null;
+
+    child.stdout.on("data", (chunk) => {
+      stdoutBytes = append(stdout, chunk, stdoutBytes);
+    });
+    child.stderr.on("data", (chunk) => {
+      stderrBytes = append(stderr, chunk, stderrBytes);
+    });
+    child.on("error", (error) => {
+      finish({ status: null, signal: null, error });
+    });
+    child.on("close", (status, signal) => {
+      const error = timedOut
+        ? new Error(`${path.basename(binary)} timed out`)
+        : bufferExceeded
+          ? new Error(`${path.basename(binary)} output exceeded ${maxBuffer} bytes`)
+          : null;
+      finish({ status, signal, error });
+    });
+
+    if (options.input !== undefined) {
+      child.stdin.end(options.input);
+    } else {
+      child.stdin.end();
+    }
+  });
+}
+
+async function runPdfMarkdownCommand(binary, args, options = {}) {
+  const result = await runCommandCapture(binary, args, {
+    timeout: PDF_MARKDOWN_CONVERTER_TIMEOUT_MS,
+    maxBuffer: 1024 * 1024 * 80,
+    env: {
+      ...process.env,
+      ...(options.env || {}),
+    },
+  });
+  if (result.error) {
+    throw new Error(`${path.basename(binary)} failed: ${result.error.message}`);
+  }
+  if (result.status !== 0) {
+    throw new Error(
+      `${path.basename(binary)} exited with ${result.status}: ${cleanCommandText(result.stderr || result.stdout)}`,
+    );
+  }
+}
+
+async function findFirstMarkdownFile(root) {
+  const matches = [];
+  await walkAllFiles(root, async (filePath) => {
+    if (filePath.toLowerCase().endsWith(".md")) matches.push(filePath);
+  });
+  matches.sort((a, b) => {
+    const aBase = path.basename(a).toLowerCase();
+    const bBase = path.basename(b).toLowerCase();
+    if (aBase === "text.md") return -1;
+    if (bBase === "text.md") return 1;
+    return a.localeCompare(b);
+  });
+  return matches[0] || "";
+}
+
+async function walkAllFiles(current, visitor) {
+  const entries = await fsp.readdir(current, { withFileTypes: true }).catch(() => []);
+  entries.sort((a, b) => a.name.localeCompare(b.name));
+  for (const entry of entries) {
+    const entryPath = path.join(current, entry.name);
+    if (entry.isDirectory()) {
+      await walkAllFiles(entryPath, visitor);
+    } else if (entry.isFile()) {
+      await visitor(entryPath);
+    }
+  }
+}
+
+function shellQuote(value) {
+  return `'${String(value).replace(/'/g, "'\\''")}'`;
 }
 
 function extractHtmlTitle(html) {
@@ -5478,22 +7687,34 @@ async function convertOfficeSourceToPdf(sourcePath, outputDir) {
   const extension = path.extname(sourcePath).toLowerCase() || ".source";
   const stagedInputPath = path.join(outputDir, `source${extension}`);
   const expectedPdfPath = path.join(outputDir, "source.pdf");
+  const userInstallationDir = await fsp.mkdtemp(
+    path.join(os.tmpdir(), "maple-soffice-profile-"),
+  );
   await fsp.rm(stagedInputPath, { force: true }).catch(() => {});
   await fsp.rm(expectedPdfPath, { force: true }).catch(() => {});
   await fsp.copyFile(sourcePath, stagedInputPath);
 
-  const result = spawnSync(
-    "soffice",
-    [
-      "--headless",
-      "--convert-to",
-      "pdf",
-      "--outdir",
-      outputDir,
-      stagedInputPath,
-    ],
-    { encoding: "utf8", maxBuffer: 1024 * 1024 * 50 },
-  );
+  let result;
+  try {
+    result = await runCommandCapture(
+      "soffice",
+      [
+        `-env:UserInstallation=${pathToFileURL(userInstallationDir).href}`,
+        "--headless",
+        "--nologo",
+        "--nofirststartwizard",
+        "--nolockcheck",
+        "--convert-to",
+        "pdf",
+        "--outdir",
+        outputDir,
+        stagedInputPath,
+      ],
+      { maxBuffer: 1024 * 1024 * 50, timeout: 5 * 60 * 1000 },
+    );
+  } finally {
+    await fsp.rm(userInstallationDir, { recursive: true, force: true }).catch(() => {});
+  }
 
   if (result.error) {
     throw new Error(`Failed to run soffice: ${result.error.message}`);
@@ -5736,9 +7957,8 @@ try manifestData.write(to: outputDir.appendingPathComponent("manifest.json"))
 print(outputDir.path)
 `;
 
-  const result = spawnSync("swift", ["-", pdfPath, outputDir], {
+  const result = await runCommandCapture("swift", ["-", pdfPath, outputDir], {
     input: swift,
-    encoding: "utf8",
     maxBuffer: 1024 * 1024 * 20,
   });
 
@@ -6707,6 +8927,9 @@ function sourcePathsForBuild(sourceStatus, options = {}) {
   const currentPending = sourceStatus.files
     .filter((file) => file.state === "new" || file.state === "modified")
     .map((file) => file.path);
+  const requiredSourcePaths = Array.isArray(options.requiredSourcePaths)
+    ? options.requiredSourcePaths
+    : [];
 
   if (options.force) {
     return sourceStatus.files
@@ -6715,7 +8938,226 @@ function sourcePathsForBuild(sourceStatus, options = {}) {
       .sort();
   }
 
-  return currentPending.sort();
+  return Array.from(new Set([...currentPending, ...requiredSourcePaths])).sort();
+}
+
+function selectSourcePathsForBuild(sourceStatus, options = {}) {
+  if (!Array.isArray(options.sourcePaths)) {
+    return sourcePathsForBuild(sourceStatus, options);
+  }
+
+  const available = new Map(
+    (sourceStatus?.files || [])
+      .filter((file) => file.state !== "removed")
+      .map((file) => [file.path, file]),
+  );
+  const selected = [];
+  const requested = [
+    ...options.sourcePaths,
+    ...(Array.isArray(options.requiredSourcePaths) ? options.requiredSourcePaths : []),
+  ];
+  for (const sourcePath of requested) {
+    if (!available.has(sourcePath)) {
+      throw new Error(`Selected source is not available in the current workspace: ${sourcePath}`);
+    }
+    selected.push(sourcePath);
+  }
+  return Array.from(new Set(selected)).sort();
+}
+
+async function collectAlwaysCheckSourcePaths(workspace, sourceStatus = null) {
+  const schemaPath = path.join(workspace, "schema.md");
+  if (!(await exists(schemaPath))) return [];
+
+  const schema = await fsp.readFile(schemaPath, "utf8");
+  const declared = extractAlwaysCheckSourcePathsFromSchema(schema);
+  if (declared.length === 0) return [];
+
+  const status = sourceStatus || await getSourceStatus(workspace);
+  const available = new Set(
+    (status?.files || [])
+      .filter((file) => file.state !== "removed")
+      .map((file) => file.path),
+  );
+  return declared.filter((sourcePath) => available.has(sourcePath));
+}
+
+function extractAlwaysCheckSourcePathsFromSchema(schema) {
+  const lines = String(schema || "").split(/\r?\n/);
+  const blocks = [];
+  let active = null;
+
+  for (const line of lines) {
+    const headingMatch = line.match(/^(#{2,6})\s+(.+?)\s*$/);
+    if (headingMatch) {
+      const level = headingMatch[1].length;
+      const title = headingMatch[2].trim().toLowerCase();
+      if (level === 2 && ALWAYS_CHECK_SOURCE_SECTION_HEADINGS.has(title)) {
+        active = { level, lines: [] };
+        blocks.push(active);
+      } else if (active && level <= active.level) {
+        active = null;
+      }
+    } else if (active) {
+      active.lines.push(line);
+    }
+  }
+
+  const paths = [];
+  for (const block of blocks) {
+    const blockText = block.lines.join("\n");
+    const matches = blockText.matchAll(/`(sources\/[^`]+)`/g);
+    for (const match of matches) {
+      const normalized = normalizeRelativePath(match[1]);
+      if (normalized && normalized.startsWith("sources/") && !normalized.includes("*")) {
+        paths.push(normalized);
+      }
+    }
+  }
+  return Array.from(new Set(paths)).sort();
+}
+
+function renderAlwaysCheckSourcePathsForPrompt(sourcePaths = []) {
+  if (!Array.isArray(sourcePaths) || sourcePaths.length === 0) return "";
+  const lines = [
+    "",
+    "Always-check source context from schema.md:",
+    "- These source files are declared as durable context and must be checked even when unchanged.",
+  ];
+  for (const sourcePath of sourcePaths) {
+    lines.push(`- ${sourcePath}`);
+  }
+  return lines.join("\n");
+}
+
+async function getSourceReadiness(workspace, sourceStatus = null) {
+  const status = sourceStatus || await getSourceStatus(workspace);
+  const registry = await readSourceArtifactsRegistry(workspace);
+  const files = [];
+
+  for (const file of status.files || []) {
+    if (file.state === "removed") continue;
+    const record = registry.sources?.[file.path] || null;
+    const currentRecord = record && record.sourceSha256 === file.sha256 ? record : null;
+    const format = sourceFormatForPath(file.path);
+    const base = {
+      path: file.path,
+      format,
+      status: "not-prepared",
+      preparedAt: null,
+      preparedPath: null,
+      manifestPath: null,
+      error: null,
+    };
+
+    if (isPlainTextSource(file.path) || isPromptImageSource(file.path)) {
+      base.status = "ready";
+      base.preparedAt = currentRecord?.preparedAt || currentRecord?.updatedAt || null;
+      base.preparedPath = file.path;
+    } else if (currentRecord) {
+      let preparedStatus = currentRecord.status || "ready";
+      const preparationState = getSourcePreparationState(currentRecord);
+      if (preparedStatus === "preparing" && preparationState.stale) {
+        preparedStatus = "not-prepared";
+      }
+      let preparedExists = false;
+      if (currentRecord.structuredMarkdown) {
+        try {
+          preparedExists = await exists(safeJoin(workspace, currentRecord.structuredMarkdown));
+        } catch (_error) {
+          preparedExists = false;
+        }
+      }
+      base.status = preparedStatus;
+      if (preparationState.stale) {
+        base.health = {
+          ok: false,
+          reason: preparationState.reason,
+        };
+      }
+      if ((preparedStatus === "ready" || !currentRecord.status) && !preparedExists) {
+        base.status = "not-prepared";
+        base.health = {
+          ok: false,
+          reason: "missing-markdown-file",
+        };
+      } else if (preparedStatus === "ready" || !currentRecord.status) {
+        const health = await validatePreparedSourceArtifact(workspace, currentRecord);
+        base.health = {
+          ok: health.ok,
+          reason: health.reason || null,
+          version: health.version,
+        };
+        if (!health.ok) {
+          base.status = "not-prepared";
+        }
+      }
+      base.preparedAt = currentRecord.preparedAt || currentRecord.updatedAt || null;
+      base.preparedPath = base.status === "ready" && preparedExists
+        ? currentRecord.structuredMarkdown
+        : null;
+      base.manifestPath = base.status === "ready" && preparedExists
+        ? currentRecord.manifestPath || null
+        : null;
+      base.error = preparationState.stale
+        ? "Previous source preparation did not finish. Try preparing this source again."
+        : currentRecord.error || null;
+    }
+
+    if (isPdfSource(file.path)) {
+      const detectedUseAs = normalizePdfUseAs(currentRecord?.detectedUseAs) ||
+        detectPdfUseAsFromSignals(file.path);
+      base.detectedUseAs = detectedUseAs;
+      base.useAs = normalizePdfUseAs(currentRecord?.useAs) || detectedUseAs;
+    }
+
+    files.push(base);
+  }
+
+  files.sort((a, b) => a.path.localeCompare(b.path));
+  return {
+    registryPath: SOURCE_ARTIFACTS_PATH,
+    message: "Maple is converting source files into readable artifacts for Build Wiki.",
+    summary: {
+      total: files.length,
+      ready: files.filter((file) => file.status === "ready").length,
+      preparing: files.filter((file) => file.status === "preparing").length,
+      failed: files.filter((file) => file.status === "failed").length,
+      notPrepared: files.filter((file) => file.status === "not-prepared").length,
+    },
+    files,
+  };
+}
+
+function getSourcePreparationState(record) {
+  if ((record?.status || "") !== "preparing") {
+    return { stale: false, reason: null };
+  }
+
+  const preparingPid = Number(record.preparingPid) || 0;
+  if (preparingPid > 0 && processIsRunning(preparingPid)) {
+    return { stale: false, reason: null };
+  }
+
+  const startedAtMs = Date.parse(record.startedAt || "");
+  if (!Number.isFinite(startedAtMs)) {
+    return { stale: true, reason: "stale-preparation" };
+  }
+
+  if (Date.now() - startedAtMs > SOURCE_PREPARATION_STALE_AFTER_MS) {
+    return { stale: true, reason: "stale-preparation" };
+  }
+
+  return { stale: false, reason: null };
+}
+
+function processIsRunning(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (_error) {
+    return false;
+  }
 }
 
 async function listWikiFiles(workspace) {
@@ -7446,6 +9888,7 @@ async function printStatus(workspace) {
     : null;
   const manifest = await buildManifest(workspace);
   const sourceStatus = await getSourceStatus(workspace);
+  const sourceReadiness = await getSourceReadiness(workspace, sourceStatus);
   const wikiStatus = await getWikiStatus(workspace);
   const outsideWikiChanges = getOutsideWikiChanges(wikiStatus, marker);
 
@@ -7455,6 +9898,7 @@ async function printStatus(workspace) {
         workspace,
         fileCount: Object.keys(manifest).length,
         sourceStatus,
+        sourceReadiness,
         wikiStatus,
         outsideWikiChanges,
         lastOperation: marker,
@@ -7998,6 +10442,8 @@ function createOperationId() {
 }
 
 module.exports = {
+  EXTRACTOR_VERSION,
+  PREPARED_SOURCE_HEALTH_VERSION,
   BUILD_WIKI_ALLOWED_PATHS,
   WIKI_WRITE_ALLOWED_PATHS,
   WIKI_HEALTHCHECK_ALLOWED_PATHS,
@@ -8006,6 +10452,7 @@ module.exports = {
   ORGANIZE_SOURCES_ALLOWED_PATHS,
   UPDATE_RULES_ALLOWED_PATHS,
   SOURCE_MANIFEST_PATH,
+  SOURCE_ARTIFACTS_PATH,
   WIKI_MANIFEST_PATH,
   WIKI_BASELINE_DIR,
   ASSET_REGISTRY_PATH,
@@ -8026,14 +10473,22 @@ module.exports = {
 	  parseSlideSelectionJson,
 	  parseVisualInspectionPlanJson,
 	  getSourceStatus,
+  getSourceReadiness,
   getWikiStatus,
   getOutsideWikiChanges,
   buildSourceManifest,
+  readSourceArtifactsRegistry,
+  writeSourceArtifactsRegistry,
+  resolveSourceArtifact,
+  validatePreparedOutputDir,
+  validatePreparedSourceArtifact,
+  classifySourceMaterial,
   buildWikiManifest,
   readAssetRegistry,
   writeAssetRegistry,
   autoRegisterReferencedWikiAssets,
   collectReferencedWikiAssetImages,
+  findLatestExtractedSourceForChat,
   validateAndRestoreProtectedAssets,
   migrateLegacyWorkspace,
   markSourcesIngested,
@@ -8048,9 +10503,14 @@ module.exports = {
   workspaceAgentInstructions,
 	  buildWikiPrompt,
 	  selectBuildWikiVisualInputs,
-	  renderSourceStatusForPrompt,
+  renderSourceStatusForPrompt,
 	  sourcePathsForBuild,
+  selectSourcePathsForBuild,
+  collectAlwaysCheckSourcePaths,
+  extractAlwaysCheckSourcePathsFromSchema,
+  readLatestPreparedSourceText,
 	  renderPreparedSourcesForPrompt,
+  normalizeConvertedMarkdownAssets,
 	  buildExploreChatPrompt,
   buildFastExploreChatPrompt,
   prepareFastExploreChatContext,
@@ -8062,6 +10522,7 @@ module.exports = {
   parseExplorePageReferences,
   isExploreVisualQuestion,
   parseSourcePathsJson,
+  parsePdfUseAsJson,
   buildApplyChatPrompt,
   buildMaintenancePrompt,
   createSnapshot,
