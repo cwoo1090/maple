@@ -61,6 +61,7 @@ import {
   Globe,
 } from "lucide-react";
 import "katex/dist/katex.min.css";
+import "katex/contrib/mhchem";
 import "./App.css";
 import {
   ProviderSetupCard,

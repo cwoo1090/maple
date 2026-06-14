@@ -1,5 +1,6 @@
 import "./styles.css";
 import "katex/dist/katex.min.css";
+import "katex/contrib/mhchem";
 import renderMathInElement from "katex/contrib/auto-render";
 import MarkdownIt from "markdown-it";
 import sanitizeHtml from "sanitize-html";
