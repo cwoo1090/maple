@@ -7,7 +7,7 @@ Open `index.html` directly in a browser, or deploy the folder to any static host
 Production URL:
 
 ```text
-https://maple-taupe.vercel.app
+https://www.maplesr.com
 ```
 
 ## macOS Download
@@ -16,7 +16,7 @@ The main download CTA links directly to the current Apple silicon DMG on the
 GitHub Release:
 
 ```text
-https://github.com/cwoo1090/maple/releases/download/v0.1.19/Maple_0.1.19_aarch64.dmg
+https://github.com/cwoo1090/maple/releases/download/v0.1.21/Maple_0.1.21_aarch64.dmg
 ```
 
 The legacy `download-macos.html` page also redirects to that DMG so old links
@@ -27,7 +27,7 @@ release build:
 
 ```bash
 LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8 \
-  shasum -a 256 ../prototype/app-shell/src-tauri/target/release/bundle/dmg/Maple_0.1.19_aarch64.dmg \
+  shasum -a 256 ../prototype/app-shell/src-tauri/target/release/bundle/dmg/Maple_0.1.21_aarch64.dmg \
   > downloads/checksums.txt
 ```
 

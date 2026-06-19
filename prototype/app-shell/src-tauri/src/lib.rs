@@ -3436,17 +3436,28 @@ fn normalize_operation_events(events: &str, workspace: &Path) -> Vec<NormalizedO
                 ));
             }
             "error" => {
-                let detail = event
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .map(|text| truncate_for_feed(text, 240));
+                let message = event.get("message").and_then(Value::as_str).unwrap_or("");
+                let is_reconnecting = message.starts_with("Reconnecting...")
+                    || message.contains("stream disconnected before completion");
+                let detail = (!message.is_empty()).then(|| truncate_for_feed(message, 240));
                 normalized.push(feed_event(
                     fallback_id,
-                    "error",
-                    "Provider error",
+                    if is_reconnecting { "status" } else { "error" },
+                    if is_reconnecting {
+                        "Provider reconnecting"
+                    } else {
+                        "Provider error"
+                    },
                     detail,
                     None,
-                    Some("failed".to_string()),
+                    Some(
+                        if is_reconnecting {
+                            "in_progress"
+                        } else {
+                            "failed"
+                        }
+                        .to_string(),
+                    ),
                 ));
             }
             "result" => {
@@ -3548,7 +3559,7 @@ fn normalize_operation_events(events: &str, workspace: &Path) -> Vec<NormalizedO
                             "Command failed"
                         };
                         normalized.push(feed_event(
-                            format!("{item_id}-{status}"),
+                            format!("{fallback_id}-{item_id}-{status}"),
                             "command",
                             title,
                             command,
@@ -3574,7 +3585,7 @@ fn normalize_operation_events(events: &str, workspace: &Path) -> Vec<NormalizedO
                                     _ => "File changed",
                                 };
                                 normalized.push(feed_event(
-                                    format!("{item_id}-{status}-{change_index}"),
+                                    format!("{fallback_id}-{item_id}-{status}-{change_index}"),
                                     "file",
                                     title,
                                     Some(kind.to_string()),
@@ -3588,7 +3599,7 @@ fn normalize_operation_events(events: &str, workspace: &Path) -> Vec<NormalizedO
                         if let Some(text) = item.get("text").and_then(Value::as_str) {
                             if !text.trim().is_empty() {
                                 normalized.push(feed_event(
-                                    format!("{item_id}-{status}"),
+                                    format!("{fallback_id}-{item_id}-{status}"),
                                     "message",
                                     "AI message",
                                     Some(truncate_for_feed(text, 240)),
@@ -9153,7 +9164,6 @@ fn normalize_selected_source_paths(
         }
     }
 
-    selected.sort();
     Ok(selected)
 }
 
@@ -10540,6 +10550,16 @@ not-json
         let normalized = normalize_operation_events(events, Path::new("/tmp/work"));
         assert_eq!(normalized.len(), 1);
         assert_eq!(normalized[0].title, "Started AI turn");
+    }
+
+    #[test]
+    fn provider_reconnect_events_are_progress_not_failures() {
+        let events = r#"{"type":"error","message":"Reconnecting... 2/5 (stream disconnected before completion: websocket closed by server before response.completed)"}"#;
+        let normalized = normalize_operation_events(events, Path::new("/tmp/work"));
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(normalized[0].kind, "status");
+        assert_eq!(normalized[0].title, "Provider reconnecting");
+        assert_eq!(normalized[0].status.as_deref(), Some("in_progress"));
     }
 
     #[test]

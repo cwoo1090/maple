@@ -43,6 +43,8 @@ const LEGACY_RUNNER_METADATA_PREFIXES = [
   ".studywiki/maintain-threads/",
 ];
 const DEFAULT_CODEX_TIMEOUT_MS = 30 * 60 * 1000;
+const BUILD_WIKI_BATCH_TARGET_COST = 10;
+const BUILD_WIKI_BATCH_MAX_SOURCES = 3;
 const RUNNING_MARKER_PATH = ".aiwiki/running/operation.json";
 const LEGACY_RUNNING_MARKER_PATH = ".studywiki/running/operation.json";
 const EXTRACTOR_VERSION = 6;
@@ -465,7 +467,6 @@ function parseSourcePathsJson(value) {
       sourcePaths.push(normalized);
     }
   }
-  sourcePaths.sort();
   return sourcePaths;
 }
 
@@ -937,6 +938,250 @@ function selectedReasoningEffort(provider, model, options = {}) {
   return "xhigh";
 }
 
+function sourceStatusFileMap(sourceStatus = null) {
+  return new Map((sourceStatus?.files || []).map((file) => [file.path, file]));
+}
+
+function estimateBuildWikiSourceCost(sourcePath, source = null, sourceStatusFile = null) {
+  const format = (source?.sourceFormat || sourceFormatForPath(sourcePath)).toLowerCase();
+  const size = Number(sourceStatusFile?.size) || 0;
+  const pageCount = Number(source?.pageCount) || 0;
+
+  if (source?.sourceImage || isPromptImageSource(sourcePath)) return 5;
+  if (format === "md" || format === "txt") {
+    return Math.max(1, Math.min(4, 1 + Math.ceil(size / 180_000)));
+  }
+  if (format === "csv" || format === "tsv" || format === "json" || format === "jsonl") {
+    return Math.max(2, Math.min(6, 2 + Math.ceil(size / 250_000)));
+  }
+  if (format === "html") {
+    return Math.max(2, Math.min(5, 2 + Math.ceil(size / 250_000)));
+  }
+  if (isPdfSource(sourcePath) || isDocxSource(sourcePath) || requiresLibreOfficeExtraction(sourcePath)) {
+    const pageCost = pageCount > 0 ? Math.ceil(pageCount / 25) : 1;
+    const sizeCost = Math.ceil(size / 20_000_000);
+    return Math.max(4, Math.min(12, 3 + pageCost + sizeCost));
+  }
+  return Math.max(1, Math.min(4, 1 + Math.ceil(size / 300_000)));
+}
+
+function planBuildWikiSourceBatches(sourcePaths, preparedSources, sourceStatus = null) {
+  const orderedPaths = Array.isArray(sourcePaths) ? sourcePaths : [];
+  const sourceByPath = new Map((preparedSources?.sources || []).map((source) => [source.sourcePath, source]));
+  const statusByPath = sourceStatusFileMap(sourceStatus);
+  const sourceCosts = orderedPaths.map((sourcePath) => ({
+    sourcePath,
+    cost: estimateBuildWikiSourceCost(sourcePath, sourceByPath.get(sourcePath), statusByPath.get(sourcePath)),
+  }));
+
+  if (sourceCosts.length === 0) {
+    return {
+      enabled: false,
+      targetCost: BUILD_WIKI_BATCH_TARGET_COST,
+      maxSources: BUILD_WIKI_BATCH_MAX_SOURCES,
+      orderedSourcePaths: [],
+      sourceCosts: [],
+      batches: [],
+    };
+  }
+
+  const batches = [];
+  let current = [];
+  let currentCost = 0;
+
+  for (const entry of sourceCosts) {
+    const wouldExceedCost =
+      current.length > 0 && currentCost + entry.cost > BUILD_WIKI_BATCH_TARGET_COST;
+    const wouldExceedCount = current.length >= BUILD_WIKI_BATCH_MAX_SOURCES;
+    if (wouldExceedCost || wouldExceedCount) {
+      batches.push({
+        index: batches.length + 1,
+        sourcePaths: current.map((item) => item.sourcePath),
+        cost: currentCost,
+        sourceCosts: current,
+      });
+      current = [];
+      currentCost = 0;
+    }
+    current.push(entry);
+    currentCost += entry.cost;
+  }
+
+  if (current.length > 0) {
+    batches.push({
+      index: batches.length + 1,
+      sourcePaths: current.map((item) => item.sourcePath),
+      cost: currentCost,
+      sourceCosts: current,
+    });
+  }
+
+  const enabled = batches.length > 1;
+  return {
+    enabled,
+    targetCost: BUILD_WIKI_BATCH_TARGET_COST,
+    maxSources: BUILD_WIKI_BATCH_MAX_SOURCES,
+    orderedSourcePaths: orderedPaths,
+    sourceCosts,
+    batches: batches.map((batch) => ({
+      ...batch,
+      total: batches.length,
+      label: `batch-${String(batch.index).padStart(2, "0")}`,
+    })),
+  };
+}
+
+function preparedSourcesForBatch(preparedSources, batchSourcePaths) {
+  const selected = new Set(batchSourcePaths);
+  return {
+    sources: (preparedSources.sources || []).filter((source) => selected.has(source.sourcePath)),
+    errors: (preparedSources.errors || []).filter((error) => selected.has(error.sourcePath)),
+    imageAttachments: [],
+    visualInput: {
+      mode: "visual-inspection-planning",
+      totalPages: 0,
+      renderedImageCount: 0,
+      contactSheetCount: 0,
+      visionInputCount: 0,
+      selectedFullSlideCount: 0,
+      skippedFullSlideCount: 0,
+      assetCandidateCount: 0,
+      promptImageBytes: 0,
+      fullImageBudget: 0,
+      pathReferencedImageCount: 0,
+      finalWikiAssetCount: 0,
+      sources: [],
+    },
+    sourceExtractionCache: {
+      extractorVersion: EXTRACTOR_VERSION,
+      entries: (preparedSources.sourceExtractionCache?.entries || []).filter((entry) =>
+        selected.has(entry.sourcePath),
+      ),
+    },
+  };
+}
+
+function mergePreparedSourcesForBuildReport(preparedSources, preparedBatches) {
+  const visualInputs = preparedBatches
+    .map((batch) => batch.visualInput)
+    .filter(Boolean);
+  preparedSources.imageAttachments = preparedBatches.flatMap((batch) => batch.imageAttachments || []);
+  preparedSources.visualInput = {
+    mode: "visual-inspection-planning",
+    provider: visualInputs.find((input) => input.provider)?.provider,
+    providerSupportsImageAttachments: visualInputs.some((input) => input.providerSupportsImageAttachments),
+    providerSupportsImagePathReferences: visualInputs.some((input) => input.providerSupportsImagePathReferences),
+    totalPages: visualInputs.reduce((total, input) => total + (input.totalPages || 0), 0),
+    renderedImageCount: visualInputs.reduce((total, input) => total + (input.renderedImageCount || 0), 0),
+    contactSheetCount: visualInputs.reduce((total, input) => total + (input.contactSheetCount || 0), 0),
+    visionInputCount: visualInputs.reduce((total, input) => total + (input.visionInputCount || 0), 0),
+    selectedFullSlideCount: visualInputs.reduce((total, input) => total + (input.selectedFullSlideCount || 0), 0),
+    skippedFullSlideCount: visualInputs.reduce((total, input) => total + (input.skippedFullSlideCount || 0), 0),
+    assetCandidateCount: visualInputs.reduce((total, input) => total + (input.assetCandidateCount || 0), 0),
+    promptImageBytes: visualInputs.reduce((total, input) => total + (input.promptImageBytes || 0), 0),
+    fullImageBudget: visualInputs.reduce((total, input) => total + (input.fullImageBudget || 0), 0),
+    pathReferencedImageCount: visualInputs.reduce((total, input) => total + (input.pathReferencedImageCount || 0), 0),
+    imageAttachmentCount: preparedBatches.reduce((total, batch) => total + (batch.imageAttachments?.length || 0), 0),
+    inlineMarkdownFigureCount: visualInputs.reduce((total, input) => total + (input.inlineMarkdownFigureCount || 0), 0),
+    visualPlanningConcurrency: VISUAL_PLANNING_CONCURRENCY,
+    finalWikiAssetCount: 0,
+    sources: visualInputs.flatMap((input) => input.sources || []),
+  };
+  return preparedSources;
+}
+
+function summarizeProviderResult(result) {
+  return {
+    skipped: result.skipped,
+    exitCode: result.exitCode,
+    signal: result.signal,
+    timedOut: result.timedOut === true,
+    cancelled: result.cancelled === true,
+    eventsPath: result.eventsPath,
+    stderrPath: result.stderrPath,
+    lastMessagePath: result.lastMessagePath,
+    label: result.label,
+  };
+}
+
+function aggregateProviderResults(provider, results, fallback) {
+  if (!results.length) return fallback;
+  const firstFailure = results.find((result) => result.exitCode !== 0);
+  const last = results[results.length - 1];
+  return {
+    skipped: results.every((result) => result.skipped),
+    exitCode: firstFailure ? firstFailure.exitCode : last.exitCode,
+    signal: results.find((result) => result.signal)?.signal || last.signal || null,
+    timedOut: results.some((result) => result.timedOut),
+    cancelled: results.some((result) => result.cancelled),
+    command: provider.binary,
+    args: ["batched build-wiki; see runs[] for per-pass arguments"],
+    eventsPath: last.eventsPath,
+    stderrPath: last.stderrPath,
+    lastMessagePath: last.lastMessagePath,
+    runs: results.map(summarizeProviderResult),
+  };
+}
+
+function providerResultFailed(result) {
+  return result.timedOut || result.cancelled || result.exitCode !== 0;
+}
+
+async function runBuildWikiProviderPass(provider, ctx) {
+  await fsp.writeFile(ctx.promptPath, ctx.prompt);
+  const imageAttachments = ctx.imageAttachments || [];
+  const args = provider.buildExecArgs({
+    workspace: ctx.workspace,
+    model: ctx.model,
+    reasoningEffort: ctx.reasoningEffort,
+    lastMessagePath: ctx.lastMessagePath,
+    imageAttachments,
+    maxTurns: Math.max(25, imageAttachments.length + 20),
+  });
+
+  console.log(`Running ${provider.name} Build Wiki ${ctx.label || "operation"}...`);
+  console.log(`Command: ${provider.binary} ${args.join(" ")} <prompt via stdin>`);
+
+  if (ctx.dryRun) {
+    if (!ctx.appendOutput) {
+      await fsp.writeFile(ctx.eventsPath, "");
+      await fsp.writeFile(ctx.stderrPath, "");
+    }
+    await fsp.appendFile(ctx.stderrPath, `dry run: ${ctx.label || "build"} was not started\n`);
+    await fsp.writeFile(ctx.lastMessagePath, "");
+    return {
+      skipped: true,
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      cancelled: false,
+      command: provider.binary,
+      args: args.concat("<prompt via stdin>"),
+      eventsPath: path.relative(ctx.workspace, ctx.eventsPath),
+      stderrPath: path.relative(ctx.workspace, ctx.stderrPath),
+      lastMessagePath: path.relative(ctx.workspace, ctx.lastMessagePath),
+      label: ctx.label,
+    };
+  }
+
+  const result = await runProviderExec(provider, args, ctx.prompt, {
+    cwd: ctx.workspace,
+    eventsPath: ctx.eventsPath,
+    stderrPath: ctx.stderrPath,
+    lastMessagePath: ctx.lastMessagePath,
+    runningMarkerPath: ctx.runningMarkerPath,
+    timeoutMs: ctx.timeoutMs,
+    operationId: ctx.operationId,
+    operationType: "build-wiki",
+    keepRunningMarker: true,
+    appendOutput: ctx.appendOutput,
+  });
+  return {
+    ...result,
+    label: ctx.label,
+  };
+}
+
 async function runBuildWiki(workspace, options = {}) {
   await assertWorkspace(workspace);
   await assertNoPendingGeneratedChanges(workspace);
@@ -997,7 +1242,7 @@ async function runBuildWiki(workspace, options = {}) {
     const requiredSourcePaths = await measure("requiredSources", () =>
       collectAlwaysCheckSourcePaths(workspace, sourceStatus),
     );
-    const buildSourcePaths = selectSourcePathsForBuild(sourceStatus, {
+    const buildSourcePaths = orderedSourcePathsForBuild(sourceStatus, {
       force: options.force,
       sourcePaths: options.sourcePaths,
       requiredSourcePaths,
@@ -1021,247 +1266,316 @@ async function runBuildWiki(workspace, options = {}) {
         pdfUseAs: options.pdfUseAs,
       }),
     );
-    await measure("visualInspectionPlanning", () =>
-      selectBuildWikiVisualInputs(workspace, provider, {
+    const batchPlan = planBuildWikiSourceBatches(buildSourcePaths, preparedSources, sourceStatus);
+    const preparedBatches = [];
+    const providerResults = [];
+
+    console.log(`Snapshot created: ${path.relative(workspace, snapshot.dir)}`);
+    if (batchPlan.enabled) {
+      console.log(
+        `Build Wiki will run ${batchPlan.batches.length} ordered source batches before final consolidation.`,
+      );
+    }
+
+    let codexResult = {
+      skipped: true,
+      exitCode: 0,
+      signal: null,
+      command: provider.binary,
+      args: [],
+      eventsPath: path.relative(workspace, eventsPath),
+      stderrPath: path.relative(workspace, stderrPath),
+      lastMessagePath: path.relative(workspace, lastMessagePath),
+    };
+
+    await fsp.writeFile(eventsPath, "");
+    await fsp.writeFile(stderrPath, "");
+
+    const providerRunStarted = Date.now();
+    const batchesToRun = batchPlan.enabled
+      ? batchPlan.batches
+      : [{
+        index: 1,
+        total: 1,
+        label: "single",
+        sourcePaths: buildSourcePaths,
+        cost: batchPlan.sourceCosts.reduce((total, item) => total + item.cost, 0),
+        sourceCosts: batchPlan.sourceCosts,
+      }];
+
+    for (const batch of batchesToRun) {
+      const batchPreparedSources = batchPlan.enabled
+        ? preparedSourcesForBatch(preparedSources, batch.sourcePaths)
+        : preparedSources;
+      preparedBatches.push(batchPreparedSources);
+
+      await measure(`visualInspectionPlanning.${batch.label}`, () =>
+        selectBuildWikiVisualInputs(workspace, provider, {
+          ...options,
+          model,
+          reasoningEffort,
+          operationId,
+          operationDir,
+          dryRun: Boolean(options.dryRun),
+        }, batchPreparedSources),
+      );
+      const batchPromptPath = batchPlan.enabled
+        ? path.join(operationDir, `${batch.label}-prompt.md`)
+        : promptPath;
+      const batchLastMessagePath = batchPlan.enabled
+        ? path.join(operationDir, `${batch.label}-last-message.md`)
+        : lastMessagePath;
+      const prompt = await measure(`promptBuild.${batch.label}`, () => buildWikiPrompt(workspace, {
         ...options,
         model,
         reasoningEffort,
+        sourceStatus,
+        buildSourcePaths: batch.sourcePaths,
+        requiredSourcePaths: requiredSourcePaths.filter((sourcePath) =>
+          batch.sourcePaths.includes(sourcePath),
+        ),
+        buildBatch: batchPlan.enabled
+          ? {
+            index: batch.index,
+            total: batch.total,
+            sourcePaths: batch.sourcePaths,
+            orderedSourcePaths: batchPlan.orderedSourcePaths,
+          }
+          : null,
+      }, batchPreparedSources));
+
+      const result = await runBuildWikiProviderPass(provider, {
+        workspace,
+        model,
+        reasoningEffort,
+        prompt,
+        promptPath: batchPromptPath,
+        eventsPath,
+        stderrPath,
+        lastMessagePath: batchLastMessagePath,
+        runningMarkerPath,
+        timeoutMs: options.timeoutMs,
         operationId,
-        operationDir,
+        imageAttachments: batchPreparedSources.imageAttachments,
+        appendOutput: true,
         dryRun: Boolean(options.dryRun),
-      }, preparedSources),
+        label: batchPlan.enabled
+          ? `batch ${batch.index}/${batch.total}`
+          : "operation",
+      });
+      providerResults.push(result);
+      codexResult = aggregateProviderResults(provider, providerResults, codexResult);
+      if (providerResultFailed(result)) break;
+    }
+
+    if (batchPlan.enabled && !providerResults.some(providerResultFailed)) {
+      const finalPromptPath = path.join(operationDir, "final-consolidation-prompt.md");
+      const finalLastMessagePath = path.join(operationDir, "final-consolidation-last-message.md");
+      const finalPrompt = buildWikiFinalPrompt(workspace, {
+        batchPlan,
+      });
+      const finalResult = await runBuildWikiProviderPass(provider, {
+        workspace,
+        model,
+        reasoningEffort,
+        prompt: finalPrompt,
+        promptPath: finalPromptPath,
+        eventsPath,
+        stderrPath,
+        lastMessagePath: finalLastMessagePath,
+        runningMarkerPath,
+        timeoutMs: options.timeoutMs,
+        operationId,
+        imageAttachments: [],
+        appendOutput: true,
+        dryRun: Boolean(options.dryRun),
+        label: "final consolidation",
+      });
+      providerResults.push(finalResult);
+      codexResult = aggregateProviderResults(provider, providerResults, codexResult);
+    }
+
+    timingsMs.providerRun = Date.now() - providerRunStarted;
+    mergePreparedSourcesForBuildReport(preparedSources, preparedBatches);
+
+    const finalize = await measure("finalize", async () => {
+      await normalizeGeneratedMarkdownFiles(workspace);
+      await restoreAssetRegistryFromSnapshotIfChanged(workspace, snapshot);
+      await autoRegisterReferencedWikiAssets(workspace, {
+        operationId,
+        origin: "ai-generated",
+        owner: "ai",
+      });
+
+      return provider.finalizeLastMessage({
+        eventsPath,
+        lastMessagePath,
+      });
+    });
+
+    const { changedFiles, validatedChanges } = await measure("diffValidation", async () => {
+      const changedFiles = await diffSnapshot(workspace, snapshot);
+      const validatedChanges = await validateAndRestoreChanges(
+        workspace,
+        snapshot,
+        changedFiles,
+        BUILD_WIKI_ALLOWED_PATHS,
+        { sourceMoveOnly: true },
+      );
+      await validateAndRestoreProtectedAssets(workspace, snapshot, validatedChanges);
+      return { changedFiles, validatedChanges };
+    });
+    annotateFinalWikiAssetCounts(preparedSources, validatedChanges);
+    const userVisibleChangedFiles = getUserVisibleChangedFiles(validatedChanges);
+    const reviewableChangedFiles = getReviewableChangedFiles(userVisibleChangedFiles);
+    const completedAt = new Date().toISOString();
+    const forbiddenCount = validatedChanges.filter((change) => !change.allowed).length;
+    const allowedCount = validatedChanges.filter((change) => change.allowed).length;
+    const wikiContentChanged = userVisibleChangedFiles.some((c) =>
+      c.status !== "deleted" && isWikiContentPagePath(c.path)
     );
-    const prompt = await measure("promptBuild", () => buildWikiPrompt(workspace, {
-      ...options,
+    const indexOrLogTouched = validatedChanges.some(
+      (c) =>
+        c.allowed &&
+        !c.restored &&
+        (c.path === "index.md" || c.path === "log.md"),
+    );
+    const pendingSourceStates = sourceStatus.files
+      .filter((file) => file.state !== "unchanged")
+      .map((file) => file.state);
+    const removalOnlySourceChange =
+      !options.force &&
+      pendingSourceStates.length > 0 &&
+      pendingSourceStates.every((state) => state === "removed");
+    const producedExpectedContent = removalOnlySourceChange
+      ? indexOrLogTouched
+      : wikiContentChanged && indexOrLogTouched;
+
+    let status;
+    if (codexResult.timedOut) {
+      status = "timed_out";
+    } else if (codexResult.cancelled) {
+      status = "cancelled";
+    } else if (finalize.subtype === "error_max_turns") {
+      status = "turn_budget_exceeded";
+    } else if (finalize.subtype === "error_during_execution" || codexResult.exitCode !== 0) {
+      status = "provider_failed";
+    } else if (!producedExpectedContent && !options.dryRun) {
+      status = "completed_without_wiki_content";
+    } else if (forbiddenCount > 0) {
+      status = "completed_with_forbidden_edits_restored";
+    } else {
+      status = "completed";
+    }
+
+    const report = {
+      id: operationId,
+      type: "build-wiki",
+      provider: provider.name,
       model,
       reasoningEffort,
-      sourceStatus,
-      buildSourcePaths,
-      requiredSourcePaths,
-    }, preparedSources));
-
-    await fsp.writeFile(promptPath, prompt);
-
-  const imageCount = preparedSources.imageAttachments.length;
-  const maxTurns = Math.max(25, imageCount + 20);
-
-  const args = provider.buildExecArgs({
-    workspace,
-    model,
-    reasoningEffort,
-    lastMessagePath,
-    imageAttachments: preparedSources.imageAttachments,
-    maxTurns,
-  });
-
-  console.log(`Snapshot created: ${path.relative(workspace, snapshot.dir)}`);
-  console.log(`Running ${provider.name} Build Wiki operation...`);
-  console.log(`Command: ${provider.binary} ${args.join(" ")} <prompt via stdin>`);
-
-  let codexResult = {
-    skipped: true,
-    exitCode: 0,
-    signal: null,
-    command: provider.binary,
-    args: args.concat("<prompt via stdin>"),
-    eventsPath: path.relative(workspace, eventsPath),
-    stderrPath: path.relative(workspace, stderrPath),
-    lastMessagePath: path.relative(workspace, lastMessagePath),
-  };
-
-  if (!options.dryRun) {
-    codexResult = await measure("providerRun", () => runProviderExec(provider, args, prompt, {
-      cwd: workspace,
-      eventsPath,
-      stderrPath,
-      lastMessagePath,
-      runningMarkerPath,
-      timeoutMs: options.timeoutMs,
-      operationId,
-      operationType: "build-wiki",
-      keepRunningMarker: true,
-    }));
-  } else {
-    await fsp.writeFile(eventsPath, "");
-    await fsp.writeFile(stderrPath, "dry run: codex exec was not started\n");
-    timingsMs.providerRun = 0;
-  }
-
-  const finalize = await measure("finalize", async () => {
-    await normalizeGeneratedMarkdownFiles(workspace);
-    await restoreAssetRegistryFromSnapshotIfChanged(workspace, snapshot);
-    await autoRegisterReferencedWikiAssets(workspace, {
-      operationId,
-      origin: "ai-generated",
-      owner: "ai",
-    });
-
-    return provider.finalizeLastMessage({
-      eventsPath,
-      lastMessagePath,
-    });
-  });
-
-  const { changedFiles, validatedChanges } = await measure("diffValidation", async () => {
-    const changedFiles = await diffSnapshot(workspace, snapshot);
-    const validatedChanges = await validateAndRestoreChanges(
+      status,
       workspace,
-      snapshot,
-      changedFiles,
-      BUILD_WIKI_ALLOWED_PATHS,
-      { sourceMoveOnly: true },
-    );
-    await validateAndRestoreProtectedAssets(workspace, snapshot, validatedChanges);
-    return { changedFiles, validatedChanges };
-  });
-  annotateFinalWikiAssetCounts(preparedSources, validatedChanges);
-  const userVisibleChangedFiles = getUserVisibleChangedFiles(validatedChanges);
-  const reviewableChangedFiles = getReviewableChangedFiles(userVisibleChangedFiles);
-  const completedAt = new Date().toISOString();
-  const forbiddenCount = validatedChanges.filter((change) => !change.allowed).length;
-  const allowedCount = validatedChanges.filter((change) => change.allowed).length;
-  const wikiContentChanged = userVisibleChangedFiles.some((c) =>
-    c.status !== "deleted" && isWikiContentPagePath(c.path)
-  );
-  const indexOrLogTouched = validatedChanges.some(
-    (c) =>
-      c.allowed &&
-      !c.restored &&
-      (c.path === "index.md" || c.path === "log.md"),
-  );
-  const pendingSourceStates = sourceStatus.files
-    .filter((file) => file.state !== "unchanged")
-    .map((file) => file.state);
-  const removalOnlySourceChange =
-    !options.force &&
-    pendingSourceStates.length > 0 &&
-    pendingSourceStates.every((state) => state === "removed");
-  const producedExpectedContent = removalOnlySourceChange
-    ? indexOrLogTouched
-    : wikiContentChanged && indexOrLogTouched;
+      startedAt,
+      completedAt,
+      allowedPathRules: BUILD_WIKI_ALLOWED_PATHS,
+      timingsMs: buildTimingReport(timingsMs, startedMs),
+      visualInput: buildVisualInputReport(preparedSources, provider),
+      sourceExtractionCache: buildSourceExtractionCacheReport(preparedSources),
+      batchPlan,
+      snapshot: {
+        id: snapshot.id,
+        path: path.relative(workspace, snapshot.dir),
+        manifestPath: path.relative(workspace, snapshot.manifestPath),
+      },
+      codex: codexResult,
+      changedFiles: validatedChanges,
+      userVisibleChangedFiles,
+      reviewableChangedFiles,
+      completionCheck: {
+        wikiContentChanged,
+        indexOrLogTouched,
+        removalOnlySourceChange,
+        producedExpectedContent,
+        requiredCategories: ["wiki/**/*.md excluding wiki/assets/**"],
+        requiredBookkeeping: ["index.md", "log.md"],
+      },
+      sourceStatus,
+      sourceScope: {
+        force: Boolean(options.force),
+        buildSourcePaths,
+        requiredSourcePaths,
+        preparedSourcePaths: buildSourcePaths,
+        pdfUseAs: options.pdfUseAs || null,
+      },
+      summary: {
+        totalChangedFiles: validatedChanges.length,
+        allowedChangedFiles: allowedCount,
+        forbiddenChangedFiles: forbiddenCount,
+        restoredForbiddenFiles: validatedChanges.filter((change) => change.restored).length,
+        userVisibleChangedFiles: userVisibleChangedFiles.length,
+        reviewableChangedFiles: reviewableChangedFiles.length,
+      },
+    };
 
-  let status;
-  if (codexResult.timedOut) {
-    status = "timed_out";
-  } else if (codexResult.cancelled) {
-    status = "cancelled";
-  } else if (finalize.subtype === "error_max_turns") {
-    status = "turn_budget_exceeded";
-  } else if (finalize.subtype === "error_during_execution" || codexResult.exitCode !== 0) {
-    status = "provider_failed";
-  } else if (!producedExpectedContent && !options.dryRun) {
-    status = "completed_without_wiki_content";
-  } else if (forbiddenCount > 0) {
-    status = "completed_with_forbidden_edits_restored";
-  } else {
-    status = "completed";
-  }
-
-  const report = {
-    id: operationId,
-    type: "build-wiki",
-    provider: provider.name,
-	    model,
-	    reasoningEffort,
-	    status,
-	    workspace,
-	    startedAt,
-	    completedAt,
-	    allowedPathRules: BUILD_WIKI_ALLOWED_PATHS,
-	    timingsMs: buildTimingReport(timingsMs, startedMs),
-	    visualInput: buildVisualInputReport(preparedSources, provider),
-	    sourceExtractionCache: buildSourceExtractionCacheReport(preparedSources),
-	    snapshot: {
-	      id: snapshot.id,
-	      path: path.relative(workspace, snapshot.dir),
-      manifestPath: path.relative(workspace, snapshot.manifestPath),
-    },
-    codex: codexResult,
-    changedFiles: validatedChanges,
-    userVisibleChangedFiles,
-    reviewableChangedFiles,
-    completionCheck: {
-      wikiContentChanged,
-      indexOrLogTouched,
-      removalOnlySourceChange,
-      producedExpectedContent,
-      requiredCategories: ["wiki/**/*.md excluding wiki/assets/**"],
-      requiredBookkeeping: ["index.md", "log.md"],
-    },
-    sourceStatus,
-    sourceScope: {
-      force: Boolean(options.force),
-      selectedSourcePaths: Array.isArray(options.sourcePaths) ? buildSourcePaths : null,
-      requiredSourcePaths,
-      preparedSourcePaths: buildSourcePaths,
-      pdfUseAs: options.pdfUseAs || null,
-    },
-    summary: {
-      totalChangedFiles: validatedChanges.length,
-      allowedChangedFiles: allowedCount,
-      forbiddenChangedFiles: forbiddenCount,
-      restoredForbiddenFiles: validatedChanges.filter((change) => change.restored).length,
-      userVisibleChangedFiles: userVisibleChangedFiles.length,
-      reviewableChangedFiles: reviewableChangedFiles.length,
-	    },
-	  };
-
-	  const reportWriteStarted = Date.now();
-	  await fsp.writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`);
-	  await fsp.writeFile(reportMarkdownPath, renderReportMarkdown(report));
-	  if (
-	    !options.dryRun &&
-	    (status === "completed" || status === "completed_with_forbidden_edits_restored")
-	  ) {
-	    await writeSourceManifest(workspace, operationId);
-	  }
+    const reportWriteStarted = Date.now();
+    await fsp.writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`);
+    await fsp.writeFile(reportMarkdownPath, renderReportMarkdown(report));
+    if (
+      !options.dryRun &&
+      (status === "completed" || status === "completed_with_forbidden_edits_restored")
+    ) {
+      await writeSourceManifest(workspace, operationId, {
+        sourcePaths: buildSourcePaths,
+      });
+    }
     if (!options.dryRun && shouldTrustWikiAfterOperationStatus(status)) {
       await writeWikiManifest(workspace, operationId, {
         source: "maple-build-wiki",
       });
     }
-	  await writeChangedMarkers(workspace, report, reportPath, reportMarkdownPath);
-	  timingsMs.reportWrite = Date.now() - reportWriteStarted;
-	  timingsMs.total = Date.now() - startedMs;
-	  report.timingsMs = buildTimingReport(timingsMs, startedMs);
-	  await fsp.writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`);
-	  await fsp.writeFile(reportMarkdownPath, renderReportMarkdown(report));
+    await writeChangedMarkers(workspace, report, reportPath, reportMarkdownPath);
+    timingsMs.reportWrite = Date.now() - reportWriteStarted;
+    timingsMs.total = Date.now() - startedMs;
+    report.timingsMs = buildTimingReport(timingsMs, startedMs);
+    await fsp.writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`);
+    await fsp.writeFile(reportMarkdownPath, renderReportMarkdown(report));
 
-  console.log("\nOperation report:");
-  console.log(`  ${path.relative(process.cwd(), reportMarkdownPath)}`);
-  console.log(`User-visible changed files: ${userVisibleChangedFiles.length}`);
-  for (const change of userVisibleChangedFiles) {
-    console.log(`  ${change.status.padEnd(8)} ${change.path}`);
-  }
-  if (forbiddenCount > 0) {
-    console.log(`Restored forbidden changes: ${forbiddenCount}`);
-    for (const change of validatedChanges.filter((item) => !item.allowed)) {
+    console.log("\nOperation report:");
+    console.log(`  ${path.relative(process.cwd(), reportMarkdownPath)}`);
+    console.log(`User-visible changed files: ${userVisibleChangedFiles.length}`);
+    for (const change of userVisibleChangedFiles) {
       console.log(`  ${change.status.padEnd(8)} ${change.path}`);
     }
-  }
-  if (status === "completed_without_wiki_content") {
-    console.log(
-      "\nWarning: Codex exited cleanly but no wiki page or index/log update was produced.",
-    );
-    console.log(
-      "  This usually means the build did not finish (turn budget, sandbox issue, or unprepared sources).",
-    );
-    if (!wikiContentChanged) {
-      console.log("  - No new/updated Markdown pages under wiki/** outside wiki/assets/**.");
+    if (forbiddenCount > 0) {
+      console.log(`Restored forbidden changes: ${forbiddenCount}`);
+      for (const change of validatedChanges.filter((item) => !item.allowed)) {
+        console.log(`  ${change.status.padEnd(8)} ${change.path}`);
+      }
     }
-    if (!indexOrLogTouched) {
-      console.log("  - index.md or log.md was not updated.");
+    if (status === "completed_without_wiki_content") {
+      console.log(
+        "\nWarning: Codex exited cleanly but no wiki page or index/log update was produced.",
+      );
+      console.log(
+        "  This usually means the build did not finish (turn budget, sandbox issue, or unprepared sources).",
+      );
+      if (!wikiContentChanged) {
+        console.log("  - No new/updated Markdown pages under wiki/** outside wiki/assets/**.");
+      }
+      if (!indexOrLogTouched) {
+        console.log("  - index.md or log.md was not updated.");
+      }
+      console.log("  Consider running 'npm run undo' and retrying.");
     }
-    console.log("  Consider running 'npm run undo' and retrying.");
-  }
 
-  if (codexResult.exitCode !== 0) {
-    process.exitCode = codexResult.exitCode || 1;
-  } else if (forbiddenCount > 0 && options.strictValidation) {
-    process.exitCode = 2;
-  } else if (status === "completed_without_wiki_content" && options.strictValidation) {
-    process.exitCode = 3;
-  }
+    if (codexResult.exitCode !== 0) {
+      process.exitCode = codexResult.exitCode || 1;
+    } else if (forbiddenCount > 0 && options.strictValidation) {
+      process.exitCode = 2;
+    } else if (status === "completed_without_wiki_content" && options.strictValidation) {
+      process.exitCode = 3;
+    }
   } catch (error) {
     const completedAt = new Date().toISOString();
     const detail = error instanceof Error ? (error.stack || error.message) : String(error);
@@ -2275,8 +2589,15 @@ function installRunningMarkerSignalCleanup(runningMarkerPath) {
 }
 
 async function runProviderExec(provider, args, prompt, paths) {
-  await fsp.writeFile(paths.eventsPath, "");
-  await fsp.writeFile(paths.stderrPath, "");
+  if (!paths.appendOutput) {
+    await fsp.writeFile(paths.eventsPath, "");
+    await fsp.writeFile(paths.stderrPath, "");
+  } else {
+    await ensureDir(path.dirname(paths.eventsPath));
+    await ensureDir(path.dirname(paths.stderrPath));
+    await fsp.appendFile(paths.eventsPath, "");
+    await fsp.appendFile(paths.stderrPath, "");
+  }
 
   const runningMarkerPath = paths.runningMarkerPath
     ? paths.runningMarkerPath
@@ -4000,7 +4321,11 @@ function renderAllowedPathRulesForPrompt(rules) {
 async function buildWikiPrompt(workspace, options, preparedSources = { sources: [] }) {
   const sourceStatus = filteredSourceStatusForPrompt(
     options.sourceStatus || await getSourceStatus(workspace),
-    Array.isArray(options.sourcePaths) ? options.buildSourcePaths : null,
+    Array.isArray(options.buildSourcePaths)
+      ? options.buildSourcePaths
+      : Array.isArray(options.sourcePaths)
+        ? options.sourcePaths
+        : null,
   );
   const today = new Date().toISOString().slice(0, 10);
   const workspaceContext = cleanCommandText(options.workspaceContext);
@@ -4016,13 +4341,14 @@ Follow AGENTS.md or CLAUDE.md for workspace bootstrap instructions.
 Use schema.md as the durable source of truth for wiki rules, workspace preferences, and operation behavior.
 
 Operation goal:
-- Compile pending source changes into the local wiki.
+- Compile the workspace sources into the local wiki.
 - Integrate source knowledge into the existing wiki according to schema.md.
 
 Operation scope:
 ${pendingSourceList}
 ${alwaysCheckSourceList}
 ${preparedSourceList}
+${renderBuildBatchContextForPrompt(options.buildBatch)}
 
 Operation-local context:
 - Current date: ${today}
@@ -4088,6 +4414,79 @@ Use this as durable workspace context:
 
   prompt += `\nWorkspace path: ${workspace}\n`;
   return prompt;
+}
+
+function renderBuildBatchContextForPrompt(buildBatch) {
+  if (!buildBatch) return "";
+  const lines = [
+    "",
+    "Build batching context:",
+    `- This is batch ${buildBatch.index} of ${buildBatch.total}.`,
+    "- The source order was chosen by the user or by Maple's source order. Preserve that order when creating learning paths.",
+    "- Integrate this batch into the existing wiki. Do not restart the wiki from scratch if earlier batches already created useful pages.",
+    "- Prefer updating existing canonical pages over creating duplicate pages for concepts introduced by previous batches.",
+  ];
+  if (Array.isArray(buildBatch.orderedSourcePaths) && buildBatch.orderedSourcePaths.length > 0) {
+    lines.push("- Full ordered source list for this build:");
+    for (const [index, sourcePath] of buildBatch.orderedSourcePaths.entries()) {
+      const marker = buildBatch.sourcePaths?.includes(sourcePath) ? "current batch" : "other batch";
+      lines.push(`  ${index + 1}. ${sourcePath} (${marker})`);
+    }
+  }
+  lines.push("- A final consolidation pass will update index.md/log.md and clean up cross-links after all batches complete.");
+  return lines.join("\n");
+}
+
+function buildWikiFinalPrompt(workspace, options) {
+  const today = new Date().toISOString().slice(0, 10);
+  const batchPlan = options.batchPlan || { batches: [], orderedSourcePaths: [] };
+  const orderedSources = (batchPlan.orderedSourcePaths || [])
+    .map((sourcePath, index) => `${index + 1}. ${sourcePath}`)
+    .join("\n") || "- No scoped source files.";
+  const batches = (batchPlan.batches || [])
+    .map((batch) => `- Batch ${batch.index}/${batch.total}: ${batch.sourcePaths.join(", ")}`)
+    .join("\n") || "- Single batch.";
+
+  return `You are running the final consolidation pass for a Maple Build Wiki operation.
+
+Follow AGENTS.md or CLAUDE.md for workspace bootstrap instructions.
+Use schema.md as the durable source of truth for wiki rules, workspace preferences, and operation behavior.
+
+Operation goal:
+- Consolidate the wiki pages created or updated by earlier Build Wiki batches.
+- Preserve the user-selected source order when creating navigation and learning paths.
+- Update index.md and log.md so the generated wiki is discoverable and the operation is recorded.
+- Merge obvious duplicate concept pages, add useful wikilinks, and keep one canonical page per durable concept.
+
+Operation-local context:
+- Current date: ${today}
+- Workspace path: ${workspace}
+
+Ordered source list:
+${orderedSources}
+
+Batch plan already run:
+${batches}
+
+Permission boundary:
+Allowed write paths:
+${renderAllowedPathRulesForPrompt(BUILD_WIKI_ALLOWED_PATHS)}
+
+- Do not edit source file contents under sources/**.
+- Do not edit .aiwiki/source-manifest.json; the runner updates it only after the full build succeeds.
+- Do not edit ${SOURCE_ARTIFACTS_PATH}; the runner owns prepared source metadata.
+- Do not edit ${ASSET_REGISTRY_PATH}; Maple updates image asset metadata after the operation.
+- Update schema.md only when the user explicitly asks for a durable rule or workspace preference.
+- Update AGENTS.md or CLAUDE.md only when the user explicitly asks for agent, bootstrap, or operation-boundary changes.
+
+Final pass instructions:
+- Inspect the current wiki files under wiki/** plus index.md and log.md.
+- Do not reread every raw source unless a citation or contradiction needs verification.
+- Ensure index.md gives a useful reader-facing map of the wiki.
+- Append a concise dated build-wiki entry to log.md.
+- Leave the wiki in a reviewable state for the Maple runner.
+
+Finish with a short summary of the consolidation work.`;
 }
 
 function filteredSourceStatusForPrompt(sourceStatus, sourcePaths = null) {
@@ -8066,8 +8465,8 @@ async function listSourceFiles(workspace) {
   return sources;
 }
 
-async function buildSourceManifest(workspace) {
-  const sourceFiles = await listSourceFiles(workspace);
+async function buildSourceManifest(workspace, sourcePaths = null) {
+  const sourceFiles = Array.isArray(sourcePaths) ? sourcePaths : await listSourceFiles(workspace);
   const files = [];
 
   for (const sourcePath of sourceFiles) {
@@ -8291,12 +8690,15 @@ async function undoOutsideWikiChanges(workspace) {
 }
 
 async function writeSourceManifest(workspace, operationId, metadata = {}) {
+  const sourcePaths = Array.isArray(metadata.sourcePaths) ? metadata.sourcePaths : null;
+  const manifestMetadata = { ...metadata };
+  delete manifestMetadata.sourcePaths;
   const manifest = {
     schemaVersion: 1,
     operationId,
     builtAt: new Date().toISOString(),
-    ...metadata,
-    files: await buildSourceManifest(workspace),
+    ...manifestMetadata,
+    files: await buildSourceManifest(workspace, sourcePaths),
   };
   const manifestPath = path.join(workspace, SOURCE_MANIFEST_PATH);
   await ensureDir(path.dirname(manifestPath));
@@ -8924,21 +9326,18 @@ function addSourceContentMatch(index, file, value) {
 }
 
 function sourcePathsForBuild(sourceStatus, options = {}) {
-  const currentPending = sourceStatus.files
-    .filter((file) => file.state === "new" || file.state === "modified")
-    .map((file) => file.path);
   const requiredSourcePaths = Array.isArray(options.requiredSourcePaths)
     ? options.requiredSourcePaths
     : [];
+  const currentSourcePaths = sourceStatus.files
+    .filter((file) =>
+      options.force
+        ? file.state !== "removed"
+        : file.state === "new" || file.state === "modified",
+    )
+    .map((file) => file.path);
 
-  if (options.force) {
-    return sourceStatus.files
-      .filter((file) => file.state !== "removed")
-      .map((file) => file.path)
-      .sort();
-  }
-
-  return Array.from(new Set([...currentPending, ...requiredSourcePaths])).sort();
+  return Array.from(new Set([...currentSourcePaths, ...requiredSourcePaths])).sort();
 }
 
 function selectSourcePathsForBuild(sourceStatus, options = {}) {
@@ -8962,7 +9361,14 @@ function selectSourcePathsForBuild(sourceStatus, options = {}) {
     }
     selected.push(sourcePath);
   }
-  return Array.from(new Set(selected)).sort();
+  return Array.from(new Set(selected));
+}
+
+function orderedSourcePathsForBuild(sourceStatus, options = {}) {
+  if (!Array.isArray(options.sourcePaths)) {
+    return sourcePathsForBuild(sourceStatus, options);
+  }
+  return selectSourcePathsForBuild(sourceStatus, options);
 }
 
 async function collectAlwaysCheckSourcePaths(workspace, sourceStatus = null) {
@@ -10262,7 +10668,30 @@ function renderReportMarkdown(report) {
 	    lines.push("");
 	  }
 
-	  lines.push("## User-Visible Changed Files", "");
+  if (report.batchPlan) {
+    lines.push("## Source Batch Plan", "");
+    lines.push(`- Ordered batching: ${report.batchPlan.enabled ? "yes" : "no"}`);
+    lines.push(`- Target cost: ${report.batchPlan.targetCost || 0}`);
+    lines.push(`- Max sources per batch: ${report.batchPlan.maxSources || 0}`);
+    if (report.batchPlan.orderedSourcePaths?.length) {
+      lines.push("", "Ordered sources:");
+      for (const [index, sourcePath] of report.batchPlan.orderedSourcePaths.entries()) {
+        const cost = report.batchPlan.sourceCosts?.find((entry) => entry.sourcePath === sourcePath)?.cost;
+        lines.push(`${index + 1}. \`${sourcePath}\`${cost ? ` (cost ${cost})` : ""}`);
+      }
+    }
+    if (report.batchPlan.batches?.length) {
+      lines.push("", "Batches:");
+      for (const batch of report.batchPlan.batches) {
+        lines.push(
+          `- Batch ${batch.index}/${batch.total}: ${batch.sourcePaths.map((item) => `\`${item}\``).join(", ")}`,
+        );
+      }
+    }
+    lines.push("");
+  }
+
+  lines.push("## User-Visible Changed Files", "");
 
   const userVisibleChangedFiles = report.userVisibleChangedFiles || report.changedFiles;
   if (userVisibleChangedFiles.length === 0) {
@@ -10506,6 +10935,9 @@ module.exports = {
   renderSourceStatusForPrompt,
 	  sourcePathsForBuild,
   selectSourcePathsForBuild,
+  orderedSourcePathsForBuild,
+  planBuildWikiSourceBatches,
+  estimateBuildWikiSourceCost,
   collectAlwaysCheckSourcePaths,
   extractAlwaysCheckSourcePathsFromSchema,
   readLatestPreparedSourceText,

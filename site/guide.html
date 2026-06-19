@@ -5,17 +5,17 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta
       name="description"
-      content="Learn Maple's workspace model: sources, wiki pages, schema.md rules, Build wiki, Explore, Update wiki, Maintain, review, and undo."
+      content="Learn Maple's workspace model: AI connection, source preparation, Build wiki, Ask Wiki, Apply to wiki, Maintain, review, and undo."
     />
-    <title>Maple Guide - Sources, rules, and Maintain</title>
+    <title>Maple Guide - Sources, Ask Wiki, and Maintain</title>
     <link rel="canonical" href="https://www.maplesr.com/guide.html" />
     <meta property="og:site_name" content="Maple" />
     <meta property="og:type" content="article" />
     <meta property="og:url" content="https://www.maplesr.com/guide.html" />
-    <meta property="og:title" content="Maple Guide - Sources, rules, and Maintain" />
+    <meta property="og:title" content="Maple Guide - Sources, Ask Wiki, and Maintain" />
     <meta
       property="og:description"
-      content="Learn Maple's local workspace model and how Build wiki, Explore, Maintain, review, and undo work."
+      content="Learn Maple's local workspace model and how source prep, Build wiki, Ask Wiki, Maintain, review, and undo work."
     />
     <meta
       property="og:image"
@@ -24,10 +24,10 @@
     <meta property="og:image:width" content="1200" />
     <meta property="og:image:height" content="630" />
     <meta name="twitter:card" content="summary_large_image" />
-    <meta name="twitter:title" content="Maple Guide - Sources, rules, and Maintain" />
+    <meta name="twitter:title" content="Maple Guide - Sources, Ask Wiki, and Maintain" />
     <meta
       name="twitter:description"
-      content="Learn Maple's local workspace model and how Build wiki, Explore, Maintain, review, and undo work."
+      content="Learn Maple's local workspace model and how source prep, Build wiki, Ask Wiki, Maintain, review, and undo work."
     />
     <meta
       name="twitter:image"
@@ -35,7 +35,7 @@
     />
     <link rel="icon" href="assets/maple-icon.png" />
     <link rel="apple-touch-icon" href="assets/maple-icon.png" />
-    <link rel="stylesheet" href="styles.css?v=20260520-copy-2" />
+    <link rel="stylesheet" href="styles.css?v=20260610-detail-1" />
   </head>
   <body>
     <header class="site-header">
@@ -44,7 +44,7 @@
         <span>Maple</span>
       </a>
       <nav class="site-nav" aria-label="Primary navigation">
-        <a href="https://github.com/cwoo1090/maple/releases/download/v0.1.19/Maple_0.1.19_aarch64.dmg">Download</a>
+        <a href="https://github.com/cwoo1090/maple/releases/download/v0.1.21/Maple_0.1.21_aarch64.dmg">Download</a>
         <a href="index.html#hero-demo">Demo</a>
         <a href="index.html#workflow">Workflow</a>
         <a href="guide.html" aria-current="page">Guide</a>
@@ -63,22 +63,25 @@
     <main class="guide-page" id="top">
       <section class="guide-doc-hero" aria-labelledby="guide-doc-title">
         <p class="section-kicker">Maple guide</p>
-        <h1 id="guide-doc-title">Sources, rules, and Maintain</h1>
+        <h1 id="guide-doc-title">Sources, Ask Wiki, and Maintain</h1>
         <p>
-          Maple turns source material into a local wiki. This guide explains
-          the words you will see in the app, what each action does, and how to
-          stay in control of AI-generated changes.
+          Maple turns local source material into a local wiki. This guide
+          explains the current app words: AI connection, source preparation,
+          Build wiki, Ask Wiki, Apply to wiki, Maintain, review, and undo.
         </p>
       </section>
 
       <nav class="guide-doc-toc" aria-label="Guide contents">
         <a href="#workspace">Workspace</a>
+        <a href="#ai-connection">AI connection</a>
         <a href="#sources">Sources</a>
+        <a href="#source-preparation">Source preparation</a>
         <a href="#build-wiki">Build wiki</a>
-        <a href="#rules">schema.md and rules</a>
-        <a href="#explore-update">Explore vs Update</a>
+        <a href="#ask-apply">Ask Wiki and Apply</a>
         <a href="#maintain">Maintain</a>
+        <a href="#rules">Rules</a>
         <a href="#review-undo">Review and undo</a>
+        <a href="#maple-guide">Maple Guide</a>
       </nav>
 
       <section class="guide-doc-section" id="workspace" aria-labelledby="workspace-title">
@@ -86,9 +89,9 @@
         <h2 id="workspace-title">What is a Maple workspace?</h2>
         <p>
           A workspace is one local folder for one subject: a course, research
-          topic, project, archive, or skill path. Maple keeps the raw material
-          and the generated wiki in separate places so the wiki can improve
-          without rewriting your original files.
+          topic, project, archive, or skill path. Maple keeps raw material,
+          generated wiki pages, review state, and AI instructions in
+          predictable local files.
         </p>
         <div class="guide-layer-grid">
           <article>
@@ -100,12 +103,40 @@
             <p>The readable layer Maple drafts: summaries, concepts, guides, links, and assets.</p>
           </article>
           <article>
-            <h3>Rules</h3>
-            <p>The workspace instructions that tell AI how this wiki should be written and maintained.</p>
+            <h3>Workspace rules</h3>
+            <p>schema.md and AGENTS.md tell AI how this wiki should be written and maintained.</p>
           </article>
           <article>
-            <h3>Reviewable changes</h3>
-            <p>Generated edits are shown as changed files, so you can inspect them before trusting them.</p>
+            <h3>.aiwiki metadata</h3>
+            <p>Snapshots, reports, chat records, review state, and prepared source artifacts live here.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="guide-doc-section" id="ai-connection" aria-labelledby="ai-connection-title">
+        <p class="section-kicker">AI connection</p>
+        <h2 id="ai-connection-title">How does Maple use AI?</h2>
+        <p>
+          Maple uses the AI subscription you already have. The app can guide
+          setup for ChatGPT or Claude, check sign-in, and reuse that connection
+          for Build wiki, Ask Wiki, Maintain, and Maple Guide.
+        </p>
+        <div class="guide-layer-grid">
+          <article>
+            <h3>No Maple billing</h3>
+            <p>The MVP does not add Maple accounts, API-key billing, AI credits, or sync.</p>
+          </article>
+          <article>
+            <h3>Connection card</h3>
+            <p>If AI is not ready, Maple shows Connect AI, sign-in, install, or recheck actions.</p>
+          </article>
+          <article>
+            <h3>Settings</h3>
+            <p>Use Settings to switch app language, AI account, model, reasoning effort, or reading text size.</p>
+          </article>
+          <article>
+            <h3>Skip for now</h3>
+            <p>You can import and browse files without AI. Build, ask, apply, and maintain need AI later.</p>
           </article>
         </div>
       </section>
@@ -115,17 +146,17 @@
         <h2 id="sources-title">What are sources?</h2>
         <p>
           Sources are the original material you want Maple to learn from. They
-          can be PDFs, slides, notes, transcripts, screenshots, Markdown files,
-          papers, or captured web links. Think of them as the reference shelf,
-          not the notebook.
+          can be PDFs, PowerPoint, Word, Excel, Markdown, text, JSON, JSONL,
+          CSV, TSV, HTML, images, notes, transcripts, papers, or saved web
+          pages.
         </p>
         <div class="guide-split">
           <div>
             <h3>Sources should stay original</h3>
             <p>
-              Maple treats source contents as immutable. Build wiki and Maintain
-              may read sources, but they should not rewrite what a PDF, note, or
-              transcript originally said.
+              Maple treats source contents as immutable. It may read sources or
+              create prepared artifacts, but it should not rewrite what the
+              source originally said.
             </p>
           </div>
           <div>
@@ -164,52 +195,190 @@
         </table>
       </section>
 
+      <section class="guide-doc-section" id="source-preparation" aria-labelledby="source-preparation-title">
+        <p class="section-kicker">Source preparation</p>
+        <h2 id="source-preparation-title">What does source preparation mean?</h2>
+        <p>
+          Maple prepares readable artifacts before AI reads some files. The
+          original source remains unchanged; extracted Markdown, page images,
+          manifests, cache records, and readiness state are stored under
+          .aiwiki.
+        </p>
+        <div class="guide-split">
+          <div>
+            <h3>Readable artifacts</h3>
+            <p>
+              PDFs and DOCX files can be converted to Markdown or page images.
+              Office previews can be rendered through LibreOffice when
+              available.
+            </p>
+          </div>
+          <div>
+            <h3>Build choices</h3>
+            <p>
+              For PDFs, Maple may show a Reading mode: Mostly text, Text with
+              diagrams, or Mostly visual.
+            </p>
+          </div>
+        </div>
+        <table class="guide-table">
+          <thead>
+            <tr>
+              <th>Readiness</th>
+              <th>What it means</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Ready</td>
+              <td>Maple has a readable source or prepared artifact.</td>
+            </tr>
+            <tr>
+              <td>Preparing</td>
+              <td>Maple is converting the source before AI can use it.</td>
+            </tr>
+            <tr>
+              <td>Needs prep</td>
+              <td>The prepared artifact is missing, stale, or not created yet.</td>
+            </tr>
+            <tr>
+              <td>Failed</td>
+              <td>Preparation failed. For Office files, check LibreOffice or the visible row error.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
       <section class="guide-doc-section" id="build-wiki" aria-labelledby="build-wiki-title">
         <p class="section-kicker">Build wiki</p>
         <h2 id="build-wiki-title">What does Build wiki do?</h2>
         <p>
           Build wiki asks AI to read pending source changes and integrate them
-          into the existing wiki. It should not simply dump one summary per file;
-          it should strengthen the knowledge base you will keep using.
+          into the existing wiki. Maple may prepare sources first, then
+          produces reviewable changes instead of silently treating AI output as
+          final.
         </p>
         <div class="guide-created-grid">
           <article>
-            <h3>Summaries</h3>
-            <p>Digests for substantial sources, such as a lecture, paper, or long note.</p>
+            <h3>Context prompt</h3>
+            <p>Tell Maple what the wiki is for: class, audience, detail level, outputs, and rules.</p>
           </article>
           <article>
-            <h3>Concept pages</h3>
-            <p>Reusable explanations of durable ideas, formulas, entities, comparisons, or processes.</p>
+            <h3>Source readiness</h3>
+            <p>If sources are still preparing, use Build when ready or build only the ready sources.</p>
           </article>
           <article>
-            <h3>Guides</h3>
-            <p>Learning paths, review paths, onboarding routes, and synthesis pages across multiple topics.</p>
+            <h3>Generated pages</h3>
+            <p>AI drafts summaries, concept pages, guides, links, assets, index updates, and log entries.</p>
           </article>
           <article>
-            <h3>Links and navigation</h3>
-            <p>Wikilinks, index updates, and graph connections that help you move through the material.</p>
+            <h3>Layered builds</h3>
+            <p>Start with a small related batch, review the structure, then add more sources.</p>
           </article>
           <article>
-            <h3>Assets</h3>
-            <p>Useful derived visuals from source material, saved separately from the original files.</p>
+            <h3>Existing wiki</h3>
+            <p>If a workspace already has a wiki, Maple can keep it as the baseline instead of rewriting everything.</p>
           </article>
           <article>
-            <h3>Log entries</h3>
-            <p>A short history of what operation changed the wiki and why.</p>
+            <h3>Operation report</h3>
+            <p>Maple records what ran and shows changed files for review after the build.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="guide-doc-section" id="ask-apply" aria-labelledby="ask-apply-title">
+        <p class="section-kicker">Ask Wiki and Apply</p>
+        <h2 id="ask-apply-title">Ask Wiki is different from Apply to wiki</h2>
+        <p>
+          Maple separates asking questions from changing the wiki. Ask Wiki is
+          for learning from the current wiki or selected source. Apply to wiki
+          is the deliberate step that turns useful answers into reviewable
+          edits.
+        </p>
+        <table class="guide-table">
+          <thead>
+            <tr>
+              <th>Action</th>
+              <th>Use it when</th>
+              <th>What changes</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Ask Wiki</td>
+              <td>You want to ask about the wiki, a selected source, or the current page.</td>
+              <td>Nothing by default. It is read-only.</td>
+            </tr>
+            <tr>
+              <td>Apply to wiki</td>
+              <td>A completed Ask Wiki answer is worth keeping for later.</td>
+              <td>Maple drafts reviewable edits to wiki pages, navigation, or logs.</td>
+            </tr>
+            <tr>
+              <td>Web search</td>
+              <td>Current or external context is needed and the selected provider supports search.</td>
+              <td>The answer may cite web-derived claims, but the local workspace remains the main source.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="guide-doc-section" id="maintain" aria-labelledby="maintain-title">
+        <p class="section-kicker">Maintain</p>
+        <h2 id="maintain-title">What are the Maintain functions?</h2>
+        <p>
+          Maintain is where you improve an existing workspace after the first
+          build. Use it when the wiki needs cleanup, restructuring, better rules,
+          source organization, or a source-grounded improvement pass.
+        </p>
+        <div class="maintain-guide-grid">
+          <article>
+            <h3>Wiki healthcheck</h3>
+            <p>
+              A conservative check for broken links, stale index entries, weak
+              pages, missing citations, and similar quality issues.
+            </p>
+            <span>Use when the wiki feels messy or stale.</span>
+          </article>
+          <article>
+            <h3>Improve wiki</h3>
+            <p>
+              A user-directed improvement pass for creating guides, connecting
+              pages, reshaping structure, or improving explanations. It can
+              re-read selected sources when source grounding is on.
+            </p>
+            <span>Use when you know what quality improvement you want.</span>
+          </article>
+          <article>
+            <h3>Organize sources</h3>
+            <p>
+              Moves or renames source files and folders without changing source
+              contents. For example, group slides and transcripts by lecture.
+            </p>
+            <span>Use when the source tree is hard to navigate.</span>
+          </article>
+          <article>
+            <h3>Update rules</h3>
+            <p>
+              Saves durable preferences for future wiki work. This is the app
+              action behind updating the workspace rulebook.
+            </p>
+            <span>Use when you want Maple to remember a convention.</span>
           </article>
         </div>
       </section>
 
       <section class="guide-doc-section" id="rules" aria-labelledby="rules-title">
         <p class="section-kicker">Rules</p>
-        <h2 id="rules-title">What is schema.md?</h2>
+        <h2 id="rules-title">What are schema.md and AGENTS.md?</h2>
         <p>
-          <code>schema.md</code> is the local rulebook for a workspace. It tells
-          AI what page types to use, how to cite sources, how links should work,
-          what the wiki is for, and what Maintain should check.
+          <code>schema.md</code> is the local rulebook for a workspace.
+          <code>AGENTS.md</code> carries workspace instructions for AI agents.
+          Together they tell AI what page types to use, how to cite sources, how
+          links should work, and what Maintain should check.
         </p>
         <div class="guide-callout">
-          <strong>You usually do not need to edit this file directly.</strong>
+          <strong>You usually do not need to edit these files directly.</strong>
           <p>
             In the app, use Update rules when you want Maple to remember a
             future preference, such as "make every guide beginner-friendly" or
@@ -234,86 +403,12 @@
         </div>
       </section>
 
-      <section class="guide-doc-section" id="explore-update" aria-labelledby="explore-update-title">
-        <p class="section-kicker">Explore and update</p>
-        <h2 id="explore-update-title">Explore Chat is different from Update wiki</h2>
-        <p>
-          Maple separates asking questions from changing the wiki. This keeps
-          normal chat safe and makes permanent edits intentional.
-        </p>
-        <table class="guide-table">
-          <thead>
-            <tr>
-              <th>Action</th>
-              <th>Use it when</th>
-              <th>What changes</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr>
-              <td>Explore Chat</td>
-              <td>You want to ask a question, understand a page, or compare ideas.</td>
-              <td>Nothing by default. It is read-only.</td>
-            </tr>
-            <tr>
-              <td>Update wiki</td>
-              <td>A chat answer is worth keeping for later.</td>
-              <td>Maple drafts reviewable edits to wiki pages, navigation, or logs.</td>
-            </tr>
-          </tbody>
-        </table>
-      </section>
-
-      <section class="guide-doc-section" id="maintain" aria-labelledby="maintain-title">
-        <p class="section-kicker">Maintain</p>
-        <h2 id="maintain-title">What are the Maintain functions?</h2>
-        <p>
-          Maintain is where you improve an existing workspace after the first
-          build. Use it when the wiki needs cleanup, restructuring, better rules,
-          or source organization.
-        </p>
-        <div class="maintain-guide-grid">
-          <article>
-            <h3>Wiki healthcheck</h3>
-            <p>
-              A conservative check for broken links, stale index entries, weak
-              pages, missing citations, and similar quality issues.
-            </p>
-            <span>Use when the wiki feels messy or stale.</span>
-          </article>
-          <article>
-            <h3>Improve wiki</h3>
-            <p>
-              A user-directed improvement pass for creating guides, connecting
-              pages, reshaping structure, or improving explanations.
-            </p>
-            <span>Use when you know what quality improvement you want.</span>
-          </article>
-          <article>
-            <h3>Organize sources</h3>
-            <p>
-              Moves or renames source files and folders without changing source
-              contents. For example, group slides and transcripts by lecture.
-            </p>
-            <span>Use when the source tree is hard to navigate.</span>
-          </article>
-          <article>
-            <h3>Update rules</h3>
-            <p>
-              Saves durable preferences for future wiki work. This is the app
-              action behind updating the workspace rulebook.
-            </p>
-            <span>Use when you want Maple to remember a convention.</span>
-          </article>
-        </div>
-      </section>
-
       <section class="guide-doc-section" id="review-undo" aria-labelledby="review-undo-title">
         <p class="section-kicker">Review and undo</p>
         <h2 id="review-undo-title">How do reviewable changes work?</h2>
         <p>
-          AI output is treated as a draft. After Build wiki, Update wiki, or a
-          Maintain operation, Maple marks generated files so you can inspect
+          AI output is treated as a draft. After Build wiki, Apply to wiki, or
+          a Maintain operation, Maple marks generated files so you can inspect
           what changed before moving on.
         </p>
         <ol class="guide-step-list">
@@ -328,7 +423,7 @@
             <span>2</span>
             <div>
               <h3>Finish review</h3>
-              <p>Mark the generated changes as reviewed when they look useful enough to keep.</p>
+              <p>Click Done reviewing when the changed files look useful enough to keep.</p>
             </div>
           </li>
           <li>
@@ -340,6 +435,34 @@
           </li>
         </ol>
       </section>
+
+      <section class="guide-doc-section" id="maple-guide" aria-labelledby="maple-guide-title">
+        <p class="section-kicker">Maple Guide</p>
+        <h2 id="maple-guide-title">What is Maple Guide?</h2>
+        <p>
+          Maple Guide is the lower-left help chat for using the app. It explains
+          buttons, panels, connection setup, review, undo, imports, Build wiki,
+          Ask Wiki, and Maintain. It is different from Ask Wiki.
+        </p>
+        <div class="guide-layer-grid">
+          <article>
+            <h3>Maple Guide</h3>
+            <p>Use it for app usage help: what to click, what a status means, or what to do first.</p>
+          </article>
+          <article>
+            <h3>Ask Wiki</h3>
+            <p>Use it for your study content, source files, generated pages, and selected document.</p>
+          </article>
+          <article>
+            <h3>Needs AI</h3>
+            <p>Maple Guide uses the same connected AI account, so it may ask you to connect ChatGPT or Claude first.</p>
+          </article>
+          <article>
+            <h3>Read-only help</h3>
+            <p>Maple Guide cannot directly import files, edit the wiki, run builds, or sign in for you.</p>
+          </article>
+        </div>
+      </section>
     </main>
 
     <footer class="site-footer">
@@ -347,6 +470,6 @@
       <span>Copyright <span id="year">2026</span> chulwoo ahn.</span>
     </footer>
 
-    <script src="script.js?v=20260520-copy-2"></script>
+    <script src="script.js?v=20260610-detail-1"></script>
   </body>
 </html>

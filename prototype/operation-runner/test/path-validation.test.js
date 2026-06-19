@@ -51,6 +51,8 @@ const {
   normalizeOperationId,
   normalizeMarkdownMathDelimiters,
   normalizeRelativePath,
+  orderedSourcePathsForBuild,
+  planBuildWikiSourceBatches,
   parseExplorePageReferences,
   parsePdfUseAsJson,
   parseSourcePathsJson,
@@ -226,8 +228,8 @@ test("selected Build Wiki source paths include schema-required sources", () => {
     sourcePaths: ["sources/selected.md"],
     requiredSourcePaths: ["sources/_core/syllabus.docx"],
   }), [
-    "sources/_core/syllabus.docx",
     "sources/selected.md",
+    "sources/_core/syllabus.docx",
   ]);
 });
 
@@ -1079,7 +1081,7 @@ test("source readiness reports current registry state and ignores stale hashes",
   assert.equal(stalePdf.preparedPath, null);
 });
 
-test("selects only requested Build Wiki source paths", () => {
+test("source path selector preserves requested subset for source preparation", () => {
   const sourceStatus = {
     files: [
       { path: "sources/a.md", state: "new" },
@@ -1096,6 +1098,70 @@ test("selects only requested Build Wiki source paths", () => {
     () => selectSourcePathsForBuild(sourceStatus, { sourcePaths: ["sources/old.md"] }),
     /not available/,
   );
+});
+
+test("Build Wiki source ordering preserves requested incremental sources", () => {
+  const sourceStatus = {
+    files: [
+      { path: "sources/a.md", state: "new" },
+      { path: "sources/b.md", state: "modified" },
+      { path: "sources/c.md", state: "unchanged" },
+      { path: "sources/old.md", state: "removed" },
+    ],
+  };
+
+  assert.deepEqual(
+    orderedSourcePathsForBuild(sourceStatus, { sourcePaths: ["sources/b.md"] }),
+    ["sources/b.md"],
+  );
+  assert.deepEqual(
+    orderedSourcePathsForBuild(sourceStatus),
+    ["sources/a.md", "sources/b.md"],
+  );
+  assert.deepEqual(
+    orderedSourcePathsForBuild(sourceStatus, { force: true }),
+    ["sources/a.md", "sources/b.md", "sources/c.md"],
+  );
+  assert.throws(
+    () => orderedSourcePathsForBuild(sourceStatus, { sourcePaths: ["sources/old.md"] }),
+    /not available/,
+  );
+});
+
+test("Build Wiki batch planner preserves source order and contiguous batches", () => {
+  const sourcePaths = [
+    "sources/ch01.pdf",
+    "sources/ch02.pdf",
+    "sources/notes.md",
+    "sources/ch03.pdf",
+  ];
+  const preparedSources = {
+    sources: [
+      { sourcePath: "sources/ch01.pdf", sourceFormat: "pdf", pageCount: 60 },
+      { sourcePath: "sources/ch02.pdf", sourceFormat: "pdf", pageCount: 60 },
+      { sourcePath: "sources/notes.md", sourceFormat: "md", pageCount: 0 },
+      { sourcePath: "sources/ch03.pdf", sourceFormat: "pdf", pageCount: 60 },
+    ],
+  };
+  const sourceStatus = {
+    files: sourcePaths.map((path) => ({ path, size: path.endsWith(".pdf") ? 8_000_000 : 20_000 })),
+  };
+
+  const plan = planBuildWikiSourceBatches(sourcePaths, preparedSources, sourceStatus);
+
+  assert.equal(plan.enabled, true);
+  assert.deepEqual(plan.orderedSourcePaths, sourcePaths);
+  assert.deepEqual(
+    plan.batches.flatMap((batch) => batch.sourcePaths),
+    sourcePaths,
+  );
+  for (const batch of plan.batches) {
+    const firstIndex = sourcePaths.indexOf(batch.sourcePaths[0]);
+    assert.deepEqual(
+      batch.sourcePaths,
+      sourcePaths.slice(firstIndex, firstIndex + batch.sourcePaths.length),
+    );
+  }
 });
 
 test("Build Wiki prompt scopes selected sources and renders PDF role guidance", async (t) => {
@@ -1911,6 +1977,7 @@ test("treats source renames with unchanged content as already ingested", async (
   assert.equal(status.files.find((file) => file.path === "sources/renamed.md")?.state, "unchanged");
   assert.equal(status.files.find((file) => file.path === "sources/a.md"), undefined);
   assert.deepEqual(sourcePathsForBuild(status), []);
+  assert.deepEqual(sourcePathsForBuild(status, { force: true }), ["sources/renamed.md"]);
   assert.match(renderSourceStatusForPrompt(status), /No pending source changes/);
 });
 
@@ -1928,6 +1995,8 @@ test("treats source moves into folders with unchanged content as already ingeste
   assert.equal(status.pendingCount, 0);
   assert.equal(status.files.find((file) => file.path === "sources/week-1/a.md")?.state, "unchanged");
   assert.equal(status.files.find((file) => file.path === "sources/a.md"), undefined);
+  assert.deepEqual(sourcePathsForBuild(status), []);
+  assert.deepEqual(sourcePathsForBuild(status, { force: true }), ["sources/week-1/a.md"]);
 });
 
 test("tracks source move plus content edit as pending source content changes", async (t) => {
@@ -2333,7 +2402,7 @@ test("Build Wiki prompt is a thin operation brief", async (t) => {
     { sources: [], imageAttachments: [] },
   );
 
-  assert.match(prompt, /Compile pending source changes/);
+  assert.match(prompt, /Compile the workspace sources/);
   assert.match(prompt, /sources\/a\.md/);
   assert.doesNotMatch(prompt, /raw\/a\.md/);
   assert.match(prompt, /Focus on exam review/);
@@ -3365,7 +3434,7 @@ test("Improve Wiki source grounding renders Claude source image path references"
 test("source picker JSON parser accepts only source-relative paths", () => {
   assert.deepEqual(
     parseSourcePathsJson('["sources/b.md", "sources/a.md", "sources/a.md"]'),
-    ["sources/a.md", "sources/b.md"],
+    ["sources/b.md", "sources/a.md"],
   );
 
   assert.equal(parseSourcePathsJson(undefined), null);

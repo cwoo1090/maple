@@ -517,6 +517,18 @@ type OperationProgress = {
   error?: string | null;
 };
 
+const BUILD_FAILED_STATUSES = new Set([
+  "cancelled",
+  "completed_without_wiki_content",
+  "provider_failed",
+  "timed_out",
+  "turn_budget_exceeded",
+]);
+const BUILD_SUCCESS_STATUSES = new Set([
+  "completed",
+  "completed_with_forbidden_edits_restored",
+]);
+
 type MaintainOperationResult = {
   runner: RunnerOutput | null;
   state: WorkspaceState;
@@ -549,6 +561,7 @@ type BuildDraft = {
   workspaceContext: string;
   requiresWorkspaceContext: boolean;
   force: boolean;
+  sourceOrder: string[];
   pdfUseAs: Record<string, PdfUseAsRole>;
   provider: string;
   model: string;
@@ -1740,6 +1753,36 @@ function reviewableChangedFileCount(state: WorkspaceState) {
   ).length;
 }
 
+function isBuildFailedStatus(status: string | null | undefined) {
+  return Boolean(status && BUILD_FAILED_STATUSES.has(status));
+}
+
+function isBuildSuccessStatus(status: string | null | undefined) {
+  return Boolean(status && BUILD_SUCCESS_STATUSES.has(status));
+}
+
+function isBuildMarker(marker: WorkspaceState["changedMarker"]) {
+  return marker?.operationType === "build-wiki" && !marker.undoneAt;
+}
+
+function isFailedBuildMarker(marker: WorkspaceState["changedMarker"]) {
+  return isBuildMarker(marker) && isBuildFailedStatus(marker?.status);
+}
+
+function isSuccessfulBuildMarker(marker: WorkspaceState["changedMarker"]) {
+  return isBuildMarker(marker) && isBuildSuccessStatus(marker?.status);
+}
+
+function isTransientReconnectEvent(event: OperationFeedEvent) {
+  const text = `${event.title} ${event.detail ?? ""}`.toLowerCase();
+  return text.includes("reconnecting") || text.includes("stream disconnected");
+}
+
+function operationEventIndicatesFailure(event: OperationFeedEvent) {
+  if (isTransientReconnectEvent(event)) return false;
+  return event.kind === "error" || event.status === "failed" || event.status === "error";
+}
+
 function isWikiExplorationPath(path: string) {
   return path === "index.md" || path.startsWith("wiki/") || path.startsWith("concepts/");
 }
@@ -1915,6 +1958,7 @@ function App() {
   const [seenMaintainThreadUpdates, setSeenMaintainThreadUpdates] = useState<SeenThreadMap>({});
   const [applyDraft, setApplyDraft] = useState<ApplyDraft>(null);
   const [buildDraft, setBuildDraft] = useState<BuildDraft>(null);
+  const [buildSourceOrderDrafts, setBuildSourceOrderDrafts] = useState<Record<string, string>>({});
   const [sourcePreparationStartedAt, setSourcePreparationStartedAt] = useState<number | null>(null);
   const autoPreparedSourceSignatureRef = useRef<string | null>(null);
   const [queuedBuildWhenReady, setQueuedBuildWhenReady] = useState<{
@@ -2101,10 +2145,7 @@ function App() {
   const workspaceBuildProgressFailed = Boolean(
     workspaceOperationProgress?.operationType === "build-wiki" &&
       (workspaceOperationProgress.error ||
-        workspaceOperationProgress.events.some(
-          (event) =>
-            event.kind === "error" || event.status === "failed" || event.status === "error",
-        )),
+        workspaceOperationProgress.events.some(operationEventIndicatesFailure)),
   );
   const showBuildOperationFeed =
     isStartingBuild ||
@@ -2234,6 +2275,32 @@ function App() {
       : null;
   const buildCompletionSummaryStatus = workspace.changedMarker?.status ?? "";
   const buildCompletionSummaryText = workspace.lastOperationMessage?.trim() ?? "";
+  const latestBuildFailed = isFailedBuildMarker(workspace.changedMarker);
+  const latestBuildFailureOperationId = latestBuildFailed
+    ? workspace.changedMarker?.operationId ?? workspace.changedMarker?.completedAt ?? null
+    : null;
+  const latestBuildFailureDetail = useMemo(() => {
+    switch (buildCompletionSummaryStatus) {
+      case "timed_out":
+        return t("app.buildFailed.timedOut");
+      case "provider_failed":
+        return t("app.buildFailed.providerFailed");
+      case "turn_budget_exceeded":
+        return t("app.buildFailed.turnBudget");
+      case "completed_without_wiki_content":
+        return t("app.buildFailed.noWikiContent");
+      case "cancelled":
+        return t("app.buildFailed.cancelled");
+      default:
+        return t("app.buildFailed.generic");
+    }
+  }, [buildCompletionSummaryStatus, t]);
+  const showBuildFailurePanel = Boolean(
+    !isBuilding &&
+      latestBuildFailed &&
+      latestBuildFailureOperationId &&
+      dismissedBuildSummaryOperationId !== latestBuildFailureOperationId,
+  );
   const showBuildCompletionSummary = Boolean(
     !isBuilding &&
       !workspaceBuildProgressFailed &&
@@ -2241,8 +2308,7 @@ function App() {
       hasPendingGeneratedChanges &&
       buildCompletionSummaryText &&
       dismissedBuildSummaryOperationId !== buildCompletionSummaryOperationId &&
-      (buildCompletionSummaryStatus === "completed" ||
-        buildCompletionSummaryStatus === "completed_with_forbidden_edits_restored"),
+      isBuildSuccessStatus(buildCompletionSummaryStatus),
   );
   const showPostBuildNextSteps = Boolean(
     reviewedBuildOperationKey &&
@@ -2546,8 +2612,13 @@ function App() {
   );
   const buildModalCandidatePaths = useMemo(() => {
     if (!buildDraft) return [];
-    if (buildDraft.force) return sourceFiles;
-    return pendingBuildSourceFiles.map((file) => file.path);
+    const buildSourcePaths = buildDraft.force
+      ? sourceFiles
+      : pendingBuildSourceFiles.map((file) => file.path);
+    const available = new Set(buildSourcePaths);
+    const ordered = buildDraft.sourceOrder.filter((path) => available.has(path));
+    const missing = buildSourcePaths.filter((path) => !ordered.includes(path));
+    return [...ordered, ...missing];
   }, [buildDraft, pendingBuildSourceFiles, sourceFiles]);
   const buildModalCandidateRows = useMemo(
     () =>
@@ -2556,11 +2627,20 @@ function App() {
         return {
           path,
           state: sourceFile?.state ?? "unchanged",
+          size: sourceFile?.size,
           readiness: sourceReadinessByPath.get(path),
           isPdf: isPdfSourcePath(path),
         };
       }),
     [buildModalCandidatePaths, sourceReadinessByPath, sourceStatus?.files],
+  );
+  const buildModalSelectedRows = useMemo(
+    () => buildModalCandidateRows,
+    [buildModalCandidateRows],
+  );
+  const buildModalSelectedSourcePaths = useMemo(
+    () => buildModalSelectedRows.map((row) => row.path),
+    [buildModalSelectedRows],
   );
   const buildModalRemovedRows = useMemo(
     () =>
@@ -2571,26 +2651,25 @@ function App() {
   );
   const buildModalReadySourcePaths = useMemo(
     () =>
-      buildModalCandidateRows
+      buildModalSelectedRows
         .filter((row) => row.readiness?.status === "ready")
         .map((row) => row.path),
-    [buildModalCandidateRows],
+    [buildModalSelectedRows],
   );
-  const buildModalFailedCount = buildModalCandidateRows.filter(
+  const buildModalFailedCount = buildModalSelectedRows.filter(
     (row) => row.readiness?.status === "failed",
   ).length;
-  const buildModalNeedsPrepCount = buildModalCandidateRows.filter((row) => {
+  const buildModalNeedsPrepCount = buildModalSelectedRows.filter((row) => {
     const status = row.readiness?.status ?? "not-prepared";
     return status === "not-prepared" || status === "preparing" || status === "failed";
   }).length;
   const buildModalNeedsPreparation = buildModalNeedsPrepCount > 0;
-  const buildReadySourcesAvailable = Boolean(
-    buildModalReadySourcePaths.length > 0 &&
-      buildModalReadySourcePaths.length < buildModalCandidateRows.length,
-  );
-  const buildModalHasPdfCandidates = buildModalCandidateRows.some((row) => row.isPdf);
+  const buildModalHasPdfCandidates = buildModalSelectedRows.some((row) => row.isPdf);
   const sourcePreparationActive = Boolean(
     sourcePreparationStartedAt || sourceReadinessPreparingCount(sourceReadiness) > 0,
+  );
+  const buildSourceOrderingDisabled = Boolean(
+    isStartingBuild || isPreparingBuildSources || queuedBuildWhenReady,
   );
   useEffect(() => {
     if (!workspace.workspacePath || sourcePreparationActive) return;
@@ -3281,6 +3360,7 @@ function App() {
     }
     if (busy) return busy;
     if (showUndoneStatus) return t("app.status.undone");
+    if (latestBuildFailed) return t("app.status.buildFailed");
     if (reviewableChangedFiles.length > 0) {
       if (unreviewedChangedFiles.length === 0) return t("app.status.generatedReviewed");
       return t("app.status.generatedToReview", {
@@ -3301,6 +3381,7 @@ function App() {
     reviewableChangedFiles.length,
     activeMaintainOperationTask,
     showUndoneStatus,
+    latestBuildFailed,
     unreviewedChangedFiles.length,
     isWikiUpdateRunning,
     language,
@@ -4652,21 +4733,30 @@ function App() {
         const state = await invoke<WorkspaceState>("load_workspace_state");
         if (cancelled) return;
         setWorkspace(state);
+        const markerMatchesOperation =
+          state.changedMarker?.operationType === "build-wiki" &&
+          state.changedMarker.operationId === progress.operationId;
+        const markerFailed = markerMatchesOperation && isFailedBuildMarker(state.changedMarker);
         const progressFailed = Boolean(
           progress.error ||
-            progress.events.some(
-              (event) =>
-                event.kind === "error" || event.status === "failed" || event.status === "error",
-            ),
+            progress.events.some(operationEventIndicatesFailure) ||
+            markerFailed,
         );
         track("wiki build completed", {
           result: progressFailed ? "failed" : "success",
-          error_kind: progressFailed ? "build_failed" : null,
+          error_kind: markerFailed
+            ? state.changedMarker?.status ?? "build_failed"
+            : progressFailed
+              ? "build_failed"
+              : null,
           ...wikiTitleProperties(state),
           changed_file_count: reviewableChangedFileCount(state),
           source_count: state.sourceFiles.length,
         });
-        const nextPath = chooseDocumentAfterCommand("build_wiki", state);
+        if (markerFailed) {
+          setError(t("app.buildFailed.toast"));
+        }
+        const nextPath = progressFailed ? null : chooseDocumentAfterCommand("build_wiki", state);
         if (nextPath) {
           void openWorkspaceFile(nextPath);
         }
@@ -4688,6 +4778,7 @@ function App() {
     workspaceOperationProgress?.operationId,
     workspaceOperationProgress?.operationType,
     workspaceOperationProgress?.running,
+    t,
   ]);
 
   useEffect(() => {
@@ -4717,7 +4808,11 @@ function App() {
               completedAtMs !== null &&
               completedAtMs >= backgroundBuildStartedAt - 1000,
           );
-          if (completedBuildWasObserved) {
+          const completedBuildFailed =
+            completedBuildWasObserved && isFailedBuildMarker(state.changedMarker);
+          const completedBuildSucceeded =
+            completedBuildWasObserved && isSuccessfulBuildMarker(state.changedMarker);
+          if (completedBuildSucceeded) {
             track("wiki build completed", {
               result: "success",
               error_kind: null,
@@ -4729,6 +4824,15 @@ function App() {
             if (nextPath) {
               void openWorkspaceFile(nextPath);
             }
+          } else if (completedBuildFailed) {
+            track("wiki build completed", {
+              result: "failed",
+              error_kind: state.changedMarker?.status ?? "build_failed",
+              ...wikiTitleProperties(state),
+              changed_file_count: reviewableChangedFileCount(state),
+              source_count: state.sourceFiles.length,
+            });
+            setError(t("app.buildFailed.toast"));
           } else {
             track("wiki build completed", {
               result: "failed",
@@ -4763,6 +4867,8 @@ function App() {
     backgroundBuildStartedAt,
     workspaceOperationProgress?.operationId,
     workspaceOperationProgress?.running,
+    language,
+    t,
   ]);
 
   useEffect(() => {
@@ -5424,42 +5530,89 @@ function App() {
     workspace.changedMarker?.completedAt,
   ]);
 
-	  function openBuildWiki(force = false) {
-	    if (buildBlockedReason) {
-	      track("onboarding blocked", {
-	        step: "build_wiki",
-	        error_kind: errorKindFromText(buildBlockedReason),
-	      });
-	      setError(buildBlockedReason);
-	      return;
+  function openBuildWiki(force = false) {
+    if (buildBlockedReason) {
+      track("onboarding blocked", {
+        step: "build_wiki",
+        error_kind: errorKindFromText(buildBlockedReason),
+      });
+      setError(buildBlockedReason);
+      return;
     }
     showAiSetupPrompt("build");
     setQueuedBuildWhenReady(null);
     const provider = activeProvider ?? providers[0];
     const modelId = provider ? appSettings?.models[provider.name] || provider.defaultModel : "";
     const model = provider?.supportedModels.find((item) => item.id === modelId);
+    const buildSourcePaths = force
+      ? sourceFiles
+      : pendingBuildSourceFiles.map((file) => file.path);
     const pdfUseAs = Object.fromEntries(
-      sourceFiles
+      buildSourcePaths
         .filter(isPdfSourcePath)
         .map((path) => [path, defaultPdfUseAsForSource(sourceReadinessByPath.get(path))]),
     ) as Record<string, PdfUseAsRole>;
-	    setBuildDraft({
+    setBuildDraft({
       instruction: "",
       workspaceContext: "",
       requiresWorkspaceContext: !force && shouldAskFirstBuildContext,
       force,
+      sourceOrder: buildSourcePaths,
       pdfUseAs,
       provider: provider?.name ?? "",
       model: modelId,
-	      reasoningEffort: modelEffort(appSettings, provider, model),
-	    });
-	    track("build modal opened", {
-	      force,
-	      source_count: sourceFiles.length,
-	      pending_source_count: pendingSourceCount,
-	      provider: provider?.name,
-	    });
-	  }
+      reasoningEffort: modelEffort(appSettings, provider, model),
+    });
+    track("build modal opened", {
+      force,
+      source_count: sourceFiles.length,
+      pending_source_count: pendingSourceCount,
+      provider: provider?.name,
+    });
+  }
+
+  function moveBuildSourceToOrder(path: string, orderNumber: number) {
+    setBuildDraft((prev) => {
+      if (!prev) return prev;
+      const buildSourcePaths = prev.force
+        ? sourceFiles
+        : pendingBuildSourceFiles.map((file) => file.path);
+      const available = new Set(buildSourcePaths);
+      const sourceOrder = prev.sourceOrder.filter((sourcePath) => available.has(sourcePath));
+      const missing = buildSourcePaths.filter((sourcePath) => !sourceOrder.includes(sourcePath));
+      sourceOrder.push(...missing);
+      const currentIndex = sourceOrder.indexOf(path);
+      if (currentIndex < 0) return prev;
+      const targetIndex = Math.max(0, Math.min(orderNumber - 1, sourceOrder.length - 1));
+      if (currentIndex === targetIndex) return prev;
+      sourceOrder.splice(currentIndex, 1);
+      sourceOrder.splice(targetIndex, 0, path);
+      return {
+        ...prev,
+        sourceOrder,
+      };
+    });
+  }
+
+  function setBuildSourceOrderDraft(path: string, value: string) {
+    setBuildSourceOrderDrafts((current) => ({
+      ...current,
+      [path]: value.replace(/[^\d]/g, ""),
+    }));
+  }
+
+  function commitBuildSourceOrderDraft(path: string, fallbackOrder: number | null) {
+    const rawValue = buildSourceOrderDrafts[path];
+    if (rawValue == null) return;
+    setBuildSourceOrderDrafts((current) => {
+      const next = { ...current };
+      delete next[path];
+      return next;
+    });
+    const parsed = Number.parseInt(rawValue, 10);
+    if (!Number.isFinite(parsed) || parsed < 1 || fallbackOrder == null) return;
+    moveBuildSourceToOrder(path, parsed);
+  }
 
   async function startBuildWiki(
     options: {
@@ -5473,14 +5626,14 @@ function App() {
       setError(buildBlockedReason);
       return;
     }
-	    if (buildDraft.requiresWorkspaceContext && !buildDraft.workspaceContext.trim()) {
-	      track("onboarding blocked", {
-	        step: "workspace_context",
-	        error_kind: "workspace_context_required",
-	      });
-	      setError("Tell Maple what this wiki is for before building.");
-	      return;
-	    }
+    if (buildDraft.requiresWorkspaceContext && !buildDraft.workspaceContext.trim()) {
+      track("onboarding blocked", {
+        step: "workspace_context",
+        error_kind: "workspace_context_required",
+      });
+      setError("Tell Maple what this wiki is for before building.");
+      return;
+    }
     const draft = buildDraft;
     const draftProvider =
       providers.find((provider) => provider.name === draft.provider) ?? activeProvider;
@@ -5509,15 +5662,38 @@ function App() {
       void draftProviderSetup.refresh("build_blocked");
       return;
     }
+    const defaultBuildSourcePaths = draft.force
+      ? sourceFiles
+      : pendingBuildSourceFiles.map((file) => file.path);
+    const availableSourceSet = new Set(defaultBuildSourcePaths);
+    const orderedDraftSourcePaths = draft.sourceOrder.filter((path) => availableSourceSet.has(path));
+    const missingDraftSourcePaths = defaultBuildSourcePaths.filter((path) => !orderedDraftSourcePaths.includes(path));
+    const allDraftSourcePaths = [...orderedDraftSourcePaths, ...missingDraftSourcePaths];
+    const buildDraftSourcePaths =
+      options.sourcePaths?.length ? options.sourcePaths : allDraftSourcePaths;
+    if (buildDraftSourcePaths.length === 0) {
+      setError(
+        draft.force
+          ? language === "ko"
+            ? "빌드할 소스가 없습니다."
+            : "No sources to build."
+          : language === "ko"
+            ? "새로 빌드할 소스 변경이 없습니다."
+            : "No new or modified sources to build.",
+      );
+      return;
+    }
+    const buildDraftSourceSet = new Set(buildDraftSourcePaths);
     const pdfUseAs = Object.fromEntries(
       Object.entries(draft.pdfUseAs).filter(
-        ([path, role]) => isPdfSourcePath(path) && isPdfUseAsRole(role),
+        ([path, role]) =>
+          buildDraftSourceSet.has(path) && isPdfSourcePath(path) && isPdfUseAsRole(role),
       ),
     ) as Record<string, PdfUseAsRole>;
-    if (options.prepareFirst && !options.skipPreparationCheck && buildModalCandidatePaths.length > 0) {
+    if (options.prepareFirst && !options.skipPreparationCheck && buildDraftSourcePaths.length > 0) {
       setBusy(sourcePreparationActive ? "Waiting for sources" : "Preparing sources");
       setError(null);
-      setQueuedBuildWhenReady({ sourcePaths: undefined });
+      setQueuedBuildWhenReady({ sourcePaths: buildDraftSourcePaths });
       if (sourcePreparationActive) {
         setSourcePreparationStartedAt((current) => current ?? Date.now());
         setBusy(null);
@@ -5525,14 +5701,14 @@ function App() {
       }
       try {
         const result = await invoke<AppCommandResult>("prepare_sources", {
-          sourcePaths: buildModalCandidatePaths,
+          sourcePaths: buildDraftSourcePaths,
           pdfUseAs,
         });
         setRunner(result.runner);
         setWorkspace(result.state);
         setSourcePreparationStartedAt(Date.now());
         track("source preparation started", {
-          source_count: buildModalCandidatePaths.length,
+          source_count: buildDraftSourcePaths.length,
           pdf_role_count: Object.keys(pdfUseAs).length,
           reason: "build_when_ready",
         });
@@ -5553,7 +5729,7 @@ function App() {
     setBuildDraft(null);
     setQueuedBuildWhenReady(null);
     clearAiSetupPrompt("build");
-    const selectedSourcePaths = options.sourcePaths?.length ? options.sourcePaths : null;
+    const buildSourcePaths = buildDraftSourcePaths.length ? buildDraftSourcePaths : null;
 
     try {
       track("wiki build started", {
@@ -5563,13 +5739,13 @@ function App() {
         ...buildWikiTopicProperties(draft),
         pending_source_count: pendingSourceCount,
         source_count: sourceFiles.length,
-        selected_source_count: selectedSourcePaths?.length ?? null,
+        build_source_count: buildSourcePaths?.length ?? null,
       });
       const result = await invoke<AppCommandResult>("build_wiki", {
         instruction: draft.instruction,
         workspaceContext: draft.requiresWorkspaceContext ? draft.workspaceContext.trim() : null,
         force: draft.force,
-        sourcePaths: selectedSourcePaths,
+        sourcePaths: buildSourcePaths,
         pdfUseAs,
         provider: draftProvider.name,
         model: draftModel,
@@ -5639,7 +5815,7 @@ function App() {
   useEffect(() => {
     if (!queuedBuildWhenReady || !buildDraft || sourcePreparationActive) return;
 
-    const failedRows = buildModalCandidateRows.filter(
+    const failedRows = buildModalSelectedRows.filter(
       (row) => row.readiness?.status === "failed",
     );
     if (failedRows.length > 0) {
@@ -5652,7 +5828,7 @@ function App() {
       return;
     }
 
-    const notReadyRows = buildModalCandidateRows.filter(
+    const notReadyRows = buildModalSelectedRows.filter(
       (row) => (row.readiness?.status ?? "not-prepared") !== "ready",
     );
     if (notReadyRows.length > 0) return;
@@ -5667,7 +5843,7 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     buildDraft,
-    buildModalCandidateRows,
+    buildModalSelectedRows,
     queuedBuildWhenReady,
     sourcePreparationActive,
   ]);
@@ -8407,10 +8583,11 @@ function App() {
               <button
                 type="button"
                 className="source-action-btn primary"
-                disabled={
-                  Boolean(buildBlockedReason) ||
-                  (!hasPendingSourceChanges && !aiSetupGateActive)
-                }
+	                disabled={
+	                  Boolean(buildBlockedReason) ||
+	                  (!aiSetupGateActive &&
+                      (sourceFiles.length === 0 || pendingBuildSourceFiles.length === 0))
+	                }
                 onClick={() =>
                   aiSetupGateActive
                     ? openAiSetupFromGate("build", "build_wiki")
@@ -8421,10 +8598,14 @@ function App() {
                     ? t("app.ai.connectToBuild")
                     : buildBlockedReason
                     ? buildBlockedReason
-                    : hasPendingSourceChanges
-                    ? t("app.sidebar.pendingSourceChanges", { count: pendingSourceCount })
-                    : t("app.sidebar.noPendingSourceChanges")
-                }
+	                    : hasPendingSourceChanges
+	                    ? t("app.sidebar.pendingSourceChanges", { count: pendingSourceCount })
+	                    : sourceFiles.length > 0
+	                      ? language === "ko"
+	                        ? "새로 빌드할 소스 변경이 없습니다."
+	                        : "No new or modified sources to build."
+	                      : t("app.sidebar.noPendingSourceChanges")
+	                }
               >
                 {aiSetupGateActive ? t("app.ai.connectToBuild") : t("app.sidebar.buildWiki")}
               </button>
@@ -8442,7 +8623,59 @@ function App() {
               </button>
             </section>
           ) : null}
-          {showBuildOperationFeed ? (
+          {showBuildFailurePanel ? (
+            <section
+              className="build-summary-panel build-failure-panel"
+              aria-label={t("app.buildFailed.title")}
+            >
+              <div className="build-summary-header">
+                <div className="build-summary-title-block">
+                  <span className="build-summary-title">{t("app.buildFailed.title")}</span>
+                  <span className="build-summary-state">{t("app.common.error")}</span>
+                </div>
+                <button
+                  type="button"
+                  className="build-summary-dismiss"
+                  aria-label={t("app.center.dismissError")}
+                  title={t("app.center.dismissError")}
+                  onClick={() =>
+                    latestBuildFailureOperationId
+                      ? setDismissedBuildSummaryOperationId(latestBuildFailureOperationId)
+                      : undefined
+                  }
+                >
+                  <X size={15} strokeWidth={2.2} aria-hidden="true" />
+                </button>
+              </div>
+              <div className="build-summary-body">
+                <p>{latestBuildFailureDetail}</p>
+                <p>
+                  {t("app.buildFailed.body", {
+                    count: pendingSourceCount,
+                    plural: pendingSourceCount === 1 ? "" : "s",
+                  })}
+                </p>
+                <div className="build-summary-actions">
+                  <button
+                    type="button"
+                    disabled={!workspace.reportMd}
+                    onClick={() => void openReportTab()}
+                  >
+                    {t("app.buildFailed.openReport")}
+                  </button>
+                  <button
+                    type="button"
+                    className="primary"
+                    disabled={Boolean(buildBlockedReason) || anyOperationBusy}
+                    title={buildBlockedReason ?? undefined}
+                    onClick={() => openBuildWiki(false)}
+                  >
+                    {t("app.buildFailed.retry")}
+                  </button>
+                </div>
+              </div>
+            </section>
+          ) : showBuildOperationFeed ? (
             <OperationFeedPanel
               progress={workspaceOperationProgress}
               title={t("app.sidebar.buildWiki")}
@@ -10155,22 +10388,35 @@ function App() {
 
               <div className="build-source-summary">
                 <div className="build-source-summary-header">
-                  <strong>
-                    {buildDraft.force
-                      ? language === "ko"
-                        ? "빌드할 소스"
-                        : "Sources to build"
-                      : language === "ko"
-                        ? "변경된 소스"
-                        : "Changed sources"}
-                  </strong>
-                  {buildModalCandidateRows.length > 0 ? (
-                    <span>
-                      {buildModalReadySourcePaths.length}/{buildModalCandidateRows.length}{" "}
-                      {language === "ko" ? "준비됨" : "ready"}
+	                  <strong>
+	                    {buildDraft.force
+                        ? language === "ko"
+                          ? "빌드할 소스"
+                          : "Sources to build"
+                        : language === "ko"
+                          ? "새로 빌드할 소스"
+                          : "New or modified sources"}
+	                  </strong>
+	                  {buildModalCandidateRows.length > 0 ? (
+	                    <span>
+	                      {buildModalSelectedSourcePaths.length}{" "}
+	                      {language === "ko" ? "개 소스" : "sources"} ·{" "}
+	                      {buildModalReadySourcePaths.length}/{buildModalSelectedRows.length}{" "}
+	                      {language === "ko" ? "준비됨" : "ready"}
                     </span>
                   ) : null}
                 </div>
+	                {buildModalCandidateRows.length > 0 ? (
+		                  <p className="build-source-order-note">
+		                    {language === "ko"
+		                      ? buildDraft.force
+                            ? "Build Wiki는 모든 소스를 위에서 아래 순서대로 읽습니다. 왼쪽 숫자를 바꾸면 그 순서로 이동합니다."
+                            : "Build Wiki는 새 소스와 수정된 소스만 위에서 아래 순서대로 읽습니다. 왼쪽 숫자를 바꾸면 그 순서로 이동합니다."
+		                      : buildDraft.force
+                            ? "Build Wiki reads all sources from top to bottom. Edit the number on the left to move a source to that position."
+                            : "Build Wiki reads only new and modified sources from top to bottom. Edit the number on the left to move a source to that position."}
+		                  </p>
+	                ) : null}
                 {sourcePreparationActive || queuedBuildWhenReady ? (
                   <p className="build-source-prep-note">
                     {buildModalHasPdfCandidates
@@ -10183,83 +10429,136 @@ function App() {
                   </p>
                 ) : null}
                 {buildModalFailedCount > 0 ? (
-                  <p className="build-source-prep-note warning">
-                    {language === "ko"
-                      ? `${buildModalFailedCount}개 소스 준비에 실패했습니다. 준비된 소스만 빌드하거나 다시 시도할 수 있습니다.`
-                      : `${buildModalFailedCount} source${
-                          buildModalFailedCount === 1 ? "" : "s"
-                        } failed preparation. You can build ready sources or retry.`}
-                  </p>
+	                  <p className="build-source-prep-note warning">
+	                    {language === "ko"
+	                      ? `${buildModalFailedCount}개 소스 준비에 실패했습니다. 다시 준비를 시도한 뒤 빌드하세요.`
+	                      : `${buildModalFailedCount} source${
+	                          buildModalFailedCount === 1 ? "" : "s"
+	                        } failed preparation. Retry preparation before building.`}
+	                  </p>
                 ) : null}
                 {buildModalCandidateRows.length > 0 || buildModalRemovedRows.length > 0 ? (
                   <div className="build-source-list">
-                    {buildModalCandidateRows.map((row) => {
-                      const readiness = row.readiness?.status ?? "not-prepared";
-                      const selectedRole = isPdfUseAsRole(buildDraft.pdfUseAs[row.path])
-                        ? buildDraft.pdfUseAs[row.path]
-                        : defaultPdfUseAsForSource(row.readiness);
-                      return (
-                        <div key={row.path} className="build-source-row">
-                          <div className="build-source-row-main">
-                            <span className="build-source-path" title={row.path}>
-                              {row.path}
-                            </span>
-                            <span className={`build-source-readiness ${readiness}`}>
-                              {sourceReadinessLabel(readiness, language)}
-                            </span>
-                          </div>
-                          {row.isPdf ? (
-                            <label className="build-source-role">
-                              <span>{language === "ko" ? "읽는 방식" : "Reading mode"}</span>
-                              <select
-                                value={selectedRole}
-                                disabled={
-                                  isStartingBuild ||
-                                  isPreparingBuildSources ||
-                                  Boolean(queuedBuildWhenReady)
-                                }
-                                onChange={(event) => {
-                                  const role = event.target.value;
-                                  if (!isPdfUseAsRole(role)) return;
-                                  setBuildDraft((prev) =>
-                                    prev
-                                      ? {
-                                          ...prev,
-                                          pdfUseAs: {
-                                            ...prev.pdfUseAs,
-                                            [row.path]: role,
-                                          },
-                                        }
-                                      : prev,
-                                  );
-                                }}
-                              >
-                                {PDF_USE_AS_OPTIONS.map((option) => (
-                                  <option key={option.value} value={option.value}>
-                                    {pdfUseAsLabel(option.value, language)}
-                                  </option>
-                                ))}
-                              </select>
-                            </label>
-                          ) : null}
-                          {row.readiness?.error ? (
-                            <p className="build-source-error">{row.readiness.error}</p>
-                          ) : null}
-                        </div>
-                      );
-                    })}
-                    {buildModalRemovedRows.map((file) => (
-                      <div key={`removed-${file.path}`} className="build-source-row removed">
-                        <div className="build-source-row-main">
-                          <span className="build-source-path" title={file.path}>
-                            {file.path}
-                          </span>
-                          <span className="build-source-readiness removed">
-                            {sourceStateLabel("removed", language)}
-                          </span>
-                        </div>
-                      </div>
-                    ))}
+	                    {buildModalCandidateRows.map((row) => {
+	                      const readiness = row.readiness?.status ?? "not-prepared";
+	                      const selectedRole = isPdfUseAsRole(buildDraft.pdfUseAs[row.path])
+	                        ? buildDraft.pdfUseAs[row.path]
+	                        : defaultPdfUseAsForSource(row.readiness);
+		                      const selectedOrderNumber =
+		                        buildModalSelectedSourcePaths.indexOf(row.path) + 1;
+		                      const orderDraftValue = buildSourceOrderDrafts[row.path];
+		                      return (
+		                        <div
+		                          key={row.path}
+		                          className="build-source-item"
+		                        >
+		                          <input
+		                            className="build-source-order-input"
+		                            type="text"
+		                            inputMode="numeric"
+		                            pattern="[0-9]*"
+		                            value={orderDraftValue ?? String(selectedOrderNumber)}
+		                            disabled={buildSourceOrderingDisabled}
+		                            aria-label={
+		                              language === "ko"
+		                                ? `${row.path} 읽는 순서`
+		                                : `Reading order for ${row.path}`
+		                            }
+		                            title={
+		                              language === "ko"
+		                                ? "숫자를 입력해 순서를 바꾸세요"
+		                                : "Type a number to change the order"
+		                            }
+		                            onChange={(event) =>
+		                              setBuildSourceOrderDraft(row.path, event.currentTarget.value)
+		                            }
+		                            onBlur={() =>
+		                              commitBuildSourceOrderDraft(row.path, selectedOrderNumber)
+		                            }
+		                            onKeyDown={(event) => {
+		                              if (event.key === "Enter") {
+		                                event.currentTarget.blur();
+		                              } else if (event.key === "Escape") {
+		                                setBuildSourceOrderDrafts((current) => {
+		                                  const next = { ...current };
+		                                  delete next[row.path];
+		                                  return next;
+		                                });
+		                                event.currentTarget.blur();
+		                              }
+		                            }}
+		                          />
+	                          <div className={`build-source-card ${row.isPdf ? "has-role" : ""}`}>
+	                            <div className="build-source-row-main">
+	                              <span className="build-source-path" title={row.path}>
+	                                {row.path}
+	                              </span>
+	                              <span className="build-source-meta">
+	                                <span className={`build-source-state ${row.state}`}>
+	                                  {sourceStateLabel(row.state, language)}
+	                                </span>
+	                                <span aria-hidden="true">·</span>
+	                                <span className={`build-source-status ${readiness}`}>
+	                                  {sourceReadinessLabel(readiness, language)}
+	                                </span>
+	                              </span>
+	                            </div>
+	                            {row.isPdf ? (
+	                              <label className="build-source-role">
+	                                <span>{language === "ko" ? "읽는 방식" : "Reading mode"}</span>
+	                                <select
+	                                  value={selectedRole}
+		                                  disabled={
+		                                    isStartingBuild ||
+		                                    isPreparingBuildSources ||
+		                                    Boolean(queuedBuildWhenReady)
+		                                  }
+	                                  onChange={(event) => {
+	                                    const role = event.target.value;
+	                                    if (!isPdfUseAsRole(role)) return;
+	                                    setBuildDraft((prev) =>
+	                                      prev
+	                                        ? {
+	                                            ...prev,
+	                                            pdfUseAs: {
+	                                              ...prev.pdfUseAs,
+	                                              [row.path]: role,
+	                                            },
+	                                          }
+	                                        : prev,
+	                                    );
+	                                  }}
+	                                >
+	                                  {PDF_USE_AS_OPTIONS.map((option) => (
+	                                    <option key={option.value} value={option.value}>
+	                                      {pdfUseAsLabel(option.value, language)}
+	                                    </option>
+	                                  ))}
+	                                </select>
+	                              </label>
+	                            ) : null}
+		                            {row.readiness?.error ? (
+	                              <p className="build-source-error">{row.readiness.error}</p>
+	                            ) : null}
+	                          </div>
+	                        </div>
+	                      );
+	                    })}
+	                    {buildModalRemovedRows.map((file) => (
+	                      <div key={`removed-${file.path}`} className="build-source-item removed">
+	                        <div className="build-source-order-empty">-</div>
+	                        <div className="build-source-card removed">
+	                          <div className="build-source-row-main">
+	                            <span className="build-source-path" title={file.path}>
+	                              {file.path}
+	                            </span>
+	                            <span className="build-source-status removed">
+	                              {sourceStateLabel("removed", language)}
+	                            </span>
+	                          </div>
+	                        </div>
+	                      </div>
+	                    ))}
                   </div>
                 ) : buildDraft.force ? (
                   <p>{t("app.build.noSources")}</p>
@@ -10378,60 +10677,42 @@ function App() {
                 >
                   {t("app.common.cancel")}
                 </button>
-                {buildReadySourcesAvailable ? (
-                  <button
-                    type="button"
-                    className="apply-modal-secondary"
-                    onClick={() =>
-                      void startBuildWiki({ sourcePaths: buildModalReadySourcePaths })
-                    }
-                    disabled={
-                      Boolean(buildBlockedReason) ||
-                      Boolean(queuedBuildWhenReady) ||
-                      isStartingBuild ||
-                      isPreparingBuildSources ||
-                      !buildDraftProvider ||
-                      !buildDraftModelId ||
-                      !selectedBuildProviderReady ||
-                      buildModalReadySourcePaths.length === 0 ||
-                      (buildDraft.requiresWorkspaceContext && !buildDraft.workspaceContext.trim())
-                    }
-                    title={
-                      buildModalReadySourcePaths.length > 0
-                        ? undefined
-                        : language === "ko"
-                          ? "준비된 소스가 없습니다."
-                          : "No ready sources."
-                    }
-                  >
-                    {language === "ko" ? "준비된 소스 빌드" : "Build ready sources"}
-                  </button>
-                ) : null}
-                <button
+	                <button
                   type="button"
                   className="apply-modal-primary"
                   onClick={() =>
                     void startBuildWiki({
-                      prepareFirst: buildModalNeedsPreparation && buildModalCandidateRows.length > 0,
+                      prepareFirst: buildModalNeedsPreparation && buildModalSelectedRows.length > 0,
                     })
                   }
                   disabled={
                     Boolean(buildBlockedReason) ||
                     Boolean(queuedBuildWhenReady) ||
                     isPreparingBuildSources ||
-                    !buildDraftProvider ||
-                    !buildDraftModelId ||
-                    !selectedBuildProviderReady ||
-                    (!buildDraft.force && pendingSourceFiles.length === 0) ||
+                      !buildDraftProvider ||
+                      !buildDraftModelId ||
+                      !selectedBuildProviderReady ||
+                    buildModalSelectedSourcePaths.length === 0 ||
                     (buildDraft.requiresWorkspaceContext && !buildDraft.workspaceContext.trim())
                   }
-                  title={buildBlockedReason ?? undefined}
+	                  title={
+	                    buildBlockedReason ??
+	                    (buildModalSelectedSourcePaths.length === 0
+	                      ? language === "ko"
+	                        ? buildDraft.force
+                            ? "빌드할 소스가 없습니다."
+                            : "새로 빌드할 소스 변경이 없습니다."
+	                        : buildDraft.force
+                            ? "No sources to build."
+                            : "No new or modified sources to build."
+	                      : undefined)
+	                  }
                 >
                   {queuedBuildWhenReady
                     ? language === "ko"
                       ? "준비되면 빌드"
                       : "Build queued"
-                    : buildModalNeedsPreparation && buildModalCandidateRows.length > 0
+                    : buildModalNeedsPreparation && buildModalSelectedRows.length > 0
                       ? language === "ko"
                         ? "준비되면 빌드"
                         : "Build when ready"

@@ -206,7 +206,7 @@ Explain sources this way:
 - Sources are the original reference files.
 - Maple should not rewrite sources.
 - Maple prepares readable copies of some sources, reads those prepared copies, and writes wiki pages.
-- If a source changes, Maple can detect pending source changes.
+- If a source changes, Maple can detect pending source changes. Normal Build wiki uses only new or modified sources; Build wiki again can be used as a full rebuild.
 - Prepared source artifacts are generated under `.aiwiki/`, not written back into `sources/`.
 
 ## Source Preparation
@@ -261,7 +261,7 @@ Good first source set:
 - Start with a small group of related files.
 - For a class, start with one lecture PDF or a few notes.
 - For a project archive, start with the most important documents.
-- Avoid dropping hundreds of files for the first build because the first review will be harder.
+- Build wiki reads the new or modified sources in the workspace, so add related source batches in the order you want Maple to learn them.
 
 If the user asks "Do I need to organize files first?":
 
@@ -280,23 +280,25 @@ Common states:
 - New source files mean Maple has not built from them yet.
 - Modified source files mean Maple previously saw the file but it changed.
 - Removed source files mean a previously tracked source is gone.
-- No pending source changes means Build wiki may not need to run unless the user wants to rebuild.
+- No pending source changes means Maple does not see new or modified sources to build. The user can still run Build wiki again to rebuild from all current sources.
 
 Source readiness tells whether the files are readable for Build wiki.
 
 In the Build wiki modal, Maple may show a source list with readiness badges such as `Ready`, `Preparing`, `Needs prep`, or `Failed`. It may also show a count like `2/3 ready`.
+Normal Build wiki uses only new or modified sources. The source list is for readiness, PDF reading mode, and reading order; it is not an include/exclude picker.
+The user should determine the reading order when order matters. Maple uses that order as context for the wiki's summaries, learning path, and guide structure.
 
 If some sources are still preparing:
 
 - Tell the user to wait for preparation to finish.
 - If the build button says `Build when ready`, it will queue the build until preparation completes.
-- If Maple offers `Build ready sources`, that builds only the sources already prepared.
+- Build wiki uses the listed new or modified sources once preparation is ready.
 
 If preparation failed:
 
 - Ask the user to read the visible error on that source row.
 - For Office files, check whether LibreOffice is installed.
-- Suggest retrying with fewer sources or converting the problematic file to PDF if needed.
+- Suggest fixing or converting the problematic file to PDF if needed. The Build wiki modal does not have an include/exclude picker.
 
 If the user asks why Build wiki is disabled:
 
@@ -304,7 +306,6 @@ Possible reasons:
 
 - No workspace is open.
 - No supported source files are present.
-- No pending source changes are detected.
 - Sources are still preparing.
 - A workspace-changing operation is already running.
 - AI connection is not ready.
@@ -318,7 +319,9 @@ If the user sees `Connect AI to build`, explain that Maple can import and show f
 
 Build wiki should:
 
-- Read the sources.
+- Read new or modified sources in the workspace for normal builds.
+- Read all current sources only for an explicit full rebuild.
+- Respect the reading order the user sets in the Build wiki modal.
 - Follow `schema.md` and workspace instructions.
 - Create or update wiki pages.
 - Write generated changes into the workspace.
@@ -329,7 +332,7 @@ For a first build:
 
 1. Add one or more source files.
 2. Click `Build wiki`.
-3. Check the changed source list and readiness badges.
+3. Check the source list, readiness badges, and reading order. If the sources have a natural sequence, such as textbook chapters, lectures, or a research timeline, set that order before starting.
 4. For PDFs, choose the best `Reading mode` if Maple shows that control.
 5. If Maple asks "What are you building?", describe the goal in plain language.
 6. Example: "This is for my robotics class. Make beginner-friendly summaries, explain formulas step by step, and create exam review guides."
@@ -370,12 +373,6 @@ If the Build wiki modal shows `Build when ready`:
 Explain:
 
 "Maple still needs to prepare one or more sources. Click `Build when ready` to let Maple finish preparation first, then start the build automatically."
-
-If the Build wiki modal shows `Build ready sources`:
-
-Explain:
-
-"Some sources are already ready and some are not. `Build ready sources` builds only the ready files. Use it when you do not want to wait for the remaining source preparation."
 
 ## Reviewing AI-Generated Changes
 
@@ -644,7 +641,7 @@ Sources are original files Maple reads from, such as PDFs, slides, Word document
 
 ### "What is Build wiki?"
 
-Build wiki asks the selected AI account to turn pending sources into a local wiki. It is the main compile step.
+Build wiki asks the selected AI account to turn all current workspace sources into a local wiki. It is the main compile step. The Build wiki source list controls reading order and preparation settings, not source inclusion. The user should set the reading order when sequence matters because Maple uses it to shape summaries, learning paths, and guides.
 
 ### "What is the difference between Build wiki and Ask Wiki?"
 
@@ -690,11 +687,7 @@ LibreOffice lets Maple preview or prepare Office files such as PowerPoint, Word,
 
 ### "What is Build when ready?"
 
-`Build when ready` means Maple will prepare the needed sources first, then start Build wiki automatically.
-
-### "What is Build ready sources?"
-
-`Build ready sources` means Maple will build only the sources that are already prepared and skip the ones still preparing or failed.
+`Build when ready` means Maple will prepare the current sources first, then start Build wiki automatically.
 
 ### "Can I edit the prepared Markdown in `.aiwiki/`?"
 
@@ -790,7 +783,8 @@ Use that state to make answers specific.
 Examples:
 
 - If no workspace is open, start with creating or opening a workspace.
-- If sources are pending, suggest Build wiki.
+- If supported sources are present and the user wants to create, refresh, or rebuild the wiki, suggest Build wiki.
+- If sources have pending changes, explain that Build wiki will use the new or modified sources and respect the order shown in the Build wiki modal.
 - If sources are preparing, suggest waiting for preparation to finish or using `Build when ready` if visible.
 - If source preparation failed, suggest checking the visible source-row error and LibreOffice status for Office files.
 - If generated changes are waiting for review, suggest reviewing or undoing before starting another write operation.

@@ -21,7 +21,7 @@ const scenes = [
     duration: 4.5,
     kicker: "LOCAL AI WIKI BUILDER",
     title: "Maple",
-    body: "Turn PDFs, notes, links, and research scraps into a local wiki you can review and keep on your Mac.",
+    body: "Turn PDFs, Office files, notes, data, links, and images into a local wiki you can review and maintain.",
   },
   {
     image: "maple-workspace-explore.png",
@@ -34,29 +34,29 @@ const scenes = [
     image: "maple-guide-sources.png",
     duration: 6,
     kicker: "2. IMPORT SOURCES",
-    title: "Bring in the raw material",
-    body: "Add PDFs, notes, transcripts, screenshots, papers, and captured links without rewriting the originals.",
+    title: "Import sources",
+    body: "Add PDFs, Office files, notes, data, images, and saved pages without rewriting originals.",
   },
   {
     image: "maple-update-wiki-modal.png",
     duration: 6,
     kicker: "3. BUILD WITH AI",
-    title: "Use your ChatGPT/Codex subscription",
-    body: "Maple asks AI to compile sources into summaries, concept pages, guides, links, and logs.",
+    title: "Build with AI",
+    body: "Prepare sources, then use ChatGPT or Claude to compile pages, links, and logs.",
   },
   {
     image: "maple-guide-generated-page.png",
     duration: 6,
     kicker: "4. REVIEW THE WIKI",
-    title: "Read the generated pages",
-    body: "The wiki becomes the working layer: structured, linked, and easier to revisit than a chat thread.",
+    title: "Review pages",
+    body: "Generated pages are structured, linked, and easier to revisit than a chat thread.",
   },
   {
     image: "maple-guide-chat.png",
     duration: 6,
-    kicker: "5. EXPLORE",
+    kicker: "5. ASK WIKI",
     title: "Ask questions safely",
-    body: "Explore Chat is read-only by default, so normal questions do not silently change your files.",
+    body: "Ask Wiki is read-only by default, so questions do not silently change your files.",
   },
   {
     image: "maple-guide-review.png",
@@ -69,7 +69,7 @@ const scenes = [
     image: "maple-guide-maintain.png",
     duration: 6,
     kicker: "7. MAINTAIN",
-    title: "Improve the archive over time",
+    title: "Maintain the wiki",
     body: "Run healthchecks, improve pages, organize sources, and update durable workspace rules.",
   },
   {
@@ -77,7 +77,7 @@ const scenes = [
     duration: 4.5,
     kicker: "MAPLE FOR MACOS",
     title: "Build your local AI wiki",
-    body: "Download Maple and turn your next pile of learning material into something you can actually explore.",
+    body: "Download Maple and turn your next pile of learning material into a wiki you can ask and maintain.",
   },
 ];
 
@@ -164,13 +164,16 @@ function makeImageScene(scene, index, output) {
     `color=c=0xfbfaf6:s=${width}x${height}:r=${fps}:d=${duration}[base]`,
     `[base]drawbox=x=185:y=55:w=1550:h=770:color=0xd4cdb9@1:t=fill[frame]`,
     `[frame][shot]overlay=x=190:y=60[withshot]`,
+  ];
+  filter.push(
     `[withshot]drawbox=x=120:y=842:w=1680:h=174:color=0xffffff@0.96:t=fill[caption]`,
     `[caption][icon]overlay=x=144:y=866[brand]`,
     `[brand]${drawText({ file: kickerFile, size: 25, color: "0xb93e17", x: 198, y: 863 })}[a]`,
     `[a]${drawText({ file: titleFile, size: 43, color: "0x1f1a12", x: 144, y: 905 })}[b]`,
     `[b]${drawText({ file: bodyFile, size: 27, color: "0x5c5447", x: 625, y: 887 })}[c]`,
     `[c]fade=t=in:st=0:d=0.35,fade=t=out:st=${duration - 0.35}:d=0.35,format=yuv420p[v]`,
-  ].join(";");
+  );
+  const filterGraph = filter.join(";");
 
   ffmpeg([
     "-loop",
@@ -186,7 +189,7 @@ function makeImageScene(scene, index, output) {
     "-i",
     icon,
     "-filter_complex",
-    filter,
+    filterGraph,
     "-map",
     "[v]",
     "-t",

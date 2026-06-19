@@ -121,6 +121,7 @@ const english = {
   "app.status.startingMaintain": "Starting Maintain discussion",
   "app.status.maintainDiscussion": "Maintain discussion",
   "app.status.undone": "Undone",
+  "app.status.buildFailed": "Build failed",
   "app.status.generatedReviewed": "Generated changes reviewed",
   "app.status.generatedToReview": "{count} generated change{plural} to review",
   "app.status.notLoaded": "Not loaded",
@@ -128,7 +129,7 @@ const english = {
   "app.sidebar.finishReviewBeforeImport":
     "Finish reviewing or undo generated changes before importing more sources.",
   "app.sidebar.buildWiki": "Build wiki",
-  "app.sidebar.noPendingSourceChanges": "No pending source changes",
+  "app.sidebar.noPendingSourceChanges": "No sources found",
   "app.sidebar.pendingSourceChanges": "{count} pending source change(s)",
   "app.sidebar.workspaceBuild": "Workspace build",
   "app.sidebar.sourceChanges": "{count} source change(s)",
@@ -276,12 +277,12 @@ const english = {
   "app.build.title": "Build wiki",
   "app.build.titleAgain": "Build wiki again",
   "app.build.titleContext": "Tell Maple what this wiki is for",
-  "app.build.body": "Process pending source changes into the wiki.",
+  "app.build.body": "Build new or modified sources into the wiki.",
   "app.build.bodyAgain": "Reprocess current sources using the workspace rules.",
   "app.build.bodyContext": "This helps Maple choose the right summaries, concepts, and guides.",
   "app.build.noSources": "No sources found.",
   "app.build.moreSources": "{count} more source(s)",
-  "app.build.noPending": "No pending source changes were detected.",
+  "app.build.noPending": "No new or modified sources found.",
   "app.build.layersTitle": "Build in layers",
   "app.build.layersBody":
     "Use this first build for one topic or area. Review the wiki, refine `schema.md` or the structure in the Maintain tab, then add the next group of sources.",
@@ -289,6 +290,22 @@ const english = {
   "app.build.existingBody":
     "These sources look like they already belong to the current wiki. Keep the wiki as the baseline to mark them ingested without asking AI to rewrite everything.",
   "app.build.keepCurrent": "Keep current wiki",
+  "app.buildFailed.title": "Build did not update the wiki",
+  "app.buildFailed.timedOut": "The AI run timed out before writing wiki files.",
+  "app.buildFailed.providerFailed":
+    "The AI provider failed before Maple could detect wiki changes.",
+  "app.buildFailed.turnBudget":
+    "The AI run hit its turn budget before writing wiki files.",
+  "app.buildFailed.noWikiContent":
+    "The AI run finished, but no wiki pages or index/log changes were produced.",
+  "app.buildFailed.cancelled": "The build was stopped before wiki changes were produced.",
+  "app.buildFailed.generic": "The build ended before Maple found any wiki changes.",
+  "app.buildFailed.body":
+    "No generated files are waiting for review. {count} source change{plural} still need to be built.",
+  "app.buildFailed.openReport": "Open report",
+  "app.buildFailed.retry": "Try again",
+  "app.buildFailed.toast":
+    "Build wiki did not create reviewable wiki changes. Open the report for details.",
   "app.build.aiModel": "AI model",
   "app.build.modelLabel": "Build wiki AI model",
   "app.build.whatBuilding": "What are you building?",
@@ -680,6 +697,7 @@ const korean: Record<TranslationKey, string> = {
   "app.status.startingMaintain": "관리 대화 시작 중",
   "app.status.maintainDiscussion": "관리 대화",
   "app.status.undone": "되돌림",
+  "app.status.buildFailed": "빌드 실패",
   "app.status.generatedReviewed": "생성된 변경 검토 완료",
   "app.status.generatedToReview": "검토할 생성 변경 {count}개",
   "app.status.notLoaded": "불러오지 않음",
@@ -687,7 +705,7 @@ const korean: Record<TranslationKey, string> = {
   "app.sidebar.finishReviewBeforeImport":
     "소스를 더 가져오기 전에 생성된 변경을 검토하거나 되돌리세요.",
   "app.sidebar.buildWiki": "위키 빌드",
-  "app.sidebar.noPendingSourceChanges": "대기 중인 소스 변경 없음",
+  "app.sidebar.noPendingSourceChanges": "소스가 없습니다",
   "app.sidebar.pendingSourceChanges": "대기 중인 소스 변경 {count}개",
   "app.sidebar.workspaceBuild": "워크스페이스 빌드",
   "app.sidebar.sourceChanges": "소스 변경 {count}개",
@@ -835,12 +853,12 @@ const korean: Record<TranslationKey, string> = {
   "app.build.title": "위키 빌드",
   "app.build.titleAgain": "위키 다시 빌드",
   "app.build.titleContext": "이 위키의 목적을 알려주세요",
-  "app.build.body": "대기 중인 소스 변경을 위키로 처리합니다.",
+  "app.build.body": "새 소스와 수정된 소스를 위키에 반영합니다.",
   "app.build.bodyAgain": "현재 소스를 워크스페이스 규칙에 따라 다시 처리합니다.",
   "app.build.bodyContext": "Maple이 적절한 요약, 개념, 가이드를 고르는 데 도움이 됩니다.",
   "app.build.noSources": "소스가 없습니다.",
   "app.build.moreSources": "소스 {count}개 더 있음",
-  "app.build.noPending": "대기 중인 소스 변경이 감지되지 않았습니다.",
+  "app.build.noPending": "새 소스나 수정된 소스가 없습니다.",
   "app.build.layersTitle": "층층이 빌드하세요",
   "app.build.layersBody":
     "첫 빌드는 한 주제나 영역에만 사용하세요. 위키를 검토하고, `schema.md`나 관리 탭의 구조를 다듬은 뒤 다음 소스 묶음을 추가하세요.",
@@ -848,6 +866,21 @@ const korean: Record<TranslationKey, string> = {
   "app.build.existingBody":
     "이 소스들은 이미 현재 위키에 속한 것처럼 보입니다. AI에게 전체를 다시 쓰게 하지 않고 현재 위키를 기준선으로 유지해 반영 완료로 표시할 수 있습니다.",
   "app.build.keepCurrent": "현재 위키 유지",
+  "app.buildFailed.title": "위키 빌드가 반영되지 않았습니다",
+  "app.buildFailed.timedOut": "AI 실행이 위키 파일을 쓰기 전에 시간 초과되었습니다.",
+  "app.buildFailed.providerFailed":
+    "Maple이 위키 변경을 감지하기 전에 AI 제공자 실행이 실패했습니다.",
+  "app.buildFailed.turnBudget": "AI 실행이 위키 파일을 쓰기 전에 턴 한도에 도달했습니다.",
+  "app.buildFailed.noWikiContent":
+    "AI 실행은 끝났지만 위키 페이지나 index/log 변경이 만들어지지 않았습니다.",
+  "app.buildFailed.cancelled": "위키 변경이 만들어지기 전에 빌드가 중지되었습니다.",
+  "app.buildFailed.generic": "Maple이 위키 변경을 찾기 전에 빌드가 끝났습니다.",
+  "app.buildFailed.body":
+    "검토할 생성 파일이 없습니다. 소스 변경 {count}개는 아직 빌드해야 합니다.",
+  "app.buildFailed.openReport": "리포트 열기",
+  "app.buildFailed.retry": "다시 시도",
+  "app.buildFailed.toast":
+    "위키 빌드가 검토 가능한 위키 변경을 만들지 못했습니다. 자세한 내용은 리포트를 확인하세요.",
   "app.build.aiModel": "AI 모델",
   "app.build.modelLabel": "위키 빌드 AI 모델",
   "app.build.whatBuilding": "무엇을 만들고 있나요?",

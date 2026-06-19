@@ -1,6 +1,6 @@
 const macosDownloadUrl =
-  "https://github.com/cwoo1090/maple/releases/download/v0.1.19/Maple_0.1.19_aarch64.dmg";
-const macosDownloadName = "Maple_0.1.19_aarch64.dmg";
+  "https://github.com/cwoo1090/maple/releases/download/v0.1.21/Maple_0.1.21_aarch64.dmg";
+const macosDownloadName = "Maple_0.1.21_aarch64.dmg";
 
 const statusElement = document.querySelector("#download-status");
 const fallbackLink = document.querySelector("#download-fallback");
@@ -19,12 +19,12 @@ const downloadMessages = {
   },
 };
 
-function currentLanguage() {
+function getDownloadLanguage() {
   return document.documentElement.lang === "ko" ? "ko" : "en";
 }
 
 function messageSet() {
-  return downloadMessages[currentLanguage()];
+  return downloadMessages[getDownloadLanguage()];
 }
 
 function setStatus(message) {

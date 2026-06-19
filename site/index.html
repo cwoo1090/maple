@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta
       name="description"
-      content="Maple turns PDFs, notes, links, and research scraps into a local AI-maintained wiki using your own ChatGPT/Codex or Claude subscription."
+      content="Maple turns PDFs, Office files, notes, data, links, and images into a local AI-maintained wiki using your own ChatGPT or Claude subscription."
     />
     <title>Maple - Download the AI wiki builder</title>
     <link rel="canonical" href="https://www.maplesr.com/" />
@@ -15,7 +15,7 @@
     <meta property="og:title" content="Maple - Local AI wiki builder" />
     <meta
       property="og:description"
-      content="Build a local AI wiki from your sources using your own ChatGPT/Codex or Claude subscription."
+      content="Build a local AI wiki from your sources using your own ChatGPT or Claude subscription."
     />
     <meta
       property="og:image"
@@ -27,7 +27,7 @@
     <meta name="twitter:title" content="Maple - Local AI wiki builder" />
     <meta
       name="twitter:description"
-      content="Build a local AI wiki from your sources using your own ChatGPT/Codex or Claude subscription."
+      content="Build a local AI wiki from your sources using your own ChatGPT or Claude subscription."
     />
     <meta
       name="twitter:image"
@@ -35,7 +35,7 @@
     />
     <link rel="icon" href="assets/maple-icon.png" />
     <link rel="apple-touch-icon" href="assets/maple-icon.png" />
-    <link rel="stylesheet" href="styles.css?v=20260520-copy-2" />
+    <link rel="stylesheet" href="styles.css?v=20260610-detail-1" />
   </head>
   <body>
     <header class="site-header">
@@ -44,7 +44,7 @@
         <span>Maple</span>
       </a>
       <nav class="site-nav" aria-label="Primary navigation">
-        <a href="https://github.com/cwoo1090/maple/releases/download/v0.1.19/Maple_0.1.19_aarch64.dmg">Download</a>
+        <a href="https://github.com/cwoo1090/maple/releases/download/v0.1.21/Maple_0.1.21_aarch64.dmg">Download</a>
         <a href="#hero-demo">Demo</a>
         <a href="#workflow">Workflow</a>
         <a href="guide.html">Guide</a>
@@ -67,13 +67,13 @@
             <p class="eyebrow">Local AI wiki builder</p>
             <h1 id="hero-title">Maple</h1>
             <p class="hero-copy">
-              Turn PDFs, notes, links, and research scraps into a local wiki
-              that you can review, explore, and keep on your Mac.
+              Turn PDFs, slides, documents, notes, data, links, and images into
+              a local wiki that you can review, ask, and maintain on your Mac.
             </p>
             <div class="hero-actions">
               <a
                 class="button primary"
-                href="https://github.com/cwoo1090/maple/releases/download/v0.1.19/Maple_0.1.19_aarch64.dmg"
+                href="https://github.com/cwoo1090/maple/releases/download/v0.1.21/Maple_0.1.21_aarch64.dmg"
               >
                 Download for macOS
               </a>
@@ -81,7 +81,7 @@
             </div>
             <p class="release-note">
               For Apple silicon Macs. Requires macOS 12 or newer and your own
-              ChatGPT/Codex or Claude subscription.
+              ChatGPT or Claude subscription.
             </p>
           </div>
           <figure class="hero-product-shot" id="hero-demo">
@@ -108,21 +108,22 @@
           <h2 id="launch-title">Use the AI subscription you already have</h2>
           <p class="section-intro">
             Maple does not sell AI credits or require a Maple account. It runs
-            wiki operations through your ChatGPT/Codex or Claude setup.
+            wiki operations through your signed-in ChatGPT or Claude setup on
+            this Mac.
           </p>
         </div>
         <div class="launch-grid">
           <article>
-            <h3>Requirements</h3>
-            <p>Apple silicon Mac, macOS 12 or newer, and either Codex or Claude installed.</p>
+            <h3>Mac-first MVP</h3>
+            <p>Apple silicon Mac and macOS 12 or newer. Maple guides any one-time connection setup it needs.</p>
           </article>
           <article>
-            <h3>Your subscription</h3>
-            <p>Build and update wikis through your own ChatGPT/Codex or Claude subscription.</p>
+            <h3>Your AI account</h3>
+            <p>Build, ask, apply, and maintain through your own ChatGPT or Claude subscription.</p>
           </article>
           <article>
             <h3>Local workspaces</h3>
-            <p>Sources and generated wiki pages stay in ordinary folders on your Mac.</p>
+            <p>Sources, wiki pages, review state, and generated artifacts stay in ordinary folders on your Mac.</p>
           </article>
         </div>
       </section>
@@ -151,27 +152,27 @@
           <article>
             <span>2</span>
             <h3>Import sources</h3>
-            <p>Add PDFs, Markdown, text notes, links, screenshots, or papers.</p>
+            <p>Add PDFs, Office files, Markdown, text, JSON, CSV, HTML, links, or images.</p>
           </article>
           <article>
             <span>3</span>
             <h3>Build wiki</h3>
-            <p>Use ChatGPT/Codex or Claude to compile summaries, concepts, and guides.</p>
+            <p>Maple prepares readable artifacts when needed, then asks AI to compile summaries, concepts, and guides.</p>
           </article>
           <article>
             <span>4</span>
-            <h3>Explore</h3>
-            <p>Read pages, follow links, and ask questions from your wiki.</p>
+            <h3>Review changes</h3>
+            <p>Open generated files, inspect the result, then choose Done reviewing or Undo last operation.</p>
           </article>
           <article>
             <span>5</span>
-            <h3>Update wiki</h3>
-            <p>Turn useful Q&A or selected chat messages into reviewable wiki changes.</p>
+            <h3>Ask Wiki and apply</h3>
+            <p>Ask about the wiki or selected source, then turn useful answers into reviewable wiki edits.</p>
           </article>
           <article>
             <span>6</span>
             <h3>Maintain</h3>
-            <p>Improve pages, run healthchecks, clean up links, and keep the wiki useful as it grows.</p>
+            <p>Run healthchecks, improve structure, organize sources, and update durable workspace rules.</p>
           </article>
         </div>
       </section>
@@ -182,8 +183,9 @@
           <h2 id="guide-title">What Maple means by an AI wiki</h2>
           <p class="section-intro">
             Maple is not a blank Markdown editor or a one-off document chat.
-            It keeps your original material untouched, then asks AI to compile
-            that material into a local, linked wiki you can review, explore, and
+            It keeps your original material untouched, prepares readable copies
+            when needed, then asks AI to compile
+            that material into a local, linked wiki you can review, ask, and
             improve over time.
           </p>
         </div>
@@ -194,8 +196,7 @@
             <p>
               In a normal chat, the useful explanation disappears into the
               conversation. In Maple, useful explanations become pages, links,
-              guides, and reviewable updates inside a workspace that stays on
-              your Mac.
+              guides, and reviewable updates inside a workspace that stays on your Mac.
             </p>
             <a class="guide-cta" href="guide.html">Read the full guide</a>
           </div>
@@ -203,17 +204,17 @@
             <li>
               <span>1</span>
               <strong>Sources are the reference shelf.</strong>
-              <p>PDFs, notes, links, screenshots, and papers stay as the original evidence.</p>
+              <p>PDFs, Office files, notes, data, links, screenshots, and papers stay as original evidence.</p>
             </li>
             <li>
               <span>2</span>
               <strong>The wiki is the working layer.</strong>
-              <p>AI drafts summaries, concepts, guides, links, and navigation from those sources.</p>
+              <p>AI drafts summaries, concepts, guides, links, images, and navigation from those sources.</p>
             </li>
             <li>
               <span>3</span>
-              <strong>Changes stay reviewable.</strong>
-              <p>Generated edits are shown as drafts, so you can inspect them before relying on them.</p>
+              <strong>Ask and apply stay separate.</strong>
+              <p>Ask Wiki is read-only by default. Apply to wiki creates reviewable edits only when you choose it.</p>
             </li>
           </ol>
         </div>
@@ -225,8 +226,9 @@
           <h2 id="privacy-title">Your archive stays inspectable</h2>
           <p>
             Maple is built around plain local folders: sources stay immutable,
-            generated wiki pages are reviewable, and the workspace can be opened
-            outside the app when you need it.
+            prepared artifacts live under .aiwiki, generated wiki pages are
+            reviewable, and the workspace can be opened outside the app when
+            you need it.
           </p>
         </div>
         <div class="principles">
@@ -236,11 +238,11 @@
           </article>
           <article>
             <h3>Local file storage</h3>
-            <p>Workspaces use readable folders like sources, wiki, index.md, and log.md.</p>
+            <p>Workspaces use readable folders like sources, wiki, index.md, log.md, schema.md, and AGENTS.md.</p>
           </article>
           <article>
-            <h3>Reviewable AI changes</h3>
-            <p>Generated edits are tracked so you can inspect what changed.</p>
+            <h3>Review and undo</h3>
+            <p>Generated edits are tracked so you can inspect or undo the last AI operation.</p>
           </article>
         </div>
       </section>
@@ -251,6 +253,6 @@
       <span>Copyright <span id="year">2026</span> chulwoo ahn.</span>
     </footer>
 
-    <script src="script.js?v=20260520-copy-2"></script>
+    <script src="script.js?v=20260610-detail-1"></script>
   </body>
 </html>
