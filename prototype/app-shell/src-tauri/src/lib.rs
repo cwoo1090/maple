@@ -173,6 +173,105 @@ struct ApplyChatResult {
     thread: ChatThread,
 }
 
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct TeamConfig {
+    schema_version: u32,
+    team_name: String,
+    github_repo_url: String,
+}
+
+impl Default for TeamConfig {
+    fn default() -> Self {
+        Self {
+            schema_version: 1,
+            team_name: String::new(),
+            github_repo_url: String::new(),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct PublishConfig {
+    schema_version: u32,
+    public_site_url: String,
+    vercel_project_url: String,
+    #[serde(default)]
+    public_sources: bool,
+}
+
+impl Default for PublishConfig {
+    fn default() -> Self {
+        Self {
+            schema_version: 1,
+            public_site_url: String::new(),
+            vercel_project_url: String::new(),
+            public_sources: false,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct TeamLockFile {
+    schema_version: u32,
+    locked_by: String,
+    device_id: String,
+    started_at: String,
+    expires_at: String,
+    #[serde(default)]
+    base_commit: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct TeamLockState {
+    schema_version: u32,
+    locked_by: String,
+    device_id: String,
+    started_at: String,
+    expires_at: String,
+    base_commit: Option<String>,
+    expired: bool,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct TeamGitCommit {
+    hash: String,
+    short_hash: String,
+    author: String,
+    timestamp: String,
+    subject: String,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct TeamGitSummary {
+    available: bool,
+    initialized: bool,
+    branch: Option<String>,
+    remote_url: Option<String>,
+    has_remote: bool,
+    clean: bool,
+    ahead: u32,
+    behind: u32,
+    changed_files: Vec<String>,
+    recent_commits: Vec<TeamGitCommit>,
+    error: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct TeamPublishState {
+    configured: bool,
+    team: TeamConfig,
+    publish: PublishConfig,
+    lock: Option<TeamLockState>,
+    git: TeamGitSummary,
+}
+
 struct WorkspaceStore {
     path: Mutex<Option<PathBuf>>,
 }
@@ -204,6 +303,18 @@ const SCHEMA_UPDATE_METADATA_FILE: &str = "schema-update.json";
 const ASSET_REGISTRY_PATH: &str = "wiki/assets/assets.json";
 const SOURCE_ARTIFACTS_PATH: &str = ".aiwiki/source-artifacts.json";
 const RUNNER_STARTUP_ERROR_PATH: &str = ".aiwiki/running/startup-error.json";
+const TEAM_CONFIG_PATH: &str = ".aiwiki/team.json";
+const TEAM_LOCK_PATH: &str = ".aiwiki/lock.json";
+const PUBLISH_CONFIG_PATH: &str = ".aiwiki/publish.json";
+const PUBLIC_SITE_DIR: &str = "public-site";
+const PUBLIC_WIKI_ROOT_ENV: &str = "MAPLE_PUBLIC_WIKI_ROOT";
+const TEAM_GITIGNORE_RULES: &[&str] = &[
+    ".DS_Store",
+    "public-site/node_modules/",
+    "public-site/dist/",
+    "public-site/.vercel/",
+    "public-site/.env*",
+];
 const PDF_USE_AS_TYPES: &[&str] = &["mostly-text", "text-with-diagrams", "mostly-visual"];
 const MAPLE_GUIDE_KNOWLEDGE: &str = include_str!("../../src/help/maple-guide.md");
 
@@ -3664,7 +3775,8 @@ fn marker_string(marker: Option<&Value>, key: &str) -> Option<String> {
 }
 
 fn normalized_operation_type(marker: Option<&Value>, fallback: Option<&str>) -> Option<String> {
-    marker_string(marker, "type")
+    marker_string(marker, "operationType")
+        .or_else(|| marker_string(marker, "type"))
         .or_else(|| fallback.map(str::to_string))
         .map(|value| {
             if value == "study-chat" || value == "side-chat" {
@@ -6225,7 +6337,27 @@ async fn prepare_sources(
     state: State<'_, WorkspaceStore>,
 ) -> Result<AppCommandResult, String> {
     let workspace = current_workspace(&state)?;
-    ensure_no_workspace_operation_running(&workspace)?;
+    if let Some(marker) =
+        read_workspace_running_marker(&workspace).filter(running_marker_process_is_running)
+    {
+        if normalized_operation_type(Some(&marker), None).as_deref() == Some("prepare-sources") {
+            return Ok(AppCommandResult {
+                runner: Some(RunnerOutput {
+                    success: true,
+                    code: Some(0),
+                    stdout: "Source preparation is already running.\n".to_string(),
+                    stderr: String::new(),
+                }),
+                state: load_state_at(&workspace)?,
+            });
+        }
+
+        return Err(
+            "A workspace operation is running. Wait for it to finish before editing files."
+                .to_string(),
+        );
+    }
+
     let selected_source_paths = normalize_selected_source_paths(&workspace, source_paths)?;
     let pdf_use_as = normalize_pdf_use_as_map(&workspace, pdf_use_as)?;
     let mut args = vec![
@@ -7288,6 +7420,683 @@ async fn discard_interrupted_operation(
         runner: Some(runner),
         state: load_state_at(&workspace)?,
     })
+}
+
+#[tauri::command]
+async fn read_team_publish_state(
+    state: State<'_, WorkspaceStore>,
+) -> Result<TeamPublishState, String> {
+    let workspace = current_workspace(&state)?;
+    read_team_publish_state_at(&workspace)
+}
+
+#[tauri::command]
+async fn save_team_publish_settings(
+    team_name: String,
+    github_repo_url: String,
+    public_site_url: String,
+    vercel_project_url: String,
+    public_sources: bool,
+    state: State<'_, WorkspaceStore>,
+) -> Result<TeamPublishState, String> {
+    let workspace = current_workspace(&state)?;
+    init_workspace_dirs(&workspace)?;
+
+    let team = TeamConfig {
+        schema_version: 1,
+        team_name: team_name.trim().to_string(),
+        github_repo_url: github_repo_url.trim().to_string(),
+    };
+    let publish = PublishConfig {
+        schema_version: 1,
+        public_site_url: public_site_url.trim().to_string(),
+        vercel_project_url: vercel_project_url.trim().to_string(),
+        public_sources,
+    };
+
+    write_pretty_json(&workspace.join(TEAM_CONFIG_PATH), &team)?;
+    write_pretty_json(&workspace.join(PUBLISH_CONFIG_PATH), &publish)?;
+
+    if !team.github_repo_url.is_empty() && is_git_repo(&workspace) {
+        set_git_origin(&workspace, &team.github_repo_url)?;
+    }
+
+    read_team_publish_state_at(&workspace)
+}
+
+#[tauri::command]
+async fn initialize_team_repository(
+    github_repo_url: String,
+    state: State<'_, WorkspaceStore>,
+) -> Result<TeamPublishState, String> {
+    let workspace = current_workspace(&state)?;
+    init_workspace_dirs(&workspace)?;
+
+    if !is_git_repo(&workspace) {
+        git_success(&workspace, &["init"])?;
+    }
+    ensure_team_gitignore(&workspace)?;
+
+    let repo_url = github_repo_url.trim();
+    if !repo_url.is_empty() {
+        set_git_origin(&workspace, repo_url)?;
+        let mut team = read_team_config(&workspace);
+        team.github_repo_url = repo_url.to_string();
+        if team.team_name.trim().is_empty() {
+            team.team_name = workspace
+                .file_name()
+                .map(|value| value.to_string_lossy().to_string())
+                .unwrap_or_else(|| "Maple team wiki".to_string());
+        }
+        write_pretty_json(&workspace.join(TEAM_CONFIG_PATH), &team)?;
+    }
+
+    read_team_publish_state_at(&workspace)
+}
+
+#[tauri::command]
+async fn pull_team_workspace(state: State<'_, WorkspaceStore>) -> Result<TeamPublishState, String> {
+    let workspace = current_workspace(&state)?;
+    ensure_team_git_ready(&workspace)?;
+    if git_remote_origin(&workspace).is_none() {
+        return Err("Add a GitHub repo URL before pulling team changes.".to_string());
+    }
+    if !git_has_upstream(&workspace) {
+        return read_team_publish_state_at(&workspace);
+    }
+    git_success(&workspace, &["pull", "--ff-only"])?;
+    read_team_publish_state_at(&workspace)
+}
+
+#[tauri::command]
+async fn publish_team_workspace(
+    message: String,
+    device_id: String,
+    state: State<'_, WorkspaceStore>,
+) -> Result<TeamPublishState, String> {
+    let workspace = current_workspace(&state)?;
+    ensure_team_git_ready(&workspace)?;
+    ensure_team_edit_session_owned(&workspace, &device_id)?;
+    ensure_team_gitignore(&workspace)?;
+    export_public_site(&workspace)?;
+    stage_team_workspace_paths(&workspace)?;
+    commit_staged_changes(
+        &workspace,
+        message.trim(),
+        "Update team wiki and public site",
+    )?;
+    push_current_branch_if_remote(&workspace)?;
+    read_team_publish_state_at(&workspace)
+}
+
+#[tauri::command]
+async fn start_team_edit_session(
+    locked_by: String,
+    device_id: String,
+    duration_minutes: Option<u64>,
+    state: State<'_, WorkspaceStore>,
+) -> Result<TeamPublishState, String> {
+    let workspace = current_workspace(&state)?;
+    ensure_team_git_ready(&workspace)?;
+
+    if git_remote_origin(&workspace).is_some() && git_has_upstream(&workspace) {
+        git_success(&workspace, &["pull", "--ff-only"])?;
+    }
+
+    let current_lock = read_team_lock(&workspace);
+    if let Some(lock) = current_lock.as_ref() {
+        if !team_lock_expired(lock) && lock.device_id != device_id {
+            return Err(format!(
+                "{} is already editing this team wiki.",
+                lock.locked_by
+            ));
+        }
+    }
+
+    let now = now_millis();
+    let duration_ms = duration_minutes.unwrap_or(120).max(15) as u128 * 60_000;
+    let lock = TeamLockFile {
+        schema_version: 1,
+        locked_by: locked_by.trim().to_string(),
+        device_id: device_id.trim().to_string(),
+        started_at: now.to_string(),
+        expires_at: (now + duration_ms).to_string(),
+        base_commit: git_head_commit(&workspace),
+    };
+    if lock.locked_by.is_empty() {
+        return Err("Enter your name before starting an edit session.".to_string());
+    }
+    if lock.device_id.is_empty() {
+        return Err("Missing local device id.".to_string());
+    }
+
+    write_pretty_json(&workspace.join(TEAM_LOCK_PATH), &lock)?;
+    git_success(&workspace, &["add", "-A", "--", TEAM_LOCK_PATH])?;
+    commit_staged_changes(
+        &workspace,
+        "Maple: start editing session",
+        "Maple: start editing session",
+    )?;
+    push_current_branch_if_remote(&workspace)?;
+    read_team_publish_state_at(&workspace)
+}
+
+#[tauri::command]
+async fn release_team_edit_session(
+    device_id: String,
+    force: Option<bool>,
+    state: State<'_, WorkspaceStore>,
+) -> Result<TeamPublishState, String> {
+    let workspace = current_workspace(&state)?;
+    ensure_team_git_ready(&workspace)?;
+
+    if git_remote_origin(&workspace).is_some() && git_has_upstream(&workspace) {
+        git_success(&workspace, &["pull", "--ff-only"])?;
+    }
+
+    let lock = read_team_lock(&workspace);
+    let Some(lock) = lock else {
+        return read_team_publish_state_at(&workspace);
+    };
+
+    let force = force.unwrap_or(false);
+    if !force && !team_lock_expired(&lock) && lock.device_id != device_id {
+        return Err(format!(
+            "{} owns the current edit session. Use Force unlock only if that session is abandoned.",
+            lock.locked_by
+        ));
+    }
+
+    let lock_path = workspace.join(TEAM_LOCK_PATH);
+    if lock_path.exists() {
+        fs::remove_file(&lock_path)
+            .map_err(|error| format!("Failed to remove team lock: {error}"))?;
+    }
+    git_success(&workspace, &["add", "-A", "--", TEAM_LOCK_PATH])?;
+    commit_staged_changes(
+        &workspace,
+        "Maple: release editing session",
+        "Maple: release editing session",
+    )?;
+    push_current_branch_if_remote(&workspace)?;
+    read_team_publish_state_at(&workspace)
+}
+
+#[tauri::command]
+async fn restore_team_version(
+    commit: String,
+    device_id: String,
+    state: State<'_, WorkspaceStore>,
+) -> Result<TeamPublishState, String> {
+    let workspace = current_workspace(&state)?;
+    ensure_team_git_ready(&workspace)?;
+    ensure_team_edit_session_owned(&workspace, &device_id)?;
+    let commit = commit.trim();
+    if !is_safe_git_revision(commit) {
+        return Err("Invalid version id.".to_string());
+    }
+
+    git_success(&workspace, &["rev-parse", "--verify", commit])?;
+    for path in [
+        "sources",
+        "wiki",
+        "index.md",
+        "log.md",
+        "schema.md",
+        "AGENTS.md",
+        "CLAUDE.md",
+    ] {
+        let output = git_output(&workspace, &["restore", "--source", commit, "--", path])?;
+        if !output.success
+            && !output.stderr.contains("pathspec")
+            && !output.stderr.contains("did not match")
+        {
+            return Err(output.stderr.trim().to_string());
+        }
+    }
+    ensure_team_gitignore(&workspace)?;
+    export_public_site(&workspace)?;
+    stage_team_workspace_paths(&workspace)?;
+    commit_staged_changes(
+        &workspace,
+        &format!("Maple: restore workspace to {}", short_revision(commit)),
+        "Maple: restore workspace version",
+    )?;
+    push_current_branch_if_remote(&workspace)?;
+    read_team_publish_state_at(&workspace)
+}
+
+fn read_team_publish_state_at(workspace: &Path) -> Result<TeamPublishState, String> {
+    init_workspace_dirs(workspace)?;
+    let mut team = read_team_config(workspace);
+    let publish = read_publish_config(workspace);
+    let git = team_git_summary(workspace);
+    if team.github_repo_url.trim().is_empty() {
+        if let Some(remote_url) = git.remote_url.as_ref() {
+            team.github_repo_url = remote_url.clone();
+        }
+    }
+    let configured =
+        !team.github_repo_url.trim().is_empty() || !publish.public_site_url.trim().is_empty();
+    Ok(TeamPublishState {
+        configured,
+        team,
+        publish,
+        lock: read_team_lock(workspace).map(|lock| {
+            let expired = team_lock_expired(&lock);
+            TeamLockState {
+                schema_version: lock.schema_version,
+                locked_by: lock.locked_by,
+                device_id: lock.device_id,
+                started_at: lock.started_at,
+                expires_at: lock.expires_at,
+                base_commit: lock.base_commit,
+                expired,
+            }
+        }),
+        git,
+    })
+}
+
+fn read_team_config(workspace: &Path) -> TeamConfig {
+    read_typed_json(&workspace.join(TEAM_CONFIG_PATH)).unwrap_or_default()
+}
+
+fn read_publish_config(workspace: &Path) -> PublishConfig {
+    read_typed_json(&workspace.join(PUBLISH_CONFIG_PATH)).unwrap_or_default()
+}
+
+fn read_team_lock(workspace: &Path) -> Option<TeamLockFile> {
+    read_typed_json(&workspace.join(TEAM_LOCK_PATH)).ok()
+}
+
+fn read_typed_json<T>(path: &Path) -> Result<T, String>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let text = fs::read_to_string(path)
+        .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
+    serde_json::from_str(&text)
+        .map_err(|error| format!("Failed to parse {}: {error}", path.display()))
+}
+
+fn write_pretty_json<T>(path: &Path, value: &T) -> Result<(), String>
+where
+    T: Serialize,
+{
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Failed to create {}: {error}", parent.display()))?;
+    }
+    let json = serde_json::to_string_pretty(value)
+        .map_err(|error| format!("Failed to serialize JSON: {error}"))?;
+    fs::write(path, format!("{json}\n"))
+        .map_err(|error| format!("Failed to write {}: {error}", path.display()))
+}
+
+fn team_lock_expired(lock: &TeamLockFile) -> bool {
+    parse_timestamp_ms(&lock.expires_at)
+        .map(|expires_at| expires_at <= now_millis())
+        .unwrap_or(false)
+}
+
+fn parse_timestamp_ms(value: &str) -> Option<u128> {
+    value.trim().parse::<u128>().ok()
+}
+
+fn team_git_summary(workspace: &Path) -> TeamGitSummary {
+    let available = Command::new("git")
+        .arg("--version")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+    if !available {
+        return TeamGitSummary {
+            available: false,
+            initialized: false,
+            branch: None,
+            remote_url: None,
+            has_remote: false,
+            clean: true,
+            ahead: 0,
+            behind: 0,
+            changed_files: Vec::new(),
+            recent_commits: Vec::new(),
+            error: Some("Git is not installed or not available in PATH.".to_string()),
+        };
+    }
+
+    let initialized = is_git_repo(workspace);
+    if !initialized {
+        return TeamGitSummary {
+            available: true,
+            initialized: false,
+            branch: None,
+            remote_url: None,
+            has_remote: false,
+            clean: true,
+            ahead: 0,
+            behind: 0,
+            changed_files: Vec::new(),
+            recent_commits: Vec::new(),
+            error: None,
+        };
+    }
+
+    let branch = git_branch(workspace);
+    let remote_url = git_remote_origin(workspace);
+    let changed_files = git_changed_files(workspace).unwrap_or_default();
+    let (ahead, behind) = git_ahead_behind(workspace).unwrap_or((0, 0));
+
+    TeamGitSummary {
+        available: true,
+        initialized: true,
+        branch,
+        has_remote: remote_url.is_some(),
+        remote_url,
+        clean: changed_files.is_empty(),
+        ahead,
+        behind,
+        changed_files,
+        recent_commits: git_recent_commits(workspace).unwrap_or_default(),
+        error: None,
+    }
+}
+
+fn git_output(workspace: &Path, args: &[&str]) -> Result<RunnerOutput, String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(workspace)
+        .output()
+        .map_err(|error| format!("Failed to run git {}: {error}", args.join(" ")))?;
+    Ok(RunnerOutput {
+        success: output.status.success(),
+        code: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+    })
+}
+
+fn git_success(workspace: &Path, args: &[&str]) -> Result<RunnerOutput, String> {
+    let output = git_output(workspace, args)?;
+    if output.success {
+        return Ok(output);
+    }
+    let message = output.stderr.trim();
+    Err(if message.is_empty() {
+        format!("git {} failed", args.join(" "))
+    } else {
+        message.to_string()
+    })
+}
+
+fn is_git_repo(workspace: &Path) -> bool {
+    git_output(workspace, &["rev-parse", "--is-inside-work-tree"])
+        .map(|output| output.success && output.stdout.trim() == "true")
+        .unwrap_or(false)
+}
+
+fn ensure_team_git_ready(workspace: &Path) -> Result<(), String> {
+    if !is_git_repo(workspace) {
+        return Err("Connect a team repository first.".to_string());
+    }
+    Ok(())
+}
+
+fn ensure_team_edit_session_owned(workspace: &Path, device_id: &str) -> Result<(), String> {
+    let lock = read_team_lock(workspace).ok_or_else(|| {
+        "Start an edit session in Share & Publish before changing this team wiki.".to_string()
+    })?;
+    if team_lock_expired(&lock) {
+        return Err(
+            "Your edit session has expired. Start editing again before publishing.".to_string(),
+        );
+    }
+    if lock.device_id != device_id.trim() {
+        return Err(format!(
+            "{} owns the current edit session. Pull latest, then wait for the lock or use Force unlock if it was abandoned.",
+            lock.locked_by
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_team_gitignore(workspace: &Path) -> Result<(), String> {
+    let gitignore_path = workspace.join(".gitignore");
+    let mut content = fs::read_to_string(&gitignore_path).unwrap_or_default();
+    let existing: HashSet<String> = content
+        .lines()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect();
+    let mut changed = false;
+    for rule in TEAM_GITIGNORE_RULES {
+        if existing.contains(*rule) {
+            continue;
+        }
+        if !content.is_empty() && !content.ends_with('\n') {
+            content.push('\n');
+        }
+        content.push_str(rule);
+        content.push('\n');
+        changed = true;
+    }
+    if changed {
+        fs::write(&gitignore_path, content)
+            .map_err(|error| format!("Failed to update .gitignore: {error}"))?;
+    }
+    Ok(())
+}
+
+fn git_branch(workspace: &Path) -> Option<String> {
+    git_output(workspace, &["branch", "--show-current"])
+        .ok()
+        .filter(|output| output.success)
+        .map(|output| output.stdout.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            git_output(workspace, &["symbolic-ref", "--short", "HEAD"])
+                .ok()
+                .filter(|output| output.success)
+                .map(|output| output.stdout.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+}
+
+fn git_remote_origin(workspace: &Path) -> Option<String> {
+    git_output(workspace, &["config", "--get", "remote.origin.url"])
+        .ok()
+        .filter(|output| output.success)
+        .map(|output| output.stdout.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn set_git_origin(workspace: &Path, url: &str) -> Result<(), String> {
+    if git_remote_origin(workspace).is_some() {
+        git_success(workspace, &["remote", "set-url", "origin", url])?;
+    } else {
+        git_success(workspace, &["remote", "add", "origin", url])?;
+    }
+    Ok(())
+}
+
+fn git_head_commit(workspace: &Path) -> Option<String> {
+    git_output(workspace, &["rev-parse", "HEAD"])
+        .ok()
+        .filter(|output| output.success)
+        .map(|output| output.stdout.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn git_changed_files(workspace: &Path) -> Result<Vec<String>, String> {
+    let output = git_success(workspace, &["status", "--porcelain=v1"])?;
+    Ok(output
+        .stdout
+        .lines()
+        .filter_map(|line| {
+            let path = line.get(3..)?.trim();
+            if path.is_empty() {
+                None
+            } else {
+                Some(path.to_string())
+            }
+        })
+        .collect())
+}
+
+fn git_ahead_behind(workspace: &Path) -> Result<(u32, u32), String> {
+    if git_has_upstream(workspace) {
+        let output = git_success(
+            workspace,
+            &["rev-list", "--left-right", "--count", "@{u}...HEAD"],
+        )?;
+        let mut parts = output.stdout.split_whitespace();
+        let behind = parts
+            .next()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(0);
+        let ahead = parts
+            .next()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(0);
+        return Ok((ahead, behind));
+    }
+    Ok((0, 0))
+}
+
+fn git_has_upstream(workspace: &Path) -> bool {
+    git_output(
+        workspace,
+        &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+    )
+    .map(|output| output.success)
+    .unwrap_or(false)
+}
+
+fn git_recent_commits(workspace: &Path) -> Result<Vec<TeamGitCommit>, String> {
+    let output = git_output(
+        workspace,
+        &[
+            "log",
+            "-n",
+            "8",
+            "--pretty=format:%H%x1f%h%x1f%an%x1f%ct%x1f%s%x1e",
+        ],
+    )?;
+    if !output.success {
+        return Ok(Vec::new());
+    }
+    Ok(output
+        .stdout
+        .split('\x1e')
+        .filter_map(|entry| {
+            let mut parts = entry.trim_matches('\n').split('\x1f');
+            Some(TeamGitCommit {
+                hash: parts.next()?.to_string(),
+                short_hash: parts.next()?.to_string(),
+                author: parts.next()?.to_string(),
+                timestamp: parts.next()?.to_string(),
+                subject: parts.next().unwrap_or_default().to_string(),
+            })
+        })
+        .collect())
+}
+
+fn stage_team_workspace_paths(workspace: &Path) -> Result<(), String> {
+    let mut paths = vec![
+        "sources",
+        "wiki",
+        "index.md",
+        "log.md",
+        "schema.md",
+        "AGENTS.md",
+        "CLAUDE.md",
+        ".gitignore",
+        METADATA_DIR,
+        PUBLIC_SITE_DIR,
+    ];
+    paths.retain(|path| workspace.join(path).exists());
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let mut args = vec!["add", "--"];
+    args.extend(paths);
+    git_success(workspace, &args)?;
+    Ok(())
+}
+
+fn export_public_site(workspace: &Path) -> Result<(), String> {
+    let public_wiki_root = public_wiki_root()?;
+    let export_script = public_wiki_root.join("scripts").join("export-site.mjs");
+    if !export_script.is_file() {
+        return Err(format!(
+            "Could not find public site export script at {}",
+            export_script.display()
+        ));
+    }
+    let node = node_executable()?;
+    let output_dir = workspace.join(PUBLIC_SITE_DIR);
+    let output = Command::new(&node)
+        .arg(&export_script)
+        .arg(workspace)
+        .arg(&output_dir)
+        .env("PATH", runner_path_env(&node))
+        .current_dir(&public_wiki_root)
+        .output()
+        .map_err(|error| format!("Failed to export public site: {error}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Err(if stderr.is_empty() {
+        if stdout.is_empty() {
+            "Failed to export public site.".to_string()
+        } else {
+            stdout
+        }
+    } else {
+        stderr
+    })
+}
+
+fn commit_staged_changes(workspace: &Path, message: &str, fallback: &str) -> Result<(), String> {
+    let diff = git_success(workspace, &["diff", "--cached", "--name-only"])?;
+    if diff.stdout.trim().is_empty() {
+        return Ok(());
+    }
+    let message = if message.trim().is_empty() {
+        fallback
+    } else {
+        message.trim()
+    };
+    git_success(workspace, &["commit", "-m", message])?;
+    Ok(())
+}
+
+fn push_current_branch_if_remote(workspace: &Path) -> Result<(), String> {
+    if git_remote_origin(workspace).is_none() {
+        return Ok(());
+    }
+    let branch = git_branch(workspace).unwrap_or_else(|| "main".to_string());
+    if git_has_upstream(workspace) {
+        git_success(workspace, &["push"])?;
+    } else {
+        git_success(workspace, &["push", "-u", "origin", &branch])?;
+    }
+    Ok(())
+}
+
+fn is_safe_git_revision(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 80
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/' | ':'))
+}
+
+fn short_revision(value: &str) -> String {
+    value.chars().take(12).collect()
 }
 
 fn current_workspace(state: &State<'_, WorkspaceStore>) -> Result<PathBuf, String> {
@@ -8640,6 +9449,21 @@ fn runner_root() -> Result<PathBuf, String> {
     Err("Could not find bundled or development operation runner".to_string())
 }
 
+fn public_wiki_root() -> Result<PathBuf, String> {
+    if let Ok(path) = env::var(PUBLIC_WIKI_ROOT_ENV) {
+        let root = PathBuf::from(path);
+        if is_public_wiki_root(&root) {
+            return Ok(root);
+        }
+    }
+
+    if let Some(root) = development_public_wiki_root() {
+        return Ok(root);
+    }
+
+    Err("Could not find bundled or development public wiki viewer".to_string())
+}
+
 fn development_runner_root() -> Option<PathBuf> {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let prototype_dir = manifest_dir.parent().and_then(Path::parent)?;
@@ -8651,8 +9475,25 @@ fn development_runner_root() -> Option<PathBuf> {
     None
 }
 
+fn development_public_wiki_root() -> Option<PathBuf> {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let prototype_dir = manifest_dir.parent().and_then(Path::parent)?;
+    let repo_root = prototype_dir.parent()?;
+    let root = repo_root.join("public-wiki");
+    if is_public_wiki_root(&root) {
+        return Some(root);
+    }
+
+    None
+}
+
 fn is_runner_root(path: &Path) -> bool {
     path.join("src").join("operation-runner.js").is_file()
+}
+
+fn is_public_wiki_root(path: &Path) -> bool {
+    path.join("scripts").join("build-snapshot.mjs").is_file()
+        && path.join("src").join("main.js").is_file()
 }
 
 fn read_text_if_exists(path: &Path) -> Option<String> {
@@ -10979,10 +11820,17 @@ pub fn run() {
                 if let Some(runner_root) = development_runner_root() {
                     env::set_var(RUNNER_ROOT_ENV, runner_root);
                 }
+                if let Some(public_wiki_root) = development_public_wiki_root() {
+                    env::set_var(PUBLIC_WIKI_ROOT_ENV, public_wiki_root);
+                }
             } else if let Ok(resource_dir) = app.path().resource_dir() {
                 let runner_root = resource_dir.join("operation-runner");
                 if is_runner_root(&runner_root) {
                     env::set_var(RUNNER_ROOT_ENV, runner_root);
+                }
+                let public_wiki_root = resource_dir.join("public-wiki");
+                if is_public_wiki_root(&public_wiki_root) {
+                    env::set_var(PUBLIC_WIKI_ROOT_ENV, public_wiki_root);
                 }
             }
             let settings = read_settings(app.handle());
@@ -11052,6 +11900,14 @@ pub fn run() {
             cancel_build,
             read_interrupted_operation,
             discard_interrupted_operation,
+            read_team_publish_state,
+            save_team_publish_settings,
+            initialize_team_repository,
+            pull_team_workspace,
+            publish_team_workspace,
+            start_team_edit_session,
+            release_team_edit_session,
+            restore_team_version,
             get_settings,
             set_provider,
             set_model,

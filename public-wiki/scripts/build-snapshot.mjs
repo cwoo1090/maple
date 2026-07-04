@@ -1,18 +1,20 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
+import { fileURLToPath } from "node:url";
 import matter from "gray-matter";
 import MarkdownIt from "markdown-it";
 import anchor from "markdown-it-anchor";
 import sanitizeHtml from "sanitize-html";
 import { enableMathProtection } from "../src/markdown-math.js";
 
-const appRoot = path.resolve(new URL("..", import.meta.url).pathname);
-const workspaceRoot = path.resolve(
-  process.env.MAPLE_WORKSPACE_PATH || "/Users/ahnchulwoo/robot-hardware-wiki",
-);
-const wikiSlug = process.env.MAPLE_WIKI_SLUG || "robot-hardware";
-const wikiTitle = process.env.MAPLE_WIKI_TITLE || "Robot Hardware Wiki";
+const templateRoot = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
+const appRoot = path.resolve(process.env.MAPLE_PUBLIC_WIKI_APP_ROOT || templateRoot);
+const workspaceRoot = process.env.MAPLE_WORKSPACE_PATH
+  ? path.resolve(process.env.MAPLE_WORKSPACE_PATH)
+  : "";
+const wikiSlug = process.env.MAPLE_WIKI_SLUG || "maple-wiki";
+const wikiTitle = process.env.MAPLE_WIKI_TITLE || "Maple Wiki";
 
 const publicDir = path.join(appRoot, "public");
 const dataDir = path.join(publicDir, "data");
@@ -100,9 +102,13 @@ async function main() {
 
   const pagePaths = await collectPagePaths();
   const pageLookup = buildPageLookup(pagePaths);
+  const publishSettings = await readPublishSettings();
   const sourceManifest = await readSourceManifest();
-  const sourceEntries = await buildSourceEntries(sourceManifest);
+  const sourceEntries = await buildSourceEntries(sourceManifest, publishSettings);
   await copyPublicSources(sourceEntries);
+  const publicSourcePaths = new Set(
+    sourceEntries.filter((source) => source.public).map((source) => source.path),
+  );
   const copiedAssets = new Map();
 
   const pages = [];
@@ -110,7 +116,7 @@ async function main() {
   const chatChunks = [];
 
   for (const relativePath of pagePaths) {
-    const page = await buildPage(relativePath, pageLookup, copiedAssets);
+    const page = await buildPage(relativePath, pageLookup, copiedAssets, publicSourcePaths);
     pages.push(page);
     searchIndex.push({
       pageKey: page.key,
@@ -133,7 +139,9 @@ async function main() {
     slug: wikiSlug,
     generatedAt: new Date().toISOString(),
     visibility: "public_noindex",
-    sourcePolicy: "all_sources_public_by_default",
+    sourcePolicy: publishSettings.publicSources
+      ? "all_sources_public_by_default"
+      : "sources_private_by_default",
     pageCount: pages.length,
     sourceCount: sourceEntries.length,
     publicSourceCount: publicSources.length,
@@ -180,6 +188,9 @@ async function main() {
 }
 
 async function assertWorkspace() {
+  if (!workspaceRoot) {
+    throw new Error("MAPLE_WORKSPACE_PATH is required to build a public wiki snapshot.");
+  }
   const required = ["index.md", "wiki"];
   for (const item of required) {
     const fullPath = path.join(workspaceRoot, item);
@@ -268,28 +279,43 @@ async function readSourceManifest() {
   }
 }
 
-async function buildSourceEntries(sourceManifest) {
+async function readPublishSettings() {
+  const publishPath = path.join(workspaceRoot, ".aiwiki", "publish.json");
+  try {
+    const parsed = JSON.parse(await fs.readFile(publishPath, "utf8"));
+    return {
+      publicSources: parsed.publicSources === true,
+    };
+  } catch {
+    return {
+      publicSources: false,
+    };
+  }
+}
+
+async function buildSourceEntries(sourceManifest, publishSettings) {
   const entries = [];
   for (const file of (sourceManifest.files || [])
     .filter((file) => file.path?.startsWith("sources/"))
   ) {
     const sourcePath = file.path;
     const type = sourceTypeForPath(sourcePath);
+    const isPublic = publishSettings.publicSources === true;
     const entry = {
       key: sourceKeyForPath(sourcePath),
       path: sourcePath,
       title: sourceTitleForPath(sourcePath),
       type,
-      public: true,
-      url: sourceRouteForPath(sourcePath),
-      rawUrl: `/published-sources/${encodeURIPath(sourcePath)}`,
+      public: isPublic,
+      url: isPublic ? sourceRouteForPath(sourcePath) : null,
+      rawUrl: isPublic ? `/published-sources/${encodeURIPath(sourcePath)}` : null,
       size: file.size || null,
       sha256: file.sha256 || null,
       contentHtml: null,
       contentText: null,
     };
 
-    if (type === "markdown" || type === "text") {
+    if (isPublic && (type === "markdown" || type === "text")) {
       const raw = await fs.readFile(path.join(workspaceRoot, sourcePath), "utf8");
       entry.contentText = raw;
       entry.contentHtml =
@@ -305,6 +331,7 @@ async function buildSourceEntries(sourceManifest) {
 
 async function copyPublicSources(sourceEntries) {
   for (const source of sourceEntries) {
+    if (!source.public) continue;
     const sourcePath = path.join(workspaceRoot, source.path);
     const outPath = path.join(sourceOutDir, source.path);
     await fs.mkdir(path.dirname(outPath), { recursive: true });
@@ -312,17 +339,19 @@ async function copyPublicSources(sourceEntries) {
   }
 }
 
-async function buildPage(relativePath, pageLookup, copiedAssets) {
+async function buildPage(relativePath, pageLookup, copiedAssets, publicSourcePaths) {
   const fullPath = path.join(workspaceRoot, relativePath);
   const raw = await fs.readFile(fullPath, "utf8");
   const parsed = matter(raw);
   const title = parsed.data.title || firstHeading(parsed.content) || titleFromPath(relativePath);
   const key = pageKeyForPath(relativePath);
+  const unit = buildUnitMetadata(parsed.content);
   const prepared = await prepareMarkdown(
     parsed.content,
     relativePath,
     pageLookup,
     copiedAssets,
+    publicSourcePaths,
   );
   const markdown = prepared.markdown;
   const rendered = md.render(markdown);
@@ -340,21 +369,25 @@ async function buildPage(relativePath, pageLookup, copiedAssets) {
     excerpt: makeExcerpt(text),
     headings,
     images: prepared.images,
+    unit: unit ? buildUnitSnapshot(unit, prepared.structuredMarkdown) : null,
     updated: parsed.data.updated || null,
   };
 }
 
-async function prepareMarkdown(markdown, relativePath, pageLookup, copiedAssets) {
+async function prepareMarkdown(markdown, relativePath, pageLookup, copiedAssets, publicSourcePaths) {
   let text = markdown;
   let images = [];
   text = replaceWikiLinks(text, pageLookup);
   const imageResult = await rewriteImages(text, relativePath, copiedAssets);
   text = imageResult.markdown;
   images = imageResult.images;
-  text = rewriteMarkdownLinks(text, relativePath, pageLookup);
+  text = rewriteMarkdownLinks(text, relativePath, pageLookup, publicSourcePaths);
+  const structuredMarkdown = text;
+  text = stripIbwikiMarkers(text);
   text = stripObsidianCallouts(text);
   return {
     markdown: text.trim(),
+    structuredMarkdown: structuredMarkdown.trim(),
     images,
   };
 }
@@ -420,17 +453,20 @@ function headingBefore(markdown, index) {
   return heading.replace(/\s+#$/, "").trim();
 }
 
-function rewriteMarkdownLinks(markdown, relativePath, pageLookup) {
+function rewriteMarkdownLinks(markdown, relativePath, pageLookup, publicSourcePaths) {
   const dir = path.dirname(relativePath);
   return markdown.replace(/(^|[^!])\[([^\]]+)\]\((<?)([^)>]+)(>?)\)/g, (full, prefix, label, _open, rawTarget) => {
     const target = rawTarget.trim().replace(/^<|>$/g, "");
-    if (target.startsWith("/robot-hardware/")) return full;
+    if (target.startsWith(`/${wikiSlug}/`)) return full;
     if (isRemoteUrl(target) || target.startsWith("#")) return full;
 
     const [cleanTarget, rawFragment] = splitTarget(target);
     const resolved = normalizePath(path.normalize(path.join(dir, cleanTarget)));
     const sourcePath = resolveSourcePath(cleanTarget, resolved);
     if (sourcePath) {
+      if (!publicSourcePaths.has(sourcePath)) {
+        return `${prefix}${label}`;
+      }
       const fragment = rawFragment ? `#${rawFragment}` : "";
       return `${prefix}[${label}](${sourceRouteForPath(sourcePath)}${fragment})`;
     }
@@ -460,6 +496,144 @@ function resolveSourcePath(cleanTarget, resolved) {
 
 function stripObsidianCallouts(markdown) {
   return markdown.replace(/^>\s*\[!(\w+)\]\s*$/gm, (_match, label) => `> ${label.toUpperCase()}`);
+}
+
+function buildUnitMetadata(markdown) {
+  const marker = markdown.match(/<!--\s*ibwiki:unit\s+({[\s\S]*?})\s*-->/);
+  if (!marker) return null;
+  try {
+    const parsed = JSON.parse(marker[1]);
+    return {
+      subject: String(parsed.subject || "").trim(),
+      unitId: String(parsed.unit_id || "").trim(),
+      title: String(parsed.unit_title || "").trim(),
+      subtitle: String(parsed.unit_subtitle || "").trim(),
+      level: String(parsed.sl_hl || "").trim(),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function buildUnitSnapshot(unit, markdown) {
+  const tabs = extractUnitTabs(markdown);
+  return {
+    ...unit,
+    tabs,
+  };
+}
+
+function extractUnitTabs(markdown) {
+  const tabs = [];
+  const pattern = /<!--\s*ibwiki:tab\s+([\w-]+)\s*-->([\s\S]*?)<!--\s*\/ibwiki:tab\s*-->/g;
+  for (const match of markdown.matchAll(pattern)) {
+    const id = normalizeUnitTabId(match[1]);
+    if (!id || id === "cross" || id === "cross-topic") continue;
+    const label = unitTabLabel(id);
+    const content = stripIbwikiMarkers(match[2]).trim();
+    const contentWithoutHeading = content.replace(/^##\s+.+$/m, "").trim();
+    const sections = splitMarkdownH3Sections(contentWithoutHeading);
+    tabs.push({
+      id,
+      label,
+      overviewHtml: renderUnitMarkdown(sections.overview),
+      cards: sections.cards.map((card, index) => buildUnitCard(card, id, index)),
+    });
+  }
+  return tabs;
+}
+
+function normalizeUnitTabId(value) {
+  return String(value || "").trim().toLowerCase().replace(/_/g, "-");
+}
+
+function unitTabLabel(id) {
+  if (id === "concepts") return "Concepts";
+  if (id === "problem-patterns") return "Problem patterns";
+  return titleFromSlug(id);
+}
+
+function splitMarkdownH3Sections(markdown) {
+  const lines = markdown.split("\n");
+  const overview = [];
+  const cards = [];
+  let current = null;
+
+  for (const line of lines) {
+    const heading = line.match(/^###\s+(.+)$/);
+    if (heading) {
+      if (current) cards.push(current);
+      current = {
+        title: heading[1].trim(),
+        body: [],
+      };
+      continue;
+    }
+    if (current) {
+      current.body.push(line);
+    } else {
+      overview.push(line);
+    }
+  }
+  if (current) cards.push(current);
+
+  return {
+    overview: overview.join("\n").trim(),
+    cards,
+  };
+}
+
+function buildUnitCard(card, tabId, index) {
+  const body = card.body.join("\n").trim();
+  const marker = body.match(/<!--\s*ibwiki:(?:kc|pattern)\s+({[\s\S]*?})\s*-->/);
+  const metadata = parseMarkerJson(marker?.[1]);
+  const title = String(metadata?.kc_title || metadata?.pattern_title || card.title || "").trim();
+  const code =
+    metadata?.kc_code !== undefined
+      ? `KC ${metadata.kc_code}`
+      : metadata?.pattern_code || (tabId === "problem-patterns" ? `P${index + 1}` : "");
+  const level = String(metadata?.kc_sl_hl || metadata?.pattern_sl_hl || "").trim();
+  const keywords = Array.isArray(metadata?.keywords)
+    ? metadata.keywords.map((item) => String(item).trim()).filter(Boolean)
+    : extractKeywords(body);
+  const bodyWithoutKeywordLine = body.replace(/\*\*Keywords:\*\*\s*[^\n]+/i, "").trim();
+  return {
+    code: String(code || "").trim(),
+    title: title || card.title,
+    level,
+    keywords,
+    html: renderUnitMarkdown(bodyWithoutKeywordLine),
+  };
+}
+
+function parseMarkerJson(value) {
+  if (!value) return null;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+}
+
+function extractKeywords(markdown) {
+  const match = markdown.match(/\*\*Keywords:\*\*\s*([^\n]+)/i);
+  if (!match) return [];
+  return match[1]
+    .split(",")
+    .map((item) => item.trim().replace(/\.$/, ""))
+    .filter(Boolean);
+}
+
+function renderUnitMarkdown(markdown) {
+  const clean = stripIbwikiMarkers(markdown).trim();
+  if (!clean) return "";
+  return sanitizeHtml(md.render(clean), sanitizeOptions);
+}
+
+function stripIbwikiMarkers(markdown) {
+  return markdown
+    .replace(/<!--\s*ibwiki:[\s\S]*?-->/g, "")
+    .replace(/<!--\s*\/ibwiki:[\s\S]*?-->/g, "");
 }
 
 function chunkPage(page) {
@@ -553,6 +727,14 @@ function titleFromPath(relativePath) {
   return path
     .basename(relativePath, ".md")
     .split("-")
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+function titleFromSlug(value) {
+  return String(value || "")
+    .split(/[-_\s]+/)
+    .filter(Boolean)
     .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
     .join(" ");
 }

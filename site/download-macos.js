@@ -1,6 +1,6 @@
 const macosDownloadUrl =
-  "https://github.com/cwoo1090/maple/releases/download/v0.1.21/Maple_0.1.21_aarch64.dmg";
-const macosDownloadName = "Maple_0.1.21_aarch64.dmg";
+  "https://github.com/cwoo1090/maple/releases/download/v0.1.22/Maple_0.1.22_aarch64.dmg";
+const macosDownloadName = "Maple_0.1.22_aarch64.dmg";
 
 const statusElement = document.querySelector("#download-status");
 const fallbackLink = document.querySelector("#download-fallback");

@@ -75,6 +75,11 @@ import {
   type ModelReasoningSelection,
 } from "./ModelReasoningPicker";
 import { Settings } from "./Settings";
+import {
+  SharePublish,
+  teamWriteBlockedReason,
+  type TeamPublishState,
+} from "./SharePublish";
 import { setAnalyticsContext, track } from "./analytics";
 import { translate, useI18n, type UiLanguage } from "./i18n";
 
@@ -713,6 +718,9 @@ const CHAT_PROGRESS_ERROR_PREFIX = "Failed to read chat progress:";
 const MAINTAIN_DISCUSSION_PROGRESS_ERROR_PREFIX = "Failed to read maintain discussion progress:";
 const OPERATION_PROGRESS_ERROR_PREFIX = "Failed to read operation progress:";
 const BACKGROUND_BUILD_PROGRESS_ERROR_PREFIX = "Failed to read background build progress:";
+const WORKSPACE_OPERATION_RUNNING_MESSAGE = "A workspace operation is running.";
+const AUTO_PREP_RUNNING_ERROR_PREFIX =
+  "Failed to prepare imported sources: A workspace operation is running.";
 const NEW_IMAGE_ASSET_ACTION_ID = "__new-image-asset__";
 const APP_UPDATE_AUTO_CHECK_DELAY_MS = 2500;
 const PENDING_GENERATED_CHANGES_ERROR =
@@ -1402,7 +1410,7 @@ function sourceStateLabel(state: SourceState, language: UiLanguage = "en"): stri
   }
 }
 
-function sourceReadinessLabel(
+function buildSourceReadinessLabel(
   status: SourceReadinessState | undefined,
   language: UiLanguage = "en",
 ): string {
@@ -1410,13 +1418,44 @@ function sourceReadinessLabel(
     case "ready":
       return language === "ko" ? "준비됨" : "Ready";
     case "preparing":
-      return language === "ko" ? "준비 중" : "Preparing";
+      return language === "ko" ? "준비 중" : "Preparing now";
     case "failed":
-      return language === "ko" ? "실패" : "Failed";
+      return language === "ko" ? "확인 필요" : "Needs attention";
     case "not-prepared":
     default:
-      return language === "ko" ? "준비 필요" : "Needs prep";
+      return language === "ko" ? "준비 대기" : "Waiting to prepare";
   }
+}
+
+function buildSourcePrepActionNote({
+  failedCount,
+  queuedBuildWhenReady,
+  sourcePreparationActive,
+  language,
+}: {
+  failedCount: number;
+  queuedBuildWhenReady: boolean;
+  sourcePreparationActive: boolean;
+  language: UiLanguage;
+}): string {
+  if (failedCount > 0) {
+    return language === "ko"
+      ? '"다시 준비"로 소스를 준비한 뒤 빌드하세요.'
+      : "Use Retry preparation, then build after the sources are ready.";
+  }
+  if (queuedBuildWhenReady) {
+    return language === "ko"
+      ? "선택한 소스가 모두 준비되면 빌드가 자동으로 시작됩니다."
+      : "Build will start automatically after all selected sources are ready.";
+  }
+  if (sourcePreparationActive) {
+    return language === "ko"
+      ? '"준비되면 빌드" 버튼은 준비가 끝난 뒤 빌드를 자동으로 시작하고 싶을 때만 누르면 됩니다.'
+      : "You can just wait. Click Build when ready only if you want Maple to start the build automatically after preparation finishes.";
+  }
+  return language === "ko"
+    ? '준비가 시작되지 않았거나 멈춘 것 같으면 "소스 준비"를 누르세요. 바로 빌드까지 예약하려면 "준비되면 빌드"를 누르면 됩니다.'
+    : "If preparation did not start or seems stopped, click Prepare sources. Use Build when ready only if you also want Maple to start the build afterward.";
 }
 
 function sourceReadinessPreparingCount(readiness: SourceReadiness | null | undefined): number {
@@ -1804,6 +1843,10 @@ function errorKindFromText(message: string | null | undefined) {
   return "other";
 }
 
+function isWorkspaceOperationRunningError(error: unknown): boolean {
+  return String(error).includes(WORKSPACE_OPERATION_RUNNING_MESSAGE);
+}
+
 function sanitizeAnalyticsText(value: string, maxLength = 500) {
   const normalized = value.replace(/\s+/g, " ").trim();
   if (normalized.length <= maxLength) return normalized;
@@ -1961,6 +2004,7 @@ function App() {
   const [buildSourceOrderDrafts, setBuildSourceOrderDrafts] = useState<Record<string, string>>({});
   const [sourcePreparationStartedAt, setSourcePreparationStartedAt] = useState<number | null>(null);
   const autoPreparedSourceSignatureRef = useRef<string | null>(null);
+  const autoPrepareInFlightSignatureRef = useRef<string | null>(null);
   const [queuedBuildWhenReady, setQueuedBuildWhenReady] = useState<{
     sourcePaths?: string[];
   } | null>(null);
@@ -2050,6 +2094,8 @@ function App() {
   ]);
   const [activeCenterTabId, setActiveCenterTabId] = useState("workspace:index.md");
   const [showSettings, setShowSettings] = useState(false);
+  const [showSharePublish, setShowSharePublish] = useState(false);
+  const [teamPublishState, setTeamPublishState] = useState<TeamPublishState | null>(null);
   const [mapleGuideOpen, setMapleGuideOpen] = useState(false);
   const [mapleGuideCalloutDismissed, setMapleGuideCalloutDismissed] = useState(
     () => window.localStorage.getItem(MAPLE_GUIDE_CALLOUT_DISMISSED_KEY) === "true",
@@ -2395,6 +2441,12 @@ function App() {
       : `${label} is running. Wait for it to finish before editing.`;
   }
 
+  const teamReadOnlyReason = teamWriteBlockedReason(
+    teamPublishState,
+    language,
+    workspace.workspacePath,
+  );
+
   function getBlockedReason(action: BlockedAction): string | null {
     if (action === "explore") {
       if (exploreBusy) {
@@ -2413,6 +2465,10 @@ function App() {
           : "Maintain discussion is answering. Wait for it to finish before asking Ask Wiki.";
       }
       return null;
+    }
+
+    if (teamReadOnlyReason) {
+      return teamReadOnlyReason;
     }
 
     if (activeWorkspaceWriteLabel) {
@@ -2463,7 +2519,9 @@ function App() {
   const sourceImportBlockedReason = getBlockedReason("source-import");
   const sourceRemoveBlockedReason = getBlockedReason("source-remove");
   const schemaUpdateBusy = busy === "Merging schema.md";
-  const schemaUpdateBlockedReason = hasPendingGeneratedChanges
+  const schemaUpdateBlockedReason = teamReadOnlyReason
+    ? teamReadOnlyReason
+    : hasPendingGeneratedChanges
     ? PENDING_GENERATED_CHANGES_ERROR
     : activeWorkspaceWriteLabel
     ? waitForSchemaUpdateMessage(activeWorkspaceWriteLabel)
@@ -2659,6 +2717,23 @@ function App() {
   const buildModalFailedCount = buildModalSelectedRows.filter(
     (row) => row.readiness?.status === "failed",
   ).length;
+  const buildModalPreparingCount = buildModalSelectedRows.filter(
+    (row) => row.readiness?.status === "preparing",
+  ).length;
+  const buildModalWaitingPrepCount = buildModalSelectedRows.filter((row) => {
+    const status = row.readiness?.status ?? "not-prepared";
+    return status === "not-prepared";
+  }).length;
+  const buildModalManualPrepareSourcePaths = useMemo(
+    () =>
+      buildModalSelectedRows
+        .filter((row) => {
+          const status = row.readiness?.status ?? "not-prepared";
+          return status === "not-prepared" || status === "failed";
+        })
+        .map((row) => row.path),
+    [buildModalSelectedRows],
+  );
   const buildModalNeedsPrepCount = buildModalSelectedRows.filter((row) => {
     const status = row.readiness?.status ?? "not-prepared";
     return status === "not-prepared" || status === "preparing" || status === "failed";
@@ -2671,6 +2746,13 @@ function App() {
   const buildSourceOrderingDisabled = Boolean(
     isStartingBuild || isPreparingBuildSources || queuedBuildWhenReady,
   );
+  useEffect(() => {
+    clearErrorMatching([AUTO_PREP_RUNNING_ERROR_PREFIX]);
+  }, [
+    sourcePreparationActive,
+    sourceReadiness?.summary?.preparing,
+    sourceReadiness?.summary?.ready,
+  ]);
   useEffect(() => {
     if (!workspace.workspacePath || sourcePreparationActive) return;
     const preparableSourcePaths = pendingBuildSourceFiles
@@ -2858,6 +2940,8 @@ function App() {
       ? language === "ko"
         ? "이 파일은 읽기 전용입니다."
         : "This file is read-only."
+      : teamReadOnlyReason
+        ? teamReadOnlyReason
       : hasPendingGeneratedChanges
         ? PENDING_GENERATED_CHANGES_ERROR
         : activeWorkspaceWriteLabel
@@ -4231,6 +4315,24 @@ function App() {
   }, []);
 
   useEffect(() => {
+    if (!workspace.workspacePath) {
+      setTeamPublishState(null);
+      return;
+    }
+    let cancelled = false;
+    invoke<TeamPublishState>("read_team_publish_state")
+      .then((state) => {
+        if (!cancelled) setTeamPublishState(state);
+      })
+      .catch(() => {
+        if (!cancelled) setTeamPublishState(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [workspace.workspacePath]);
+
+  useEffect(() => {
     setOpenedChangedFiles(new Set());
   }, [
     workspace.workspacePath,
@@ -5351,6 +5453,19 @@ function App() {
     } catch (_err) {}
   }
 
+  async function refreshWorkspaceAndTeamState() {
+    try {
+      const [state, teamState] = await Promise.all([
+        invoke<WorkspaceState>("load_workspace_state"),
+        invoke<TeamPublishState>("read_team_publish_state"),
+      ]);
+      setWorkspace(state);
+      setTeamPublishState(teamState);
+    } catch (err) {
+      setError(`Failed to refresh workspace: ${String(err)}`);
+    }
+  }
+
   async function refreshWorkspaceStateAfterPendingGeneratedChangesError(error: unknown) {
     if (!String(error).includes(PENDING_GENERATED_CHANGES_ERROR)) return;
     try {
@@ -5612,6 +5727,51 @@ function App() {
     const parsed = Number.parseInt(rawValue, 10);
     if (!Number.isFinite(parsed) || parsed < 1 || fallbackOrder == null) return;
     moveBuildSourceToOrder(path, parsed);
+  }
+
+  async function prepareBuildModalSources() {
+    if (!buildDraft || !workspace.workspacePath) return;
+    if (sourcePreparationActive || queuedBuildWhenReady || buildModalManualPrepareSourcePaths.length === 0) {
+      return;
+    }
+    const sourcePaths = buildModalManualPrepareSourcePaths;
+    const sourceSet = new Set(sourcePaths);
+    const pdfUseAs = Object.fromEntries(
+      Object.entries(buildDraft.pdfUseAs).filter(
+        ([path, role]) => sourceSet.has(path) && isPdfSourcePath(path) && isPdfUseAsRole(role),
+      ),
+    ) as Record<string, PdfUseAsRole>;
+
+    setBusy("Preparing sources");
+    setError(null);
+    setQueuedBuildWhenReady(null);
+    setSourcePreparationStartedAt(Date.now());
+    try {
+      const result = await invoke<AppCommandResult>("prepare_sources", {
+        sourcePaths,
+        pdfUseAs,
+        force: buildModalFailedCount > 0,
+      });
+      setRunner(result.runner);
+      setWorkspace(result.state);
+      track("source preparation started", {
+        source_count: sourcePaths.length,
+        pdf_role_count: Object.keys(pdfUseAs).length,
+        reason: "manual_prepare",
+      });
+    } catch (err) {
+      if (isWorkspaceOperationRunningError(err)) {
+        try {
+          const state = await invoke<WorkspaceState>("load_workspace_state");
+          setWorkspace(state);
+        } catch (_refreshErr) {}
+        return;
+      }
+      setSourcePreparationStartedAt(null);
+      setError(`Failed to prepare sources: ${String(err)}`);
+    } finally {
+      setBusy(null);
+    }
   }
 
   async function startBuildWiki(
@@ -7084,6 +7244,12 @@ function App() {
     const preparableSourcePaths = importedSourcePaths.filter(isAutoPreparableSourcePath);
     if (preparableSourcePaths.length === 0) return;
 
+    const signature = `${workspace.workspacePath}\n${preparableSourcePaths
+      .slice()
+      .sort()
+      .join("\n")}`;
+    if (autoPrepareInFlightSignatureRef.current === signature) return;
+    autoPrepareInFlightSignatureRef.current = signature;
     setSourcePreparationStartedAt(Date.now());
     try {
       const result = await invoke<AppCommandResult>("prepare_sources", {
@@ -7091,14 +7257,30 @@ function App() {
       });
       setRunner(result.runner);
       setWorkspace(result.state);
+      clearErrorMatching([AUTO_PREP_RUNNING_ERROR_PREFIX]);
       track("source preparation started", {
         source_count: preparableSourcePaths.length,
         pdf_role_count: 0,
         reason,
       });
     } catch (err) {
+      if (isWorkspaceOperationRunningError(err)) {
+        clearErrorMatching([AUTO_PREP_RUNNING_ERROR_PREFIX]);
+        try {
+          const state = await invoke<WorkspaceState>("load_workspace_state");
+          setWorkspace(state);
+        } catch (_refreshErr) {
+          // Auto-prep is a background convenience; keep polling briefly rather than
+          // replacing a harmless race with another global error banner.
+        }
+        return;
+      }
       setSourcePreparationStartedAt(null);
       setError(`Failed to prepare imported sources: ${String(err)}`);
+    } finally {
+      if (autoPrepareInFlightSignatureRef.current === signature) {
+        autoPrepareInFlightSignatureRef.current = null;
+      }
     }
   }
 
@@ -7200,12 +7382,12 @@ function App() {
       const update = await check({ timeout: 15_000 });
       if (update) {
         setAppUpdate(update);
-        setAppUpdateStatus("available");
         track("app update available", {
           version: update.version,
           current_version: appVersion,
           automatic: silent,
         });
+        setAppUpdateStatus("available");
         return;
       }
 
@@ -7251,6 +7433,7 @@ function App() {
       setAppUpdate(update);
     }
 
+    setAppUpdate(update);
     resetAppUpdateProgress();
     setAppUpdateStatus("downloading");
     setError(null);
@@ -8490,6 +8673,15 @@ function App() {
                   }}
                 >
                   {t("app.topbar.settings")}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (topbarMenuRef.current) topbarMenuRef.current.open = false;
+                    setShowSharePublish(true);
+                  }}
+                >
+                  Share & Publish
                 </button>
                 <button
                   type="button"
@@ -10407,27 +10599,100 @@ function App() {
                   ) : null}
                 </div>
 	                {buildModalCandidateRows.length > 0 ? (
-		                  <p className="build-source-order-note">
-		                    {language === "ko"
-		                      ? buildDraft.force
-                            ? "Build Wiki는 모든 소스를 위에서 아래 순서대로 읽습니다. 왼쪽 숫자를 바꾸면 그 순서로 이동합니다."
-                            : "Build Wiki는 새 소스와 수정된 소스만 위에서 아래 순서대로 읽습니다. 왼쪽 숫자를 바꾸면 그 순서로 이동합니다."
-		                      : buildDraft.force
-                            ? "Build Wiki reads all sources from top to bottom. Edit the number on the left to move a source to that position."
-                            : "Build Wiki reads only new and modified sources from top to bottom. Edit the number on the left to move a source to that position."}
-		                  </p>
+			                  <p className="build-source-order-note">
+			                    {language === "ko"
+			                      ? buildDraft.force
+	                            ? "Build Wiki는 모든 소스를 위에서 아래 순서대로 읽습니다. 순서가 중요할 때만 왼쪽 숫자를 바꾸세요."
+	                            : "Build Wiki는 새 소스와 수정된 소스를 위에서 아래 순서대로 읽습니다. 순서가 중요할 때만 왼쪽 숫자를 바꾸세요."
+			                      : buildDraft.force
+	                            ? "Build Wiki reads all sources from top to bottom. Change the number only when order matters."
+	                            : "Build Wiki reads new and modified sources from top to bottom. Change the number only when order matters."}
+			                  </p>
+		                ) : null}
+	                {buildModalNeedsPreparation && buildModalCandidateRows.length > 0 ? (
+	                  <section
+	                    className="build-source-prep-note"
+	                    aria-label={language === "ko" ? "소스 준비 상태" : "Source preparation status"}
+	                  >
+	                    <div className="build-source-prep-heading">
+	                      <Info size={14} strokeWidth={2.2} aria-hidden="true" />
+	                      <strong>
+	                        {sourcePreparationActive || queuedBuildWhenReady
+	                          ? language === "ko"
+	                            ? "소스를 준비하는 중"
+	                            : "Preparing sources"
+	                          : language === "ko"
+	                            ? "빌드 전에 소스 준비"
+	                            : "Prepare before building"}
+	                      </strong>
+	                      <span>
+	                        {language === "ko"
+	                          ? `${buildModalReadySourcePaths.length}/${buildModalSelectedRows.length} 준비됨`
+	                          : `${buildModalReadySourcePaths.length}/${buildModalSelectedRows.length} ready`}
+	                        {buildModalPreparingCount > 0
+	                          ? language === "ko"
+	                            ? ` · ${buildModalPreparingCount}개 준비 중`
+	                            : ` · ${buildModalPreparingCount} preparing`
+	                          : ""}
+	                        {buildModalWaitingPrepCount > 0
+	                          ? language === "ko"
+	                            ? ` · ${buildModalWaitingPrepCount}개 대기`
+	                            : ` · ${buildModalWaitingPrepCount} waiting`
+	                          : ""}
+	                        {buildModalFailedCount > 0
+	                          ? language === "ko"
+	                            ? ` · ${buildModalFailedCount}개 확인 필요`
+	                            : ` · ${buildModalFailedCount} needs attention`
+	                          : ""}
+	                      </span>
+	                    </div>
+	                    <p>
+	                      {language === "ko"
+	                        ? "Maple은 AI가 읽기 전에 PDF와 Office 파일을 읽기 쉬운 형태로 준비합니다. 빠르고 안정적인 준비를 위해 한 번에 최대 2개씩 처리합니다."
+	                        : "Maple prepares PDFs and Office files before AI reads them. It handles up to 2 files at a time to keep your computer responsive."}
+	                    </p>
+	                    <p>
+	                      {buildSourcePrepActionNote({
+	                        failedCount: buildModalFailedCount,
+	                        queuedBuildWhenReady: Boolean(queuedBuildWhenReady),
+	                        sourcePreparationActive,
+	                        language,
+	                      })}
+	                    </p>
+	                    {buildModalManualPrepareSourcePaths.length > 0 &&
+	                    !sourcePreparationActive &&
+	                    !queuedBuildWhenReady ? (
+	                      <div className="build-source-prep-actions">
+	                        <button
+	                          type="button"
+	                          className="build-source-prep-button"
+	                          onClick={() => void prepareBuildModalSources()}
+	                          disabled={anyOperationBusy || isStartingBuild || isPreparingBuildSources}
+	                          title={
+	                            anyOperationBusy && activeOperationLabel
+	                              ? runningTitle(activeOperationLabel)
+	                              : undefined
+	                          }
+	                        >
+	                          {buildModalFailedCount > 0
+	                            ? language === "ko"
+	                              ? "다시 준비"
+	                              : "Retry preparation"
+	                            : language === "ko"
+	                              ? "소스 준비"
+	                              : "Prepare sources"}
+	                        </button>
+	                      </div>
+	                    ) : null}
+	                  </section>
 	                ) : null}
-                {sourcePreparationActive || queuedBuildWhenReady ? (
-                  <p className="build-source-prep-note">
-                    {buildModalHasPdfCandidates
-                      ? language === "ko"
-                        ? "Maple이 PDF를 Build Wiki가 읽기 좋은 소스로 변환하고 있습니다. 파일에 따라 준비에 몇 분 이상 걸릴 수 있습니다."
-                        : "Maple is converting this PDF into a readable source for Build Wiki. Preparation can take several minutes or longer depending on the file."
-                      : language === "ko"
-                        ? "Maple이 소스를 Build Wiki가 읽기 좋은 형태로 준비하고 있습니다. 파일에 따라 준비에 몇 분 이상 걸릴 수 있습니다."
-                        : "Maple is preparing these sources for Build Wiki. Preparation can take several minutes or longer depending on the file."}
-                  </p>
-                ) : null}
+	                {buildModalHasPdfCandidates ? (
+	                  <p className="build-source-mode-note">
+	                    {language === "ko"
+	                      ? "PDF Reading mode는 Maple이 텍스트와 그림 중 어디에 더 의존할지 정합니다. 텍스트 위주의 자료는 Mostly text, 그림과 표가 중요한 자료는 Text with diagrams 또는 Mostly visual을 고르세요."
+	                      : "PDF Reading mode tells Maple how much to rely on text versus visuals. Use Mostly text for text-heavy files, Text with diagrams for mixed files, and Mostly visual when figures, tables, or layout carry the meaning."}
+	                  </p>
+	                ) : null}
                 {buildModalFailedCount > 0 ? (
 	                  <p className="build-source-prep-note warning">
 	                    {language === "ko"
@@ -10497,11 +10762,11 @@ function App() {
 	                                <span className={`build-source-state ${row.state}`}>
 	                                  {sourceStateLabel(row.state, language)}
 	                                </span>
-	                                <span aria-hidden="true">·</span>
-	                                <span className={`build-source-status ${readiness}`}>
-	                                  {sourceReadinessLabel(readiness, language)}
-	                                </span>
-	                              </span>
+		                                <span aria-hidden="true">·</span>
+		                                <span className={`build-source-status ${readiness}`}>
+		                                  {buildSourceReadinessLabel(readiness, language)}
+		                                </span>
+		                              </span>
 	                            </div>
 	                            {row.isPdf ? (
 	                              <label className="build-source-role">
@@ -11009,6 +11274,15 @@ function App() {
             </div>
           </div>
         ) : null}
+
+      {showSharePublish ? (
+        <SharePublish
+          workspacePath={workspace.workspacePath}
+          onClose={() => setShowSharePublish(false)}
+          onWorkspaceChanged={refreshWorkspaceAndTeamState}
+          onStateChange={setTeamPublishState}
+        />
+      ) : null}
 
       {showSettings ? (
         <Settings

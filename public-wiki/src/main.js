@@ -22,13 +22,14 @@ const CHAT_HISTORY_TEXT_LIMIT = 1600;
 const CHAT_SCROLL_BOTTOM_THRESHOLD = 32;
 const READER_GUIDE_KEY = "_guide";
 const DEFAULT_LAYOUT = {
-  sidebarWidth: 268,
+  sidebarWidth: 210,
   chatWidth: 356,
   mobileChatHeight: 50,
   sidebarCollapsed: false,
 };
+const PRIMARY_PAGE_TYPES = new Set(["index", "guides", "concepts", "summaries"]);
 const PANEL_LIMITS = {
-  sidebar: { min: 220, max: 420 },
+  sidebar: { min: 190, max: 320 },
   chat: { min: 280, max: 560 },
   mobileChatHeight: { min: 36, max: 88 },
 };
@@ -86,6 +87,7 @@ const state = {
   webSearch: false,
   chatScope: "wiki",
   connectionsOpen: false,
+  unitTab: "concepts",
   layout: loadLayoutState(),
   readerTabs: loadReaderTabs(),
 };
@@ -223,7 +225,7 @@ function render(options = {}) {
         aria-label="Resize wiki navigation"
       ></div>
 
-      <main class="reader ${activeSource ? "source-reader" : ""}">
+      <main class="reader ${activeSource ? "source-reader" : ""} ${!activeSource && page?.unit ? "unit-reader" : ""}">
         ${renderReaderTabs(activeTab.id)}
         ${activeSource ? renderSourceReader(activeSource) : renderPageReader(page)}
       </main>
@@ -1186,7 +1188,22 @@ function renderNav() {
     ${renderTreeRoot("guides", "Guides")}
     ${renderTreeRoot("concepts", "Concepts")}
     ${renderTreeRoot("summaries", "Summaries")}
+    ${renderAdditionalPageRoots()}
   `;
+}
+
+function renderAdditionalPageRoots() {
+  const roots = [
+    ...new Set(
+      state.snapshot.pages
+        .map((page) => page.type)
+        .filter((type) => type && !PRIMARY_PAGE_TYPES.has(type)),
+    ),
+  ];
+  return roots
+    .sort((a, b) => titleCase(a).localeCompare(titleCase(b)))
+    .map((root) => renderTreeRoot(root, titleCase(root)))
+    .join("");
 }
 
 function renderSearchResults(pages) {
@@ -1215,7 +1232,7 @@ function renderTreeRoot(root, label) {
     return renderConceptTree(label, pages);
   }
 
-  const folders = groupByFolder(pages);
+  const folders = groupByFolder(pages, root);
   return `
     <section class="nav-section">
       <h3>${label}</h3>
@@ -1288,14 +1305,34 @@ function renderConceptTree(label, pages) {
 function renderPageLink(page, options = {}) {
   if (!page) return "";
   const label = options.label || page.title;
+  const isActive = page.key === state.activePageKey;
   return `
-    <a
-      class="page-link ${page.key === state.activePageKey ? "active" : ""}"
-      href="${page.path}"
-      data-route="${escapeHtml(page.key)}"
-    >
-      <span>${escapeHtml(label)}</span>
-    </a>
+    <div class="page-link-row">
+      <a
+        class="page-link ${isActive ? "active" : ""}"
+        href="${page.path}"
+        data-route="${escapeHtml(page.key)}"
+      >
+        <span>${escapeHtml(label)}</span>
+      </a>
+      ${isActive && page.unit?.tabs?.length ? renderUnitSidebarTabs(page) : ""}
+    </div>
+  `;
+}
+
+function renderUnitSidebarTabs(page) {
+  return `
+    <div class="unit-sidebar-tabs">
+      ${page.unit.tabs.map((tab) => `
+        <button
+          class="unit-sidebar-tab ${activeUnitTab(page).id === tab.id ? "active" : ""}"
+          type="button"
+          data-unit-tab="${escapeHtml(tab.id)}"
+        >
+          ${escapeHtml(tab.label)}
+        </button>
+      `).join("")}
+    </div>
   `;
 }
 
@@ -1342,6 +1379,7 @@ function renderReaderTabs(activeTabId) {
 }
 
 function renderPageReader(page) {
+  if (page.unit?.tabs?.length) return renderUnitPageReader(page);
   const showConnections = !page.virtual;
   const connections = showConnections ? connectionsFor("page", page.key) : null;
   return `
@@ -1363,6 +1401,93 @@ function renderPageReader(page) {
     ${showConnections ? renderConnectionsBadge(connections) : ""}
     <article class="wiki-content">
       ${page.html}
+    </article>
+  `;
+}
+
+function renderUnitPageReader(page) {
+  const connections = connectionsFor("page", page.key);
+  const unit = page.unit;
+  const tab = activeUnitTab(page);
+  return `
+    <section class="unit-hero">
+      <div class="unit-breadcrumb">
+        <span>${escapeHtml(titleCase(unit.subject || page.type || "Wiki"))}</span>
+        <span aria-hidden="true">›</span>
+        <strong>${escapeHtml(unit.unitId || page.title)}</strong>
+      </div>
+      <h1>${escapeHtml(unit.title || page.title)}</h1>
+      ${unit.subtitle ? `<p>${escapeHtml(unit.subtitle)}</p>` : ""}
+      <div class="unit-tags" aria-label="Unit metadata">
+        ${unit.subject ? `<span class="unit-tag subject">${escapeHtml(titleCase(unit.subject))}</span>` : ""}
+        ${unit.level ? `<span class="unit-tag level">${escapeHtml(unit.level)}</span>` : ""}
+        <span class="unit-tag neutral">${escapeHtml(readingTime(page.text))}</span>
+        <span class="unit-tag neutral">${escapeHtml(sourceCountForPage(page))} sources listed</span>
+      </div>
+    </section>
+    <div class="unit-tab-bar" role="tablist" aria-label="Unit sections">
+      ${unit.tabs.map((item) => `
+        <button
+          class="unit-tab ${item.id === tab.id ? "active" : ""}"
+          type="button"
+          role="tab"
+          aria-selected="${item.id === tab.id ? "true" : "false"}"
+          data-unit-tab="${escapeHtml(item.id)}"
+        >
+          ${escapeHtml(item.label)}
+        </button>
+      `).join("")}
+    </div>
+    <section class="unit-panel" data-unit-panel="${escapeHtml(tab.id)}">
+      ${tab.overviewHtml ? `
+        <div class="unit-overview-card">
+          <div class="unit-card-label">Overview</div>
+          <div class="unit-card-body">${tab.overviewHtml}</div>
+        </div>
+      ` : ""}
+      ${tab.cards.length ? `
+        <div class="unit-card-list">
+          ${tab.cards.map((card) => renderUnitCard(card, tab.id)).join("")}
+        </div>
+      ` : `
+        <div class="unit-empty">
+          <p>No ${escapeHtml(tab.label.toLowerCase())} have been published for this unit yet.</p>
+        </div>
+      `}
+    </section>
+    ${renderConnectionsBadge(connections)}
+  `;
+}
+
+function activeUnitTab(page) {
+  return (
+    page.unit?.tabs?.find((tab) => tab.id === state.unitTab) ||
+    page.unit?.tabs?.[0] || {
+      id: "overview",
+      label: "Overview",
+      overviewHtml: page.html,
+      cards: [],
+    }
+  );
+}
+
+function renderUnitCard(card, tabId) {
+  return `
+    <article class="unit-card ${tabId === "problem-patterns" ? "pattern" : "concept"}">
+      <button class="unit-card-header" type="button" data-card-toggle aria-expanded="true">
+        ${card.code ? `<span class="unit-card-code">${escapeHtml(card.code)}</span>` : ""}
+        <span class="unit-card-title">${escapeHtml(card.title)}</span>
+        ${card.level ? `<span class="unit-card-tag">${escapeHtml(card.level)}</span>` : ""}
+        <span class="unit-card-chevron" aria-hidden="true">⌄</span>
+      </button>
+      <div class="unit-card-content">
+        <div class="unit-card-body">${card.html}</div>
+        ${card.keywords?.length ? `
+          <div class="unit-keywords" aria-label="Keywords">
+            ${card.keywords.slice(0, 10).map((keyword) => `<span>${escapeHtml(keyword)}</span>`).join("")}
+          </div>
+        ` : ""}
+      </div>
     </article>
   `;
 }
@@ -2138,6 +2263,23 @@ function bindEvents() {
     });
   });
 
+  document.querySelectorAll("[data-unit-tab]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.unitTab = button.getAttribute("data-unit-tab") || "concepts";
+      render({ preserveSidebarScroll: true });
+    });
+  });
+
+  document.querySelectorAll("[data-card-toggle]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const card = button.closest(".unit-card");
+      const content = card?.querySelector(".unit-card-content");
+      const isCollapsed = card?.classList.toggle("collapsed");
+      button.setAttribute("aria-expanded", isCollapsed ? "false" : "true");
+      if (content) content.hidden = Boolean(isCollapsed);
+    });
+  });
+
   document.querySelector("[data-chat-messages]")?.addEventListener("scroll", scheduleChatScrollSave, { passive: true });
   document.querySelector("[data-chat-form]")?.addEventListener("submit", askWiki);
   document.querySelector("[data-chat-form] textarea")?.addEventListener("keydown", handleChatTextareaKeydown);
@@ -2244,7 +2386,7 @@ function postProcessArticleLinks() {
 }
 
 function renderMath() {
-  document.querySelectorAll(".wiki-content, .message.assistant").forEach((element) => {
+  document.querySelectorAll(".wiki-content, .unit-panel, .message.assistant").forEach((element) => {
     renderMathInElement(element, {
       delimiters: [
         { left: "$$", right: "$$", display: true },
@@ -3035,9 +3177,9 @@ function groupPages(pages) {
   }, {});
 }
 
-function groupByFolder(pages) {
+function groupByFolder(pages, root = "") {
   return pages.reduce((groups, page) => {
-    const folder = folderLabelForPage(page);
+    const folder = folderLabelForPage(page, root);
     groups[folder] ||= [];
     groups[folder].push(page);
     return groups;
@@ -3081,7 +3223,7 @@ function groupConceptPages(pages) {
   }));
 }
 
-function folderLabelForPage(page) {
+function folderLabelForPage(page, root = "") {
   const parts = page.key.split("/");
   if (parts[0] === "concepts") {
     return [parts[1], parts[2]].filter(Boolean).map(titleCase).join(" / ") || "Concepts";
@@ -3090,7 +3232,7 @@ function folderLabelForPage(page) {
     if (parts[1] === "textbooks" && parts[2]) return `Textbooks / ${titleCase(parts[2])}`;
     return titleCase(parts[1] || "Summaries");
   }
-  return titleCase(parts[0] || "Pages");
+  return titleCase(parts.length > 2 ? parts[1] : root || parts[0] || "Pages");
 }
 
 function pageBreadcrumb(page) {

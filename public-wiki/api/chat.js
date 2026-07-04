@@ -338,7 +338,7 @@ async function runReadOnlyWikiAgent({
 
     let executed = 0;
     for (const action of actions.slice(0, AGENT_MAX_ACTIONS_PER_STEP)) {
-      const normalizedAction = normalizeWikiReadAction(action);
+      const normalizedAction = normalizeWikiReadAction(action, data);
       if (!normalizedAction || normalizedAction.action === "finish") {
         finishedReading = true;
         continue;
@@ -641,7 +641,7 @@ function parseJsonObjectFromText(text) {
   return null;
 }
 
-function normalizeWikiReadAction(action) {
+function normalizeWikiReadAction(action, data) {
   if (!action || typeof action !== "object") return null;
   const name = String(action.action || action.tool || action.name || "").trim().toLowerCase();
   if (name === "finish" || name === "done") return { action: "finish" };
@@ -653,7 +653,7 @@ function normalizeWikiReadAction(action) {
   }
 
   if (name === "read_page" || name === "open_page") {
-    const pageKey = cleanPageKey(action.pageKey || action.key || action.page || action.path);
+    const pageKey = cleanPageKey(action.pageKey || action.key || action.page || action.path, data);
     if (!pageKey) return null;
     return { action: "read_page", pageKey };
   }
@@ -665,7 +665,7 @@ function normalizeWikiReadAction(action) {
   }
 
   if (name === "list_links" || name === "links") {
-    const pageKey = cleanPageKey(action.pageKey || action.key || action.page || action.path);
+    const pageKey = cleanPageKey(action.pageKey || action.key || action.page || action.path, data);
     if (!pageKey) return null;
     return { action: "list_links", pageKey };
   }
@@ -950,13 +950,14 @@ function cleanActionText(value) {
   return String(value || "").trim().slice(0, 200);
 }
 
-function cleanPageKey(value) {
-  return String(value || "")
+function cleanPageKey(value, data) {
+  const text = String(value || "")
     .trim()
     .replace(/^\/+/, "")
-    .replace(/^robot-hardware\/?/, "")
-    .replace(/^#/, "")
-    .slice(0, 160);
+    .replace(/^#/, "");
+  const slug = String(data?.manifest?.slug || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const withoutSlug = slug ? text.replace(new RegExp(`^${slug}/?`, "i"), "") : text;
+  return withoutSlug.slice(0, 160);
 }
 
 function clampLimit(value, fallback) {
