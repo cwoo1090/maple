@@ -2095,6 +2095,11 @@ function App() {
   const [activeCenterTabId, setActiveCenterTabId] = useState("workspace:index.md");
   const [showSettings, setShowSettings] = useState(false);
   const [showSharePublish, setShowSharePublish] = useState(false);
+  const [showJoinTeamWorkspace, setShowJoinTeamWorkspace] = useState(false);
+  const [joinTeamRepoUrl, setJoinTeamRepoUrl] = useState("");
+  const [joinTeamParentDirectory, setJoinTeamParentDirectory] = useState("");
+  const [joinTeamBusy, setJoinTeamBusy] = useState(false);
+  const [joinTeamError, setJoinTeamError] = useState<string | null>(null);
   const [teamPublishState, setTeamPublishState] = useState<TeamPublishState | null>(null);
   const [mapleGuideOpen, setMapleGuideOpen] = useState(false);
   const [mapleGuideCalloutDismissed, setMapleGuideCalloutDismissed] = useState(
@@ -7348,6 +7353,63 @@ function App() {
     }
   }
 
+  async function chooseJoinTeamParentDirectory() {
+    setJoinTeamError(null);
+    let defaultPath: string | undefined;
+    try {
+      defaultPath = await documentDir();
+    } catch (_error) {}
+    const selected = await open({
+      directory: true,
+      title: t("app.joinTeam.chooseSaveFolder"),
+      defaultPath,
+    });
+    if (!selected) return;
+    setJoinTeamParentDirectory((Array.isArray(selected) ? selected[0] : selected) ?? "");
+  }
+
+  async function joinTeamWorkspace(event?: ReactFormEvent<HTMLFormElement>) {
+    event?.preventDefault();
+    const repoUrl = joinTeamRepoUrl.trim();
+    const parentDirectory = joinTeamParentDirectory.trim();
+    if (!repoUrl) {
+      setJoinTeamError(t("app.joinTeam.repoRequired"));
+      return;
+    }
+    if (!parentDirectory) {
+      setJoinTeamError(t("app.joinTeam.folderRequired"));
+      return;
+    }
+
+    const hadWorkspaceOpen = Boolean(workspace.workspacePath);
+    setJoinTeamBusy(true);
+    setJoinTeamError(null);
+    setError(null);
+    try {
+      const state = await invoke<WorkspaceState>("clone_team_workspace", {
+        githubRepoUrl: repoUrl,
+        parentDirectory,
+      });
+      localStorage.setItem("workspacePath", state.workspacePath);
+      track("team workspace joined", {
+        source_count: state.sourceFiles.length,
+        wiki_file_count: state.wikiFiles.length,
+      });
+      setShowJoinTeamWorkspace(false);
+      setJoinTeamRepoUrl("");
+      setJoinTeamParentDirectory("");
+      if (hadWorkspaceOpen) {
+        window.location.reload();
+      } else {
+        setWorkspace(state);
+      }
+    } catch (err) {
+      setJoinTeamError(String(err));
+    } finally {
+      setJoinTeamBusy(false);
+    }
+  }
+
   async function closeWorkspace() {
     setError(null);
     try {
@@ -8122,6 +8184,68 @@ function App() {
     );
   }
 
+  const joinTeamWorkspaceModal = showJoinTeamWorkspace ? (
+    <div className="join-team-overlay" role="dialog" aria-modal="true" aria-labelledby="join-team-title">
+      <form className="join-team-panel" onSubmit={joinTeamWorkspace}>
+        <div className="join-team-header">
+          <div>
+            <span>{t("app.joinTeam.kicker")}</span>
+            <h2 id="join-team-title">{t("app.joinTeam.title")}</h2>
+          </div>
+          <button
+            type="button"
+            className="join-team-close"
+            onClick={() => {
+              if (!joinTeamBusy) setShowJoinTeamWorkspace(false);
+            }}
+            aria-label={t("app.common.close")}
+            disabled={joinTeamBusy}
+          >
+            <X size={16} aria-hidden="true" />
+          </button>
+        </div>
+        <p className="join-team-body">{t("app.joinTeam.body")}</p>
+        <label className="join-team-field">
+          <span>{t("app.joinTeam.repoUrl")}</span>
+          <input
+            value={joinTeamRepoUrl}
+            onChange={(event) => setJoinTeamRepoUrl(event.target.value)}
+            placeholder="https://github.com/company/team-wiki.git"
+            disabled={joinTeamBusy}
+            autoFocus
+          />
+        </label>
+        <label className="join-team-field">
+          <span>{t("app.joinTeam.saveFolder")}</span>
+          <div className="join-team-folder-row">
+            <input
+              value={joinTeamParentDirectory || t("app.joinTeam.folderNotChosen")}
+              readOnly
+              className={!joinTeamParentDirectory ? "placeholder" : ""}
+            />
+            <button type="button" onClick={chooseJoinTeamParentDirectory} disabled={joinTeamBusy}>
+              {t("app.joinTeam.chooseFolder")}
+            </button>
+          </div>
+        </label>
+        <p className="join-team-note">{t("app.joinTeam.note")}</p>
+        {joinTeamError ? <p className="join-team-error">{joinTeamError}</p> : null}
+        <div className="join-team-actions">
+          <button
+            type="button"
+            onClick={() => setShowJoinTeamWorkspace(false)}
+            disabled={joinTeamBusy}
+          >
+            {t("app.common.cancel")}
+          </button>
+          <button type="submit" className="primary" disabled={joinTeamBusy}>
+            {joinTeamBusy ? t("app.joinTeam.joining") : t("app.joinTeam.submit")}
+          </button>
+        </div>
+      </form>
+    </div>
+  ) : null;
+
   void runner;
 
   if (!workspace.workspacePath) {
@@ -8170,10 +8294,20 @@ function App() {
               >
                 {t("app.empty.openFolder")}
               </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setJoinTeamError(null);
+                  setShowJoinTeamWorkspace(true);
+                }}
+              >
+                {t("app.empty.joinTeamWorkspace")}
+              </button>
             </div>
             {error ? <p className="empty-state-error">{error}</p> : null}
           </div>
         </div>
+        {joinTeamWorkspaceModal}
         {renderMapleGuideWidget()}
       </main>
     );
@@ -8492,6 +8626,16 @@ function App() {
                   }}
                 >
                   {t("app.topbar.openWorkspace")}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (topbarWorkspaceMenuRef.current) topbarWorkspaceMenuRef.current.open = false;
+                    setJoinTeamError(null);
+                    setShowJoinTeamWorkspace(true);
+                  }}
+                >
+                  {t("app.topbar.joinTeamWorkspace")}
                 </button>
                 <div className="topbar-workspace-dropdown-separator" role="separator" />
                 <button
@@ -11274,6 +11418,8 @@ function App() {
             </div>
           </div>
         ) : null}
+
+      {joinTeamWorkspaceModal}
 
       {showSharePublish ? (
         <SharePublish

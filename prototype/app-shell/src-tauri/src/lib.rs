@@ -4032,6 +4032,77 @@ async fn set_workspace(
 }
 
 #[tauri::command]
+async fn clone_team_workspace(
+    github_repo_url: String,
+    parent_directory: String,
+    state: State<'_, WorkspaceStore>,
+) -> Result<WorkspaceState, String> {
+    let repo_url = github_repo_url.trim();
+    if repo_url.is_empty() {
+        return Err("Enter the GitHub repo URL for this team workspace.".to_string());
+    }
+    if repo_url.chars().any(char::is_control) {
+        return Err("GitHub repo URL contains unsupported characters.".to_string());
+    }
+
+    let parent = PathBuf::from(parent_directory.trim());
+    if !parent.is_absolute() {
+        return Err(
+            "Choose a local folder where Maple should save the team workspace.".to_string(),
+        );
+    }
+    if !parent.is_dir() {
+        return Err(
+            "Choose an existing local folder where Maple should save the team workspace."
+                .to_string(),
+        );
+    }
+
+    let folder_name = repo_folder_name(repo_url);
+    let destination = parent.join(&folder_name);
+    if destination.exists() {
+        return Err(format!(
+            "{} already exists. Choose a different save folder, or open that existing workspace folder in Maple.",
+            destination.display()
+        ));
+    }
+
+    let destination_arg = destination.to_string_lossy().to_string();
+    let output = Command::new("git")
+        .args(["clone", "--", repo_url, &destination_arg])
+        .current_dir(&parent)
+        .output()
+        .map_err(|error| format!("Failed to run git clone: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let detail = if stderr.is_empty() { stdout } else { stderr };
+        return Err(if detail.is_empty() {
+            "Could not clone this GitHub repo. Confirm the teammate accepted the GitHub invite and is signed in to GitHub on this Mac.".to_string()
+        } else {
+            format!(
+                "Could not clone this GitHub repo. Confirm the teammate accepted the GitHub invite and is signed in to GitHub on this Mac.\n\nGit said: {detail}"
+            )
+        });
+    }
+
+    let canonical = destination
+        .canonicalize()
+        .map_err(|error| format!("Failed to resolve cloned workspace path: {error}"))?;
+    init_workspace_dirs(&canonical)?;
+    let mut team = read_team_config(&canonical);
+    if team.team_name.trim().is_empty() {
+        team.team_name = folder_name;
+    }
+    if team.github_repo_url.trim().is_empty() {
+        team.github_repo_url = repo_url.to_string();
+    }
+    write_pretty_json(&canonical.join(TEAM_CONFIG_PATH), &team)?;
+    *state.path.lock().unwrap() = Some(canonical.clone());
+    load_state_at(&canonical)
+}
+
+#[tauri::command]
 async fn check_schema_update_prompt(
     state: State<'_, WorkspaceStore>,
 ) -> Result<SchemaUpdatePrompt, String> {
@@ -8099,6 +8170,34 @@ fn short_revision(value: &str) -> String {
     value.chars().take(12).collect()
 }
 
+fn repo_folder_name(repo_url: &str) -> String {
+    let mut value = repo_url.trim().trim_end_matches('/').to_string();
+    if value.ends_with(".git") {
+        value.truncate(value.len().saturating_sub(4));
+    }
+    let candidate = value
+        .rsplit(['/', ':'])
+        .next()
+        .unwrap_or("maple-team-wiki")
+        .trim();
+    let sanitized: String = candidate
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let sanitized = sanitized.trim_matches(['.', '-']).to_string();
+    if sanitized.is_empty() || sanitized == ".." {
+        "maple-team-wiki".to_string()
+    } else {
+        sanitized
+    }
+}
+
 fn current_workspace(state: &State<'_, WorkspaceStore>) -> Result<PathBuf, String> {
     current_workspace_optional(state).ok_or_else(|| "No workspace is open".to_string())
 }
@@ -11845,6 +11944,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             set_workspace,
+            clone_team_workspace,
             check_schema_update_prompt,
             dismiss_schema_update_prompt,
             apply_standard_schema_update,

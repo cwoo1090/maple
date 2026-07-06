@@ -216,6 +216,156 @@ code {
   font-size: 11px;
 }
 
+.join-team-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(33, 30, 26, 0.28);
+}
+
+.join-team-panel {
+  width: min(520px, 100%);
+  padding: 22px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--bg-elevated);
+  box-shadow: 0 18px 48px rgba(40, 31, 20, 0.18);
+}
+
+.join-team-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 10px;
+}
+
+.join-team-header span {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--text-faint);
+  font-size: 11px;
+  font-weight: 750;
+  text-transform: uppercase;
+}
+
+.join-team-header h2 {
+  margin: 0;
+  color: var(--text);
+  font-size: 18px;
+  font-weight: 750;
+}
+
+.join-team-close {
+  display: inline-grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: var(--text-muted);
+}
+
+.join-team-close:hover:not(:disabled) {
+  border-color: var(--border);
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.join-team-body,
+.join-team-note,
+.join-team-error {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.join-team-body {
+  margin-bottom: 18px;
+  color: var(--text-muted);
+}
+
+.join-team-field {
+  display: grid;
+  gap: 7px;
+  margin-bottom: 14px;
+  text-align: left;
+}
+
+.join-team-field > span {
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.join-team-field input {
+  width: 100%;
+  height: 36px;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  padding: 0 10px;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 13px;
+}
+
+.join-team-field input.placeholder {
+  color: var(--text-faint);
+}
+
+.join-team-folder-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+}
+
+.join-team-folder-row button,
+.join-team-actions button {
+  height: 36px;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  padding: 0 13px;
+  background: var(--bg-elevated);
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.join-team-folder-row button:hover:not(:disabled),
+.join-team-actions button:hover:not(:disabled) {
+  background: var(--bg-hover);
+}
+
+.join-team-note {
+  color: var(--text-faint);
+}
+
+.join-team-error {
+  margin-top: 12px;
+  padding: 10px;
+  border: 1px solid var(--danger-border);
+  border-radius: 6px;
+  background: var(--danger-bg);
+  color: var(--danger);
+  white-space: pre-wrap;
+}
+
+.join-team-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 18px;
+}
+
+.join-team-actions button.primary {
+  border-color: var(--accent-border);
+  background: var(--accent-bg-strong);
+  color: var(--accent);
+}
+
 /* ============ Topbar ============ */
 
 .app-topbar {
