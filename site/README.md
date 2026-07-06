@@ -16,7 +16,7 @@ The main download CTA links directly to the current Apple silicon DMG on the
 GitHub Release:
 
 ```text
-https://github.com/cwoo1090/maple/releases/download/v0.1.22/Maple_0.1.22_aarch64.dmg
+https://github.com/cwoo1090/maple/releases/download/v0.1.23/Maple_0.1.23_aarch64.dmg
 ```
 
 The legacy `download-macos.html` page also redirects to that DMG so old links
@@ -27,7 +27,7 @@ release build:
 
 ```bash
 LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8 \
-  shasum -a 256 ../prototype/app-shell/src-tauri/target/release/bundle/dmg/Maple_0.1.22_aarch64.dmg \
+  shasum -a 256 ../prototype/app-shell/src-tauri/target/release/bundle/dmg/Maple_0.1.23_aarch64.dmg \
   > downloads/checksums.txt
 ```
 
@@ -35,19 +35,18 @@ Update the CTA links when a new versioned DMG is published.
 
 ## Launch Demo Video
 
-The homepage uses:
+The homepage uses the current ScreenStudio export:
 
 ```text
 assets/maple-launch-demo.mp4
 assets/maple-launch-demo-poster.jpg
 ```
 
-Regenerate the current screenshot-based launch demo with:
+Regenerate a lightweight screenshot-based fallback with:
 
 ```bash
 node create-launch-demo-video.mjs
 ```
 
-This is a lightweight site video built from the checked-in Maple screenshots.
-Replace the MP4 and poster with a ScreenStudio export when a live capture is
-ready.
+The fallback script builds a site video from the checked-in Maple screenshots.
+Replace the MP4 and poster with a newer ScreenStudio export when needed.

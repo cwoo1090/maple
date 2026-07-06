@@ -5,7 +5,7 @@ Place release builds in this folder when publishing the static site.
 The public site download CTA links directly to the current GitHub Release DMG:
 
 ```text
-https://github.com/cwoo1090/maple/releases/download/v0.1.22/Maple_0.1.22_aarch64.dmg
+https://github.com/cwoo1090/maple/releases/download/v0.1.23/Maple_0.1.23_aarch64.dmg
 ```
 
 The legacy `download-macos.html` page redirects to the same DMG.

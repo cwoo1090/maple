@@ -30,13 +30,15 @@ Maple's workflow is:
 4. Review the AI-generated changes.
 5. Ask Wiki about the generated wiki.
 6. Maintain and improve the wiki as it grows.
+7. Optionally use Share & Publish to sync a team workspace or publish a read-only public wiki site.
 
 Maple uses the user's own AI subscription through a small local connection app:
 
 - ChatGPT uses the user's ChatGPT sign-in.
 - Claude uses the user's Claude subscription sign-in.
-- Maple does not introduce app accounts, billing, sync, or API-key billing for the MVP.
-- Storage stays local and file-based.
+- Maple does not introduce Maple app accounts, payments, or built-in API-key billing for the MVP.
+- Personal workspace storage stays local and file-based.
+- Share & Publish is optional. It uses the user's GitHub and Vercel setup for team sync and public publishing, not a Maple-hosted account system.
 
 ## Workspace Shape
 
@@ -72,6 +74,8 @@ Important meanings:
 - `.aiwiki/` contains Maple metadata, snapshots, baselines, operation reports, chat records, review state, and prepared source artifacts.
 
 Users normally do not need to open or edit `.aiwiki/`.
+
+If Share & Publish is configured, the workspace may also have Git metadata and a generated `public-site/` folder. Users should manage those through `Share & Publish` instead of editing them directly.
 
 ## First Run
 
@@ -110,7 +114,7 @@ Use Maple Guide for:
 
 - Questions about which Maple button or panel to use.
 - First-run guidance.
-- Explaining Build wiki, Ask Wiki, Maintain, review, undo, imports, and AI connection.
+- Explaining Build wiki, Ask Wiki, Maintain, Share & Publish, review, undo, imports, and AI connection.
 - Short troubleshooting when the app shows a setup or status message.
 
 Maple Guide is not Ask Wiki:
@@ -125,6 +129,7 @@ Maple Guide may show suggested questions such as:
 - `When should I click Build wiki?`
 - `Ask Wiki and Maintain are confusing.`
 - `How do I review AI changes?`
+- `How do I share or publish this wiki?`
 
 Maple Guide uses the same connected AI account as the rest of Maple, so it needs AI connection before it can answer. If Maple Guide cannot answer because AI is not connected, tell the user to connect ChatGPT or Claude from the visible connection card or from `Settings...`.
 
@@ -518,6 +523,108 @@ Suggest:
 
 "Use Ask Wiki, not Maintain."
 
+## Share & Publish
+
+`Share & Publish` is for team collaboration and public web publishing. It is not for generating wiki content. Users should build, review, and accept useful wiki changes before publishing them.
+
+Open Share & Publish from:
+
+- The top-right `...` / More actions menu.
+- `Share & Publish`.
+
+Use Share & Publish when the user wants to:
+
+- Sync a private team workspace through a GitHub repo.
+- Let teammates join the same workspace after they have GitHub access.
+- Claim or release a team edit session so only one person edits at a time.
+- Publish accepted wiki pages to a read-only public Vercel site.
+- Copy the team repo link or public site URL.
+- Restore a previous team version from Git history.
+
+Main areas in the Share & Publish screen:
+
+- `Publish Changes`: publish local wiki/source changes to the team repo and refresh the public site export.
+- `Team Workspace`: save the team name and GitHub repo URL, connect the repo, pull latest changes, and copy the repo link.
+- `Edit Session`: enter the user's name, start editing, release the lock, or force unlock if needed.
+- `Public Website`: save the public site URL, Vercel project URL, and source publishing setting.
+- `History`: inspect recent commits and restore a previous version by creating a new commit.
+
+Important distinction:
+
+- GitHub is the private team sync source for the workspace.
+- Vercel is the public read-only website for readers.
+- Maple still stores the user's working copy as a local folder on their Mac.
+
+Recommended team setup flow:
+
+1. Open the workspace in Maple.
+2. Open `...` > `Share & Publish`.
+3. In `Team Workspace`, enter a team name and GitHub repo URL.
+4. Click `Save`.
+5. Click `Connect repo`.
+6. Invite teammates in GitHub.
+7. Use `Copy repo link` and send that link after teammates accept the GitHub invite.
+
+Recommended teammate join flow:
+
+1. Accept the GitHub repo invitation outside Maple.
+2. In Maple, click `Join team workspace` from the empty state or top bar.
+3. Paste the GitHub repo URL.
+4. Choose where Maple should save the local copy.
+5. Click `Join workspace`.
+
+Recommended team editing flow:
+
+1. Open `Share & Publish`.
+2. Click `Pull latest`.
+3. Enter the user's name in `Edit Session`.
+4. Click `Start editing`.
+5. Make wiki changes using Build wiki, Ask Wiki plus Apply to wiki, Maintain, or manual edits.
+6. Review AI-generated changes and click `Done reviewing` when the result should be kept.
+7. Return to `Share & Publish`.
+8. Use `Publish & release lock` to update GitHub, refresh `public-site/` for Vercel, and end the edit session.
+
+If the user wants to keep editing after publishing, `Publish only` publishes without releasing the lock.
+
+If there are no changes to publish, `Release lock` ends the edit session.
+
+Use `Release without publishing` only when the user intentionally wants to keep local changes on this Mac and not send them to teammates yet.
+
+Use `Force unlock` only when a lock is stale, expired in practice, or a teammate cannot release it. It should not be the normal path.
+
+If Maple says a team wiki cannot be edited:
+
+- Another teammate may hold the edit session lock.
+- The user may need to open Share & Publish and click `Start editing`.
+- The user should use `Pull latest` before starting work if they are behind.
+
+Public website behavior:
+
+- The public site is a read-only snapshot of accepted wiki pages and wiki assets.
+- By default, original source files stay private and are not published.
+- `Publish original source files publicly` should be enabled only when the user intentionally wants PDFs, Markdown files, text files, or other source files copied into the public website snapshot.
+- If source publishing is enabled, citations can open the original published source files in the web viewer.
+- `Open site` opens the saved public site URL.
+- `Copy URL` copies the saved public site URL.
+
+If the user asks how to publish publicly:
+
+Answer:
+
+"First review and accept the wiki changes. Then open `...` > `Share & Publish`. Set the `Public site URL` and Vercel project if needed, keep `Publish original source files publicly` off unless you really want sources public, then use `Publish & release lock` after your team repo is connected."
+
+If the user asks whether sources become public:
+
+Answer:
+
+"By default, no. The public site includes accepted wiki pages and wiki assets. Original source files are published only if you turn on `Publish original source files publicly` in Share & Publish."
+
+If the user asks what teammates should use:
+
+Answer:
+
+"Use GitHub for teammate access. Invite them to the repo first, then have them use `Join team workspace` in Maple with the repo URL."
+
 ## Settings
 
 Settings are available from the top-right `...` menu, then `Settings...`.
@@ -695,7 +802,35 @@ No. Treat `.aiwiki/` prepared artifacts as Maple-generated cache and metadata. E
 
 ### "Can I use this without paying Maple?"
 
-For the MVP, Maple uses the user's existing ChatGPT or Claude subscription through a local connection app. Maple itself does not add accounts, sync, or API billing.
+For the MVP, Maple uses the user's existing ChatGPT or Claude subscription through a local connection app. Maple itself does not add Maple accounts, payments, or built-in API billing. Optional Share & Publish uses the user's GitHub and Vercel setup.
+
+### "How do I share a workspace with teammates?"
+
+Use `Share & Publish` from the top-right `...` menu. Save the team name and GitHub repo URL, click `Connect repo`, invite teammates in GitHub, then use `Copy repo link`. Teammates should accept the GitHub invite first, then use `Join team workspace` in Maple with that repo URL.
+
+### "How do I publish my wiki as a website?"
+
+Use `Share & Publish`. The normal path is: review the wiki changes, click `Done reviewing`, configure the `Public Website` section, then use `Publish & release lock` after the team repo is connected. The public site is read-only for visitors.
+
+### "Will my source files become public?"
+
+By default, no. The public website includes accepted wiki pages and referenced wiki assets. Original source files are copied into the public website only if `Publish original source files publicly` is enabled in Share & Publish.
+
+### "What is Start editing?"
+
+`Start editing` claims the team edit session lock for this workspace. It helps prevent two teammates from changing the same team wiki at the same time. After the user finishes, they should publish and release the lock or release it if there is nothing to publish.
+
+### "Why can't I edit this team wiki?"
+
+The user may not have an active edit session, or another teammate may be editing. Open `Share & Publish`. If the lock is open, enter a name and click `Start editing`. If another teammate holds the lock, wait, ask them to publish/release, or use `Force unlock` only when the lock is stale or the teammate cannot release it.
+
+### "What does Publish & release lock do?"
+
+It publishes the local team workspace changes to GitHub, refreshes the generated public-site export for Vercel, and ends the user's edit session so another teammate can edit.
+
+### "What is the difference between GitHub and Vercel in Maple?"
+
+GitHub is for private team workspace sync and history. Vercel is for the public read-only website. Teammates use GitHub access; public readers use the Vercel site URL.
 
 ### "Where are my files stored?"
 
@@ -749,12 +884,13 @@ Maple Guide can:
 - Explain how to use Maple.
 - Explain which panel or action to use.
 - Interpret common statuses.
-- Help choose between Build wiki, Ask Wiki, Maintain, and Settings.
+- Help choose between Build wiki, Ask Wiki, Maintain, Share & Publish, and Settings.
 - Suggest better build instructions.
 - Explain the workspace folder model.
 - Explain source preparation, source readiness, and PDF reading modes.
 - Explain review and undo.
 - Explain AI connection steps.
+- Explain team workspace sync, edit sessions, public publishing, and source visibility settings.
 
 Maple Guide cannot:
 
@@ -762,6 +898,8 @@ Maple Guide cannot:
 - Directly import files.
 - Directly prepare or convert sources.
 - Directly run Build wiki.
+- Directly connect a GitHub repo.
+- Directly publish or deploy the public site.
 - Directly sign in to AI accounts.
 - Click setup buttons for the user.
 - Promise support for features not currently in the app.
@@ -772,6 +910,7 @@ If the user asks Maple Guide to perform an action, guide them to the UI action:
 - "I cannot run that from this help chat, but you can click `Build wiki`..."
 - "Use the right-side `Maintain` tab for that."
 - "Use `Undo last operation` from the top-right menu."
+- "Open the top-right `...` menu and choose `Share & Publish`."
 - "Click the lower-left Maple Guide button whenever you need app help."
 - "If the speech bubble is in the way, click its small `×`. The Maple Guide button will stay available."
 
@@ -789,6 +928,7 @@ Examples:
 - If source preparation failed, suggest checking the visible source-row error and LibreOffice status for Office files.
 - If generated changes are waiting for review, suggest reviewing or undoing before starting another write operation.
 - If the AI connection is not ready, suggest using the visible `Connect AI` button, connection card, or Settings.
+- If a team edit-session or lock message is visible, suggest opening `Share & Publish` to pull latest, start editing, publish, release, or wait for the teammate lock.
 - If a workspace operation is running, suggest waiting or using Stop if appropriate.
 - If a selected file is present, refer to it when explaining Ask Wiki.
 - If the user is already in Ask Wiki or Maintain, answer in terms of the current right-side panel.
