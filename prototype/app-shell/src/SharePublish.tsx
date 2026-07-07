@@ -15,6 +15,7 @@ import {
   Users,
   X,
 } from "lucide-react";
+import { TeamConnectionPanel, useTeamConnectionSetup } from "./TeamConnectionSetup";
 import { useI18n, type UiLanguage } from "./i18n";
 
 export type TeamPublishGitCommit = {
@@ -245,12 +246,14 @@ export function SharePublish({
   const [busyAction, setBusyAction] = useState<ActionName | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState<string | null>(null);
+  const teamConnection = useTeamConnectionSetup(true);
 
   const deviceId = useMemo(() => readLocalTeamDeviceId(workspacePath), [workspacePath]);
   const readOnlyReason = teamLockReadOnlyReason(state, language, workspacePath);
   const lockIsMine = Boolean(state?.lock && !state.lock.expired && state.lock.deviceId === deviceId);
   const lockedByOther = Boolean(readOnlyReason);
   const gitReady = Boolean(state?.git.available && state.git.initialized);
+  const teamSyncReady = Boolean(gitReady && teamConnection.ready);
   const gitHasRemote = Boolean(state?.git.hasRemote);
   const gitChangedFiles = state?.git.changedFiles ?? [];
   const contentChangedFiles = useMemo(() => mapleContentChanges(gitChangedFiles), [gitChangedFiles]);
@@ -309,6 +312,26 @@ export function SharePublish({
     }
   }
 
+  function requireTeamConnection() {
+    if (!teamConnection.gitReady) {
+      setError(
+        language === "ko"
+          ? "팀 동기화를 사용하려면 먼저 Git을 설치하고 다시 확인하세요."
+          : "Install Git, then recheck before using team sync.",
+      );
+      return false;
+    }
+    if (!teamConnection.githubReady) {
+      setError(
+        language === "ko"
+          ? "팀 동기화를 사용하려면 먼저 Maple에서 GitHub를 연결하세요."
+          : "Connect GitHub in Maple before using team sync.",
+      );
+      return false;
+    }
+    return true;
+  }
+
   async function saveSettings() {
     await runAction("save", async () => {
       await invoke("save_team_publish_settings", {
@@ -322,7 +345,13 @@ export function SharePublish({
   }
 
   async function initializeRepository() {
+    if (!requireTeamConnection()) return;
     await runAction("init", async () => {
+      if (githubRepoUrl.trim()) {
+        await invoke<string>("github_check_repo_access", {
+          githubRepoUrl: githubRepoUrl.trim(),
+        });
+      }
       await invoke("initialize_team_repository", {
         githubRepoUrl: githubRepoUrl.trim(),
       });
@@ -330,12 +359,14 @@ export function SharePublish({
   }
 
   async function pullLatest() {
+    if (!requireTeamConnection()) return;
     await runAction("pull", async () => {
       await invoke("pull_team_workspace");
     });
   }
 
   async function publishWorkspace() {
+    if (!requireTeamConnection()) return;
     await runAction("publish", async () => {
       await invoke("publish_team_workspace", {
         message: commitMessage.trim() || "Update team wiki and public site",
@@ -345,6 +376,7 @@ export function SharePublish({
   }
 
   async function publishAndReleaseWorkspace() {
+    if (!requireTeamConnection()) return;
     await runAction("publishRelease", async () => {
       await invoke("publish_team_workspace", {
         message: commitMessage.trim() || "Update team wiki and public site",
@@ -358,6 +390,7 @@ export function SharePublish({
   }
 
   async function startEditing() {
+    if (!requireTeamConnection()) return;
     const name = memberName.trim();
     if (!name) {
       setError("Enter your name before starting an edit session.");
@@ -374,6 +407,7 @@ export function SharePublish({
   }
 
   async function releaseEditing(force = false) {
+    if (!requireTeamConnection()) return;
     if (!force && lockIsMine && hasContentChanges) {
       const confirmed = window.confirm(
         "Release without publishing? Your local changes will stay on this Mac and teammates will not receive them until you start editing again and publish.",
@@ -389,6 +423,7 @@ export function SharePublish({
   }
 
   async function restoreVersion(commit: TeamPublishGitCommit) {
+    if (!requireTeamConnection()) return;
     const confirmed = window.confirm(
       `Restore wiki files to "${commit.subject || commit.shortHash}"? Maple will create a new commit instead of deleting history.`,
     );
@@ -418,8 +453,15 @@ export function SharePublish({
   const statusItems = [
     {
       label: "Team repo",
-      value: gitReady ? "Connected" : state?.git.available ? "Not initialized" : "Git missing",
-      tone: gitReady ? "ready" : "warning",
+      value: teamSyncReady ? "Connected" : state?.git.available ? "Not initialized" : "Git missing",
+      tone: teamSyncReady ? "ready" : "warning",
+    },
+    {
+      label: "GitHub account",
+      value: teamConnection.githubReady
+        ? teamConnection.githubStatus?.login || "Connected"
+        : "Connect needed",
+      tone: teamConnection.githubReady ? "ready" : "warning",
     },
     {
       label: "Remote",
@@ -456,6 +498,8 @@ export function SharePublish({
         </header>
 
         {error ? <div className="share-publish-error">{error}</div> : null}
+
+        <TeamConnectionPanel setup={teamConnection} />
 
         <div className="share-publish-status-grid">
           {statusItems.map((item) => (
@@ -515,7 +559,7 @@ export function SharePublish({
                 type="button"
                 className="primary"
                 onClick={publishAndReleaseWorkspace}
-                disabled={Boolean(busyAction) || !gitReady || !lockIsMine}
+                disabled={Boolean(busyAction) || !teamSyncReady || !lockIsMine}
               >
                 <Upload size={14} aria-hidden="true" />
                 Publish & release lock
@@ -523,7 +567,7 @@ export function SharePublish({
               <button
                 type="button"
                 onClick={publishWorkspace}
-                disabled={Boolean(busyAction) || !gitReady || !lockIsMine}
+                disabled={Boolean(busyAction) || !teamSyncReady || !lockIsMine}
               >
                 <Upload size={14} aria-hidden="true" />
                 Publish only
@@ -531,7 +575,7 @@ export function SharePublish({
               <button
                 type="button"
                 onClick={() => releaseEditing(false)}
-                disabled={Boolean(busyAction) || !lockIsMine}
+                disabled={Boolean(busyAction) || !teamSyncReady || !lockIsMine}
               >
                 {hasContentChanges ? "Release without publishing" : "Release lock"}
               </button>
@@ -563,14 +607,18 @@ export function SharePublish({
                 <Save size={14} aria-hidden="true" />
                 Save
               </button>
-              <button type="button" onClick={initializeRepository} disabled={Boolean(busyAction)}>
+              <button
+                type="button"
+                onClick={initializeRepository}
+                disabled={Boolean(busyAction) || !teamConnection.ready}
+              >
                 <GitBranch size={14} aria-hidden="true" />
                 Connect repo
               </button>
               <button
                 type="button"
                 onClick={pullLatest}
-                disabled={Boolean(busyAction) || !gitReady || !gitHasRemote}
+                disabled={Boolean(busyAction) || !teamSyncReady || !gitHasRemote}
               >
                 <RefreshCcw size={14} aria-hidden="true" />
                 Pull latest
@@ -633,7 +681,7 @@ export function SharePublish({
                 type="button"
                 className="primary"
                 onClick={startEditing}
-                disabled={Boolean(busyAction) || !gitReady || lockedByOther || lockIsMine}
+                disabled={Boolean(busyAction) || !teamSyncReady || lockedByOther || lockIsMine}
               >
                 <Lock size={14} aria-hidden="true" />
                 Start editing
@@ -642,7 +690,7 @@ export function SharePublish({
                 type="button"
                 className="danger"
                 onClick={() => releaseEditing(true)}
-                disabled={Boolean(busyAction) || !state?.lock}
+                disabled={Boolean(busyAction) || !teamSyncReady || !state?.lock}
               >
                 Force unlock
               </button>
@@ -745,7 +793,7 @@ export function SharePublish({
                     <button
                       type="button"
                       onClick={() => restoreVersion(commit)}
-                      disabled={Boolean(busyAction) || !gitReady || !lockIsMine}
+                      disabled={Boolean(busyAction) || !teamSyncReady || !lockIsMine}
                     >
                       Restore
                     </button>

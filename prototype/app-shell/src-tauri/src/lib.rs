@@ -272,6 +272,76 @@ struct TeamPublishState {
     git: TeamGitSummary,
 }
 
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct GitAvailability {
+    available: bool,
+    version: Option<String>,
+    installable: bool,
+    status: String,
+    message: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct GitHubAuthStatus {
+    configured: bool,
+    connected: bool,
+    login: Option<String>,
+    name: Option<String>,
+    email: Option<String>,
+    token_scopes: Vec<String>,
+    message: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all(serialize = "camelCase", deserialize = "snake_case"))]
+struct GitHubDeviceLogin {
+    device_code: String,
+    user_code: String,
+    verification_uri: String,
+    expires_in: u64,
+    interval: u64,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct GitHubPollResult {
+    status: String,
+    auth: GitHubAuthStatus,
+    interval: Option<u64>,
+    message: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GitHubTokenResponse {
+    access_token: Option<String>,
+    scope: Option<String>,
+    error: Option<String>,
+    error_description: Option<String>,
+    interval: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct GitHubViewerResponse {
+    login: String,
+    id: u64,
+    name: Option<String>,
+    email: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GitHubEmailResponse {
+    email: String,
+    primary: bool,
+    verified: bool,
+}
+
+#[derive(Deserialize)]
+struct GitHubRepoResponse {
+    full_name: String,
+}
+
 struct WorkspaceStore {
     path: Mutex<Option<PathBuf>>,
 }
@@ -308,6 +378,9 @@ const TEAM_LOCK_PATH: &str = ".aiwiki/lock.json";
 const PUBLISH_CONFIG_PATH: &str = ".aiwiki/publish.json";
 const PUBLIC_SITE_DIR: &str = "public-site";
 const PUBLIC_WIKI_ROOT_ENV: &str = "MAPLE_PUBLIC_WIKI_ROOT";
+const GITHUB_KEYCHAIN_SERVICE: &str = "com.ahnchulwoo.maple.github";
+const GITHUB_KEYCHAIN_ACCOUNT: &str = "github.com";
+const GITHUB_DEVICE_SCOPE: &str = "repo read:user user:email";
 const TEAM_GITIGNORE_RULES: &[&str] = &[
     ".DS_Store",
     "public-site/node_modules/",
@@ -4044,6 +4117,21 @@ async fn clone_team_workspace(
     if repo_url.chars().any(char::is_control) {
         return Err("GitHub repo URL contains unsupported characters.".to_string());
     }
+    if parse_github_repo_url(repo_url).is_none() {
+        return Err("Enter a GitHub repo URL like https://github.com/owner/repo.git.".to_string());
+    }
+    if !is_github_https_repo_url(repo_url) {
+        return Err("Use the HTTPS GitHub repo URL for Maple team workspaces.".to_string());
+    }
+    let git = git_availability();
+    if !git.available {
+        return Err(git.message.unwrap_or_else(|| {
+            "Install Git before joining a team workspace.".to_string()
+        }));
+    }
+    if read_github_token_from_keychain()?.is_none() {
+        return Err("Connect GitHub in Maple before joining a team workspace.".to_string());
+    }
 
     let parent = PathBuf::from(parent_directory.trim());
     if !parent.is_absolute() {
@@ -4068,11 +4156,11 @@ async fn clone_team_workspace(
     }
 
     let destination_arg = destination.to_string_lossy().to_string();
-    let output = Command::new("git")
-        .args(["clone", "--", repo_url, &destination_arg])
-        .current_dir(&parent)
-        .output()
-        .map_err(|error| format!("Failed to run git clone: {error}"))?;
+    let output = run_git_with_optional_auth(
+        &parent,
+        &["clone", "--", repo_url, &destination_arg],
+        Some(repo_url),
+    )?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -4081,7 +4169,8 @@ async fn clone_team_workspace(
             "Could not clone this GitHub repo. Confirm the teammate accepted the GitHub invite and is signed in to GitHub on this Mac.".to_string()
         } else {
             format!(
-                "Could not clone this GitHub repo. Confirm the teammate accepted the GitHub invite and is signed in to GitHub on this Mac.\n\nGit said: {detail}"
+                "Could not clone this GitHub repo.\n\n{}",
+                friendly_git_error(&detail)
             )
         });
     }
@@ -4100,6 +4189,642 @@ async fn clone_team_workspace(
     write_pretty_json(&canonical.join(TEAM_CONFIG_PATH), &team)?;
     *state.path.lock().unwrap() = Some(canonical.clone());
     load_state_at(&canonical)
+}
+
+#[tauri::command]
+async fn check_git_available() -> Result<GitAvailability, String> {
+    Ok(git_availability())
+}
+
+#[tauri::command]
+async fn install_apple_command_line_tools() -> Result<GitAvailability, String> {
+    if cfg!(target_os = "macos") {
+        match Command::new("xcode-select").arg("--install").output() {
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                let detail = if stderr.trim().is_empty() {
+                    stdout.trim().to_string()
+                } else {
+                    stderr.trim().to_string()
+                };
+                if output.status.success()
+                    || detail.contains("install requested")
+                    || detail.contains("already installed")
+                {
+                    return Ok(GitAvailability {
+                        available: false,
+                        version: None,
+                        installable: true,
+                        status: "install-requested".to_string(),
+                        message: Some(
+                            "macOS opened the Command Line Tools installer. Finish the installation, then click Recheck.".to_string(),
+                        ),
+                    });
+                }
+                return Ok(GitAvailability {
+                    available: false,
+                    version: None,
+                    installable: true,
+                    status: "error".to_string(),
+                    message: Some(friendly_git_error(&detail)),
+                });
+            }
+            Err(error) => {
+                return Ok(GitAvailability {
+                    available: false,
+                    version: None,
+                    installable: true,
+                    status: "error".to_string(),
+                    message: Some(format!(
+                        "Could not open the macOS Command Line Tools installer: {error}"
+                    )),
+                });
+            }
+        }
+    }
+
+    Ok(GitAvailability {
+        available: false,
+        version: None,
+        installable: false,
+        status: "unsupported".to_string(),
+        message: Some("Install Git before using team workspace sync.".to_string()),
+    })
+}
+
+#[tauri::command]
+async fn github_auth_status() -> Result<GitHubAuthStatus, String> {
+    github_auth_status_inner().await
+}
+
+#[tauri::command]
+async fn github_start_device_login() -> Result<GitHubDeviceLogin, String> {
+    let client_id = github_oauth_client_id().ok_or_else(|| {
+        "This Maple build does not include GitHub login configuration.".to_string()
+    })?;
+    let client = github_http_client()?;
+    let response = client
+        .post("https://github.com/login/device/code")
+        .header("Accept", "application/json")
+        .form(&[
+            ("client_id", client_id.as_str()),
+            ("scope", GITHUB_DEVICE_SCOPE),
+        ])
+        .send()
+        .await
+        .map_err(|error| format!("Could not start GitHub login: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "GitHub login setup failed with status {}.",
+            response.status()
+        ));
+    }
+    response
+        .json::<GitHubDeviceLogin>()
+        .await
+        .map_err(|error| format!("Could not read GitHub login response: {error}"))
+}
+
+#[tauri::command]
+async fn github_poll_device_login(device_code: String) -> Result<GitHubPollResult, String> {
+    let client_id = github_oauth_client_id().ok_or_else(|| {
+        "This Maple build does not include GitHub login configuration.".to_string()
+    })?;
+    let client = github_http_client()?;
+    let response = client
+        .post("https://github.com/login/oauth/access_token")
+        .header("Accept", "application/json")
+        .form(&[
+            ("client_id", client_id.as_str()),
+            ("device_code", device_code.trim()),
+            (
+                "grant_type",
+                "urn:ietf:params:oauth:grant-type:device_code",
+            ),
+        ])
+        .send()
+        .await
+        .map_err(|error| format!("Could not finish GitHub login: {error}"))?;
+    let token_response = response
+        .json::<GitHubTokenResponse>()
+        .await
+        .map_err(|error| format!("Could not read GitHub login status: {error}"))?;
+
+    if let Some(error) = token_response.error.as_deref() {
+        let status = match error {
+            "authorization_pending" => "pending",
+            "slow_down" => "slow-down",
+            "expired_token" => "expired",
+            "access_denied" => "denied",
+            _ => "error",
+        };
+        return Ok(GitHubPollResult {
+            status: status.to_string(),
+            auth: github_auth_status_inner().await?,
+            interval: token_response.interval,
+            message: Some(
+                token_response
+                    .error_description
+                    .unwrap_or_else(|| github_device_error_message(error)),
+            ),
+        });
+    }
+
+    let token = token_response
+        .access_token
+        .ok_or_else(|| "GitHub did not return an access token.".to_string())?;
+    write_github_token_to_keychain(&token)?;
+    let mut auth = github_auth_status_inner().await?;
+    auth.token_scopes = parse_github_scopes(token_response.scope.as_deref());
+    Ok(GitHubPollResult {
+        status: "connected".to_string(),
+        auth,
+        interval: None,
+        message: None,
+    })
+}
+
+#[tauri::command]
+async fn github_disconnect() -> Result<GitHubAuthStatus, String> {
+    delete_github_token_from_keychain()?;
+    github_auth_status_inner().await
+}
+
+#[tauri::command]
+async fn github_check_repo_access(github_repo_url: String) -> Result<String, String> {
+    let token = read_github_token_from_keychain()?.ok_or_else(|| {
+        "Connect GitHub before checking this team workspace repo.".to_string()
+    })?;
+    if !is_github_https_repo_url(&github_repo_url) {
+        return Err("Use the HTTPS GitHub repo URL for Maple team workspaces.".to_string());
+    }
+    let (owner, repo) = parse_github_repo_url(&github_repo_url)
+        .ok_or_else(|| "Enter a GitHub repo URL like https://github.com/owner/repo.git.".to_string())?;
+    let client = github_http_client()?;
+    let response = client
+        .get(format!("https://api.github.com/repos/{owner}/{repo}"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|error| format!("Could not check GitHub repo access: {error}"))?;
+    if response.status().as_u16() == 404 {
+        return Err(
+            "Maple cannot access this repo. Accept the GitHub invite with the connected account, then try again."
+                .to_string(),
+        );
+    }
+    if response.status().as_u16() == 401 || response.status().as_u16() == 403 {
+        return Err(
+            "GitHub did not allow access to this repo. Reconnect GitHub or confirm the repo invite was accepted."
+                .to_string(),
+        );
+    }
+    if !response.status().is_success() {
+        return Err(format!(
+            "GitHub repo access check failed with status {}.",
+            response.status()
+        ));
+    }
+    let repo = response
+        .json::<GitHubRepoResponse>()
+        .await
+        .map_err(|error| format!("Could not read GitHub repo information: {error}"))?;
+    Ok(repo.full_name)
+}
+
+fn git_availability() -> GitAvailability {
+    match Command::new("git").arg("--version").output() {
+        Ok(output) if output.status.success() => {
+            let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            GitAvailability {
+                available: true,
+                version: if version.is_empty() { None } else { Some(version) },
+                installable: cfg!(target_os = "macos"),
+                status: "available".to_string(),
+                message: None,
+            }
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let detail = if stderr.is_empty() { stdout } else { stderr };
+            GitAvailability {
+                available: false,
+                version: None,
+                installable: cfg!(target_os = "macos"),
+                status: "unavailable".to_string(),
+                message: Some(friendly_git_error(&detail)),
+            }
+        }
+        Err(error) => GitAvailability {
+            available: false,
+            version: None,
+            installable: cfg!(target_os = "macos"),
+            status: "missing".to_string(),
+            message: Some(friendly_git_error(&format!("Failed to run git: {error}"))),
+        },
+    }
+}
+
+fn github_oauth_client_id() -> Option<String> {
+    env::var("MAPLE_GITHUB_CLIENT_ID")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            option_env!("MAPLE_GITHUB_CLIENT_ID")
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+}
+
+fn github_http_client() -> Result<reqwest::Client, String> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::ACCEPT,
+        reqwest::header::HeaderValue::from_static("application/vnd.github+json"),
+    );
+    headers.insert(
+        "X-GitHub-Api-Version",
+        reqwest::header::HeaderValue::from_static("2022-11-28"),
+    );
+    reqwest::Client::builder()
+        .user_agent(format!("Maple/{}", env!("CARGO_PKG_VERSION")))
+        .default_headers(headers)
+        .build()
+        .map_err(|error| format!("Could not prepare GitHub connection: {error}"))
+}
+
+async fn github_auth_status_inner() -> Result<GitHubAuthStatus, String> {
+    let configured = github_oauth_client_id().is_some();
+    if !configured {
+        return Ok(GitHubAuthStatus {
+            configured: false,
+            connected: false,
+            login: None,
+            name: None,
+            email: None,
+            token_scopes: Vec::new(),
+            message: Some(
+                "This Maple build does not include GitHub login configuration.".to_string(),
+            ),
+        });
+    }
+
+    let Some(token) = read_github_token_from_keychain()? else {
+        return Ok(GitHubAuthStatus {
+            configured: true,
+            connected: false,
+            login: None,
+            name: None,
+            email: None,
+            token_scopes: Vec::new(),
+            message: None,
+        });
+    };
+
+    let client = github_http_client()?;
+    let response = client
+        .get("https://api.github.com/user")
+        .bearer_auth(&token)
+        .send()
+        .await
+        .map_err(|error| format!("Could not check GitHub login: {error}"))?;
+
+    if response.status().as_u16() == 401 {
+        let _ = delete_github_token_from_keychain();
+        return Ok(GitHubAuthStatus {
+            configured: true,
+            connected: false,
+            login: None,
+            name: None,
+            email: None,
+            token_scopes: Vec::new(),
+            message: Some("GitHub login expired. Connect GitHub again.".to_string()),
+        });
+    }
+    if !response.status().is_success() {
+        return Ok(GitHubAuthStatus {
+            configured: true,
+            connected: false,
+            login: None,
+            name: None,
+            email: None,
+            token_scopes: Vec::new(),
+            message: Some(format!(
+                "Could not verify GitHub login. GitHub returned status {}.",
+                response.status()
+            )),
+        });
+    }
+
+    let token_scopes = response
+        .headers()
+        .get("x-oauth-scopes")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| parse_github_scopes(Some(value)))
+        .unwrap_or_default();
+    let viewer = response
+        .json::<GitHubViewerResponse>()
+        .await
+        .map_err(|error| format!("Could not read GitHub account information: {error}"))?;
+    let email = if let Some(email) = viewer
+        .email
+        .as_ref()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        email
+    } else {
+        github_primary_email(&client, &token)
+            .await
+            .unwrap_or_else(|| format!("{}+{}@users.noreply.github.com", viewer.id, viewer.login))
+    };
+
+    Ok(GitHubAuthStatus {
+        configured: true,
+        connected: true,
+        login: Some(viewer.login),
+        name: viewer.name,
+        email: Some(email),
+        token_scopes,
+        message: None,
+    })
+}
+
+async fn github_primary_email(client: &reqwest::Client, token: &str) -> Option<String> {
+    let response = client
+        .get("https://api.github.com/user/emails")
+        .bearer_auth(token)
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let emails = response.json::<Vec<GitHubEmailResponse>>().await.ok()?;
+    emails
+        .iter()
+        .find(|email| email.primary && email.verified)
+        .or_else(|| emails.iter().find(|email| email.verified))
+        .map(|email| email.email.clone())
+}
+
+fn parse_github_scopes(value: Option<&str>) -> Vec<String> {
+    value
+        .unwrap_or_default()
+        .split(',')
+        .map(|scope| scope.trim().to_string())
+        .filter(|scope| !scope.is_empty())
+        .collect()
+}
+
+fn github_device_error_message(error: &str) -> String {
+    match error {
+        "authorization_pending" => "Waiting for GitHub approval in the browser.".to_string(),
+        "slow_down" => "GitHub asked Maple to check less often.".to_string(),
+        "expired_token" => "This GitHub login code expired. Start GitHub login again.".to_string(),
+        "access_denied" => "GitHub login was canceled.".to_string(),
+        "device_flow_disabled" => {
+            "GitHub device login is disabled for this Maple OAuth app.".to_string()
+        }
+        _ => "GitHub login could not be completed.".to_string(),
+    }
+}
+
+fn read_github_token_from_keychain() -> Result<Option<String>, String> {
+    if !cfg!(target_os = "macos") {
+        return Ok(None);
+    }
+    let output = Command::new("security")
+        .args([
+            "find-generic-password",
+            "-a",
+            GITHUB_KEYCHAIN_ACCOUNT,
+            "-s",
+            GITHUB_KEYCHAIN_SERVICE,
+            "-w",
+        ])
+        .output()
+        .map_err(|error| format!("Could not read GitHub login from Keychain: {error}"))?;
+    if output.status.success() {
+        let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        return Ok(if token.is_empty() { None } else { Some(token) });
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+    if stderr.contains("could not be found")
+        || stderr.contains("not be found")
+        || output.status.code() == Some(44)
+    {
+        return Ok(None);
+    }
+    Err(format!(
+        "Could not read GitHub login from Keychain: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    ))
+}
+
+fn write_github_token_to_keychain(token: &str) -> Result<(), String> {
+    if !cfg!(target_os = "macos") {
+        return Err("GitHub login storage is currently supported on macOS.".to_string());
+    }
+    let output = Command::new("security")
+        .args([
+            "add-generic-password",
+            "-a",
+            GITHUB_KEYCHAIN_ACCOUNT,
+            "-s",
+            GITHUB_KEYCHAIN_SERVICE,
+            "-w",
+            token,
+            "-U",
+        ])
+        .output()
+        .map_err(|error| format!("Could not save GitHub login to Keychain: {error}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "Could not save GitHub login to Keychain: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    ))
+}
+
+fn delete_github_token_from_keychain() -> Result<(), String> {
+    if !cfg!(target_os = "macos") {
+        return Ok(());
+    }
+    let output = Command::new("security")
+        .args([
+            "delete-generic-password",
+            "-a",
+            GITHUB_KEYCHAIN_ACCOUNT,
+            "-s",
+            GITHUB_KEYCHAIN_SERVICE,
+        ])
+        .output()
+        .map_err(|error| format!("Could not remove GitHub login from Keychain: {error}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+    if stderr.contains("could not be found")
+        || stderr.contains("not be found")
+        || output.status.code() == Some(44)
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "Could not remove GitHub login from Keychain: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    ))
+}
+
+fn parse_github_repo_url(repo_url: &str) -> Option<(String, String)> {
+    let mut value = repo_url.trim().trim_end_matches('/').to_string();
+    if value.is_empty() {
+        return None;
+    }
+    if let Some(stripped) = value.strip_prefix("git@github.com:") {
+        value = stripped.to_string();
+    } else if let Some(stripped) = value.strip_prefix("ssh://git@github.com/") {
+        value = stripped.to_string();
+    } else if let Some(stripped) = value.strip_prefix("https://github.com/") {
+        value = stripped.to_string();
+    } else if let Some(stripped) = value.strip_prefix("http://github.com/") {
+        value = stripped.to_string();
+    } else {
+        return None;
+    }
+
+    value = value
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default()
+        .trim_matches('/')
+        .to_string();
+    if value.ends_with(".git") {
+        value.truncate(value.len().saturating_sub(4));
+    }
+    let mut parts = value.split('/');
+    let owner = parts.next()?.trim();
+    let repo = parts.next()?.trim();
+    if owner.is_empty() || repo.is_empty() || parts.next().is_some() {
+        return None;
+    }
+    Some((owner.to_string(), repo.to_string()))
+}
+
+fn is_github_https_repo_url(repo_url: &str) -> bool {
+    repo_url.trim().starts_with("https://github.com/")
+}
+
+fn git_args_need_auth(args: &[&str]) -> bool {
+    matches!(args.first().copied(), Some("clone" | "fetch" | "pull" | "push"))
+}
+
+fn run_git_with_optional_auth(
+    workspace: &Path,
+    args: &[&str],
+    auth_url: Option<&str>,
+) -> Result<std::process::Output, String> {
+    let mut helper_path = None;
+    let mut command = Command::new("git");
+    command
+        .args(args)
+        .current_dir(workspace)
+        .env("GIT_TERMINAL_PROMPT", "0");
+
+    if let Some(url) = auth_url.filter(|url| parse_github_repo_url(url).is_some()) {
+        let _ = url;
+        if let Some(token) = read_github_token_from_keychain()? {
+            let path = write_git_askpass_helper()?;
+            command
+                .env("GIT_ASKPASS", &path)
+                .env("MAPLE_GIT_USERNAME", "x-access-token")
+                .env("MAPLE_GIT_TOKEN", token);
+            helper_path = Some(path);
+        }
+    }
+
+    let output = command.output();
+    if let Some(path) = helper_path {
+        let _ = fs::remove_file(path);
+    }
+    output.map_err(|error| friendly_git_error(&format!("Failed to run git: {error}")))
+}
+
+fn write_git_askpass_helper() -> Result<PathBuf, String> {
+    let path = env::temp_dir().join(format!(
+        "maple-git-askpass-{}-{}.sh",
+        std::process::id(),
+        now_millis()
+    ));
+    fs::write(
+        &path,
+        "#!/bin/sh\ncase \"$1\" in\n  *Username*) printf '%s\\n' \"${MAPLE_GIT_USERNAME:-x-access-token}\" ;;\n  *) printf '%s\\n' \"$MAPLE_GIT_TOKEN\" ;;\nesac\n",
+    )
+    .map_err(|error| format!("Could not prepare GitHub credential helper: {error}"))?;
+    #[cfg(unix)]
+    {
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("Could not secure GitHub credential helper: {error}"))?;
+    }
+    Ok(path)
+}
+
+fn friendly_git_error(detail: &str) -> String {
+    let trimmed = detail.trim();
+    let lower = trimmed.to_lowercase();
+    if lower.contains("failed to run git")
+        && (lower.contains("no such file or directory") || lower.contains("os error 2"))
+    {
+        return "Git is not installed on this Mac. Install Apple's Command Line Tools, then try again."
+            .to_string();
+    }
+    if lower.contains("could not read username")
+        || lower.contains("device not configured")
+        || lower.contains("terminal prompts disabled")
+    {
+        return "GitHub is not connected in Maple. Connect GitHub, then try again.".to_string();
+    }
+    if lower.contains("authentication failed") || lower.contains("bad credentials") {
+        return "GitHub rejected the saved login. Disconnect GitHub, connect again, then retry."
+            .to_string();
+    }
+    if lower.contains("repository not found") {
+        return "Maple cannot access this repo. Accept the GitHub invite with the connected account, then try again."
+            .to_string();
+    }
+    if lower.contains("permission denied (publickey)") {
+        return "This looks like an SSH GitHub URL. Use the HTTPS repo URL for Maple team workspaces."
+            .to_string();
+    }
+    if lower.contains("fetch first")
+        || lower.contains("failed to push some refs")
+        || lower.contains("non-fast-forward")
+    {
+        return "GitHub has newer workspace changes. Click Pull latest, then publish again."
+            .to_string();
+    }
+    if lower.contains("not possible to fast-forward") {
+        return "This workspace has local changes and GitHub has newer changes. Review local changes, then pull latest."
+            .to_string();
+    }
+    if lower.contains("your local changes to the following files would be overwritten") {
+        return "Local workspace changes would be overwritten by GitHub changes. Publish or review local changes before pulling."
+            .to_string();
+    }
+    if lower.contains("author identity unknown") || lower.contains("please tell me who you are") {
+        return "Git needs a commit identity. Maple will set a local team workspace identity and retry on the next action."
+            .to_string();
+    }
+    if trimmed.is_empty() {
+        "Git command failed.".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 #[tauri::command]
@@ -7512,11 +8237,15 @@ async fn save_team_publish_settings(
 ) -> Result<TeamPublishState, String> {
     let workspace = current_workspace(&state)?;
     init_workspace_dirs(&workspace)?;
+    let github_repo_url = github_repo_url.trim().to_string();
+    if !github_repo_url.is_empty() && !is_github_https_repo_url(&github_repo_url) {
+        return Err("Use the HTTPS GitHub repo URL for Maple team workspaces.".to_string());
+    }
 
     let team = TeamConfig {
         schema_version: 1,
         team_name: team_name.trim().to_string(),
-        github_repo_url: github_repo_url.trim().to_string(),
+        github_repo_url,
     };
     let publish = PublishConfig {
         schema_version: 1,
@@ -7550,6 +8279,9 @@ async fn initialize_team_repository(
 
     let repo_url = github_repo_url.trim();
     if !repo_url.is_empty() {
+        if !is_github_https_repo_url(repo_url) {
+            return Err("Use the HTTPS GitHub repo URL for Maple team workspaces.".to_string());
+        }
         set_git_origin(&workspace, repo_url)?;
         let mut team = read_team_config(&workspace);
         team.github_repo_url = repo_url.to_string();
@@ -7875,11 +8607,12 @@ fn team_git_summary(workspace: &Path) -> TeamGitSummary {
 }
 
 fn git_output(workspace: &Path, args: &[&str]) -> Result<RunnerOutput, String> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(workspace)
-        .output()
-        .map_err(|error| format!("Failed to run git {}: {error}", args.join(" ")))?;
+    let auth_url = if git_args_need_auth(args) {
+        git_remote_origin(workspace)
+    } else {
+        None
+    };
+    let output = run_git_with_optional_auth(workspace, args, auth_url.as_deref())?;
     Ok(RunnerOutput {
         success: output.status.success(),
         code: output.status.code(),
@@ -7893,11 +8626,15 @@ fn git_success(workspace: &Path, args: &[&str]) -> Result<RunnerOutput, String> 
     if output.success {
         return Ok(output);
     }
-    let message = output.stderr.trim();
+    let message = if output.stderr.trim().is_empty() {
+        output.stdout.trim()
+    } else {
+        output.stderr.trim()
+    };
     Err(if message.is_empty() {
         format!("git {} failed", args.join(" "))
     } else {
-        message.to_string()
+        friendly_git_error(message)
     })
 }
 
@@ -8136,12 +8873,32 @@ fn commit_staged_changes(workspace: &Path, message: &str, fallback: &str) -> Res
     if diff.stdout.trim().is_empty() {
         return Ok(());
     }
+    ensure_git_commit_identity(workspace)?;
     let message = if message.trim().is_empty() {
         fallback
     } else {
         message.trim()
     };
     git_success(workspace, &["commit", "-m", message])?;
+    Ok(())
+}
+
+fn ensure_git_commit_identity(workspace: &Path) -> Result<(), String> {
+    let has_name = git_output(workspace, &["config", "--get", "user.name"])
+        .map(|output| output.success && !output.stdout.trim().is_empty())
+        .unwrap_or(false);
+    if !has_name {
+        git_success(workspace, &["config", "user.name", "Maple"])?;
+    }
+    let has_email = git_output(workspace, &["config", "--get", "user.email"])
+        .map(|output| output.success && !output.stdout.trim().is_empty())
+        .unwrap_or(false);
+    if !has_email {
+        git_success(
+            workspace,
+            &["config", "user.email", "maple@users.noreply.github.com"],
+        )?;
+    }
     Ok(())
 }
 
@@ -10264,22 +11021,24 @@ mod tests {
         ensure_asset_master_file_for_edit, ensure_maintain_thread_task_matches,
         ensure_no_pending_generated_changes, extract_partial_answer_from_events,
         finalize_provider_check_report, html_to_text_preview, import_source_file,
-        initialize_workspace_files, is_readable_workspace_preview_path,
-        is_supported_source_extension, is_valid_asset_relative_path, load_state_at,
+        friendly_git_error, initialize_workspace_files, is_github_https_repo_url,
+        is_readable_workspace_preview_path, is_supported_source_extension,
+        is_valid_asset_relative_path, load_state_at,
         login_command_for_settings, maintain_operation_assistant_text,
         maintain_operation_user_text, make_chat_thread, make_maintain_thread,
         node_version_supported, normalize_operation_events, normalize_settings, parse_node_major,
-        parse_provider_ready, provider_choice_required, provider_ready_candidate_count,
-        provider_simulation_value_matches, read_requested_or_new_chat_thread, read_text_tail,
-        read_thread_file, read_wiki_image_asset_registry, refresh_maintain_operation_messages,
+        parse_github_repo_url, parse_provider_ready, provider_choice_required,
+        provider_ready_candidate_count, provider_simulation_value_matches,
+        read_requested_or_new_chat_thread, read_text_tail, read_thread_file,
+        read_wiki_image_asset_registry, refresh_maintain_operation_messages,
         refresh_streaming_messages, register_existing_wiki_asset_references,
         resolve_editable_workspace_file, run_command_probe, runner_path_env,
         schema_update_prompt_for_workspace, select_node_candidate, shell_single_quote,
         terminal_command_script, thread_activity_context, validate_provider_candidate,
         validate_provider_path, write_schema_update_marker, write_wiki_image_asset_registry,
-        AppSettings, ChatSelectionSnippet, ChatThreadMessage, NodeCandidate, NodePathCandidate,
-        ProviderCandidate, ProviderPathCandidate, ThreadFileKind, WikiImageAsset,
-        WikiImageAssetRegistry,
+        AppSettings, ChatSelectionSnippet, ChatThreadMessage, GitHubDeviceLogin, NodeCandidate,
+        NodePathCandidate, ProviderCandidate, ProviderPathCandidate, ThreadFileKind,
+        WikiImageAsset, WikiImageAssetRegistry,
     };
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -10308,6 +11067,69 @@ mod tests {
             fs::set_permissions(&path, permissions).unwrap();
         }
         path
+    }
+
+    #[test]
+    fn parses_supported_github_repo_urls() {
+        assert_eq!(
+            parse_github_repo_url("https://github.com/cwoo1090/ib-wiki.git"),
+            Some(("cwoo1090".to_string(), "ib-wiki".to_string()))
+        );
+        assert_eq!(
+            parse_github_repo_url("git@github.com:cwoo1090/ib-wiki.git"),
+            Some(("cwoo1090".to_string(), "ib-wiki".to_string()))
+        );
+        assert_eq!(
+            parse_github_repo_url("ssh://git@github.com/cwoo1090/ib-wiki.git"),
+            Some(("cwoo1090".to_string(), "ib-wiki".to_string()))
+        );
+        assert!(is_github_https_repo_url(
+            "https://github.com/cwoo1090/ib-wiki.git"
+        ));
+        assert!(!is_github_https_repo_url(
+            "git@github.com:cwoo1090/ib-wiki.git"
+        ));
+        assert_eq!(parse_github_repo_url("https://example.com/cwoo1090/ib-wiki"), None);
+        assert_eq!(parse_github_repo_url("https://github.com/cwoo1090"), None);
+    }
+
+    #[test]
+    fn maps_common_git_failures_to_user_safe_messages() {
+        assert_eq!(
+            friendly_git_error("fatal: could not read Username for 'https://github.com': Device not configured"),
+            "GitHub is not connected in Maple. Connect GitHub, then try again."
+        );
+        assert_eq!(
+            friendly_git_error("[rejected] main -> main (fetch first)\nerror: failed to push some refs"),
+            "GitHub has newer workspace changes. Click Pull latest, then publish again."
+        );
+        assert_eq!(
+            friendly_git_error("ERROR: Repository not found."),
+            "Maple cannot access this repo. Accept the GitHub invite with the connected account, then try again."
+        );
+    }
+
+    #[test]
+    fn reads_github_device_flow_response_shape() {
+        let login: GitHubDeviceLogin = serde_json::from_str(
+            r#"{
+              "device_code": "device-123",
+              "user_code": "ABCD-EFGH",
+              "verification_uri": "https://github.com/login/device",
+              "expires_in": 900,
+              "interval": 5
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(login.device_code, "device-123");
+        let serialized = serde_json::to_value(login).unwrap();
+        assert_eq!(serialized["deviceCode"], "device-123");
+        assert_eq!(serialized["userCode"], "ABCD-EFGH");
+        assert_eq!(
+            serialized["verificationUri"],
+            "https://github.com/login/device"
+        );
     }
 
     #[test]
@@ -11945,6 +12767,13 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             set_workspace,
             clone_team_workspace,
+            check_git_available,
+            install_apple_command_line_tools,
+            github_auth_status,
+            github_start_device_login,
+            github_poll_device_login,
+            github_disconnect,
+            github_check_repo_access,
             check_schema_update_prompt,
             dismiss_schema_update_prompt,
             apply_standard_schema_update,

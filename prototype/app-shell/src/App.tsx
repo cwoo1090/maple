@@ -80,6 +80,7 @@ import {
   teamWriteBlockedReason,
   type TeamPublishState,
 } from "./SharePublish";
+import { TeamConnectionPanel, useTeamConnectionSetup } from "./TeamConnectionSetup";
 import { setAnalyticsContext, track } from "./analytics";
 import { translate, useI18n, type UiLanguage } from "./i18n";
 
@@ -2100,6 +2101,7 @@ function App() {
   const [joinTeamParentDirectory, setJoinTeamParentDirectory] = useState("");
   const [joinTeamBusy, setJoinTeamBusy] = useState(false);
   const [joinTeamError, setJoinTeamError] = useState<string | null>(null);
+  const joinTeamSetup = useTeamConnectionSetup(showJoinTeamWorkspace);
   const [teamPublishState, setTeamPublishState] = useState<TeamPublishState | null>(null);
   const [mapleGuideOpen, setMapleGuideOpen] = useState(false);
   const [mapleGuideCalloutDismissed, setMapleGuideCalloutDismissed] = useState(
@@ -7380,12 +7382,31 @@ function App() {
       setJoinTeamError(t("app.joinTeam.folderRequired"));
       return;
     }
+    if (!joinTeamSetup.gitReady) {
+      setJoinTeamError(
+        language === "ko"
+          ? "팀 워크스페이스를 열려면 먼저 Git을 설치하고 다시 확인하세요."
+          : "Install Git, then recheck before joining a team workspace.",
+      );
+      return;
+    }
+    if (!joinTeamSetup.githubReady) {
+      setJoinTeamError(
+        language === "ko"
+          ? "팀 워크스페이스를 열려면 먼저 Maple에서 GitHub를 연결하세요."
+          : "Connect GitHub in Maple before joining a team workspace.",
+      );
+      return;
+    }
 
     const hadWorkspaceOpen = Boolean(workspace.workspacePath);
     setJoinTeamBusy(true);
     setJoinTeamError(null);
     setError(null);
     try {
+      await invoke<string>("github_check_repo_access", {
+        githubRepoUrl: repoUrl,
+      });
       const state = await invoke<WorkspaceState>("clone_team_workspace", {
         githubRepoUrl: repoUrl,
         parentDirectory,
@@ -8021,6 +8042,7 @@ function App() {
   }
 
   function renderMapleGuideWidget() {
+    if (showJoinTeamWorkspace || showSharePublish) return null;
     const showIntro = mapleGuideMessages.length === 0;
     const showGuideCallout = !mapleGuideOpen && !mapleGuideCalloutDismissed;
     const isFirstRunGuide = !workspace.workspacePath;
@@ -8205,6 +8227,7 @@ function App() {
           </button>
         </div>
         <p className="join-team-body">{t("app.joinTeam.body")}</p>
+        <TeamConnectionPanel setup={joinTeamSetup} compact />
         <label className="join-team-field">
           <span>{t("app.joinTeam.repoUrl")}</span>
           <input
@@ -8238,7 +8261,11 @@ function App() {
           >
             {t("app.common.cancel")}
           </button>
-          <button type="submit" className="primary" disabled={joinTeamBusy}>
+          <button
+            type="submit"
+            className="primary"
+            disabled={joinTeamBusy || !joinTeamSetup.ready}
+          >
             {joinTeamBusy ? t("app.joinTeam.joining") : t("app.joinTeam.submit")}
           </button>
         </div>
