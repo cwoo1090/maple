@@ -40,20 +40,24 @@ Share & Publish에는 다음 영역이 있습니다.
 설정 담당자가 확인할 것:
 
 1. `Share & Publish`를 엽니다.
-2. `Team Workspace`에서 팀 이름을 입력합니다.
-3. GitHub repo URL을 입력합니다.
-4. `Save`를 클릭합니다.
-5. `Connect repo`를 클릭합니다.
-6. `Copy repo link`로 팀원에게 전달할 workspace repo 링크를 복사합니다.
+2. Maple이 Git이 없다고 표시하면 화면의 설치 버튼으로 macOS Command Line Tools 설치를 진행한 뒤 `Recheck`를 클릭합니다.
+3. `Connect GitHub`를 클릭하고 브라우저에서 GitHub 승인을 완료합니다.
+4. `Team Workspace`에서 팀 이름을 입력합니다.
+5. GitHub repo URL을 입력합니다.
+6. `Save`를 클릭합니다.
+7. `Connect repo`를 클릭합니다.
+8. `Copy repo link`로 팀원에게 전달할 workspace repo 링크를 복사합니다.
 
 초대를 받은 팀원이 할 일:
 
 1. GitHub 초대 메일 또는 알림에서 repo 초대를 수락합니다.
 2. Maple을 엽니다.
 3. `Join team workspace`를 클릭합니다.
-4. 전달받은 GitHub repo URL을 붙여넣습니다.
-5. 로컬에 저장할 폴더를 선택합니다.
-6. `Join workspace`를 클릭합니다.
+4. Maple이 Git이 없다고 표시하면 화면의 설치 버튼으로 설치를 진행한 뒤 `Recheck`를 클릭합니다.
+5. `Connect GitHub`를 클릭하고 초대를 수락한 GitHub 계정으로 승인을 완료합니다.
+6. 전달받은 GitHub repo URL을 붙여넣습니다.
+7. 로컬에 저장할 폴더를 선택합니다.
+8. `Join workspace`를 클릭합니다.
 
 만약 `Join workspace`가 실패하면 먼저 GitHub 초대를 수락했는지, 해당 GitHub 계정으로 이 Mac에서 접근 가능한지 확인합니다. Maple은 GitHub 권한 자체를 대신 부여하지 않고, 이미 받은 repo 접근 권한을 사용합니다.
 

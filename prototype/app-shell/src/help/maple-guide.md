@@ -559,19 +559,23 @@ Recommended team setup flow:
 
 1. Open the workspace in Maple.
 2. Open `...` > `Share & Publish`.
-3. In `Team Workspace`, enter a team name and GitHub repo URL.
-4. Click `Save`.
-5. Click `Connect repo`.
-6. Invite teammates in GitHub.
-7. Use `Copy repo link` and send that link after teammates accept the GitHub invite.
+3. If Maple shows that Git is missing, use the visible install action, finish the macOS Command Line Tools installer, then click `Recheck`.
+4. Click `Connect GitHub` and finish the GitHub browser approval.
+5. In `Team Workspace`, enter a team name and GitHub repo URL.
+6. Click `Save`.
+7. Click `Connect repo`.
+8. Invite teammates in GitHub.
+9. Use `Copy repo link` and send that link after teammates accept the GitHub invite.
 
 Recommended teammate join flow:
 
 1. Accept the GitHub repo invitation outside Maple.
 2. In Maple, click `Join team workspace` from the empty state or top bar.
-3. Paste the GitHub repo URL.
-4. Choose where Maple should save the local copy.
-5. Click `Join workspace`.
+3. If Maple shows that Git is missing, use the visible install action, finish the macOS Command Line Tools installer, then click `Recheck`.
+4. Click `Connect GitHub` and finish the GitHub browser approval with the account that accepted the repo invitation.
+5. Paste the GitHub repo URL.
+6. Choose where Maple should save the local copy.
+7. Click `Join workspace`.
 
 Recommended team editing flow:
 
@@ -806,7 +810,7 @@ For the MVP, Maple uses the user's existing ChatGPT or Claude subscription throu
 
 ### "How do I share a workspace with teammates?"
 
-Use `Share & Publish` from the top-right `...` menu. Save the team name and GitHub repo URL, click `Connect repo`, invite teammates in GitHub, then use `Copy repo link`. Teammates should accept the GitHub invite first, then use `Join team workspace` in Maple with that repo URL.
+Use `Share & Publish` from the top-right `...` menu. Maple checks Git and GitHub there. Connect GitHub, save the team name and GitHub repo URL, click `Connect repo`, invite teammates in GitHub, then use `Copy repo link`. Teammates should accept the GitHub invite first, then use `Join team workspace` in Maple with that repo URL.
 
 ### "How do I publish my wiki as a website?"
 

@@ -13,6 +13,9 @@ Maple's first publish path should be a direct-download `.dmg`. The Mac App Store
 - Tauri updater private key is stored outside the repo:
   - `/Users/ahnchulwoo/.tauri/maple-updater.key`
   - Keep this file backed up and private. Losing it means already-installed apps cannot receive future in-app updates.
+- GitHub OAuth App for Maple team workspaces exists with Device Flow enabled.
+  - Set `MAPLE_GITHUB_CLIENT_ID` to that OAuth app's client id before building a release.
+  - The client id is public, but the release build must include it or Maple will show that GitHub login is not configured.
 
 ## Local Build Checks
 
@@ -33,6 +36,7 @@ For a full signed app bundle check:
 ```bash
 cd prototype/app-shell
 export APPLE_SIGNING_IDENTITY="Developer ID Application: chulwoo ahn (7UK3MMC4SB)"
+export MAPLE_GITHUB_CLIENT_ID="..."
 npm run build:mac:app
 ```
 
@@ -55,6 +59,7 @@ Build a Developer ID signed DMG:
 ```bash
 cd prototype/app-shell
 export APPLE_SIGNING_IDENTITY="Developer ID Application: chulwoo ahn (7UK3MMC4SB)"
+export MAPLE_GITHUB_CLIENT_ID="..."
 npm run build:mac:dmg
 npm run release:latest-json
 ```

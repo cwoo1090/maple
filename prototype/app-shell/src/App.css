@@ -227,7 +227,7 @@ code {
 }
 
 .join-team-panel {
-  width: min(520px, 100%);
+  width: min(640px, 100%);
   padding: 22px;
   border: 1px solid var(--border-strong);
   border-radius: 8px;
@@ -364,6 +364,135 @@ code {
   border-color: var(--accent-border);
   background: var(--accent-bg-strong);
   color: var(--accent);
+}
+
+.team-connection {
+  display: grid;
+  gap: 8px;
+  margin: 2px 0 14px;
+}
+
+.team-connection.compact {
+  margin-bottom: 16px;
+}
+
+.team-connection-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+}
+
+.team-connection-row.ready {
+  border-color: var(--success-border);
+  background: var(--success-bg);
+}
+
+.team-connection-row.warning {
+  border-color: var(--warn-border);
+  background: var(--warn-bg);
+}
+
+.team-connection-icon {
+  display: inline-grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  color: var(--accent);
+}
+
+.team-connection-row.ready .team-connection-icon {
+  color: var(--success);
+}
+
+.team-connection-copy {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.team-connection-copy strong {
+  color: var(--text);
+  font-size: 12.5px;
+  font-weight: 750;
+}
+
+.team-connection-copy span,
+.team-connection-message,
+.team-connection-code span {
+  overflow-wrap: anywhere;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.team-connection-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 7px;
+}
+
+.team-connection-actions button,
+.team-connection-code button {
+  min-height: 30px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--border-strong);
+  border-radius: 7px;
+  padding: 0 10px;
+  background: var(--bg-elevated);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.team-connection-actions button:hover:not(:disabled),
+.team-connection-code button:hover:not(:disabled) {
+  background: var(--bg-hover);
+}
+
+.team-connection-code {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 9px;
+  align-items: center;
+  padding: 9px 10px;
+  border: 1px solid var(--accent-border);
+  border-radius: 8px;
+  background: var(--accent-bg);
+}
+
+.team-connection-code strong {
+  color: var(--text);
+  letter-spacing: 0.04em;
+}
+
+.team-connection-message {
+  margin: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+}
+
+@media (max-width: 640px) {
+  .team-connection-row,
+  .team-connection-code {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .team-connection-actions,
+  .team-connection-code button {
+    grid-column: 1 / -1;
+    justify-content: flex-start;
+  }
 }
 
 /* ============ Topbar ============ */
@@ -9140,7 +9269,7 @@ button.tree-name-clickable {
 
 .share-publish-status-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
   gap: 8px;
 }
 
