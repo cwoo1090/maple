@@ -125,7 +125,7 @@ async function main() {
       text: page.text,
       excerpt: page.excerpt,
     });
-    chatChunks.push(...chunkPage(page));
+    chatChunks.push(...chunkPage({ ...page, text: page.chatText }));
   }
 
   pages.sort(comparePages);
@@ -150,22 +150,24 @@ async function main() {
     chatChunkCount: chatChunks.length,
   };
 
+  const publicPages = pages.map(({ chatText, images, ...page }) =>
+    page.unit ? page : { ...page, images },
+  );
   const snapshot = {
     manifest,
-    pages,
+    pages: publicPages,
     sources: publicSources,
     searchIndex,
-    chatChunks,
   };
 
   const chatData = {
     manifest,
     globalDocs,
-    pages: pages.map(({ key, title, path, text, excerpt, images }) => ({
+    pages: pages.map(({ key, title, path, chatText, excerpt, images }) => ({
       key,
       title,
       path,
-      text,
+      text: chatText,
       excerpt,
       images,
     })),
@@ -223,7 +225,7 @@ async function buildGlobalDocs(pages) {
       key: "index",
       title: indexPage.title,
       path: "index.md",
-      text: indexPage.text,
+      text: indexPage.chatText || indexPage.text,
     });
   }
 
@@ -355,9 +357,15 @@ async function buildPage(relativePath, pageLookup, copiedAssets, publicSourcePat
   );
   const markdown = prepared.markdown;
   const rendered = md.render(markdown);
-  const html = sanitizeHtml(rendered, sanitizeOptions);
-  const text = markdownToText(markdown);
-  const headings = extractHeadings(markdown);
+  const fullHtml = sanitizeHtml(rendered, sanitizeOptions);
+  const chatText = [
+    markdownToText(markdown),
+    extractQuestionContextText(prepared.structuredMarkdown),
+  ].filter(Boolean).join("\n\n");
+  const unitSnapshot = unit ? buildUnitSnapshot(unit, prepared.structuredMarkdown) : null;
+  const text = unitSnapshot ? buildPublicUnitText(unitSnapshot) : markdownToText(markdown);
+  const html = unitSnapshot ? "" : fullHtml;
+  const headings = unitSnapshot ? [] : extractHeadings(markdown);
 
   return {
     key,
@@ -366,10 +374,11 @@ async function buildPage(relativePath, pageLookup, copiedAssets, publicSourcePat
     type: pageTypeForKey(key),
     html,
     text,
+    chatText,
     excerpt: makeExcerpt(text),
     headings,
     images: prepared.images,
-    unit: unit ? buildUnitSnapshot(unit, prepared.structuredMarkdown) : null,
+    unit: unitSnapshot,
     updated: parsed.data.updated || null,
   };
 }
@@ -455,8 +464,8 @@ function headingBefore(markdown, index) {
 
 function rewriteMarkdownLinks(markdown, relativePath, pageLookup, publicSourcePaths) {
   const dir = path.dirname(relativePath);
-  return markdown.replace(/(^|[^!])\[([^\]]+)\]\((<?)([^)>]+)(>?)\)/g, (full, prefix, label, _open, rawTarget) => {
-    const target = rawTarget.trim().replace(/^<|>$/g, "");
+  return markdown.replace(/(^|[^!])\[([^\]]+)\]\((?:<([^>]+)>|([^)]+))\)/g, (full, prefix, label, wrappedTarget, plainTarget) => {
+    const target = (wrappedTarget ?? plainTarget).trim();
     if (target.startsWith(`/${wikiSlug}/`)) return full;
     if (isRemoteUrl(target) || target.startsWith("#")) return full;
 
@@ -465,7 +474,8 @@ function rewriteMarkdownLinks(markdown, relativePath, pageLookup, publicSourcePa
     const sourcePath = resolveSourcePath(cleanTarget, resolved);
     if (sourcePath) {
       if (!publicSourcePaths.has(sourcePath)) {
-        return `${prefix}${label}`;
+        const privateLabel = label.replace(/^(\d+)\.(\s)/, "$1\\.$2");
+        return `${prefix}${privateLabel}`;
       }
       const fragment = rawFragment ? `#${rawFragment}` : "";
       return `${prefix}[${label}](${sourceRouteForPath(sourcePath)}${fragment})`;
@@ -530,14 +540,17 @@ function extractUnitTabs(markdown) {
     const id = normalizeUnitTabId(match[1]);
     if (!id || id === "cross" || id === "cross-topic") continue;
     const label = unitTabLabel(id);
-    const content = stripIbwikiMarkers(match[2]).trim();
+    const content = match[2].trim();
     const contentWithoutHeading = content.replace(/^##\s+.+$/m, "").trim();
     const sections = splitMarkdownH3Sections(contentWithoutHeading);
+    const publicCards = id === "concepts"
+      ? sections.cards.filter((card) => /^(Topic overview|At a glance)$/i.test(card.title))
+      : sections.cards;
     tabs.push({
       id,
       label,
-      overviewHtml: renderUnitMarkdown(sections.overview),
-      cards: sections.cards.map((card, index) => buildUnitCard(card, id, index)),
+      overviewHtml: id === "problem-patterns" ? "" : renderUnitMarkdown(sections.overview),
+      cards: publicCards.map((card, index) => buildUnitCard(card, id, index)),
     });
   }
   return tabs;
@@ -548,7 +561,7 @@ function normalizeUnitTabId(value) {
 }
 
 function unitTabLabel(id) {
-  if (id === "concepts") return "Concepts";
+  if (id === "concepts") return "Ask & Learn";
   if (id === "problem-patterns") return "Problem patterns";
   return titleFromSlug(id);
 }
@@ -558,22 +571,41 @@ function splitMarkdownH3Sections(markdown) {
   const overview = [];
   const cards = [];
   let current = null;
+  let pendingSectionMarker = [];
 
   for (const line of lines) {
+    if (/^<!--\s*ibwiki:(?:kc|pattern)\b/.test(line)) {
+      pendingSectionMarker = [line];
+      continue;
+    }
+    if (pendingSectionMarker.length && !line.trim()) {
+      pendingSectionMarker.push(line);
+      continue;
+    }
     const heading = line.match(/^###\s+(.+)$/);
     if (heading) {
       if (current) cards.push(current);
       current = {
         title: heading[1].trim(),
-        body: [],
+        body: pendingSectionMarker,
       };
+      pendingSectionMarker = [];
       continue;
+    }
+    if (pendingSectionMarker.length) {
+      if (current) current.body.push(...pendingSectionMarker);
+      else overview.push(...pendingSectionMarker);
+      pendingSectionMarker = [];
     }
     if (current) {
       current.body.push(line);
     } else {
       overview.push(line);
     }
+  }
+  if (pendingSectionMarker.length) {
+    if (current) current.body.push(...pendingSectionMarker);
+    else overview.push(...pendingSectionMarker);
   }
   if (current) cards.push(current);
 
@@ -587,23 +619,143 @@ function buildUnitCard(card, tabId, index) {
   const body = card.body.join("\n").trim();
   const marker = body.match(/<!--\s*ibwiki:(?:kc|pattern)\s+({[\s\S]*?})\s*-->/);
   const metadata = parseMarkerJson(marker?.[1]);
-  const title = String(metadata?.kc_title || metadata?.pattern_title || card.title || "").trim();
+  const title = String(metadata?.kc_title || metadata?.pattern_name || metadata?.pattern_title || card.title || "").trim();
   const code =
     metadata?.kc_code !== undefined
       ? `KC ${metadata.kc_code}`
-      : metadata?.pattern_code || (tabId === "problem-patterns" ? `P${index + 1}` : "");
+      : metadata?.pattern_code || (metadata?.pattern_number ? `P${metadata.pattern_number}` : tabId === "problem-patterns" ? `P${index + 1}` : "");
   const level = String(metadata?.kc_sl_hl || metadata?.pattern_sl_hl || "").trim();
   const keywords = Array.isArray(metadata?.keywords)
     ? metadata.keywords.map((item) => String(item).trim()).filter(Boolean)
     : extractKeywords(body);
-  const bodyWithoutKeywordLine = body.replace(/\*\*Keywords:\*\*\s*[^\n]+/i, "").trim();
+  const questions = tabId === "problem-patterns" ? extractQuestionBlocks(body) : [];
+  const bodyWithoutQuestions = body.replace(
+    /<!--\s*ibwiki:question\s+{[\s\S]*?}\s*-->[\s\S]*?<!--\s*\/ibwiki:question\s*-->/g,
+    "",
+  );
+  const bodyWithoutKeywordLine = bodyWithoutQuestions.replace(/\*\*Keywords:\*\*\s*[^\n]+/i, "").trim();
+  const introduction = tabId === "problem-patterns" ? extractPatternIntroduction(bodyWithoutKeywordLine) : null;
   return {
     code: String(code || "").trim(),
     title: title || card.title,
     level,
     keywords,
     html: renderUnitMarkdown(bodyWithoutKeywordLine),
+    ...(introduction ? { introduction } : {}),
+    questions,
   };
+}
+
+function extractPatternIntroduction(markdown) {
+  const snapshot = markdownH4Section(markdown, ["pattern snapshot"]);
+  const recognition = markdownH4Section(markdown, ["recognition signals"]);
+  const attack = markdownH4Section(markdown, [
+    "how to attack",
+    "solving moves",
+    "practice moves",
+    "worked moves",
+    "strategy",
+  ]);
+  return {
+    summary: markdownSectionText(snapshot),
+    signals: markdownSectionText(recognition)
+      .split(/,\s*/)
+      .map((item) => item.trim().replace(/^or\s+/i, ""))
+      .filter(Boolean),
+    steps: attack
+      .split("\n")
+      .map((line) => line.match(/^\s*(?:\d+\.|[-*])\s+(.+)$/)?.[1] || "")
+      .map((item) => markdownSectionText(item))
+      .filter(Boolean),
+  };
+}
+
+function markdownH4Section(markdown, acceptedHeadings) {
+  const accepted = new Set(acceptedHeadings.map((heading) => heading.toLowerCase()));
+  const lines = String(markdown || "").split("\n");
+  const section = [];
+  let collecting = false;
+  for (const line of lines) {
+    const heading = line.match(/^####\s+(.+)$/);
+    if (heading) {
+      if (collecting) break;
+      collecting = accepted.has(heading[1].trim().toLowerCase());
+      continue;
+    }
+    if (collecting && /^#{1,3}\s+/.test(line)) break;
+    if (collecting) section.push(line);
+  }
+  return section.join("\n").trim();
+}
+
+function markdownSectionText(markdown) {
+  if (!markdown) return "";
+  return htmlToPlainText(renderUnitMarkdown(markdown));
+}
+
+function extractQuestionBlocks(markdown) {
+  const questions = [];
+  const pattern = /<!--\s*ibwiki:question\s+({[\s\S]*?})\s*-->([\s\S]*?)<!--\s*\/ibwiki:question\s*-->/g;
+  for (const match of markdown.matchAll(pattern)) {
+    const metadata = parseMarkerJson(match[1]);
+    if (!metadata) continue;
+    questions.push({
+      id: String(metadata.question_id || `Q${questions.length + 1}`),
+      anchor: `p${metadata.pattern_number || 1}-${String(metadata.question_id || `q${questions.length + 1}`).toLowerCase()}`,
+      questionImages: extractImagesFromMarker(match[2], "question-image"),
+      answerImages: extractImagesFromMarker(match[2], "answer-image"),
+      questionPages: Array.isArray(metadata.question_pages) ? metadata.question_pages : [],
+      answerPages: Array.isArray(metadata.answer_pages) ? metadata.answer_pages : [],
+    });
+  }
+  return questions;
+}
+
+function extractImagesFromMarker(markdown, markerName) {
+  const match = markdown.match(
+    new RegExp(`<!--\\s*ibwiki:${markerName}\\s*-->([\\s\\S]*?)<!--\\s*\\/ibwiki:${markerName}\\s*-->`),
+  );
+  if (!match) return [];
+  return [...match[1].matchAll(/!\[([^\]]*)\]\(([^)]+)\)/g)].map((image) => ({
+    alt: image[1].trim(),
+    src: image[2].trim().replace(/^<|>$/g, ""),
+  }));
+}
+
+function extractQuestionContextText(markdown) {
+  const contexts = [];
+  const pattern = /<!--\s*ibwiki:question\s+({[\s\S]*?})\s*-->/g;
+  for (const match of markdown.matchAll(pattern)) {
+    const metadata = parseMarkerJson(match[1]);
+    const context = String(metadata?.context || "").trim();
+    if (!context) continue;
+    contexts.push(`## Problem ${metadata.pattern_number || ""} ${metadata.question_id || ""}\n${context}`.trim());
+  }
+  return contexts.join("\n\n");
+}
+
+function buildPublicUnitText(unit) {
+  const lines = [unit.title, unit.subtitle];
+  for (const tab of unit.tabs || []) {
+    lines.push(tab.label);
+    for (const card of tab.cards || []) {
+      lines.push(card.code, card.title, htmlToPlainText(card.html));
+    }
+  }
+  return lines.filter(Boolean).join("\n").trim();
+}
+
+function htmlToPlainText(html) {
+  return String(html || "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function parseMarkerJson(value) {

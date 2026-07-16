@@ -7,6 +7,13 @@ import sanitizeHtml from "sanitize-html";
 import * as pdfjs from "pdfjs-dist";
 import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.mjs?url";
 import { enableMathProtection } from "./markdown-math.js";
+import {
+  chatContextFromThread,
+  pageChatContext,
+  problemChatContext,
+  selectThreadForContext,
+  threadMatchesContext,
+} from "./chat-context.js";
 
 pdfjs.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
@@ -15,8 +22,9 @@ const LAYOUT_STORAGE_KEY = "maple-public-wiki-layout";
 const READER_TABS_STORAGE_KEY = "maple-public-wiki-reader-tabs";
 const CHAT_THREADS_STORAGE_PREFIX = "maple-public-wiki-chat-threads";
 const ACTIVE_CHAT_THREAD_STORAGE_PREFIX = "maple-public-wiki-active-chat-thread";
+const ACTIVE_CHAT_CONTEXTS_STORAGE_PREFIX = "maple-public-wiki-active-chat-contexts";
 const MAX_READER_TABS = 12;
-const MAX_CHAT_THREADS = 12;
+const MAX_CHAT_THREADS = 40;
 const CHAT_HISTORY_LIMIT = 6;
 const CHAT_HISTORY_TEXT_LIMIT = 1600;
 const CHAT_SCROLL_BOTTOM_THRESHOLD = 32;
@@ -82,12 +90,21 @@ const state = {
   messages: [],
   chatThreads: [],
   activeChatThreadId: "",
+  activeChatThreadIdsByContext: {},
+  chatContext: null,
   chatHistoryOpen: false,
   askingThreadIds: new Set(),
   webSearch: false,
-  chatScope: "wiki",
+  chatScope: "current",
   connectionsOpen: false,
   unitTab: "concepts",
+  activePatternCode: "",
+  activeQuestions: {},
+  revealedAnswers: {},
+  reviewedQuestions: {},
+  patternMenuOpen: false,
+  patternIntroductionOpen: false,
+  chatDraft: "",
   layout: loadLayoutState(),
   readerTabs: loadReaderTabs(),
 };
@@ -110,15 +127,19 @@ async function init() {
   if (!response.ok) throw new Error("snapshot.json not found");
   state.snapshot = await response.json();
   await loadChatConfig();
-  restoreChatThreads();
 
   if (location.pathname === "/") {
     history.replaceState(null, "", `/${state.snapshot.manifest.slug}`);
   }
 
   state.activePageKey = pageKeyFromLocation();
+  restoreChatThreads();
+  switchChatContext(pageContextForKey(state.activePageKey));
   window.addEventListener("popstate", () => {
     state.activePageKey = pageKeyFromLocation();
+    if (!sourceFromLocation()) {
+      switchChatContext(pageContextForKey(state.activePageKey));
+    }
     render();
     if (!sourceFromLocation()) {
       scrollToReaderPosition(decodeURIComponent(location.hash.replace(/^#/, "")));
@@ -141,6 +162,9 @@ function render(options = {}) {
   const activeSource = sourceFromLocation();
   const sidebarTab = state.sidebarTab || (activeSource ? "sources" : "pages");
   const page = activeSource ? null : findPage(state.activePageKey) || snapshot.pages[0];
+  const isUnitPage = Boolean(!activeSource && page?.unit?.tabs?.length);
+  const unitTab = isUnitPage ? activeUnitTab(page) : null;
+  const showUnitChatDrawer = unitTab?.id === "problem-patterns";
   const activeTab = activeSource ? readerTabForSource(activeSource) : readerTabForPage(page);
   ensureReaderTab(activeTab);
   const shellClass = [
@@ -178,7 +202,7 @@ function render(options = {}) {
         </div>
       </header>
 
-      <div class="publish-layout ${activeSource ? "source-layout" : "has-chat"}">
+      <div class="publish-layout ${activeSource ? "source-layout" : isUnitPage ? "unit-site-layout" : "has-chat"}">
       <aside class="sidebar">
         <div class="sidebar-head">
           <a class="brand" href="/${snapshot.manifest.slug}" data-route="index">
@@ -205,13 +229,15 @@ function render(options = {}) {
           >
             Wiki
           </button>
-          <button
-            class="${sidebarTab === "sources" ? "active" : ""}"
-            type="button"
-            data-sidebar-tab="sources"
-          >
-            Sources
-          </button>
+          ${snapshot.sources.length ? `
+            <button
+              class="${sidebarTab === "sources" ? "active" : ""}"
+              type="button"
+              data-sidebar-tab="sources"
+            >
+              Sources
+            </button>
+          ` : ""}
         </div>
         <nav class="page-nav" aria-label="${sidebarTab === "sources" ? "Wiki sources" : "Wiki pages"}">
           ${sidebarTab === "sources" ? renderSourceNav() : renderNav()}
@@ -231,17 +257,23 @@ function render(options = {}) {
       </main>
 
       ${
-        activeSource
+        activeSource || (isUnitPage && !showUnitChatDrawer)
           ? ""
           : `
-            <div
-              class="panel-resizer chat-resizer"
-              data-panel-resizer="chat"
-              role="separator"
-              aria-orientation="vertical"
-              aria-label="Resize Ask Wiki panel"
-            ></div>
-            ${renderChatPanel()}
+            ${
+              isUnitPage
+                ? renderChatPanel({ drawer: true })
+                : `
+                    <div
+                      class="panel-resizer chat-resizer"
+                      data-panel-resizer="chat"
+                      role="separator"
+                      aria-orientation="vertical"
+                      aria-label="Resize Ask Wiki panel"
+                    ></div>
+                    ${renderChatPanel()}
+                  `
+            }
           `
       }
       </div>
@@ -287,24 +319,29 @@ async function loadChatConfig() {
     if (!response.ok) return;
     const config = await response.json();
     const models = Array.isArray(config.models)
-      ? config.models.filter(isChatModelOption).filter(isGeminiChatModelOption)
+      ? config.models.filter(isChatModelOption)
       : [];
     const selectedModel =
       models.find((option) => option.model === config.model) ||
       models[0] ||
-      (isGeminiModelName(config.model)
+      (inferChatProviderFromModel(config.model)
         ? {
             model: config.model,
-            provider: "gemini",
-            label: modelLabelForConfig(config.model, "gemini"),
-            webSearchSupported: true,
+            provider: config.provider || inferChatProviderFromModel(config.model),
+            label: modelLabelForConfig(config.model, config.provider),
+            webSearchSupported: config.webSearchSupported !== false,
           }
         : null);
+    const provider =
+      selectedModel?.provider ||
+      config.provider ||
+      inferChatProviderFromModel(selectedModel?.model);
     state.chatConfig = {
-      provider: "gemini",
+      provider,
       model: selectedModel?.model || "",
-      modelLabel: selectedModel?.label || "Gemini",
-      webSearchSupported: true,
+      modelLabel: selectedModel?.label || modelLabelForConfig(selectedModel?.model, provider),
+      webSearchSupported:
+        selectedModel?.webSearchSupported ?? config.webSearchSupported ?? true,
       models,
     };
   } catch {
@@ -322,18 +359,18 @@ function isChatModelOption(option) {
   );
 }
 
-function isGeminiChatModelOption(option) {
-  return isGeminiModelName(option.model) && (!option.provider || option.provider === "gemini");
-}
-
-function isGeminiModelName(model) {
-  return /^gemini(?:-|$)/i.test(String(model || "").replace(/^models\//, "").trim());
+function inferChatProviderFromModel(model) {
+  const normalized = String(model || "").replace(/^models\//, "").trim();
+  if (/^gemini(?:-|$)/i.test(normalized)) return "gemini";
+  if (/^(?:gpt-|o[134](?:-|$))/i.test(normalized)) return "openai";
+  return "";
 }
 
 function modelLabelForConfig(model, provider) {
   const cleanModel = String(model || "").replace(/^models\//, "").trim();
   if (!cleanModel) {
     if (provider === "gemini") return "Gemini";
+    if (provider === "openai") return "OpenAI";
     return "AI";
   }
 
@@ -385,22 +422,129 @@ function activeChatThreadStorageKey() {
   return `${ACTIVE_CHAT_THREAD_STORAGE_PREFIX}:${chatStorageSuffix()}`;
 }
 
+function activeChatContextsStorageKey() {
+  return `${ACTIVE_CHAT_CONTEXTS_STORAGE_PREFIX}:${chatStorageSuffix()}`;
+}
+
+function pageTitleForChatContext(pageKey) {
+  const page = findPage(pageKey);
+  if (!page) return "";
+  return page.key === "index" ? "Wiki Index" : page.title;
+}
+
+function pageContextForKey(pageKey = state.activePageKey) {
+  const page = findPage(pageKey) || findPage("index") || state.snapshot?.pages?.[0];
+  return pageChatContext({
+    pageKey: page?.key || pageKey || "index",
+    pageTitle: page?.key === "index" ? "Wiki Index" : page?.title || "",
+  });
+}
+
+function problemContextForQuestion(problemCode, questionId) {
+  const pageContext = pageContextForKey(state.activePageKey);
+  return problemChatContext({
+    pageKey: pageContext.pageKey,
+    pageTitle: pageContext.label,
+    problemCode,
+    questionId,
+  });
+}
+
+function normalizedChatThread(thread) {
+  const context = chatContextFromThread(thread, {
+    fallbackPageKey: state.activePageKey || "index",
+    pageTitleForKey: pageTitleForChatContext,
+  });
+  return applyChatContextToThread({ ...thread }, context);
+}
+
+function applyChatContextToThread(thread, context = state.chatContext || pageContextForKey()) {
+  thread.contextKey = context.key;
+  thread.contextKind = context.kind;
+  thread.contextPageKey = context.pageKey;
+  thread.contextPageTitle = pageTitleForChatContext(context.pageKey) || context.label;
+  thread.contextLabel = context.label;
+  thread.problemCode = context.problemCode || "";
+  thread.questionId = context.questionId || "";
+  thread.initialContextLabel = thread.initialContextLabel || context.label;
+  thread.initialContextPageKey = thread.initialContextPageKey || context.pageKey;
+  return thread;
+}
+
+function chatContextForThread(thread) {
+  return chatContextFromThread(thread, {
+    fallbackPageKey: state.activePageKey || "index",
+    pageTitleForKey: pageTitleForChatContext,
+  });
+}
+
+function currentChatContextKey() {
+  return state.chatContext?.key || pageContextForKey().key;
+}
+
+function chatThreadsForCurrentContext() {
+  const contextKey = currentChatContextKey();
+  return state.chatThreads.filter((thread) => threadMatchesContext(thread, contextKey));
+}
+
+function switchChatContext(context, { persist = true } = {}) {
+  if (!context?.key) return;
+  saveChatScrollPosition();
+  state.chatContext = context;
+  state.chatDraft = "";
+  state.chatHistoryOpen = false;
+
+  const thread = selectThreadForContext(
+    state.chatThreads,
+    state.activeChatThreadIdsByContext,
+    context.key,
+  );
+  state.activeChatThreadId = thread?.id || "";
+  state.messages = Array.isArray(thread?.messages) ? thread.messages.slice() : [];
+  if (thread) {
+    state.activeChatThreadIdsByContext[context.key] = thread.id;
+  } else {
+    delete state.activeChatThreadIdsByContext[context.key];
+  }
+
+  if (persist) saveChatThreads();
+}
+
 function restoreChatThreads() {
   try {
     const threads = JSON.parse(localStorage.getItem(chatThreadsStorageKey()) || "[]");
-    state.chatThreads = Array.isArray(threads) ? threads.slice(0, MAX_CHAT_THREADS) : [];
+    state.chatThreads = Array.isArray(threads)
+      ? threads.slice(0, MAX_CHAT_THREADS).map(normalizedChatThread)
+      : [];
   } catch {
     state.chatThreads = [];
   }
 
   try {
-    state.activeChatThreadId = localStorage.getItem(activeChatThreadStorageKey()) || "";
+    const storedContexts = JSON.parse(localStorage.getItem(activeChatContextsStorageKey()) || "{}");
+    state.activeChatThreadIdsByContext =
+      storedContexts && typeof storedContexts === "object" && !Array.isArray(storedContexts)
+        ? storedContexts
+        : {};
   } catch {
-    state.activeChatThreadId = "";
+    state.activeChatThreadIdsByContext = {};
   }
 
-  const activeThread = state.chatThreads.find((thread) => thread.id === state.activeChatThreadId);
-  state.messages = activeThread?.messages || [];
+  try {
+    const legacyActiveId = localStorage.getItem(activeChatThreadStorageKey()) || "";
+    const legacyActiveThread = chatThreadById(legacyActiveId);
+    if (
+      legacyActiveThread &&
+      !state.activeChatThreadIdsByContext[legacyActiveThread.contextKey]
+    ) {
+      state.activeChatThreadIdsByContext[legacyActiveThread.contextKey] = legacyActiveThread.id;
+    }
+  } catch {
+    // The legacy active thread is migration-only.
+  }
+
+  state.activeChatThreadId = "";
+  state.messages = [];
 }
 
 function saveChatThreads() {
@@ -408,8 +552,19 @@ function saveChatThreads() {
     .filter((thread) => Array.isArray(thread.messages) && thread.messages.length > 0)
     .slice(0, MAX_CHAT_THREADS);
   state.chatThreads = nonEmptyThreads;
+  const storedIds = new Set(nonEmptyThreads.map((thread) => thread.id));
+  state.activeChatThreadIdsByContext = Object.fromEntries(
+    Object.entries(state.activeChatThreadIdsByContext).filter(([contextKey, threadId]) => {
+      const thread = state.chatThreads.find((item) => item.id === threadId);
+      return storedIds.has(threadId) && threadMatchesContext(thread, contextKey);
+    }),
+  );
   try {
     localStorage.setItem(chatThreadsStorageKey(), JSON.stringify(nonEmptyThreads));
+    localStorage.setItem(
+      activeChatContextsStorageKey(),
+      JSON.stringify(state.activeChatThreadIdsByContext),
+    );
     localStorage.setItem(activeChatThreadStorageKey(), state.activeChatThreadId || "");
   } catch {
     // Chat persistence is optional.
@@ -471,9 +626,10 @@ function restoreChatScrollPosition({ forceBottom = false } = {}) {
 }
 
 function ensureActiveChatThread() {
+  const context = state.chatContext || pageContextForKey();
   if (state.activeChatThreadId) {
     const existing = state.chatThreads.find((thread) => thread.id === state.activeChatThreadId);
-    if (existing) return existing;
+    if (existing && threadMatchesContext(existing, context.key)) return existing;
   }
 
   const now = new Date().toISOString();
@@ -486,7 +642,9 @@ function ensureActiveChatThread() {
     initialContextPageKey: currentChatContextPageKey(),
     messages: [],
   };
+  applyChatContextToThread(thread, context);
   state.activeChatThreadId = thread.id;
+  state.activeChatThreadIdsByContext[context.key] = thread.id;
   state.chatThreads.unshift(thread);
   return thread;
 }
@@ -498,7 +656,9 @@ function syncActiveChatThread() {
   thread.updatedAt = new Date().toISOString();
   thread.initialContextLabel = thread.initialContextLabel || currentChatContextLabel();
   thread.initialContextPageKey = thread.initialContextPageKey || currentChatContextPageKey();
+  applyChatContextToThread(thread);
   thread.messages = state.messages.slice();
+  state.activeChatThreadIdsByContext[thread.contextKey] = thread.id;
   state.chatThreads = [
     thread,
     ...state.chatThreads.filter((item) => item.id !== thread.id),
@@ -540,8 +700,10 @@ function appendMessageToChatThread(threadId, message, { markUnread = false } = {
 
 function createNewChat() {
   saveChatScrollPosition();
+  delete state.activeChatThreadIdsByContext[currentChatContextKey()];
   state.messages = [];
   state.activeChatThreadId = "";
+  state.chatDraft = "";
   state.chatHistoryOpen = false;
   saveChatThreads();
   render();
@@ -556,13 +718,17 @@ function openChatThread(threadId) {
     thread.chatStickToBottom = true;
   }
   thread.unreadAnswer = false;
+  const context = chatContextForThread(thread);
+  state.chatContext = context;
   state.activeChatThreadId = thread.id;
+  state.activeChatThreadIdsByContext[context.key] = thread.id;
   state.messages = Array.isArray(thread.messages) ? thread.messages : [];
+  state.chatDraft = "";
   state.chatHistoryOpen = false;
   saveChatThreads();
   const contextPage = latestChatContextPage(thread);
   if (contextPage && contextPage.key !== state.activePageKey) {
-    navigate(contextPage.key);
+    navigate(contextPage.key, "", { chatContext: context });
     return;
   }
   render();
@@ -575,11 +741,20 @@ function deleteChatThread(threadId) {
   if (threadIndex === -1) return;
 
   const wasActive = state.activeChatThreadId === threadId;
+  const deletedContextKey = thread.contextKey;
   state.chatThreads = state.chatThreads.filter((item) => item.id !== threadId);
+  if (state.activeChatThreadIdsByContext[deletedContextKey] === threadId) {
+    delete state.activeChatThreadIdsByContext[deletedContextKey];
+  }
   if (wasActive) {
-    const nextThread = state.chatThreads[0] || null;
+    const nextThread = state.chatThreads.find((item) =>
+      threadMatchesContext(item, currentChatContextKey()),
+    ) || null;
     state.activeChatThreadId = nextThread?.id || "";
     state.messages = Array.isArray(nextThread?.messages) ? nextThread.messages : [];
+    if (nextThread) {
+      state.activeChatThreadIdsByContext[currentChatContextKey()] = nextThread.id;
+    }
   }
 
   state.chatHistoryOpen = true;
@@ -591,9 +766,13 @@ function currentChatContextLabel() {
   return state.chatScope === "current" ? chatContextLabel() : "Whole wiki";
 }
 
+function currentChatScopeSubject() {
+  return state.chatContext?.kind === "problem" ? "this question" : "this page";
+}
+
 function currentChatContextPageKey() {
   if (state.chatScope !== "current") return "";
-  return findPage(state.activePageKey)?.key || "";
+  return state.chatContext?.pageKey || findPage(state.activePageKey)?.key || "";
 }
 
 function pageFromMessageContext(message) {
@@ -727,6 +906,7 @@ function activateReaderTab(tabId) {
     state.activePageKey = page.key;
     state.sidebarTab = "pages";
     history.pushState(null, "", tab.href || page.path);
+    switchChatContext(pageContextForKey(page.key));
   }
 
   render();
@@ -1074,6 +1254,14 @@ function focusChatInput() {
   });
 }
 
+function setChatPanelOpen(open) {
+  document.body.classList.toggle("show-chat", open);
+  const drawer = document.querySelector(".unit-chat-drawer");
+  if (!drawer) return;
+  drawer.toggleAttribute("inert", !open);
+  drawer.setAttribute("aria-hidden", open ? "false" : "true");
+}
+
 function readerGuidePage() {
   const manifest = state.snapshot.manifest;
   const chatEnabled = manifest.chatEnabled !== false;
@@ -1406,9 +1594,11 @@ function renderPageReader(page) {
 }
 
 function renderUnitPageReader(page) {
-  const connections = connectionsFor("page", page.key);
   const unit = page.unit;
   const tab = activeUnitTab(page);
+  const conceptsTab = unit.tabs.find((item) => item.id === "concepts");
+  const patternsTab = unit.tabs.find((item) => item.id === "problem-patterns");
+  const patternCount = patternsTab?.cards?.length || 0;
   return `
     <section class="unit-hero">
       <div class="unit-breadcrumb">
@@ -1421,8 +1611,7 @@ function renderUnitPageReader(page) {
       <div class="unit-tags" aria-label="Unit metadata">
         ${unit.subject ? `<span class="unit-tag subject">${escapeHtml(titleCase(unit.subject))}</span>` : ""}
         ${unit.level ? `<span class="unit-tag level">${escapeHtml(unit.level)}</span>` : ""}
-        <span class="unit-tag neutral">${escapeHtml(readingTime(page.text))}</span>
-        <span class="unit-tag neutral">${escapeHtml(sourceCountForPage(page))} sources listed</span>
+        <span class="unit-tag neutral">${patternCount} problem patterns</span>
       </div>
     </section>
     <div class="unit-tab-bar" role="tablist" aria-label="Unit sections">
@@ -1438,25 +1627,248 @@ function renderUnitPageReader(page) {
         </button>
       `).join("")}
     </div>
-    <section class="unit-panel" data-unit-panel="${escapeHtml(tab.id)}">
-      ${tab.overviewHtml ? `
-        <div class="unit-overview-card">
-          <div class="unit-card-label">Overview</div>
-          <div class="unit-card-body">${tab.overviewHtml}</div>
+    ${tab.id === "problem-patterns"
+      ? renderProblemPatternsPanel(patternsTab)
+      : renderAskLearnPanel(page, conceptsTab)}
+  `;
+}
+
+function renderAskLearnPanel(page, tab) {
+  const summaryCards = tab?.cards || [];
+  return `
+    <section class="unit-panel ask-learn-panel" data-unit-panel="concepts">
+      <div class="unit-ask-card">
+        <div class="unit-ask-copy">
+          <span class="unit-ask-kicker">ASK & LEARN</span>
+          <h2>What do you want to understand?</h2>
+          <p>Ask about ${escapeHtml(page.unit?.title || page.title)}. Answers use the academy's complete internal wiki and the matched question context.</p>
+        </div>
+        ${renderChatPanel({ embedded: true })}
+      </div>
+      <div class="unit-summary-grid">
+        ${summaryCards.map((card) => `
+          <article class="unit-summary-card ${/^At a glance$/i.test(card.title) ? "key-summary" : "topic-overview"}">
+            <span>${/^At a glance$/i.test(card.title) ? "KEY SUMMARY" : "TOPIC OVERVIEW"}</span>
+            <h2>${escapeHtml(card.title)}</h2>
+            <div class="unit-card-body">${card.html}</div>
+          </article>
+        `).join("")}
+      </div>
+    </section>
+  `;
+}
+
+function renderProblemPatternsPanel(tab) {
+  if (!tab?.cards?.length) {
+    return `<section class="unit-panel"><div class="unit-empty"><p>No problem patterns have been published yet.</p></div></section>`;
+  }
+  const patterns = tab.cards;
+  const activePattern = patterns.find((card) => card.code === state.activePatternCode) || patterns[0];
+  const activePatternIndex = patterns.indexOf(activePattern);
+  const questions = activePattern.questions || [];
+  const activeQuestionId = state.activeQuestions[activePattern.code] || questions[0]?.id || "";
+  const activeQuestion = questions.find((question) => question.id === activeQuestionId) || questions[0];
+  const answerKey = activeQuestion ? `${activePattern.code}:${activeQuestion.id}` : "";
+  const flipped = Boolean(answerKey && state.revealedAnswers[answerKey]);
+  return `
+    <section class="unit-panel problem-patterns-panel" data-unit-panel="problem-patterns">
+      <div class="patterns-heading">
+        <div>
+          <span>QUESTION BANK</span>
+          <h2>Problem patterns</h2>
+        </div>
+        <p>Pick a pattern, solve one question, then flip the card for the markscheme.</p>
+      </div>
+
+      <div class="pattern-selector-wrap">
+        <button
+          class="pattern-selector"
+          type="button"
+          data-pattern-selector
+          aria-haspopup="listbox"
+          aria-expanded="${state.patternMenuOpen ? "true" : "false"}"
+        >
+          <span class="pattern-selector-code">${escapeHtml(activePattern.code)}</span>
+          <span class="pattern-selector-copy">
+            <strong>${escapeHtml(activePattern.title)}</strong>
+            ${activePattern.introduction?.summary ? `<span>${escapeHtml(activePattern.introduction.summary)}</span>` : ""}
+          </span>
+          <span class="pattern-progress-rail" aria-hidden="true">
+            ${patterns.map((pattern, index) => {
+              const complete = (pattern.questions || []).length > 0 && pattern.questions.every((question) => state.reviewedQuestions[`${pattern.code}:${question.id}`]);
+              return `<i class="${index === activePatternIndex ? "active" : complete ? "complete" : ""}"></i>`;
+            }).join("")}
+          </span>
+          <span class="pattern-selector-position">${activePatternIndex + 1} / ${patterns.length}</span>
+          <span class="pattern-selector-caret" aria-hidden="true">⌄</span>
+        </button>
+        <div class="pattern-selector-menu" role="listbox" ${state.patternMenuOpen ? "" : "hidden"}>
+          ${patterns.map((pattern) => `
+            <button
+              class="pattern-selector-option ${pattern.code === activePattern.code ? "active" : ""}"
+              type="button"
+              role="option"
+              aria-selected="${pattern.code === activePattern.code ? "true" : "false"}"
+              data-pattern-option="${escapeHtml(pattern.code)}"
+            >
+              <span class="pattern-selector-option-code">${escapeHtml(pattern.code)}</span>
+              <span class="pattern-selector-option-title">${escapeHtml(pattern.title)}</span>
+              <span class="pattern-selector-option-count">${pattern.questions?.length || 0}</span>
+              <span class="pattern-selector-option-check" aria-hidden="true">${pattern.code === activePattern.code ? "✓" : ""}</span>
+            </button>
+          `).join("")}
+        </div>
+      </div>
+
+      ${renderPatternIntroduction(activePattern)}
+
+      <div class="pattern-question-row">
+        <div class="pattern-question-tabs" role="tablist" aria-label="${escapeHtml(activePattern.code)} questions">
+          ${questions.map((question) => {
+            const questionKey = `${activePattern.code}:${question.id}`;
+            return `
+              <button
+                class="pattern-question-tab ${question.id === activeQuestion?.id ? "active" : ""} ${state.reviewedQuestions[questionKey] ? "reviewed" : ""}"
+                type="button"
+                role="tab"
+                aria-selected="${question.id === activeQuestion?.id ? "true" : "false"}"
+                data-question-tab="${escapeHtml(question.id)}"
+                data-pattern-code="${escapeHtml(activePattern.code)}"
+              >${escapeHtml(question.id)}</button>
+            `;
+          }).join("")}
+        </div>
+        <button
+          class="pattern-introduction-button ${state.patternIntroductionOpen ? "active" : ""}"
+          type="button"
+          data-pattern-introduction-toggle
+          aria-expanded="${state.patternIntroductionOpen ? "true" : "false"}"
+        >
+          <span aria-hidden="true">◈</span>
+          ${state.patternIntroductionOpen ? "Hide introduction" : "Pattern introduction"}
+          <small aria-hidden="true">⌄</small>
+        </button>
+      </div>
+
+      ${activeQuestion ? renderPatternFlipCard(activePattern, activeQuestion, flipped) : `
+        <div class="pattern-no-questions"><p>No questions have been added to this pattern yet.</p></div>
+      `}
+
+      ${activeQuestion ? `
+        <div class="pattern-footer">
+          <div>
+            <button class="pattern-secondary-button" type="button" data-pattern-step="-1">‹ Prev</button>
+            <button class="pattern-secondary-button" type="button" data-pattern-step="1">Next ›</button>
+          </div>
+          <div>
+            <button class="pattern-secondary-button" type="button" data-answer-toggle="${escapeHtml(answerKey)}">
+              ${flipped ? "Back to question" : "Flip to markscheme"}
+            </button>
+            <button
+              class="ask-question-button"
+              type="button"
+              data-ask-question
+              data-pattern-code="${escapeHtml(activePattern.code)}"
+              data-question-id="${escapeHtml(activeQuestion.id)}"
+            ><span aria-hidden="true">✦</span> Ask AI about this</button>
+          </div>
         </div>
       ` : ""}
-      ${tab.cards.length ? `
-        <div class="unit-card-list">
-          ${tab.cards.map((card) => renderUnitCard(card, tab.id)).join("")}
-        </div>
-      ` : `
-        <div class="unit-empty">
-          <p>No ${escapeHtml(tab.label.toLowerCase())} have been published for this unit yet.</p>
-        </div>
-      `}
     </section>
-    ${renderConnectionsBadge(connections)}
   `;
+}
+
+function renderPatternIntroduction(pattern) {
+  const introduction = pattern.introduction || {};
+  const signals = introduction.signals || [];
+  const steps = introduction.steps || [];
+  if (!signals.length && !steps.length) return "";
+  return `
+    <section class="pattern-introduction" ${state.patternIntroductionOpen ? "" : "hidden"}>
+      ${signals.length ? `
+        <div class="pattern-introduction-label">RECOGNITION SIGNALS</div>
+        <div class="pattern-signal-list">
+          ${signals.map((signal) => `<span>${escapeHtml(signal)}</span>`).join("")}
+        </div>
+      ` : ""}
+      ${steps.length ? `
+        <div class="pattern-introduction-label">HOW TO ATTACK</div>
+        <ol class="pattern-attack-steps">
+          ${steps.map((step) => `<li>${escapeHtml(step)}</li>`).join("")}
+        </ol>
+      ` : ""}
+    </section>
+  `;
+}
+
+function renderPatternFlipCard(pattern, question, flipped) {
+  const tag = `${pattern.code} · ${question.id} of ${pattern.questions.length}`;
+  return `
+    <div class="pattern-card-scene" id="${escapeHtml(question.anchor)}">
+      <button
+        class="pattern-flip-card ${flipped ? "flipped" : ""}"
+        type="button"
+        data-pattern-card-flip="${escapeHtml(`${pattern.code}:${question.id}`)}"
+        aria-label="${flipped ? "Show question" : "Show markscheme"}"
+      >
+        <span class="pattern-card-face pattern-card-front" aria-hidden="${flipped ? "true" : "false"}">
+          <span class="pattern-card-label"><strong>${escapeHtml(tag)}</strong><small>QUESTION</small></span>
+          <span class="pattern-card-body">
+            ${renderProblemImages(question.questionImages, "question")}
+            <span class="pattern-card-hint">Answer it first — then flip.</span>
+          </span>
+        </span>
+        <span class="pattern-card-face pattern-card-back" aria-hidden="${flipped ? "false" : "true"}">
+          <span class="pattern-card-label"><strong>${escapeHtml(tag)}</strong><small>MARKSCHEME</small></span>
+          <span class="pattern-card-body">
+            ${renderProblemImages(question.answerImages, "markscheme")}
+          </span>
+        </span>
+      </button>
+    </div>
+  `;
+}
+
+function renderProblemImages(images, kind) {
+  if (images?.length) {
+    return images.map((image) => `<img class="problem-image ${kind === "markscheme" ? "answer-image" : ""}" src="${escapeHtml(image.src)}" alt="${escapeHtml(image.alt)}" loading="lazy" />`).join("");
+  }
+  return `
+    <span class="pattern-image-placeholder">
+      <strong>${kind === "markscheme" ? "Markscheme unavailable" : "Question image unavailable"}</strong>
+      <span>This ${kind} has not been published yet.</span>
+    </span>
+  `;
+}
+
+function activeProblemPatterns() {
+  const page = findPage(state.activePageKey);
+  return page?.unit?.tabs?.find((tab) => tab.id === "problem-patterns")?.cards || [];
+}
+
+function stepPatternQuestion(direction) {
+  const patterns = activeProblemPatterns();
+  const sequence = patterns.flatMap((pattern) => (pattern.questions || []).map((question) => ({ pattern, question })));
+  if (!sequence.length) return;
+  const activePattern = patterns.find((pattern) => pattern.code === state.activePatternCode) || patterns[0];
+  const activeQuestionId = state.activeQuestions[activePattern.code] || activePattern.questions?.[0]?.id;
+  const currentIndex = sequence.findIndex(({ pattern, question }) => pattern.code === activePattern.code && question.id === activeQuestionId);
+  const nextIndex = Math.min(sequence.length - 1, Math.max(0, (currentIndex < 0 ? 0 : currentIndex) + direction));
+  const next = sequence[nextIndex];
+  if (!next) return;
+  state.activePatternCode = next.pattern.code;
+  state.activeQuestions[next.pattern.code] = next.question.id;
+  state.revealedAnswers[`${next.pattern.code}:${next.question.id}`] = false;
+  state.patternMenuOpen = false;
+  render({ preserveSidebarScroll: true });
+}
+
+function togglePatternAnswer(answerKey) {
+  if (!answerKey) return;
+  const willReveal = !state.revealedAnswers[answerKey];
+  state.revealedAnswers[answerKey] = willReveal;
+  if (willReveal) state.reviewedQuestions[answerKey] = true;
+  render({ preserveSidebarScroll: true });
 }
 
 function activeUnitTab(page) {
@@ -1471,24 +1883,71 @@ function activeUnitTab(page) {
   );
 }
 
-function renderUnitCard(card, tabId) {
+function renderUnitCard(card, tabId, index = 0) {
+  const isPattern = tabId === "problem-patterns";
+  const expanded = true;
   return `
-    <article class="unit-card ${tabId === "problem-patterns" ? "pattern" : "concept"}">
-      <button class="unit-card-header" type="button" data-card-toggle aria-expanded="true">
+    <article class="unit-card ${isPattern ? "pattern" : "concept"} ${expanded ? "" : "collapsed"}">
+      <button class="unit-card-header" type="button" data-card-toggle data-pattern-code="${escapeHtml(card.code)}" aria-expanded="${expanded ? "true" : "false"}">
         ${card.code ? `<span class="unit-card-code">${escapeHtml(card.code)}</span>` : ""}
         <span class="unit-card-title">${escapeHtml(card.title)}</span>
         ${card.level ? `<span class="unit-card-tag">${escapeHtml(card.level)}</span>` : ""}
+        ${isPattern && card.questions?.length ? `<span class="unit-card-question-count">${card.questions.length} questions</span>` : ""}
         <span class="unit-card-chevron" aria-hidden="true">⌄</span>
       </button>
-      <div class="unit-card-content">
+      <div class="unit-card-content" ${expanded ? "" : "hidden"}>
         <div class="unit-card-body">${card.html}</div>
         ${card.keywords?.length ? `
           <div class="unit-keywords" aria-label="Keywords">
             ${card.keywords.slice(0, 10).map((keyword) => `<span>${escapeHtml(keyword)}</span>`).join("")}
           </div>
         ` : ""}
+        ${isPattern ? renderPatternQuestions(card) : ""}
       </div>
     </article>
+  `;
+}
+
+function renderPatternQuestions(card) {
+  const questions = card.questions || [];
+  if (!questions.length) return `<p class="pattern-no-questions">No questions have been added to this pattern yet.</p>`;
+  const activeId = state.activeQuestions[card.code] || questions[0].id;
+  const active = questions.find((question) => question.id === activeId) || questions[0];
+  const answerKey = `${card.code}:${active.id}`;
+  const revealed = Boolean(state.revealedAnswers[answerKey]);
+  return `
+    <div class="pattern-question-bank" id="${escapeHtml(active.anchor)}">
+      <div class="pattern-question-tabs" role="tablist" aria-label="${escapeHtml(card.code)} questions">
+        ${questions.map((question) => `
+          <button
+            class="pattern-question-tab ${question.id === active.id ? "active" : ""}"
+            type="button"
+            role="tab"
+            aria-selected="${question.id === active.id ? "true" : "false"}"
+            data-question-tab="${escapeHtml(question.id)}"
+            data-pattern-code="${escapeHtml(card.code)}"
+          >${escapeHtml(question.id)}</button>
+        `).join("")}
+      </div>
+      <div class="pattern-question-stage">
+        <div class="pattern-question-label"><span>${escapeHtml(card.code)} · ${escapeHtml(active.id)}</span><small>Question</small></div>
+        ${active.questionImages.map((image) => `<img class="problem-image" src="${escapeHtml(image.src)}" alt="${escapeHtml(image.alt)}" loading="lazy" />`).join("")}
+        ${revealed ? `
+          <div class="pattern-answer" aria-live="polite">
+            <div class="pattern-question-label answer"><span>Markscheme</span><small>Answer</small></div>
+            ${active.answerImages.map((image) => `<img class="problem-image answer-image" src="${escapeHtml(image.src)}" alt="${escapeHtml(image.alt)}" loading="lazy" />`).join("")}
+          </div>
+        ` : ""}
+        <div class="pattern-question-actions">
+          <button class="show-answer-button" type="button" data-answer-toggle="${escapeHtml(answerKey)}">
+            ${revealed ? "Hide answer" : "Show answer"}
+          </button>
+          <button class="ask-question-button" type="button" data-ask-question data-pattern-code="${escapeHtml(card.code)}" data-question-id="${escapeHtml(active.id)}">
+            Ask about this question
+          </button>
+        </div>
+      </div>
+    </div>
   `;
 }
 
@@ -1599,12 +2058,17 @@ function renderConnectionLink(item) {
   `;
 }
 
-function renderChatPanel() {
+function renderChatPanel({ embedded = false, drawer = false } = {}) {
   const contextLabel = currentChatContextLabel();
   const webSearchSupported = state.chatConfig.webSearchSupported !== false;
   const chatIsAsking = activeChatIsAsking();
+  const drawerOpen = drawer && document.body.classList.contains("show-chat");
   return `
-    <aside class="chat-panel" data-chat-panel>
+    <aside
+      class="chat-panel ${embedded ? "embedded-chat-panel" : ""} ${drawer ? "unit-chat-drawer" : ""}"
+      data-chat-panel
+      ${drawer ? `aria-hidden="${drawerOpen ? "false" : "true"}" ${drawerOpen ? "" : "inert"}` : ""}
+    >
       <div
         class="chat-sheet-drag-handle"
         data-chat-height-handle
@@ -1652,7 +2116,7 @@ function renderChatPanel() {
               aria-pressed="${state.chatScope === "current" ? "true" : "false"}"
               ${chatIsAsking ? "disabled" : ""}
             >
-              This page
+              ${state.chatContext?.kind === "problem" ? "This question" : "This page"}
             </button>
             <button
               class="chat-scope-option ${state.chatScope === "wiki" ? "active" : ""}"
@@ -1668,9 +2132,9 @@ function renderChatPanel() {
         <textarea
           name="question"
           rows="3"
-          placeholder="Ask about ${state.chatScope === "current" ? "this page" : "this wiki"}..."
+          placeholder="Ask about ${state.chatScope === "current" ? currentChatScopeSubject() : "this wiki"}..."
           ${chatIsAsking ? "disabled" : ""}
-        ></textarea>
+        >${escapeHtml(state.chatDraft)}</textarea>
         <div class="chat-composer-footer">
           <div class="chat-model-controls">
             ${renderChatModelPicker()}
@@ -1717,39 +2181,45 @@ function renderChatModelPicker() {
 }
 
 function chatModelOptionsForUi() {
-  if (state.chatConfig.models.length) return state.chatConfig.models.filter(isGeminiChatModelOption);
-  const model = isGeminiModelName(state.chatConfig.model) ? state.chatConfig.model : "";
+  if (state.chatConfig.models.length) return state.chatConfig.models.filter(isChatModelOption);
+  const model = inferChatProviderFromModel(state.chatConfig.model) ? state.chatConfig.model : "";
+  const provider = state.chatConfig.provider || inferChatProviderFromModel(model);
   return [
     {
       model,
-      provider: "gemini",
-      label: state.chatConfig.modelLabel || modelLabelForConfig(model, "gemini"),
-      webSearchSupported: true,
+      provider,
+      label: state.chatConfig.modelLabel || modelLabelForConfig(model, provider),
+      webSearchSupported: state.chatConfig.webSearchSupported !== false,
     },
   ].filter((option) => option.model);
 }
 
 function chatContextLabel() {
+  if (state.chatContext?.label) return state.chatContext.label;
   const page = findPage(state.activePageKey);
   if (!page) return state.snapshot?.manifest?.title || "Published wiki";
   return page.key === "index" ? "Wiki Index" : page.title;
 }
 
 function renderChatHistoryPopover() {
-  if (!state.chatThreads.length) {
+  const contextThreads = chatThreadsForCurrentContext();
+  const title = state.chatContext?.kind === "problem"
+    ? `${state.chatContext.problemCode} ${state.chatContext.questionId} chats`
+    : `${state.chatContext?.label || "Page"} chats`;
+  if (!contextThreads.length) {
     return `
       <div class="chat-history-popover">
-        <div class="chat-history-title">Chats</div>
-        <div class="chat-history-empty">No saved chats yet.</div>
+        <div class="chat-history-title">${escapeHtml(title)}</div>
+        <div class="chat-history-empty">No saved chats for this context yet.</div>
       </div>
     `;
   }
 
   return `
     <div class="chat-history-popover">
-      <div class="chat-history-title">Chats</div>
+      <div class="chat-history-title">${escapeHtml(title)}</div>
       <ul class="chat-history-list">
-        ${state.chatThreads
+        ${contextThreads
           .map((thread) => {
             const title = chatThreadTitle(thread);
             const preview = chatThreadPreview(thread);
@@ -2154,12 +2624,14 @@ function setChatModel(model) {
   const option = chatModelOptionsForUi().find((item) => item.model === model);
   if (!option) return;
 
+  const provider = option.provider || inferChatProviderFromModel(option.model);
+
   state.chatConfig = {
     ...state.chatConfig,
-    provider: "gemini",
+    provider,
     model: option.model,
-    modelLabel: option.label || modelLabelForConfig(option.model, "gemini"),
-    webSearchSupported: true,
+    modelLabel: option.label || modelLabelForConfig(option.model, provider),
+    webSearchSupported: option.webSearchSupported !== false,
   };
 }
 
@@ -2234,7 +2706,7 @@ function syncChatScopeState() {
   if (input) {
     input.setAttribute(
       "placeholder",
-      `Ask about ${state.chatScope === "current" ? "this page" : "this wiki"}...`,
+      `Ask about ${state.chatScope === "current" ? currentChatScopeSubject() : "this wiki"}...`,
     );
   }
 }
@@ -2265,7 +2737,11 @@ function bindEvents() {
 
   document.querySelectorAll("[data-unit-tab]").forEach((button) => {
     button.addEventListener("click", () => {
+      setChatPanelOpen(false);
       state.unitTab = button.getAttribute("data-unit-tab") || "concepts";
+      if (state.unitTab === "concepts") {
+        switchChatContext(pageContextForKey(state.activePageKey));
+      }
       render({ preserveSidebarScroll: true });
     });
   });
@@ -2280,12 +2756,88 @@ function bindEvents() {
     });
   });
 
+  document.querySelectorAll("[data-question-tab]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const patternCode = button.getAttribute("data-pattern-code");
+      const questionId = button.getAttribute("data-question-tab");
+      if (!patternCode || !questionId) return;
+      state.activePatternCode = patternCode;
+      state.activeQuestions[patternCode] = questionId;
+      state.revealedAnswers[`${patternCode}:${questionId}`] = false;
+      render({ preserveSidebarScroll: true });
+      document.getElementById(`${patternCode.toLowerCase()}-${questionId.toLowerCase()}`)?.scrollIntoView({ block: "nearest" });
+    });
+  });
+
+  document.querySelector("[data-pattern-selector]")?.addEventListener("click", () => {
+    state.patternMenuOpen = !state.patternMenuOpen;
+    render({ preserveSidebarScroll: true });
+  });
+
+  document.querySelectorAll("[data-pattern-option]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const patternCode = button.getAttribute("data-pattern-option");
+      const pattern = activeProblemPatterns().find((item) => item.code === patternCode);
+      if (!pattern) return;
+      const firstQuestion = pattern.questions?.[0];
+      state.activePatternCode = pattern.code;
+      state.activeQuestions[pattern.code] = firstQuestion?.id || "";
+      if (firstQuestion) state.revealedAnswers[`${pattern.code}:${firstQuestion.id}`] = false;
+      state.patternMenuOpen = false;
+      render({ preserveSidebarScroll: true });
+    });
+  });
+
+  document.querySelector("[data-pattern-introduction-toggle]")?.addEventListener("click", () => {
+    state.patternIntroductionOpen = !state.patternIntroductionOpen;
+    render({ preserveSidebarScroll: true });
+  });
+
+  document.querySelectorAll("[data-pattern-step]").forEach((button) => {
+    button.addEventListener("click", () => {
+      stepPatternQuestion(Number(button.getAttribute("data-pattern-step")) || 0);
+    });
+  });
+
+  document.querySelector("[data-pattern-card-flip]")?.addEventListener("click", (event) => {
+    togglePatternAnswer(event.currentTarget.getAttribute("data-pattern-card-flip"));
+  });
+
+  document.querySelectorAll("[data-answer-toggle]").forEach((button) => {
+    button.addEventListener("click", () => {
+      togglePatternAnswer(button.getAttribute("data-answer-toggle"));
+    });
+  });
+
+  document.querySelectorAll("[data-ask-question]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const patternCode = button.getAttribute("data-pattern-code") || "this pattern";
+      const questionId = button.getAttribute("data-question-id") || "this question";
+      const context = problemContextForQuestion(patternCode, questionId);
+      switchChatContext(context);
+      state.chatScope = "current";
+      state.chatDraft = state.messages.length
+        ? ""
+        : `Help me solve ${context.problemCode} ${context.questionId}. Start with a hint and do not reveal the full answer immediately.`;
+      setChatPanelOpen(true);
+      render({ preserveSidebarScroll: true });
+      requestAnimationFrame(() => {
+        const input = document.querySelector(".unit-chat-drawer [data-chat-form] textarea");
+        input?.focus();
+        input?.setSelectionRange(input.value.length, input.value.length);
+      });
+    });
+  });
+
   document.querySelector("[data-chat-messages]")?.addEventListener("scroll", scheduleChatScrollSave, { passive: true });
   document.querySelector("[data-chat-form]")?.addEventListener("submit", askWiki);
   document.querySelector("[data-chat-form] textarea")?.addEventListener("keydown", handleChatTextareaKeydown);
+  document.querySelector("[data-chat-form] textarea")?.addEventListener("input", (event) => {
+    state.chatDraft = event.target.value;
+  });
   document.querySelector("[data-chat-new]")?.addEventListener("click", createNewChat);
   document.querySelector("[data-chat-close]")?.addEventListener("click", () => {
-    document.body.classList.remove("show-chat");
+    setChatPanelOpen(false);
   });
   document.querySelector("[data-chat-height-handle]")?.addEventListener("pointerdown", startMobileChatHeightDrag);
   document.querySelector("[data-chat-height-handle]")?.addEventListener("keydown", (event) => {
@@ -2352,12 +2904,21 @@ function bindEvents() {
   });
   document.querySelector("[data-chat-toggle]")?.addEventListener("click", () => {
     document.body.classList.remove("show-sidebar");
-    document.body.classList.add("show-chat");
+    const drawer = document.querySelector(".unit-chat-drawer");
+    const embedded = document.querySelector(".embedded-chat-panel");
+    if (drawer) {
+      setChatPanelOpen(true);
+    } else if (embedded) {
+      setChatPanelOpen(false);
+    } else {
+      document.body.classList.add("show-chat");
+    }
     focusChatInput();
   });
   document.querySelector("[data-overlay-close]")?.addEventListener("click", () => {
     const hadSidebarOpen = document.body.classList.contains("show-sidebar");
-    document.body.classList.remove("show-sidebar", "show-chat");
+    document.body.classList.remove("show-sidebar");
+    setChatPanelOpen(false);
     if (hadSidebarOpen) render();
   });
 }
@@ -2484,12 +3045,18 @@ function handleInternalLinkClick(event) {
 }
 
 function handleDocumentClick(event) {
-  if (!state.chatHistoryOpen) return;
   const target = event.target;
   if (!(target instanceof Element)) return;
-  if (target.closest("[data-chat-history-toggle], .chat-history-popover")) return;
-  state.chatHistoryOpen = false;
-  render();
+  let shouldRender = false;
+  if (state.patternMenuOpen && !target.closest("[data-pattern-selector], .pattern-selector-menu")) {
+    state.patternMenuOpen = false;
+    shouldRender = true;
+  }
+  if (state.chatHistoryOpen && !target.closest("[data-chat-history-toggle], .chat-history-popover")) {
+    state.chatHistoryOpen = false;
+    shouldRender = true;
+  }
+  if (shouldRender) render();
 }
 
 function handleChatTextareaKeydown(event) {
@@ -2531,6 +3098,7 @@ async function askWiki(event) {
   const thread = syncActiveChatThread();
   const threadId = thread.id;
   state.askingThreadIds.add(threadId);
+  state.chatDraft = "";
   thread.chatStickToBottom = true;
   render({ chatForceBottom: true });
   scrollChatMessagesToBottom();
@@ -2645,11 +3213,12 @@ async function readJsonResponse(response) {
   }
 }
 
-function navigate(pageKey, hash = "") {
+function navigate(pageKey, hash = "", { chatContext = null } = {}) {
   saveActiveTabScroll();
   const page = findPage(pageKey) || state.snapshot.pages[0];
   state.activePageKey = page.key;
   state.sidebarTab = "pages";
+  switchChatContext(chatContext || pageContextForKey(page.key));
   const nextUrl = hash ? `${page.path}#${hash}` : page.path;
   history.pushState(null, "", nextUrl);
   document.body.classList.remove("show-sidebar", "show-chat");

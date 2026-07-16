@@ -1,5 +1,9 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const API_DIR = path.dirname(fileURLToPath(import.meta.url));
+const PUBLIC_DIR = path.resolve(API_DIR, "..", "public");
 
 const rateLimit = new Map();
 let cachedData = null;
@@ -17,11 +21,53 @@ const AGENT_PLANNER_OUTPUT_TOKENS = 700;
 const AGENT_FINAL_OUTPUT_TOKENS = 1600;
 const CHAT_HISTORY_LIMIT = 6;
 const CHAT_HISTORY_TEXT_LIMIT = 1600;
-const CURRENT_PAGE_IMAGE_LIMIT = 4;
+const CURRENT_PAGE_IMAGE_LIMIT = 2;
 const CURRENT_PAGE_IMAGE_MAX_BYTES = 2 * 1024 * 1024;
 const CURRENT_PAGE_IMAGE_TOTAL_MAX_BYTES = 5 * 1024 * 1024;
 const CHAT_IMAGE_MIME_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
-const DEFAULT_CHAT_MODELS = [
+const IMAGE_QUERY_STOP_TOKENS = new Set([
+  "answer",
+  "about",
+  "and",
+  "an",
+  "are",
+  "can",
+  "does",
+  "explain",
+  "final",
+  "first",
+  "for",
+  "from",
+  "give",
+  "help",
+  "hint",
+  "in",
+  "is",
+  "markscheme",
+  "only",
+  "of",
+  "one",
+  "page",
+  "pattern",
+  "problem",
+  "question",
+  "sentence",
+  "show",
+  "solve",
+  "the",
+  "that",
+  "this",
+  "to",
+  "what",
+  "when",
+  "where",
+  "which",
+  "wiki",
+  "with",
+  "why",
+]);
+const DEFAULT_OPENAI_MODELS = ["gpt-5.6-luna", "gpt-5.4"];
+const DEFAULT_GEMINI_MODELS = [
   "gemini-3.5-flash",
   "gemini-3.1-flash-lite",
   "gemini-2.5-flash-lite",
@@ -72,12 +118,22 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: "Question must be between 1 and 1000 characters." });
   }
 
-  const data = await loadChatData();
-  const contextResult = buildChatContext(data, { question, pageKey, scope });
-  const currentPageImages =
-    scope === "current"
-      ? await loadCurrentPageImages(contextResult.selectedPage, question, req)
-      : [];
+  let data;
+  let contextResult;
+  let currentPageImages;
+  try {
+    data = await loadChatData();
+    contextResult = buildChatContext(data, { question, pageKey, scope });
+    currentPageImages =
+      scope === "current"
+        ? await loadCurrentPageImages(contextResult.selectedPage, question, req)
+        : [];
+  } catch (error) {
+    console.error("Ask Wiki failed to load its published context.", error);
+    return res.status(500).json({
+      error: "The published wiki context could not be loaded. Please try again shortly.",
+    });
+  }
   const contextSummary = {
     ...contextResult.summary,
     imageCount: currentPageImages.length,
@@ -93,7 +149,8 @@ export default async function handler(req, res) {
 
   let result;
   try {
-    result = await answerWithGemini({
+    const answer = chatConfig.provider === "openai" ? answerWithOpenAI : answerWithGemini;
+    result = await answer({
       data,
       question,
       context,
@@ -135,20 +192,22 @@ export default async function handler(req, res) {
 
 function resolveChatConfig({ requestedModel = "" } = {}) {
   const genericModel = cleanEnv(process.env.CHAT_MODEL);
+  const openAIModel = cleanEnv(process.env.OPENAI_MODEL);
   const geminiModel = cleanEnv(process.env.GEMINI_MODEL);
   let modelOptions = chatModelOptions();
-  const envModel = [geminiModel, genericModel].find(isGeminiModel) || "";
+  const envModel = [openAIModel, geminiModel, genericModel].find(isSupportedChatModel) || "";
 
   if (envModel && !modelOptions.includes(envModel)) {
     modelOptions = [envModel, ...modelOptions];
   }
-  const requestedGeminiModel = isGeminiModel(requestedModel) ? requestedModel : "";
-  const model = normalizeRequestedModel(requestedGeminiModel, envModel, modelOptions);
+  const supportedRequestedModel = isSupportedChatModel(requestedModel) ? requestedModel : "";
+  const model = normalizeRequestedModel(supportedRequestedModel, envModel, modelOptions);
+  const provider = inferProviderFromModel(model) || "openai";
 
   return {
-    provider: "gemini",
+    provider,
     model,
-    modelLabel: modelLabel(model, "gemini"),
+    modelLabel: modelLabel(model, provider),
     webSearchSupported: true,
     models: modelOptions.map((option) => modelOption(option)),
   };
@@ -168,8 +227,13 @@ function chatModelOptions() {
   const configured = cleanEnv(process.env.CHAT_MODELS)
     .split(",")
     .map((model) => model.trim())
-    .filter(isGeminiModel);
-  const options = configured.length ? configured : DEFAULT_CHAT_MODELS;
+    .filter(isSupportedChatModel);
+  if (configured.length) return [...new Set(configured)];
+
+  const options = [];
+  if (cleanEnv(process.env.OPENAI_API_KEY)) options.push(...DEFAULT_OPENAI_MODELS);
+  if (cleanEnv(process.env.GEMINI_API_KEY)) options.push(...DEFAULT_GEMINI_MODELS);
+  if (!options.length) options.push(...DEFAULT_OPENAI_MODELS);
   return [...new Set(options)];
 }
 
@@ -178,14 +242,15 @@ function normalizeRequestedModel(requestedModel, fallbackModel, modelOptions) {
   if (requested && modelOptions.includes(requested)) return requested;
   if (fallbackModel && modelOptions.includes(fallbackModel)) return fallbackModel;
   if (fallbackModel) return fallbackModel;
-  return modelOptions[0] || "gemini-3.1-flash-lite";
+  return modelOptions[0] || DEFAULT_OPENAI_MODELS[0];
 }
 
 function modelOption(model) {
+  const provider = inferProviderFromModel(model);
   return {
     model,
-    provider: "gemini",
-    label: modelLabel(model, "gemini"),
+    provider,
+    label: modelLabel(model, provider),
     webSearchSupported: true,
   };
 }
@@ -198,15 +263,28 @@ function isGeminiModel(model) {
   return inferProviderFromModel(model) === "gemini";
 }
 
+function isOpenAIModel(model) {
+  return inferProviderFromModel(model) === "openai";
+}
+
+function isSupportedChatModel(model) {
+  return Boolean(inferProviderFromModel(model));
+}
+
 function inferProviderFromModel(model) {
   const normalized = cleanEnv(model).replace(/^models\//, "");
   if (/^gemini(?:-|$)/i.test(normalized)) return "gemini";
+  if (/^(?:gpt-|o[134](?:-|$))/i.test(normalized)) return "openai";
   return "";
 }
 
 function modelLabel(model, provider) {
   const cleanModel = cleanEnv(model).replace(/^models\//, "");
-  if (!cleanModel) return provider === "gemini" ? "Gemini" : "AI";
+  if (!cleanModel) {
+    if (provider === "gemini") return "Gemini";
+    if (provider === "openai") return "OpenAI";
+    return "AI";
+  }
 
   return cleanModel
     .split(/[-_\s]+/)
@@ -243,6 +321,7 @@ async function answerWithGemini({
     const candidateModel = modelsToTry[index];
     try {
       const agentResult = await runReadOnlyWikiAgent({
+        provider: "gemini",
         apiKey,
         model: candidateModel,
         data,
@@ -292,7 +371,72 @@ async function answerWithGemini({
   throw lastCapacityError || httpError(502, "Gemini request failed.");
 }
 
+async function answerWithOpenAI({
+  data,
+  question,
+  context,
+  chunks,
+  history,
+  scope,
+  selectedPage,
+  images = [],
+  webSearch,
+  model,
+}) {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) {
+    throw httpError(503, "Chat is not configured yet. Set OPENAI_API_KEY on the Vercel project.");
+  }
+
+  let lastRetryableError = null;
+  const modelsToTry = openAIModelFallbackOrder(model);
+
+  for (let index = 0; index < modelsToTry.length; index += 1) {
+    const candidateModel = modelsToTry[index];
+    try {
+      const agentResult = await runReadOnlyWikiAgent({
+        provider: "openai",
+        apiKey,
+        model: candidateModel,
+        data,
+        question,
+        initialContext: context,
+        initialChunks: chunks,
+        history,
+        scope,
+        selectedPage,
+        images,
+        webSearch,
+      });
+
+      return {
+        answer: agentResult.answer,
+        references: agentResult.webReferences,
+        localReferences: agentResult.localReferences,
+        model: candidateModel,
+        webSearch,
+      };
+    } catch (error) {
+      const retryable = isOpenAIRetryableError(error);
+      if (!retryable || index === modelsToTry.length - 1) {
+        if (retryable && lastRetryableError) {
+          throw httpError(503, "OpenAI is temporarily unavailable across the configured chat models. Please try again shortly.");
+        }
+        throw error;
+      }
+
+      lastRetryableError = error;
+      console.warn(
+        `OpenAI model ${candidateModel} is unavailable; retrying with ${modelsToTry[index + 1]}.`,
+      );
+    }
+  }
+
+  throw lastRetryableError || httpError(502, "OpenAI request failed.");
+}
+
 async function runReadOnlyWikiAgent({
+  provider,
   apiKey,
   model,
   data,
@@ -320,15 +464,33 @@ async function runReadOnlyWikiAgent({
   let finishedReading = false;
 
   for (let step = 0; step < AGENT_MAX_READ_STEPS && !finishedReading; step += 1) {
-    const planText = await callGeminiText({
-      apiKey,
-      model,
-      systemPrompt: WIKI_READER_SYSTEM_PROMPT,
-      parts: [{ text: buildWikiReaderPrompt({ data, question, history, scope, selectedPage, initialContext, observations }) }],
-      maxOutputTokens: AGENT_PLANNER_OUTPUT_TOKENS,
-      temperature: 0.1,
-      webSearch: false,
+    const plannerPrompt = buildWikiReaderPrompt({
+      data,
+      question,
+      history,
+      scope,
+      selectedPage,
+      initialContext,
+      observations,
     });
+    const planText = provider === "openai"
+      ? await callOpenAIText({
+          apiKey,
+          model,
+          systemPrompt: WIKI_READER_SYSTEM_PROMPT,
+          input: [{ role: "user", content: [{ type: "input_text", text: plannerPrompt }] }],
+          maxOutputTokens: AGENT_PLANNER_OUTPUT_TOKENS,
+          webSearch: false,
+        })
+      : await callGeminiText({
+          apiKey,
+          model,
+          systemPrompt: WIKI_READER_SYSTEM_PROMPT,
+          parts: [{ text: plannerPrompt }],
+          maxOutputTokens: AGENT_PLANNER_OUTPUT_TOKENS,
+          temperature: 0.1,
+          webSearch: false,
+        });
     const actions = parseWikiReaderActions(planText);
 
     if (!actions.length || actions.some((action) => action.action === "finish")) {
@@ -365,28 +527,42 @@ async function runReadOnlyWikiAgent({
     referenceNumbers,
   });
 
-  const finalPayload = await callGeminiPayload({
-    apiKey,
-    model,
-    systemPrompt: CHAT_SYSTEM_PROMPT,
-    parts: buildGeminiParts({
-      question,
-      context: finalContext,
-      history,
-      scope,
-      selectedPage,
-      images,
-      webSearch,
-    }),
-    maxOutputTokens: AGENT_FINAL_OUTPUT_TOKENS,
-    temperature: 0.2,
+  const promptArgs = {
+    question,
+    context: finalContext,
+    history,
+    scope,
+    selectedPage,
+    images,
     webSearch,
-  });
-  const webReferences = extractGeminiWebReferences(finalPayload);
-  const answer = annotateWebCitations(extractGeminiText(finalPayload), finalPayload, webReferences);
+  };
+  const finalPayload = provider === "openai"
+    ? await callOpenAIPayload({
+        apiKey,
+        model,
+        systemPrompt: CHAT_SYSTEM_PROMPT,
+        input: buildOpenAIInput(promptArgs),
+        maxOutputTokens: AGENT_FINAL_OUTPUT_TOKENS,
+        webSearch,
+      })
+    : await callGeminiPayload({
+        apiKey,
+        model,
+        systemPrompt: CHAT_SYSTEM_PROMPT,
+        parts: buildGeminiParts(promptArgs),
+        maxOutputTokens: AGENT_FINAL_OUTPUT_TOKENS,
+        temperature: 0.2,
+        webSearch,
+      });
+  const webReferences = provider === "openai"
+    ? extractOpenAIWebReferences(finalPayload)
+    : extractGeminiWebReferences(finalPayload);
+  const answer = provider === "openai"
+    ? extractOpenAIText(finalPayload)
+    : annotateWebCitations(extractGeminiText(finalPayload), finalPayload, webReferences);
 
   return {
-    answer: answer.trim() || "Gemini returned no text for this question.",
+    answer: answer.trim() || "The selected model returned no text for this question.",
     webReferences,
     localReferences,
   };
@@ -450,6 +626,87 @@ async function callGeminiPayload({
   }
 
   return payload;
+}
+
+async function callOpenAIText(args) {
+  return extractOpenAIText(await callOpenAIPayload(args));
+}
+
+async function callOpenAIPayload({
+  apiKey,
+  model,
+  systemPrompt,
+  input,
+  maxOutputTokens,
+  webSearch,
+}) {
+  const response = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model,
+      instructions: systemPrompt,
+      input,
+      max_output_tokens: maxOutputTokens,
+      reasoning: { effort: "low" },
+      text: { verbosity: "low" },
+      store: false,
+      ...(webSearch ? { tools: [{ type: "web_search_preview" }] } : {}),
+    }),
+  });
+
+  const rawPayload = await response.text();
+  let payload = {};
+  try {
+    payload = rawPayload ? JSON.parse(rawPayload) : {};
+  } catch {
+    payload = {};
+  }
+
+  if (!response.ok) {
+    const error = httpError(
+      openAIHttpStatus(response.status),
+      payload.error?.message || "OpenAI request failed.",
+    );
+    error.openAIStatusCode = response.status;
+    error.openAICode = payload.error?.code || "";
+    error.openAIType = payload.error?.type || "";
+    error.openAIModel = model;
+    throw error;
+  }
+
+  return payload;
+}
+
+function openAIModelFallbackOrder(model) {
+  const models = [
+    cleanEnv(model),
+    ...chatModelOptions().filter(isOpenAIModel),
+    ...DEFAULT_OPENAI_MODELS,
+  ].filter(isOpenAIModel);
+  return [...new Set(models)];
+}
+
+function openAIHttpStatus(statusCode) {
+  return statusCode === 429 || statusCode >= 500 ? 503 : 502;
+}
+
+function isOpenAIRetryableError(error) {
+  const statusCode = Number(error?.openAIStatusCode || error?.statusCode);
+  const code = cleanEnv(error?.openAICode);
+  const type = cleanEnv(error?.openAIType);
+  const message = cleanEnv(error?.message);
+  return (
+    statusCode === 404 ||
+    statusCode === 429 ||
+    statusCode >= 500 ||
+    code === "model_not_found" ||
+    type === "server_error" ||
+    /model .*not found|does not exist|temporarily|overload|try again|unavailable/i.test(message)
+  );
 }
 
 function geminiModelFallbackOrder(model) {
@@ -523,6 +780,42 @@ function buildGeminiParts({
   });
 
   return parts;
+}
+
+function buildOpenAIInput({
+  question,
+  context,
+  history,
+  scope,
+  selectedPage,
+  images,
+  webSearch,
+}) {
+  const content = [
+    {
+      type: "input_text",
+      text: buildUserPrompt({
+        question,
+        context,
+        history,
+        scope,
+        selectedPage,
+        images,
+        webSearch,
+      }),
+    },
+  ];
+
+  images.forEach((image, index) => {
+    content.push({ type: "input_text", text: currentPageImageLabel(image, index) });
+    content.push({
+      type: "input_image",
+      image_url: `data:${image.mimeType};base64,${image.base64}`,
+      detail: "high",
+    });
+  });
+
+  return [{ role: "user", content }];
 }
 
 function buildUserPrompt({ question, context, history, scope, selectedPage, images = [], webSearch }) {
@@ -1000,7 +1293,7 @@ function httpError(statusCode, message) {
 
 async function loadChatData() {
   if (cachedData) return cachedData;
-  const filePath = path.join(process.cwd(), "api", "data", "chat-data.json");
+  const filePath = path.join(API_DIR, "data", "chat-data.json");
   cachedData = JSON.parse(await fs.readFile(filePath, "utf8"));
   return cachedData;
 }
@@ -1161,7 +1454,8 @@ async function readCurrentPageImageFromOrigin(image, req, maxBytes) {
 }
 
 function rankPageImages(images, question) {
-  const tokens = tokenize(question);
+  const tokens = tokenize(question).filter((token) => !IMAGE_QUERY_STOP_TOKENS.has(token));
+  const problemIdentity = extractProblemImageIdentity(question);
   return images
     .map((image, index) => {
       const item = image || {};
@@ -1175,13 +1469,53 @@ function rankPageImages(images, question) {
         .join(" ");
       const hayTokens = tokenize(haystack);
       let score = 0;
+      const matchesProblem = problemIdentity
+        ? imageMatchesProblemIdentity(item, problemIdentity)
+        : false;
+      if (problemIdentity && !matchesProblem) return { ...item, score: 0, index };
+      if (matchesProblem) score += 100;
       for (const token of tokens) {
         if (hayTokens.includes(token)) score += token.length > 4 ? 3 : 1;
       }
       if (haystack.toLowerCase().includes(String(question || "").toLowerCase())) score += 6;
       return { ...item, score, index };
     })
+    .filter((image) => image.score > 0)
     .sort((a, b) => b.score - a.score || a.index - b.index);
+}
+
+function extractProblemImageIdentity(question) {
+  const value = String(question || "");
+  const patternThenQuestion = value.match(
+    /\b(?:p|pattern)\s*0*(\d+)\s*(?:q|question)\s*0*(\d+)\b/i,
+  );
+  if (patternThenQuestion) {
+    return {
+      patternNumber: Number(patternThenQuestion[1]),
+      questionNumber: Number(patternThenQuestion[2]),
+    };
+  }
+
+  const questionThenPattern = value.match(
+    /\b(?:q|question)\s*0*(\d+)\s*(?:p|pattern)\s*0*(\d+)\b/i,
+  );
+  if (!questionThenPattern) return null;
+  return {
+    patternNumber: Number(questionThenPattern[2]),
+    questionNumber: Number(questionThenPattern[1]),
+  };
+}
+
+function imageMatchesProblemIdentity(image, identity) {
+  const haystack = [image?.filename, image?.alt, image?.assetPath]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+  const pattern = identity.patternNumber;
+  const question = identity.questionNumber;
+  const patternMatch = new RegExp(`(?:p|pattern)[\\s_-]*0*${pattern}(?:\\D|$)`, "i").test(haystack);
+  const questionMatch = new RegExp(`(?:q|question)[\\s_-]*0*${question}(?:\\D|$)`, "i").test(haystack);
+  return patternMatch && questionMatch;
 }
 
 function isSupportedChatImage(image) {
@@ -1205,9 +1539,8 @@ function publicFilePathForPublishedAsset(src) {
   }
 
   const normalized = path.normalize(decoded);
-  const publicRoot = path.join(process.cwd(), "public");
-  const fullPath = path.join(publicRoot, normalized);
-  const relative = path.relative(publicRoot, fullPath);
+  const fullPath = path.join(PUBLIC_DIR, normalized);
+  const relative = path.relative(PUBLIC_DIR, fullPath);
   if (relative.startsWith("..") || path.isAbsolute(relative)) return "";
   if (!normalizePath(relative).startsWith("published-assets/")) return "";
   return fullPath;
@@ -1382,6 +1715,42 @@ function tokenize(value) {
     .split(/\s+/)
     .filter((token) => token.length > 1)
     .slice(0, 40);
+}
+
+function extractOpenAIText(payload) {
+  const directText = typeof payload?.output_text === "string" ? payload.output_text : "";
+  if (directText.trim()) return directText;
+
+  return (payload?.output || [])
+    .filter((item) => item?.type === "message")
+    .flatMap((item) => item.content || [])
+    .filter((content) => content?.type === "output_text")
+    .map((content) => content.text || "")
+    .join("\n");
+}
+
+function extractOpenAIWebReferences(payload) {
+  const seen = new Set();
+  const refs = [];
+
+  for (const item of payload?.output || []) {
+    for (const content of item?.content || []) {
+      for (const annotation of content?.annotations || []) {
+        const uri = annotation?.url;
+        if (annotation?.type !== "url_citation" || !uri || seen.has(uri)) continue;
+        seen.add(uri);
+        refs.push({
+          kind: "web",
+          citationNumber: refs.length + 1,
+          title: annotation.title || hostnameForUrl(uri),
+          path: uri,
+        });
+        if (refs.length >= 5) return refs;
+      }
+    }
+  }
+
+  return refs;
 }
 
 function extractGeminiText(payload) {
