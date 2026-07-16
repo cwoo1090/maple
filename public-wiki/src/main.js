@@ -111,6 +111,7 @@ const state = {
 const pdfDocuments = new Map();
 const pdfViews = new Map();
 const sourceTextCache = new Map();
+const preloadedProblemImages = new Set();
 let connectionGraph = null;
 let scrollSaveFrame = null;
 let chatScrollSaveFrame = null;
@@ -286,6 +287,7 @@ function render(options = {}) {
   postProcessArticleLinks();
   renderMath();
   renderMermaid();
+  preloadActivePatternImages();
   mountSourceViewer(activeSource);
   if (preserveSidebarScroll) restoreSidebarScroll(sidebarScrollTop);
   restoreReaderTabsScroll(readerTabsScrollLeft);
@@ -1671,7 +1673,11 @@ function renderProblemPatternsPanel(tab) {
   const answerKey = activeQuestion ? `${activePattern.code}:${activeQuestion.id}` : "";
   const flipped = Boolean(answerKey && state.revealedAnswers[answerKey]);
   return `
-    <section class="unit-panel problem-patterns-panel" data-unit-panel="problem-patterns">
+    <section
+      class="unit-panel problem-patterns-panel"
+      data-unit-panel="problem-patterns"
+      data-active-pattern-code="${escapeHtml(activePattern.code)}"
+    >
       <div class="patterns-heading">
         <div>
           <span>QUESTION BANK</span>
@@ -1745,36 +1751,42 @@ function renderProblemPatternsPanel(tab) {
           aria-expanded="${state.patternIntroductionOpen ? "true" : "false"}"
         >
           <span aria-hidden="true">◈</span>
-          ${state.patternIntroductionOpen ? "Hide introduction" : "Pattern introduction"}
+          <span data-pattern-introduction-label>${state.patternIntroductionOpen ? "Hide introduction" : "Pattern introduction"}</span>
           <small aria-hidden="true">⌄</small>
         </button>
       </div>
 
-      ${activeQuestion ? renderPatternFlipCard(activePattern, activeQuestion, flipped) : `
+      ${activeQuestion ? renderPatternQuestionView(activePattern, activeQuestion, flipped) : `
         <div class="pattern-no-questions"><p>No questions have been added to this pattern yet.</p></div>
       `}
-
-      ${activeQuestion ? `
-        <div class="pattern-footer">
-          <div>
-            <button class="pattern-secondary-button" type="button" data-pattern-step="-1">‹ Prev</button>
-            <button class="pattern-secondary-button" type="button" data-pattern-step="1">Next ›</button>
-          </div>
-          <div>
-            <button class="pattern-secondary-button" type="button" data-answer-toggle="${escapeHtml(answerKey)}">
-              ${flipped ? "Back to question" : "Flip to markscheme"}
-            </button>
-            <button
-              class="ask-question-button"
-              type="button"
-              data-ask-question
-              data-pattern-code="${escapeHtml(activePattern.code)}"
-              data-question-id="${escapeHtml(activeQuestion.id)}"
-            ><span aria-hidden="true">✦</span> Ask AI about this</button>
-          </div>
-        </div>
-      ` : ""}
     </section>
+  `;
+}
+
+function renderPatternQuestionView(pattern, question, flipped) {
+  const answerKey = `${pattern.code}:${question.id}`;
+  return `
+    <div class="pattern-question-view" data-pattern-question-view>
+      ${renderPatternFlipCard(pattern, question, flipped)}
+      <div class="pattern-footer">
+        <div>
+          <button class="pattern-secondary-button" type="button" data-pattern-step="-1">‹ Prev</button>
+          <button class="pattern-secondary-button" type="button" data-pattern-step="1">Next ›</button>
+        </div>
+        <div>
+          <button class="pattern-secondary-button" type="button" data-answer-toggle="${escapeHtml(answerKey)}">
+            ${flipped ? "Back to question" : "Flip to markscheme"}
+          </button>
+          <button
+            class="ask-question-button"
+            type="button"
+            data-ask-question
+            data-pattern-code="${escapeHtml(pattern.code)}"
+            data-question-id="${escapeHtml(question.id)}"
+          ><span aria-hidden="true">✦</span> Ask AI about this</button>
+        </div>
+      </div>
+    </div>
   `;
 }
 
@@ -1841,9 +1853,127 @@ function renderProblemImages(images, kind) {
   `;
 }
 
-function activeProblemPatterns() {
+function activeProblemPatternsTab() {
   const page = findPage(state.activePageKey);
-  return page?.unit?.tabs?.find((tab) => tab.id === "problem-patterns")?.cards || [];
+  return page?.unit?.tabs?.find((tab) => tab.id === "problem-patterns");
+}
+
+function activeProblemPatterns() {
+  return activeProblemPatternsTab()?.cards || [];
+}
+
+function preloadPatternImages(pattern) {
+  if (!pattern || typeof Image === "undefined") return;
+  (pattern.questions || []).forEach((question) => {
+    [...(question.questionImages || []), ...(question.answerImages || [])].forEach((image) => {
+      const src = image?.src;
+      if (!src || preloadedProblemImages.has(src)) return;
+      preloadedProblemImages.add(src);
+      const preload = new Image();
+      preload.decoding = "async";
+      preload.src = src;
+    });
+  });
+}
+
+function preloadActivePatternImages() {
+  const panel = document.querySelector("[data-active-pattern-code]");
+  if (!panel) return;
+  const patternCode = panel.getAttribute("data-active-pattern-code");
+  preloadPatternImages(activeProblemPatterns().find((pattern) => pattern.code === patternCode));
+}
+
+function refreshPatternProgress() {
+  const patterns = activeProblemPatterns();
+  const activePattern = patterns.find((pattern) => pattern.code === state.activePatternCode) || patterns[0];
+  document.querySelectorAll(".pattern-progress-rail i").forEach((segment, index) => {
+    const pattern = patterns[index];
+    const complete = Boolean(
+      pattern?.questions?.length &&
+      pattern.questions.every((question) => state.reviewedQuestions[`${pattern.code}:${question.id}`]),
+    );
+    segment.classList.toggle("active", pattern?.code === activePattern?.code);
+    segment.classList.toggle("complete", pattern?.code !== activePattern?.code && complete);
+  });
+}
+
+function refreshPatternQuestionView(patternCode, questionId) {
+  const panel = document.querySelector(".problem-patterns-panel");
+  if (!panel || panel.getAttribute("data-active-pattern-code") !== patternCode) return false;
+
+  const pattern = activeProblemPatterns().find((item) => item.code === patternCode);
+  const question = pattern?.questions?.find((item) => item.id === questionId);
+  const currentView = panel.querySelector("[data-pattern-question-view]");
+  if (!pattern || !question || !currentView) return false;
+
+  panel.querySelectorAll("[data-question-tab]").forEach((button) => {
+    const buttonQuestionId = button.getAttribute("data-question-tab");
+    const isActive = buttonQuestionId === questionId;
+    button.classList.toggle("active", isActive);
+    button.classList.toggle(
+      "reviewed",
+      Boolean(state.reviewedQuestions[`${patternCode}:${buttonQuestionId}`]),
+    );
+    button.setAttribute("aria-selected", isActive ? "true" : "false");
+  });
+
+  const answerKey = `${patternCode}:${questionId}`;
+  currentView.outerHTML = renderPatternQuestionView(
+    pattern,
+    question,
+    Boolean(state.revealedAnswers[answerKey]),
+  );
+  const nextView = panel.querySelector("[data-pattern-question-view]");
+  bindPatternQuestionViewEvents(nextView);
+  preloadPatternImages(pattern);
+  return true;
+}
+
+function refreshProblemPatternsPanel() {
+  const currentPanel = document.querySelector(".problem-patterns-panel");
+  const tab = activeProblemPatternsTab();
+  if (!currentPanel || !tab) return false;
+
+  const template = document.createElement("template");
+  template.innerHTML = renderProblemPatternsPanel(tab).trim();
+  const nextPanel = template.content.firstElementChild;
+  if (!nextPanel) return false;
+
+  currentPanel.replaceWith(nextPanel);
+  bindProblemPatternsPanelEvents(nextPanel);
+  preloadActivePatternImages();
+  return true;
+}
+
+function setPatternMenuOpen(open) {
+  state.patternMenuOpen = Boolean(open);
+  const selector = document.querySelector("[data-pattern-selector]");
+  const menu = document.querySelector(".pattern-selector-menu");
+  selector?.setAttribute("aria-expanded", state.patternMenuOpen ? "true" : "false");
+  if (menu) menu.hidden = !state.patternMenuOpen;
+}
+
+function setPatternIntroductionOpen(open) {
+  state.patternIntroductionOpen = Boolean(open);
+  const button = document.querySelector("[data-pattern-introduction-toggle]");
+  const introduction = document.querySelector(".pattern-introduction");
+  button?.classList.toggle("active", state.patternIntroductionOpen);
+  button?.setAttribute("aria-expanded", state.patternIntroductionOpen ? "true" : "false");
+  const label = button?.querySelector("[data-pattern-introduction-label]");
+  if (label) {
+    label.textContent = state.patternIntroductionOpen ? "Hide introduction" : "Pattern introduction";
+  }
+  if (introduction) introduction.hidden = !state.patternIntroductionOpen;
+}
+
+function selectPatternQuestion(patternCode, questionId) {
+  if (!patternCode || !questionId) return;
+  state.activePatternCode = patternCode;
+  state.activeQuestions[patternCode] = questionId;
+  state.revealedAnswers[`${patternCode}:${questionId}`] = false;
+  if (!refreshPatternQuestionView(patternCode, questionId)) {
+    render({ preserveSidebarScroll: true });
+  }
 }
 
 function stepPatternQuestion(direction) {
@@ -1860,7 +1990,12 @@ function stepPatternQuestion(direction) {
   state.activeQuestions[next.pattern.code] = next.question.id;
   state.revealedAnswers[`${next.pattern.code}:${next.question.id}`] = false;
   state.patternMenuOpen = false;
-  render({ preserveSidebarScroll: true });
+  if (
+    !refreshPatternQuestionView(next.pattern.code, next.question.id) &&
+    !refreshProblemPatternsPanel()
+  ) {
+    render({ preserveSidebarScroll: true });
+  }
 }
 
 function togglePatternAnswer(answerKey) {
@@ -1868,7 +2003,32 @@ function togglePatternAnswer(answerKey) {
   const willReveal = !state.revealedAnswers[answerKey];
   state.revealedAnswers[answerKey] = willReveal;
   if (willReveal) state.reviewedQuestions[answerKey] = true;
-  render({ preserveSidebarScroll: true });
+
+  const card = [...document.querySelectorAll("[data-pattern-card-flip]")].find(
+    (element) => element.getAttribute("data-pattern-card-flip") === answerKey,
+  );
+  const answerToggle = [...document.querySelectorAll("[data-answer-toggle]")].find(
+    (element) => element.getAttribute("data-answer-toggle") === answerKey,
+  );
+  if (!card || !answerToggle) {
+    render({ preserveSidebarScroll: true });
+    return;
+  }
+
+  card.classList.toggle("flipped", willReveal);
+  card.setAttribute("aria-label", willReveal ? "Show question" : "Show markscheme");
+  card.querySelector(".pattern-card-front")?.setAttribute("aria-hidden", willReveal ? "true" : "false");
+  card.querySelector(".pattern-card-back")?.setAttribute("aria-hidden", willReveal ? "false" : "true");
+  answerToggle.textContent = willReveal ? "Back to question" : "Flip to markscheme";
+
+  const [patternCode, questionId] = answerKey.split(":");
+  const questionTab = [...document.querySelectorAll("[data-question-tab]")].find(
+    (element) =>
+      element.getAttribute("data-pattern-code") === patternCode &&
+      element.getAttribute("data-question-tab") === questionId,
+  );
+  questionTab?.classList.toggle("reviewed", Boolean(state.reviewedQuestions[answerKey]));
+  refreshPatternProgress();
 }
 
 function activeUnitTab(page) {
@@ -2711,6 +2871,87 @@ function syncChatScopeState() {
   }
 }
 
+function bindPatternQuestionViewEvents(root = document) {
+  if (!root) return;
+
+  root.querySelectorAll("[data-pattern-step]").forEach((button) => {
+    button.addEventListener("click", () => {
+      stepPatternQuestion(Number(button.getAttribute("data-pattern-step")) || 0);
+    });
+  });
+
+  root.querySelectorAll("[data-pattern-card-flip]").forEach((button) => {
+    button.addEventListener("click", () => {
+      togglePatternAnswer(button.getAttribute("data-pattern-card-flip"));
+    });
+  });
+
+  root.querySelectorAll("[data-answer-toggle]").forEach((button) => {
+    button.addEventListener("click", () => {
+      togglePatternAnswer(button.getAttribute("data-answer-toggle"));
+    });
+  });
+
+  root.querySelectorAll("[data-ask-question]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const patternCode = button.getAttribute("data-pattern-code") || "this pattern";
+      const questionId = button.getAttribute("data-question-id") || "this question";
+      const context = problemContextForQuestion(patternCode, questionId);
+      switchChatContext(context);
+      state.chatScope = "current";
+      state.chatDraft = state.messages.length
+        ? ""
+        : `Help me solve ${context.problemCode} ${context.questionId}. Start with a hint and do not reveal the full answer immediately.`;
+      setChatPanelOpen(true);
+      render({ preserveSidebarScroll: true });
+      requestAnimationFrame(() => {
+        const input = document.querySelector(".unit-chat-drawer [data-chat-form] textarea");
+        input?.focus();
+        input?.setSelectionRange(input.value.length, input.value.length);
+      });
+    });
+  });
+}
+
+function bindProblemPatternsPanelEvents(root = document) {
+  if (!root) return;
+
+  root.querySelectorAll("[data-question-tab]").forEach((button) => {
+    button.addEventListener("click", () => {
+      selectPatternQuestion(
+        button.getAttribute("data-pattern-code"),
+        button.getAttribute("data-question-tab"),
+      );
+    });
+  });
+
+  root.querySelector("[data-pattern-selector]")?.addEventListener("click", () => {
+    setPatternMenuOpen(!state.patternMenuOpen);
+  });
+
+  root.querySelectorAll("[data-pattern-option]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const patternCode = button.getAttribute("data-pattern-option");
+      const pattern = activeProblemPatterns().find((item) => item.code === patternCode);
+      if (!pattern) return;
+      const firstQuestion = pattern.questions?.[0];
+      state.activePatternCode = pattern.code;
+      state.activeQuestions[pattern.code] = firstQuestion?.id || "";
+      if (firstQuestion) state.revealedAnswers[`${pattern.code}:${firstQuestion.id}`] = false;
+      state.patternMenuOpen = false;
+      if (!refreshProblemPatternsPanel()) {
+        render({ preserveSidebarScroll: true });
+      }
+    });
+  });
+
+  root.querySelector("[data-pattern-introduction-toggle]")?.addEventListener("click", () => {
+    setPatternIntroductionOpen(!state.patternIntroductionOpen);
+  });
+
+  bindPatternQuestionViewEvents(root);
+}
+
 function bindEvents() {
   document.querySelector("[data-search]")?.addEventListener("input", (event) => {
     state.searchQuery = event.target.value;
@@ -2756,78 +2997,7 @@ function bindEvents() {
     });
   });
 
-  document.querySelectorAll("[data-question-tab]").forEach((button) => {
-    button.addEventListener("click", () => {
-      const patternCode = button.getAttribute("data-pattern-code");
-      const questionId = button.getAttribute("data-question-tab");
-      if (!patternCode || !questionId) return;
-      state.activePatternCode = patternCode;
-      state.activeQuestions[patternCode] = questionId;
-      state.revealedAnswers[`${patternCode}:${questionId}`] = false;
-      render({ preserveSidebarScroll: true });
-      document.getElementById(`${patternCode.toLowerCase()}-${questionId.toLowerCase()}`)?.scrollIntoView({ block: "nearest" });
-    });
-  });
-
-  document.querySelector("[data-pattern-selector]")?.addEventListener("click", () => {
-    state.patternMenuOpen = !state.patternMenuOpen;
-    render({ preserveSidebarScroll: true });
-  });
-
-  document.querySelectorAll("[data-pattern-option]").forEach((button) => {
-    button.addEventListener("click", () => {
-      const patternCode = button.getAttribute("data-pattern-option");
-      const pattern = activeProblemPatterns().find((item) => item.code === patternCode);
-      if (!pattern) return;
-      const firstQuestion = pattern.questions?.[0];
-      state.activePatternCode = pattern.code;
-      state.activeQuestions[pattern.code] = firstQuestion?.id || "";
-      if (firstQuestion) state.revealedAnswers[`${pattern.code}:${firstQuestion.id}`] = false;
-      state.patternMenuOpen = false;
-      render({ preserveSidebarScroll: true });
-    });
-  });
-
-  document.querySelector("[data-pattern-introduction-toggle]")?.addEventListener("click", () => {
-    state.patternIntroductionOpen = !state.patternIntroductionOpen;
-    render({ preserveSidebarScroll: true });
-  });
-
-  document.querySelectorAll("[data-pattern-step]").forEach((button) => {
-    button.addEventListener("click", () => {
-      stepPatternQuestion(Number(button.getAttribute("data-pattern-step")) || 0);
-    });
-  });
-
-  document.querySelector("[data-pattern-card-flip]")?.addEventListener("click", (event) => {
-    togglePatternAnswer(event.currentTarget.getAttribute("data-pattern-card-flip"));
-  });
-
-  document.querySelectorAll("[data-answer-toggle]").forEach((button) => {
-    button.addEventListener("click", () => {
-      togglePatternAnswer(button.getAttribute("data-answer-toggle"));
-    });
-  });
-
-  document.querySelectorAll("[data-ask-question]").forEach((button) => {
-    button.addEventListener("click", () => {
-      const patternCode = button.getAttribute("data-pattern-code") || "this pattern";
-      const questionId = button.getAttribute("data-question-id") || "this question";
-      const context = problemContextForQuestion(patternCode, questionId);
-      switchChatContext(context);
-      state.chatScope = "current";
-      state.chatDraft = state.messages.length
-        ? ""
-        : `Help me solve ${context.problemCode} ${context.questionId}. Start with a hint and do not reveal the full answer immediately.`;
-      setChatPanelOpen(true);
-      render({ preserveSidebarScroll: true });
-      requestAnimationFrame(() => {
-        const input = document.querySelector(".unit-chat-drawer [data-chat-form] textarea");
-        input?.focus();
-        input?.setSelectionRange(input.value.length, input.value.length);
-      });
-    });
-  });
+  bindProblemPatternsPanelEvents(document);
 
   document.querySelector("[data-chat-messages]")?.addEventListener("scroll", scheduleChatScrollSave, { passive: true });
   document.querySelector("[data-chat-form]")?.addEventListener("submit", askWiki);
@@ -3049,8 +3219,7 @@ function handleDocumentClick(event) {
   if (!(target instanceof Element)) return;
   let shouldRender = false;
   if (state.patternMenuOpen && !target.closest("[data-pattern-selector], .pattern-selector-menu")) {
-    state.patternMenuOpen = false;
-    shouldRender = true;
+    setPatternMenuOpen(false);
   }
   if (state.chatHistoryOpen && !target.closest("[data-chat-history-toggle], .chat-history-popover")) {
     state.chatHistoryOpen = false;
