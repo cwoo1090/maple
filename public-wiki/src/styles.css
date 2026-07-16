@@ -4293,8 +4293,35 @@ h4:hover .heading-anchor {
 
 .pattern-card-body {
   display: grid;
+  height: clamp(360px, 54vh, 560px);
+  height: clamp(360px, 54dvh, 560px);
+  min-height: 0;
+  align-content: start;
   gap: 12px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
   padding: 16px;
+  scrollbar-color: #c7cbd4 transparent;
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
+  touch-action: pan-y;
+  -webkit-overflow-scrolling: touch;
+}
+
+.pattern-card-body::-webkit-scrollbar {
+  width: 9px;
+}
+
+.pattern-card-body::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.pattern-card-body::-webkit-scrollbar-thumb {
+  border: 2px solid transparent;
+  border-radius: 999px;
+  background: #c7cbd4;
+  background-clip: padding-box;
 }
 
 .pattern-card-body .problem-image {
@@ -4419,6 +4446,8 @@ h4:hover .heading-anchor {
   }
 
   .pattern-card-body {
+    height: clamp(300px, 52vh, 440px);
+    height: clamp(300px, 52dvh, 440px);
     padding: 12px;
   }
 
