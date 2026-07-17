@@ -159,7 +159,7 @@ module.exports = {
   ],
   installCommand: "npm i -g @openai/codex",
   loginCommand: "codex login",
-  defaultTimeoutMs: 30 * 60 * 1000,
+  defaultTimeoutMs: 60 * 60 * 1000,
   checkInstalled,
   checkLoggedIn,
   buildExecArgs,

@@ -66,6 +66,7 @@ const {
   resolveSourceArtifact,
   validatePreparedOutputDir,
   validatePreparedSourceArtifact,
+  renderReportMarkdown,
   renderPreparedSourcesForPrompt,
   renderSourceStatusForPrompt,
   loadAskWikiKeywordIndex,
@@ -88,6 +89,34 @@ const {
   wikiSchemaTemplate,
   parseArgs,
 } = require("../src/operation-runner");
+
+test("operation report makes a timeout explicit even when the provider exits zero", () => {
+  const markdown = renderReportMarkdown({
+    id: "timeout-report",
+    type: "build-wiki",
+    status: "timed_out",
+    provider: "codex",
+    model: "gpt-5.5",
+    reasoningEffort: "xhigh",
+    startedAt: "2026-07-15T13:14:09.749Z",
+    completedAt: "2026-07-15T13:44:10.552Z",
+    codex: {
+      exitCode: 0,
+      signal: null,
+      timedOut: true,
+      cancelled: false,
+    },
+    snapshot: { path: ".aiwiki/snapshots/timeout-report" },
+    changedFiles: [],
+    userVisibleChangedFiles: [],
+    reviewableChangedFiles: [],
+    allowedPathRules: [],
+  });
+
+  assert.match(markdown, /Provider outcome: timed out/);
+  assert.match(markdown, /Provider exit code: 0/);
+  assert.doesNotMatch(markdown, /Codex exit code/);
+});
 
 async function pathExists(filePath) {
   try {

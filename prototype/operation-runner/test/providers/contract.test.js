@@ -80,6 +80,10 @@ test("provider visual input capabilities are explicit", () => {
   assert.equal(claude.supportsImagePathReferences, true);
 });
 
+test("codex allows an hour for long document build passes", () => {
+  assert.equal(codex.defaultTimeoutMs, 60 * 60 * 1000);
+});
+
 test("codex exposes the GPT-5.6 family and limits max effort to it", () => {
   assert.equal(codex.defaultModel, "gpt-5.6-sol");
 
