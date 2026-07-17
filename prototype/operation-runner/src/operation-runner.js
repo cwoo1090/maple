@@ -42,7 +42,6 @@ const LEGACY_RUNNER_METADATA_PREFIXES = [
   ".studywiki/chat-threads/",
   ".studywiki/maintain-threads/",
 ];
-const DEFAULT_CODEX_TIMEOUT_MS = 30 * 60 * 1000;
 const BUILD_WIKI_BATCH_TARGET_COST = 10;
 const BUILD_WIKI_BATCH_MAX_SOURCES = 3;
 const RUNNING_MARKER_PATH = ".aiwiki/running/operation.json";
@@ -10584,6 +10583,14 @@ function renderChangedText(marker) {
 }
 
 function renderReportMarkdown(report) {
+  const providerProcess = report.codex || {};
+  const providerOutcome = providerProcess.timedOut
+    ? "timed out"
+    : providerProcess.cancelled
+      ? "cancelled"
+      : providerProcess.exitCode === 0
+        ? "completed"
+        : "failed";
   const lines = [
     `# Operation Report: ${report.id}`,
     "",
@@ -10594,14 +10601,16 @@ function renderReportMarkdown(report) {
     `- Reasoning effort: ${report.reasoningEffort || "unknown"}`,
     `- Started: ${report.startedAt}`,
     `- Completed: ${report.completedAt}`,
-    `- Codex exit code: ${report.codex.exitCode}`,
+    `- Provider outcome: ${providerOutcome}`,
+    `- Provider exit code: ${providerProcess.exitCode ?? "unknown"}`,
+    `- Provider signal: ${providerProcess.signal || "none"}`,
     `- Snapshot: ${report.snapshot.path}`,
     "",
   ];
 
-	  if (report.status === "completed_without_wiki_content") {
+  if (report.status === "completed_without_wiki_content") {
     lines.push(
-      "> Warning: Codex exited cleanly but no wiki page or index/log update was produced.",
+      "> Warning: The AI provider exited cleanly but no wiki page or index/log update was produced.",
       "> The build did not finish in a meaningful way.",
       "",
     );
@@ -10620,7 +10629,7 @@ function renderReportMarkdown(report) {
       );
       lines.push("");
     }
-	  }
+  }
 
 	  if (report.timingsMs) {
 	    lines.push("## Timings", "");
@@ -10962,6 +10971,7 @@ module.exports = {
   readRenderedPdfResult,
   annotateFinalWikiAssetCounts,
   validateAndRestoreChanges,
+  renderReportMarkdown,
   parseArgs,
 };
 
