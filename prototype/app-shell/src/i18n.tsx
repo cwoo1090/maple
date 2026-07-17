@@ -171,6 +171,8 @@ const english = {
   "app.review.done": "Done reviewing",
   "app.review.markAll": "Mark all remaining changes reviewed",
   "app.review.undo": "Undo",
+  "app.review.finishOrUndo":
+    "Finish reviewing or undo generated changes before starting another workspace-changing action.",
   "app.postBuild.title": "Your wiki was updated.",
   "app.postBuild.reviewFirst": "First, review the AI changes.",
   "app.postBuild.next": "After review, the usual next steps are:",
@@ -308,21 +310,29 @@ const english = {
     "These sources look like they already belong to the current wiki. Keep the wiki as the baseline to mark them ingested without asking AI to rewrite everything.",
   "app.build.keepCurrent": "Keep current wiki",
   "app.buildFailed.title": "Build did not update the wiki",
-  "app.buildFailed.timedOut": "The AI run timed out before writing wiki files.",
+  "app.buildFailed.partialTitle": "Build stopped before it finished",
+  "app.buildFailed.timedOut": "The AI run timed out before it finished.",
   "app.buildFailed.providerFailed":
-    "The AI provider failed before Maple could detect wiki changes.",
+    "The AI provider stopped before the build finished.",
   "app.buildFailed.turnBudget":
-    "The AI run hit its turn budget before writing wiki files.",
+    "The AI run hit its turn budget before the build finished.",
   "app.buildFailed.noWikiContent":
     "The AI run finished, but no wiki pages or index/log changes were produced.",
-  "app.buildFailed.cancelled": "The build was stopped before wiki changes were produced.",
-  "app.buildFailed.generic": "The build ended before Maple found any wiki changes.",
+  "app.buildFailed.cancelled": "The build was stopped before it finished.",
+  "app.buildFailed.generic": "The build ended before it finished.",
   "app.buildFailed.body":
     "No generated files are waiting for review. {count} source change{plural} still need to be built.",
+  "app.buildFailed.partialBody":
+    "Maple saved {count} partial generated change{plural} before the build stopped. Review each file and choose Done reviewing to keep them, or Undo before trying the build again.",
+  "app.buildFailed.pendingSources":
+    "Maple has not marked {count} source change{plural} as fully built yet.",
   "app.buildFailed.openReport": "Open report",
+  "app.buildFailed.reviewChanges": "Review changes",
   "app.buildFailed.retry": "Try again",
   "app.buildFailed.toast":
     "Build wiki did not create reviewable wiki changes. Open the report for details.",
+  "app.buildFailed.partialToast":
+    "Build wiki stopped with {count} partial change{plural}. Review or undo them before trying again.",
   "app.build.aiModel": "AI model",
   "app.build.modelLabel": "Build wiki AI model",
   "app.build.whatBuilding": "What are you building?",
@@ -764,6 +774,8 @@ const korean: Record<TranslationKey, string> = {
   "app.review.done": "검토 완료",
   "app.review.markAll": "남은 변경을 모두 검토 완료로 표시",
   "app.review.undo": "되돌리기",
+  "app.review.finishOrUndo":
+    "다른 워크스페이스 변경 작업을 시작하기 전에 생성된 변경을 검토 완료하거나 되돌리세요.",
   "app.postBuild.title": "위키가 업데이트됐습니다.",
   "app.postBuild.reviewFirst": "먼저 AI 변경사항을 검토하세요.",
   "app.postBuild.next": "검토 후에는 보통 이렇게 이어갑니다:",
@@ -901,20 +913,28 @@ const korean: Record<TranslationKey, string> = {
     "이 소스들은 이미 현재 위키에 속한 것처럼 보입니다. AI에게 전체를 다시 쓰게 하지 않고 현재 위키를 기준선으로 유지해 반영 완료로 표시할 수 있습니다.",
   "app.build.keepCurrent": "현재 위키 유지",
   "app.buildFailed.title": "위키 빌드가 반영되지 않았습니다",
-  "app.buildFailed.timedOut": "AI 실행이 위키 파일을 쓰기 전에 시간 초과되었습니다.",
+  "app.buildFailed.partialTitle": "위키 빌드가 완료되기 전에 중단되었습니다",
+  "app.buildFailed.timedOut": "AI 실행이 완료되기 전에 시간 초과되었습니다.",
   "app.buildFailed.providerFailed":
-    "Maple이 위키 변경을 감지하기 전에 AI 제공자 실행이 실패했습니다.",
-  "app.buildFailed.turnBudget": "AI 실행이 위키 파일을 쓰기 전에 턴 한도에 도달했습니다.",
+    "위키 빌드가 끝나기 전에 AI 제공자 실행이 중단되었습니다.",
+  "app.buildFailed.turnBudget": "위키 빌드가 끝나기 전에 AI 실행이 턴 한도에 도달했습니다.",
   "app.buildFailed.noWikiContent":
     "AI 실행은 끝났지만 위키 페이지나 index/log 변경이 만들어지지 않았습니다.",
-  "app.buildFailed.cancelled": "위키 변경이 만들어지기 전에 빌드가 중지되었습니다.",
-  "app.buildFailed.generic": "Maple이 위키 변경을 찾기 전에 빌드가 끝났습니다.",
+  "app.buildFailed.cancelled": "위키 빌드가 완료되기 전에 중지되었습니다.",
+  "app.buildFailed.generic": "위키 빌드가 완료되기 전에 종료되었습니다.",
   "app.buildFailed.body":
     "검토할 생성 파일이 없습니다. 소스 변경 {count}개는 아직 빌드해야 합니다.",
+  "app.buildFailed.partialBody":
+    "빌드가 중단되기 전에 만들어진 부분 변경 {count}개가 저장되어 있습니다. 각 파일을 검토한 뒤 유지하려면 검토 완료를, 다시 빌드하려면 먼저 되돌리기를 선택하세요.",
+  "app.buildFailed.pendingSources":
+    "소스 변경 {count}개는 아직 빌드 완료로 표시되지 않았습니다.",
   "app.buildFailed.openReport": "리포트 열기",
+  "app.buildFailed.reviewChanges": "변경 검토",
   "app.buildFailed.retry": "다시 시도",
   "app.buildFailed.toast":
     "위키 빌드가 검토 가능한 위키 변경을 만들지 못했습니다. 자세한 내용은 리포트를 확인하세요.",
+  "app.buildFailed.partialToast":
+    "위키 빌드가 부분 변경 {count}개를 남기고 중단되었습니다. 다시 시도하기 전에 검토하거나 되돌리세요.",
   "app.build.aiModel": "AI 모델",
   "app.build.modelLabel": "위키 빌드 AI 모델",
   "app.build.whatBuilding": "무엇을 만들고 있나요?",

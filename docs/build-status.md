@@ -77,7 +77,7 @@ Listed in roughly the order they should ship.
 - **Build-prompt anchor support:** edit `operation-runner.js` to instruct Codex to emit `[[page#section]]` when citing a specific section. Without this, the anchor-jump infrastructure is dormant.
 - **L2:** actually exercise the stuck-recovery flow (code in place, never tested end-to-end).
 - Provider report naming: `report.json` still stores provider process details under `codex` even for Claude. Behavior works, but the key should become provider-neutral before more provider-specific UX is built.
-- Codex model list now defaults to `gpt-5.5` after `gpt-5-codex` stopped working with ChatGPT auth. Settings normalization maps old local selections to `gpt-5.5`.
+- Codex model list now exposes the full GPT-5.6 family: Sol (default/highest quality), Terra (balanced), and Luna (efficient). GPT-5.5 and GPT-5.4 remain available as fallback choices. Settings normalization maps the former GPT-5.5 default and older local selections to `gpt-5.6-sol`.
 
 ## Architecture decisions *(don't re-litigate)*
 

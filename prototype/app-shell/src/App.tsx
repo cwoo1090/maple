@@ -2306,6 +2306,7 @@ function App() {
   const reviewableChangedFiles = changedFiles.filter(isPendingReviewChange);
   const hasPendingGeneratedChanges =
     reviewableChangedFiles.length > 0 && !workspace.changedMarker?.undoneAt;
+  const pendingGeneratedChangesBlockedReason = t("app.review.finishOrUndo");
   const generatedChangesReviewKey =
     workspace.changedMarker?.operationId ??
     workspace.changedMarker?.completedAt ??
@@ -2329,6 +2330,10 @@ function App() {
   const buildCompletionSummaryStatus = workspace.changedMarker?.status ?? "";
   const buildCompletionSummaryText = workspace.lastOperationMessage?.trim() ?? "";
   const latestBuildFailed = isFailedBuildMarker(workspace.changedMarker);
+  const buildFailureHasPartialChanges = latestBuildFailed && hasPendingGeneratedChanges;
+  const buildFailureTitle = buildFailureHasPartialChanges
+    ? t("app.buildFailed.partialTitle")
+    : t("app.buildFailed.title");
   const latestBuildFailureOperationId = latestBuildFailed
     ? workspace.changedMarker?.operationId ?? workspace.changedMarker?.completedAt ?? null
     : null;
@@ -2510,7 +2515,7 @@ function App() {
     }
 
     if (hasPendingGeneratedChanges && action !== "review" && action !== "undo") {
-      return PENDING_GENERATED_CHANGES_ERROR;
+      return pendingGeneratedChangesBlockedReason;
     }
 
     return null;
@@ -2529,7 +2534,7 @@ function App() {
   const schemaUpdateBlockedReason = teamReadOnlyReason
     ? teamReadOnlyReason
     : hasPendingGeneratedChanges
-    ? PENDING_GENERATED_CHANGES_ERROR
+    ? pendingGeneratedChangesBlockedReason
     : activeWorkspaceWriteLabel
     ? waitForSchemaUpdateMessage(activeWorkspaceWriteLabel)
     : exploreBusy
@@ -2950,7 +2955,7 @@ function App() {
       : teamReadOnlyReason
         ? teamReadOnlyReason
       : hasPendingGeneratedChanges
-        ? PENDING_GENERATED_CHANGES_ERROR
+        ? pendingGeneratedChangesBlockedReason
         : activeWorkspaceWriteLabel
           ? waitForEditingMessage(activeWorkspaceWriteLabel)
           : blockingUiBusy && activeOperationLabel
@@ -4863,7 +4868,15 @@ function App() {
           source_count: state.sourceFiles.length,
         });
         if (markerFailed) {
-          setError(t("app.buildFailed.toast"));
+          const partialCount = reviewableChangedFileCount(state);
+          setError(
+            partialCount > 0
+              ? t("app.buildFailed.partialToast", {
+                  count: partialCount,
+                  plural: partialCount === 1 ? "" : "s",
+                })
+              : t("app.buildFailed.toast"),
+          );
         }
         const nextPath = progressFailed ? null : chooseDocumentAfterCommand("build_wiki", state);
         if (nextPath) {
@@ -4941,7 +4954,15 @@ function App() {
               changed_file_count: reviewableChangedFileCount(state),
               source_count: state.sourceFiles.length,
             });
-            setError(t("app.buildFailed.toast"));
+            const partialCount = reviewableChangedFileCount(state);
+            setError(
+              partialCount > 0
+                ? t("app.buildFailed.partialToast", {
+                    count: partialCount,
+                    plural: partialCount === 1 ? "" : "s",
+                  })
+                : t("app.buildFailed.toast"),
+            );
           } else {
             track("wiki build completed", {
               result: "failed",
@@ -7133,7 +7154,7 @@ function App() {
       return;
     }
     if (!canRemoveSourceFiles) {
-      setError("Finish reviewing or undo generated changes before importing more sources.");
+      setError(t("app.sidebar.finishReviewBeforeImport"));
       return;
     }
     const supported = paths.filter((p) =>
@@ -8989,11 +9010,11 @@ function App() {
           {showBuildFailurePanel ? (
             <section
               className="build-summary-panel build-failure-panel"
-              aria-label={t("app.buildFailed.title")}
+              aria-label={buildFailureTitle}
             >
               <div className="build-summary-header">
                 <div className="build-summary-title-block">
-                  <span className="build-summary-title">{t("app.buildFailed.title")}</span>
+                  <span className="build-summary-title">{buildFailureTitle}</span>
                   <span className="build-summary-state">{t("app.common.error")}</span>
                 </div>
                 <button
@@ -9012,12 +9033,31 @@ function App() {
               </div>
               <div className="build-summary-body">
                 <p>{latestBuildFailureDetail}</p>
-                <p>
-                  {t("app.buildFailed.body", {
-                    count: pendingSourceCount,
-                    plural: pendingSourceCount === 1 ? "" : "s",
-                  })}
-                </p>
+                {buildFailureHasPartialChanges ? (
+                  <>
+                    <p>
+                      {t("app.buildFailed.partialBody", {
+                        count: reviewableChangedFiles.length,
+                        plural: reviewableChangedFiles.length === 1 ? "" : "s",
+                      })}
+                    </p>
+                    {pendingSourceCount > 0 ? (
+                      <p>
+                        {t("app.buildFailed.pendingSources", {
+                          count: pendingSourceCount,
+                          plural: pendingSourceCount === 1 ? "" : "s",
+                        })}
+                      </p>
+                    ) : null}
+                  </>
+                ) : (
+                  <p>
+                    {t("app.buildFailed.body", {
+                      count: pendingSourceCount,
+                      plural: pendingSourceCount === 1 ? "" : "s",
+                    })}
+                  </p>
+                )}
                 <div className="build-summary-actions">
                   <button
                     type="button"
@@ -9029,11 +9069,26 @@ function App() {
                   <button
                     type="button"
                     className="primary"
-                    disabled={Boolean(buildBlockedReason) || anyOperationBusy}
-                    title={buildBlockedReason ?? undefined}
-                    onClick={() => openBuildWiki(false)}
+                    disabled={
+                      buildFailureHasPartialChanges
+                        ? anyOperationBusy
+                        : Boolean(buildBlockedReason) || anyOperationBusy
+                    }
+                    title={
+                      buildFailureHasPartialChanges ? undefined : buildBlockedReason ?? undefined
+                    }
+                    onClick={() => {
+                      if (buildFailureHasPartialChanges) {
+                        const firstChange = unreviewedChangedFiles[0] ?? reviewableChangedFiles[0];
+                        if (firstChange) void openWorkspaceFile(firstChange.path);
+                        return;
+                      }
+                      openBuildWiki(false);
+                    }}
                   >
-                    {t("app.buildFailed.retry")}
+                    {buildFailureHasPartialChanges
+                      ? t("app.buildFailed.reviewChanges")
+                      : t("app.buildFailed.retry")}
                   </button>
                 </div>
               </div>

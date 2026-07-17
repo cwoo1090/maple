@@ -53,6 +53,11 @@ const SUPPORTED_REASONING_EFFORTS = [
   { id: "xhigh", label: "XHigh", description: "Deepest", recommended: true },
 ];
 
+const GPT_56_REASONING_EFFORTS = [
+  ...SUPPORTED_REASONING_EFFORTS,
+  { id: "max", label: "Max", description: "Maximum" },
+];
+
 function buildExecArgs(ctx) {
   const reasoningEffort = ctx.reasoningEffort || defaultReasoningEffort(ctx.model);
   const args = [
@@ -106,14 +111,35 @@ module.exports = {
   binary: providerOverridePath("codex") || "codex",
   supportsImageAttachments: true,
   supportsImagePathReferences: false,
-  defaultModel: "gpt-5.5",
+  defaultModel: "gpt-5.6-sol",
   defaultReasoningEffort,
-  supportedReasoningEfforts: SUPPORTED_REASONING_EFFORTS,
+  supportedReasoningEfforts: GPT_56_REASONING_EFFORTS,
   supportedModels: [
+    {
+      id: "gpt-5.6-sol",
+      label: "GPT-5.6 Sol",
+      description: "Highest quality",
+      recommended: true,
+      defaultReasoningEffort: "xhigh",
+      supportedReasoningEfforts: GPT_56_REASONING_EFFORTS,
+    },
+    {
+      id: "gpt-5.6-terra",
+      label: "GPT-5.6 Terra",
+      description: "Balanced",
+      defaultReasoningEffort: "medium",
+      supportedReasoningEfforts: GPT_56_REASONING_EFFORTS,
+    },
+    {
+      id: "gpt-5.6-luna",
+      label: "GPT-5.6 Luna",
+      description: "Efficient",
+      defaultReasoningEffort: "medium",
+      supportedReasoningEfforts: GPT_56_REASONING_EFFORTS,
+    },
     {
       id: "gpt-5.5",
       label: "GPT-5.5",
-      recommended: true,
       defaultReasoningEffort: "xhigh",
       supportedReasoningEfforts: SUPPORTED_REASONING_EFFORTS,
     },
@@ -133,7 +159,7 @@ module.exports = {
   ],
   installCommand: "npm i -g @openai/codex",
   loginCommand: "codex login",
-  defaultTimeoutMs: 30 * 60 * 1000,
+  defaultTimeoutMs: 60 * 60 * 1000,
   checkInstalled,
   checkLoggedIn,
   buildExecArgs,
