@@ -381,6 +381,7 @@ const PUBLIC_WIKI_ROOT_ENV: &str = "MAPLE_PUBLIC_WIKI_ROOT";
 const GITHUB_KEYCHAIN_SERVICE: &str = "com.ahnchulwoo.maple.github";
 const GITHUB_KEYCHAIN_ACCOUNT: &str = "github.com";
 const GITHUB_DEVICE_SCOPE: &str = "repo read:user user:email";
+const MODEL_CATALOG_VERSION: u32 = 2;
 const TEAM_GITIGNORE_RULES: &[&str] = &[
     ".DS_Store",
     "public-site/node_modules/",
@@ -396,6 +397,8 @@ const MAPLE_GUIDE_KNOWLEDGE: &str = include_str!("../../src/help/maple-guide.md"
 struct AppSettings {
     provider: String,
     models: HashMap<String, String>,
+    #[serde(default)]
+    model_catalog_version: u32,
     #[serde(default)]
     reasoning_efforts: HashMap<String, HashMap<String, String>>,
     #[serde(default)]
@@ -594,7 +597,14 @@ enum ThreadFileKind {
 
 fn known_provider_models(provider: &str) -> &'static [&'static str] {
     match provider {
-        "codex" => &["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"],
+        "codex" => &[
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "gpt-5.5",
+            "gpt-5.4",
+            "gpt-5.4-mini",
+        ],
         "claude" => &[
             "claude-sonnet-4-6",
             "claude-opus-4-7",
@@ -607,7 +617,7 @@ fn known_provider_models(provider: &str) -> &'static [&'static str] {
 fn default_model_for_provider(provider: &str) -> &'static str {
     match provider {
         "claude" => "claude-sonnet-4-6",
-        _ => "gpt-5.5",
+        _ => "gpt-5.6-sol",
     }
 }
 
@@ -622,21 +632,33 @@ fn default_maple_guide_model_for_provider(provider: &str) -> &'static str {
 fn supported_reasoning_efforts(provider: &str) -> &'static [&'static str] {
     match provider {
         "claude" => &["low", "medium", "high", "xhigh", "max"],
-        "codex" => &["low", "medium", "high", "xhigh"],
+        "codex" => &["low", "medium", "high", "xhigh", "max"],
         _ => &[],
+    }
+}
+
+fn supported_reasoning_efforts_for_model(provider: &str, model: &str) -> &'static [&'static str] {
+    match (provider, model) {
+        (
+            "codex",
+            "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna",
+        ) => &["low", "medium", "high", "xhigh", "max"],
+        ("codex", _) => &["low", "medium", "high", "xhigh"],
+        _ => supported_reasoning_efforts(provider),
     }
 }
 
 fn default_reasoning_effort_for_model(provider: &str, model: &str) -> &'static str {
     match (provider, model) {
         ("codex", "gpt-5.4-mini") => "medium",
+        ("codex", "gpt-5.6-terra" | "gpt-5.6-luna") => "medium",
         ("claude", "claude-haiku-4-5-20251001") => "medium",
         _ => "xhigh",
     }
 }
 
-fn is_supported_reasoning_effort(provider: &str, effort: &str) -> bool {
-    supported_reasoning_efforts(provider).contains(&effort)
+fn is_supported_reasoning_effort(provider: &str, model: &str, effort: &str) -> bool {
+    supported_reasoning_efforts_for_model(provider, model).contains(&effort)
 }
 
 fn selected_model(settings: &AppSettings, provider: &str) -> String {
@@ -653,14 +675,14 @@ fn selected_reasoning_effort(settings: &AppSettings, provider: &str, model: &str
         .get(provider)
         .and_then(|models| models.get(model))
         .map(String::as_str)
-        .filter(|effort| is_supported_reasoning_effort(provider, effort))
+        .filter(|effort| is_supported_reasoning_effort(provider, model, effort))
         .unwrap_or_else(|| default_reasoning_effort_for_model(provider, model))
         .to_string()
 }
 
 fn default_settings() -> AppSettings {
     let mut models = HashMap::new();
-    models.insert("codex".to_string(), "gpt-5.5".to_string());
+    models.insert("codex".to_string(), "gpt-5.6-sol".to_string());
     models.insert("claude".to_string(), "claude-sonnet-4-6".to_string());
     let mut reasoning_efforts = HashMap::new();
     for provider in ["codex", "claude"] {
@@ -676,6 +698,7 @@ fn default_settings() -> AppSettings {
     AppSettings {
         provider: "codex".to_string(),
         models,
+        model_catalog_version: MODEL_CATALOG_VERSION,
         reasoning_efforts,
         provider_paths: HashMap::new(),
     }
@@ -683,13 +706,19 @@ fn default_settings() -> AppSettings {
 
 fn normalize_settings(mut settings: AppSettings) -> AppSettings {
     match settings.models.get("codex").map(String::as_str) {
-        Some("gpt-5-codex") | Some("gpt-5") | None => {
+        Some("gpt-5-codex") | Some("gpt-5") | Some("gpt-5.6") | None => {
             settings
                 .models
-                .insert("codex".to_string(), "gpt-5.5".to_string());
+                .insert("codex".to_string(), "gpt-5.6-sol".to_string());
+        }
+        Some("gpt-5.5") if settings.model_catalog_version < MODEL_CATALOG_VERSION => {
+            settings
+                .models
+                .insert("codex".to_string(), "gpt-5.6-sol".to_string());
         }
         _ => {}
     }
+    settings.model_catalog_version = MODEL_CATALOG_VERSION;
     if !settings.models.contains_key("claude") {
         settings
             .models
@@ -705,7 +734,7 @@ fn normalize_settings(mut settings: AppSettings) -> AppSettings {
             .or_default();
         provider_efforts.retain(|model, effort| {
             known_provider_models(provider).contains(&model.as_str())
-                && is_supported_reasoning_effort(provider, effort)
+                && is_supported_reasoning_effort(provider, model, effort)
         });
         for model in known_provider_models(provider) {
             provider_efforts
@@ -861,7 +890,7 @@ async fn set_reasoning_effort(
     if !known_provider_models(&provider).contains(&model_id.as_str()) {
         return Err(format!("Unknown model for {provider}: {model_id}"));
     }
-    if !is_supported_reasoning_effort(&provider, &effort_id) {
+    if !is_supported_reasoning_effort(&provider, &model_id, &effort_id) {
         return Err(format!(
             "Unsupported reasoning effort for {provider}: {effort_id}"
         ));
@@ -1007,7 +1036,15 @@ struct ProviderAuthCheck {
 }
 
 fn provider_reasoning_effort_options(provider: &str) -> Vec<ProviderReasoningEffort> {
-    supported_reasoning_efforts(provider)
+    reasoning_effort_options(supported_reasoning_efforts(provider))
+}
+
+fn model_reasoning_effort_options(provider: &str, model: &str) -> Vec<ProviderReasoningEffort> {
+    reasoning_effort_options(supported_reasoning_efforts_for_model(provider, model))
+}
+
+fn reasoning_effort_options(efforts: &[&str]) -> Vec<ProviderReasoningEffort> {
+    efforts
         .iter()
         .map(|effort| ProviderReasoningEffort {
             id: (*effort).to_string(),
@@ -1039,16 +1076,49 @@ async fn list_providers() -> Result<Vec<ProviderInfo>, String> {
             label: "ChatGPT (via Codex CLI)".into(),
             install_command: "npm i -g @openai/codex".into(),
             login_command: "codex login".into(),
-            default_model: "gpt-5.5".into(),
+            default_model: "gpt-5.6-sol".into(),
             supported_reasoning_efforts: provider_reasoning_effort_options("codex"),
             supported_models: vec![
+                ProviderModel {
+                    id: "gpt-5.6-sol".into(),
+                    label: "GPT-5.6 Sol".into(),
+                    description: Some("Highest quality".into()),
+                    recommended: Some(true),
+                    default_reasoning_effort: "xhigh".into(),
+                    supported_reasoning_efforts: model_reasoning_effort_options(
+                        "codex",
+                        "gpt-5.6-sol",
+                    ),
+                },
+                ProviderModel {
+                    id: "gpt-5.6-terra".into(),
+                    label: "GPT-5.6 Terra".into(),
+                    description: Some("Balanced".into()),
+                    recommended: None,
+                    default_reasoning_effort: "medium".into(),
+                    supported_reasoning_efforts: model_reasoning_effort_options(
+                        "codex",
+                        "gpt-5.6-terra",
+                    ),
+                },
+                ProviderModel {
+                    id: "gpt-5.6-luna".into(),
+                    label: "GPT-5.6 Luna".into(),
+                    description: Some("Efficient".into()),
+                    recommended: None,
+                    default_reasoning_effort: "medium".into(),
+                    supported_reasoning_efforts: model_reasoning_effort_options(
+                        "codex",
+                        "gpt-5.6-luna",
+                    ),
+                },
                 ProviderModel {
                     id: "gpt-5.5".into(),
                     label: "GPT-5.5".into(),
                     description: None,
-                    recommended: Some(true),
+                    recommended: None,
                     default_reasoning_effort: "xhigh".into(),
-                    supported_reasoning_efforts: provider_reasoning_effort_options("codex"),
+                    supported_reasoning_efforts: model_reasoning_effort_options("codex", "gpt-5.5"),
                 },
                 ProviderModel {
                     id: "gpt-5.4".into(),
@@ -1056,7 +1126,7 @@ async fn list_providers() -> Result<Vec<ProviderInfo>, String> {
                     description: None,
                     recommended: None,
                     default_reasoning_effort: "xhigh".into(),
-                    supported_reasoning_efforts: provider_reasoning_effort_options("codex"),
+                    supported_reasoning_efforts: model_reasoning_effort_options("codex", "gpt-5.4"),
                 },
                 ProviderModel {
                     id: "gpt-5.4-mini".into(),
@@ -1064,7 +1134,10 @@ async fn list_providers() -> Result<Vec<ProviderInfo>, String> {
                     description: Some("Fastest".into()),
                     recommended: None,
                     default_reasoning_effort: "medium".into(),
-                    supported_reasoning_efforts: provider_reasoning_effort_options("codex"),
+                    supported_reasoning_efforts: model_reasoning_effort_options(
+                        "codex",
+                        "gpt-5.4-mini",
+                    ),
                 },
             ],
         },
@@ -7069,7 +7142,7 @@ async fn build_wiki(
         .unwrap_or_else(|| default_model_for_provider(&provider).to_string());
     let reasoning_effort = reasoning_effort
         .map(|value| value.trim().to_string())
-        .filter(|value| is_supported_reasoning_effort(&provider, value))
+        .filter(|value| is_supported_reasoning_effort(&provider, &model, value))
         .unwrap_or_else(|| selected_reasoning_effort(&settings, &provider, &model));
     let mut args = vec![
         "build".to_string(),
@@ -11017,12 +11090,15 @@ mod tests {
     use super::{
         backup_schema_before_update, build_history_json, chat_thread_summary, chat_threads_dir,
         compose_maintain_operation_instruction, dedupe_node_path_candidates,
-        default_workspace_schema, delete_wiki_image_asset_from_workspace,
+        default_model_for_provider, default_reasoning_effort_for_model,
+        default_workspace_schema,
+        delete_wiki_image_asset_from_workspace,
         ensure_asset_master_file_for_edit, ensure_maintain_thread_task_matches,
         ensure_no_pending_generated_changes, extract_partial_answer_from_events,
         finalize_provider_check_report, html_to_text_preview, import_source_file,
         friendly_git_error, initialize_workspace_files, is_github_https_repo_url,
-        is_readable_workspace_preview_path, is_supported_source_extension,
+        is_readable_workspace_preview_path, is_supported_reasoning_effort,
+        is_supported_source_extension, known_provider_models,
         is_valid_asset_relative_path, load_state_at,
         login_command_for_settings, maintain_operation_assistant_text,
         maintain_operation_user_text, make_chat_thread, make_maintain_thread,
@@ -11038,7 +11114,7 @@ mod tests {
         validate_provider_path, write_schema_update_marker, write_wiki_image_asset_registry,
         AppSettings, ChatSelectionSnippet, ChatThreadMessage, GitHubDeviceLogin, NodeCandidate,
         NodePathCandidate, ProviderCandidate, ProviderPathCandidate, ThreadFileKind,
-        WikiImageAsset, WikiImageAssetRegistry,
+        WikiImageAsset, WikiImageAssetRegistry, MODEL_CATALOG_VERSION,
     };
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -11828,6 +11904,24 @@ mod tests {
     }
 
     #[test]
+    fn codex_exposes_the_gpt_56_family_and_limits_max_effort_to_it() {
+        assert_eq!(default_model_for_provider("codex"), "gpt-5.6-sol");
+        for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            assert!(known_provider_models("codex").contains(&model));
+            assert!(is_supported_reasoning_effort("codex", model, "max"));
+        }
+        assert_eq!(
+            default_reasoning_effort_for_model("codex", "gpt-5.6-terra"),
+            "medium"
+        );
+        assert_eq!(
+            default_reasoning_effort_for_model("codex", "gpt-5.6-luna"),
+            "medium"
+        );
+        assert!(!is_supported_reasoning_effort("codex", "gpt-5.5", "max"));
+    }
+
+    #[test]
     fn settings_normalization_adds_provider_paths_and_reasoning_defaults() {
         let settings = serde_json::from_str::<AppSettings>(
             r#"{"provider":"codex","models":{"codex":"gpt-5.5"}}"#,
@@ -11835,9 +11929,19 @@ mod tests {
         .unwrap();
         let normalized = normalize_settings(settings);
         assert!(normalized.provider_paths.is_empty());
+        assert_eq!(normalized.model_catalog_version, MODEL_CATALOG_VERSION);
+        assert_eq!(normalized.models.get("codex").unwrap(), "gpt-5.6-sol");
         assert_eq!(
             normalized.models.get("claude").unwrap(),
             "claude-sonnet-4-6"
+        );
+        assert_eq!(
+            normalized
+                .reasoning_efforts
+                .get("codex")
+                .and_then(|models| models.get("gpt-5.6-sol"))
+                .map(String::as_str),
+            Some("xhigh")
         );
         assert_eq!(
             normalized
@@ -11863,6 +11967,20 @@ mod tests {
                 .map(String::as_str),
             Some("medium")
         );
+    }
+
+    #[test]
+    fn settings_normalization_preserves_a_new_explicit_gpt_55_selection() {
+        let settings = serde_json::from_value::<AppSettings>(serde_json::json!({
+            "provider": "codex",
+            "models": { "codex": "gpt-5.5" },
+            "modelCatalogVersion": MODEL_CATALOG_VERSION,
+        }))
+        .unwrap();
+
+        let normalized = normalize_settings(settings);
+
+        assert_eq!(normalized.models.get("codex").unwrap(), "gpt-5.5");
     }
 
     #[test]
@@ -12051,6 +12169,7 @@ exit 1
         let mut settings = AppSettings {
             provider: "codex".to_string(),
             models: HashMap::new(),
+            model_catalog_version: MODEL_CATALOG_VERSION,
             reasoning_efforts: HashMap::new(),
             provider_paths: HashMap::new(),
         };

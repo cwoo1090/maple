@@ -80,6 +80,24 @@ test("provider visual input capabilities are explicit", () => {
   assert.equal(claude.supportsImagePathReferences, true);
 });
 
+test("codex exposes the GPT-5.6 family and limits max effort to it", () => {
+  assert.equal(codex.defaultModel, "gpt-5.6-sol");
+
+  const gpt56 = codex.supportedModels.filter((model) => model.id.startsWith("gpt-5.6-"));
+  const gpt55 = codex.supportedModels.find((model) => model.id === "gpt-5.5");
+
+  assert.deepEqual(
+    gpt56.map((model) => model.id),
+    ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"],
+  );
+  assert.equal(gpt56[0]?.recommended, true);
+  assert.ok(gpt56.every((model) => model.supportedReasoningEfforts.some((effort) => effort.id === "max")));
+  assert.equal(gpt56[1]?.defaultReasoningEffort, "medium");
+  assert.equal(gpt56[2]?.defaultReasoningEffort, "medium");
+  assert.equal(gpt55?.recommended, undefined);
+  assert.equal(gpt55?.supportedReasoningEfforts.some((effort) => effort.id === "max"), false);
+});
+
 test("claude build forwards selected reasoning effort", () => {
   const args = claude.buildExecArgs({
     workspace: "/tmp/workspace",
