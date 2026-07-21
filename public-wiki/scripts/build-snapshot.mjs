@@ -516,6 +516,7 @@ function buildUnitMetadata(markdown) {
     return {
       subject: String(parsed.subject || "").trim(),
       unitId: String(parsed.unit_id || "").trim(),
+      order: Number.isFinite(Number(parsed.unit_order)) ? Number(parsed.unit_order) : null,
       title: String(parsed.unit_title || "").trim(),
       subtitle: String(parsed.unit_subtitle || "").trim(),
       level: String(parsed.sl_hl || "").trim(),
@@ -974,6 +975,13 @@ function comparePagePaths(a, b) {
 function comparePages(a, b) {
   if (a.key === "index") return -1;
   if (b.key === "index") return 1;
+  const aOrder = a.unit?.order;
+  const bOrder = b.unit?.order;
+  if (Number.isFinite(aOrder) || Number.isFinite(bOrder)) {
+    if (!Number.isFinite(aOrder)) return 1;
+    if (!Number.isFinite(bOrder)) return -1;
+    if (aOrder !== bOrder) return aOrder - bOrder;
+  }
   return a.title.localeCompare(b.title);
 }
 

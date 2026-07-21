@@ -1438,7 +1438,7 @@ function renderTreeRoot(root, label) {
                 <small>${items.length}</small>
               </summary>
               <div class="folder-items">
-                ${items.map(renderPageLink).join("")}
+                ${[...items].sort(compareNavigationPages).map(renderPageLink).join("")}
               </div>
             </details>
           `;
@@ -1447,6 +1447,17 @@ function renderTreeRoot(root, label) {
         .join("")}
     </section>
   `;
+}
+
+function compareNavigationPages(a, b) {
+  const aOrder = a.unit?.order;
+  const bOrder = b.unit?.order;
+  if (Number.isFinite(aOrder) || Number.isFinite(bOrder)) {
+    if (!Number.isFinite(aOrder)) return 1;
+    if (!Number.isFinite(bOrder)) return -1;
+    if (aOrder !== bOrder) return aOrder - bOrder;
+  }
+  return a.title.localeCompare(b.title);
 }
 
 function renderConceptTree(label, pages) {
@@ -1822,7 +1833,7 @@ function renderPatternQuestionView(pattern, question, flipped) {
             <button class="pattern-secondary-button" type="button" data-answer-toggle="${escapeHtml(answerKey)}">
               ${flipped ? "Back to question" : "Flip to markscheme"}
             </button>
-          ` : `<span class="pattern-answer-unavailable">Source markscheme unavailable</span>`}
+          ` : ""}
           <button
             class="ask-question-button"
             type="button"
@@ -1869,7 +1880,6 @@ function renderPatternFlipCard(pattern, question, flipped) {
             <span class="pattern-card-label"><strong>${escapeHtml(tag)}</strong><small>QUESTION</small></span>
             <span class="pattern-card-body">
               ${renderProblemImages(question.questionImages, "question")}
-              <span class="pattern-card-hint">Source markscheme unavailable — use Ask AI for guided help.</span>
             </span>
           </span>
         </div>
@@ -2165,7 +2175,7 @@ function renderPatternQuestions(card) {
             <button class="show-answer-button" type="button" data-answer-toggle="${escapeHtml(answerKey)}">
               ${revealed ? "Hide answer" : "Show answer"}
             </button>
-          ` : `<span class="pattern-answer-unavailable">Source markscheme unavailable</span>`}
+          ` : ""}
           <button class="ask-question-button" type="button" data-ask-question data-pattern-code="${escapeHtml(card.code)}" data-question-id="${escapeHtml(active.id)}">
             Ask about this question
           </button>
