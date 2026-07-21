@@ -1666,17 +1666,13 @@ function renderAskLearnPanel(page, tab) {
 }
 
 function renderSyllabusPoints(points) {
-  const understandingCount = points.reduce(
-    (total, point) => total + (point.understandings?.length || 0),
-    0,
-  );
   const levelLabel = syllabusLevelLabel(points);
   const chatIsAsking = activeChatIsAsking();
   return `
     <section class="syllabus-points" data-syllabus-points aria-labelledby="syllabus-points-title">
       <div class="syllabus-points-heading">
         <h2 id="syllabus-points-title">Syllabus points</h2>
-        <p>${understandingCount} ${understandingCount === 1 ? "understanding" : "understandings"}${levelLabel ? ` · ${escapeHtml(levelLabel)}` : ""}</p>
+        <p>${points.length} syllabus ${points.length === 1 ? "point" : "points"}${levelLabel ? ` · ${escapeHtml(levelLabel)}` : ""}</p>
       </div>
       <div class="syllabus-point-list">
         ${points.map((point) => `
@@ -1812,18 +1808,21 @@ function renderProblemPatternsPanel(tab) {
 
 function renderPatternQuestionView(pattern, question, flipped) {
   const answerKey = `${pattern.code}:${question.id}`;
+  const hasAnswer = Boolean(question.answerImages?.length);
   return `
     <div class="pattern-question-view" data-pattern-question-view>
-      ${renderPatternFlipCard(pattern, question, flipped)}
+      ${renderPatternFlipCard(pattern, question, hasAnswer && flipped)}
       <div class="pattern-footer">
         <div>
           <button class="pattern-secondary-button" type="button" data-pattern-step="-1">‹ Prev</button>
           <button class="pattern-secondary-button" type="button" data-pattern-step="1">Next ›</button>
         </div>
         <div>
-          <button class="pattern-secondary-button" type="button" data-answer-toggle="${escapeHtml(answerKey)}">
-            ${flipped ? "Back to question" : "Flip to markscheme"}
-          </button>
+          ${hasAnswer ? `
+            <button class="pattern-secondary-button" type="button" data-answer-toggle="${escapeHtml(answerKey)}">
+              ${flipped ? "Back to question" : "Flip to markscheme"}
+            </button>
+          ` : `<span class="pattern-answer-unavailable">Source markscheme unavailable</span>`}
           <button
             class="ask-question-button"
             type="button"
@@ -1862,6 +1861,21 @@ function renderPatternIntroduction(pattern) {
 
 function renderPatternFlipCard(pattern, question, flipped) {
   const tag = `${pattern.code} · ${question.id} of ${pattern.questions.length}`;
+  if (!question.answerImages?.length) {
+    return `
+      <div class="pattern-card-scene" id="${escapeHtml(question.anchor)}">
+        <div class="pattern-flip-card pattern-flip-card-static" role="group" aria-label="${escapeHtml(tag)} question">
+          <span class="pattern-card-face pattern-card-front">
+            <span class="pattern-card-label"><strong>${escapeHtml(tag)}</strong><small>QUESTION</small></span>
+            <span class="pattern-card-body">
+              ${renderProblemImages(question.questionImages, "question")}
+              <span class="pattern-card-hint">Source markscheme unavailable — use Ask AI for guided help.</span>
+            </span>
+          </span>
+        </div>
+      </div>
+    `;
+  }
   return `
     <div class="pattern-card-scene" id="${escapeHtml(question.anchor)}">
       <button
@@ -2121,6 +2135,7 @@ function renderPatternQuestions(card) {
   const activeId = state.activeQuestions[card.code] || questions[0].id;
   const active = questions.find((question) => question.id === activeId) || questions[0];
   const answerKey = `${card.code}:${active.id}`;
+  const hasAnswer = Boolean(active.answerImages?.length);
   const revealed = Boolean(state.revealedAnswers[answerKey]);
   return `
     <div class="pattern-question-bank" id="${escapeHtml(active.anchor)}">
@@ -2139,16 +2154,18 @@ function renderPatternQuestions(card) {
       <div class="pattern-question-stage">
         <div class="pattern-question-label"><span>${escapeHtml(card.code)} · ${escapeHtml(active.id)}</span><small>Question</small></div>
         ${active.questionImages.map((image) => `<img class="problem-image" src="${escapeHtml(image.src)}" alt="${escapeHtml(image.alt)}" loading="lazy" />`).join("")}
-        ${revealed ? `
+        ${hasAnswer && revealed ? `
           <div class="pattern-answer" aria-live="polite">
             <div class="pattern-question-label answer"><span>Markscheme</span><small>Answer</small></div>
             ${active.answerImages.map((image) => `<img class="problem-image answer-image" src="${escapeHtml(image.src)}" alt="${escapeHtml(image.alt)}" loading="lazy" />`).join("")}
           </div>
         ` : ""}
         <div class="pattern-question-actions">
-          <button class="show-answer-button" type="button" data-answer-toggle="${escapeHtml(answerKey)}">
-            ${revealed ? "Hide answer" : "Show answer"}
-          </button>
+          ${hasAnswer ? `
+            <button class="show-answer-button" type="button" data-answer-toggle="${escapeHtml(answerKey)}">
+              ${revealed ? "Hide answer" : "Show answer"}
+            </button>
+          ` : `<span class="pattern-answer-unavailable">Source markscheme unavailable</span>`}
           <button class="ask-question-button" type="button" data-ask-question data-pattern-code="${escapeHtml(card.code)}" data-question-id="${escapeHtml(active.id)}">
             Ask about this question
           </button>
