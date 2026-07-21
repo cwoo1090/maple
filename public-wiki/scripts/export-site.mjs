@@ -13,7 +13,9 @@ const outputRoot = path.resolve(
 async function main() {
   assertSafePaths();
   await assertWorkspace();
+  const existingViewerConfig = await readExistingViewerConfig();
   await copyViewerTemplate();
+  await restoreViewerConfig(existingViewerConfig);
 
   const metadata = await readSiteMetadata();
   await writeInitialHtmlMetadata(metadata);
@@ -79,9 +81,10 @@ async function copyViewerTemplate() {
     await copyFile(file);
   }
 
-  for (const dir of ["api", "scripts", "src"]) {
+  for (const dir of ["api", "src"]) {
     await copyDirectory(dir);
   }
+  await copyDirectory("scripts", { clean: false });
 
   await fs.mkdir(path.join(outputRoot, "public"), { recursive: true });
   for (const file of ["favicon.svg", "maple-icon.png", "robots.txt"]) {
@@ -105,15 +108,53 @@ async function copyFile(relativePath) {
   await fs.copyFile(from, to);
 }
 
-async function copyDirectory(relativePath) {
+async function copyDirectory(relativePath, { clean = true } = {}) {
   const from = path.join(templateRoot, relativePath);
   const to = path.join(outputRoot, relativePath);
-  await fs.rm(to, { recursive: true, force: true });
+  if (clean) await fs.rm(to, { recursive: true, force: true });
   await fs.cp(from, to, {
     recursive: true,
     force: true,
     filter: (source) => !shouldSkipTemplatePath(source),
   });
+}
+
+async function readExistingViewerConfig() {
+  return {
+    packageJson: await readJson(path.join(outputRoot, "package.json")),
+    vercelJson: await readJson(path.join(outputRoot, "vercel.json")),
+  };
+}
+
+async function restoreViewerConfig(existing) {
+  const generatedPackage = await readJson(path.join(outputRoot, "package.json"));
+  const packageJson = {
+    ...existing.packageJson,
+    ...generatedPackage,
+    scripts: {
+      ...(existing.packageJson?.scripts || {}),
+      ...(generatedPackage.scripts || {}),
+    },
+  };
+  await fs.writeFile(
+    path.join(outputRoot, "package.json"),
+    `${JSON.stringify(packageJson, null, 2)}\n`,
+  );
+
+  const generatedVercel = await readJson(path.join(outputRoot, "vercel.json"));
+  const functions = {
+    ...(existing.vercelJson?.functions || {}),
+    ...(generatedVercel.functions || {}),
+  };
+  const vercelJson = {
+    ...existing.vercelJson,
+    ...generatedVercel,
+    ...(Object.keys(functions).length ? { functions } : {}),
+  };
+  await fs.writeFile(
+    path.join(outputRoot, "vercel.json"),
+    `${JSON.stringify(vercelJson, null, 2)}\n`,
+  );
 }
 
 function shouldSkipTemplatePath(source) {
