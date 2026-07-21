@@ -3420,6 +3420,107 @@ h4:hover .heading-anchor {
   padding-left: 19px;
 }
 
+.syllabus-points {
+  margin-top: 30px;
+}
+
+.syllabus-points-heading {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  margin-bottom: 18px;
+}
+
+.syllabus-points-heading h2 {
+  margin: 0;
+  color: #1d1d1f;
+  font-size: clamp(24px, 2.2vw, 30px);
+  line-height: 1.15;
+}
+
+.syllabus-points-heading p {
+  margin: 0;
+  color: #969eab;
+  font-size: 15px;
+  font-weight: 520;
+}
+
+.syllabus-point-list {
+  display: grid;
+  gap: 14px;
+}
+
+.syllabus-point-card {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 24px;
+  min-height: 112px;
+  border: 1px solid #e1e5e8;
+  border-radius: 18px;
+  padding: 20px 24px;
+  background: #fff;
+  box-shadow: 0 3px 9px rgba(30, 42, 55, 0.06);
+}
+
+.syllabus-point-code {
+  display: inline-grid;
+  min-width: 92px;
+  min-height: 54px;
+  place-items: center;
+  border-radius: 14px;
+  padding: 0 14px;
+  background: #e3f7ee;
+  color: #159b68;
+  font-size: 16px;
+  font-weight: 760;
+  white-space: nowrap;
+}
+
+.syllabus-point-understandings {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.syllabus-point-understandings p {
+  margin: 0;
+  color: #202327;
+  font-size: clamp(15px, 1.35vw, 18px);
+  line-height: 1.48;
+}
+
+.syllabus-point-ask {
+  min-width: 88px;
+  min-height: 52px;
+  border: 0;
+  border-radius: 999px;
+  padding: 0 22px;
+  background: #e0f5eb;
+  color: #159b68;
+  cursor: pointer;
+  font-size: 16px;
+  font-weight: 720;
+  transition: background 120ms ease, transform 120ms ease;
+}
+
+.syllabus-point-ask:hover {
+  background: #cceedd;
+  transform: translateY(-1px);
+}
+
+.syllabus-point-ask:focus-visible {
+  outline: 3px solid rgba(21, 155, 104, 0.2);
+  outline-offset: 2px;
+}
+
+.syllabus-point-ask:disabled {
+  cursor: wait;
+  opacity: 0.55;
+  transform: none;
+}
+
 .patterns-heading {
   display: flex;
   align-items: end;
@@ -3674,6 +3775,60 @@ h4:hover .heading-anchor {
 
   .pattern-question-actions {
     display: grid;
+  }
+
+  .syllabus-point-card {
+    grid-template-columns: auto minmax(0, 1fr);
+    align-items: start;
+    gap: 14px 16px;
+    min-height: 0;
+    padding: 18px;
+  }
+
+  .syllabus-point-code {
+    min-width: 82px;
+    min-height: 46px;
+    border-radius: 12px;
+    padding: 0 12px;
+    font-size: 14px;
+  }
+
+  .syllabus-point-ask {
+    grid-column: 2;
+    justify-self: start;
+    min-width: 78px;
+    min-height: 44px;
+    padding: 0 19px;
+    font-size: 14px;
+  }
+}
+
+@media (max-width: 520px) {
+  .syllabus-points-heading {
+    display: block;
+  }
+
+  .syllabus-points-heading p {
+    margin-top: 6px;
+  }
+
+  .syllabus-point-card {
+    grid-template-columns: 1fr auto;
+  }
+
+  .syllabus-point-code {
+    justify-self: start;
+  }
+
+  .syllabus-point-understandings {
+    grid-column: 1 / -1;
+    grid-row: 2;
+  }
+
+  .syllabus-point-ask {
+    grid-column: 2;
+    grid-row: 1;
+    justify-self: end;
   }
 }
 

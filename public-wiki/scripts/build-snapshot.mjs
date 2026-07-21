@@ -543,17 +543,43 @@ function extractUnitTabs(markdown) {
     const content = match[2].trim();
     const contentWithoutHeading = content.replace(/^##\s+.+$/m, "").trim();
     const sections = splitMarkdownH3Sections(contentWithoutHeading);
+    const syllabusPoints = id === "concepts"
+      ? extractSyllabusPoints(contentWithoutHeading)
+      : [];
     const publicCards = id === "concepts"
-      ? sections.cards.filter((card) => /^(Topic overview|At a glance)$/i.test(card.title))
+      ? syllabusPoints.length
+        ? []
+        : sections.cards.filter((card) => /^(Topic overview|At a glance)$/i.test(card.title))
       : sections.cards;
     tabs.push({
       id,
       label,
       overviewHtml: id === "problem-patterns" ? "" : renderUnitMarkdown(sections.overview),
+      ...(syllabusPoints.length ? { syllabusPoints } : {}),
       cards: publicCards.map((card, index) => buildUnitCard(card, id, index)),
     });
   }
   return tabs;
+}
+
+function extractSyllabusPoints(markdown) {
+  const points = [];
+  const pattern = /<!--\s*ibwiki:syllabus-point\s+({[\s\S]*?})\s*-->([\s\S]*?)<!--\s*\/ibwiki:syllabus-point\s*-->/g;
+  for (const match of markdown.matchAll(pattern)) {
+    const metadata = parseMarkerJson(match[1]);
+    const bulletId = String(metadata?.bullet_id || "").trim();
+    const level = String(metadata?.sl_hl || "").trim();
+    const understandings = Array.isArray(metadata?.understandings)
+      ? metadata.understandings.map((item) => String(item).trim()).filter(Boolean)
+      : [];
+    if (!bulletId || !understandings.length) continue;
+    points.push({
+      bulletId,
+      level,
+      understandings,
+    });
+  }
+  return points;
 }
 
 function normalizeUnitTabId(value) {

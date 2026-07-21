@@ -1637,6 +1637,7 @@ function renderUnitPageReader(page) {
 
 function renderAskLearnPanel(page, tab) {
   const summaryCards = tab?.cards || [];
+  const syllabusPoints = tab?.syllabusPoints || [];
   return `
     <section class="unit-panel ask-learn-panel" data-unit-panel="concepts">
       <div class="unit-ask-card">
@@ -1647,17 +1648,63 @@ function renderAskLearnPanel(page, tab) {
         </div>
         ${renderChatPanel({ embedded: true })}
       </div>
-      <div class="unit-summary-grid">
-        ${summaryCards.map((card) => `
-          <article class="unit-summary-card ${/^At a glance$/i.test(card.title) ? "key-summary" : "topic-overview"}">
-            <span>${/^At a glance$/i.test(card.title) ? "KEY SUMMARY" : "TOPIC OVERVIEW"}</span>
-            <h2>${escapeHtml(card.title)}</h2>
-            <div class="unit-card-body">${card.html}</div>
+      ${syllabusPoints.length
+        ? renderSyllabusPoints(syllabusPoints)
+        : `
+          <div class="unit-summary-grid">
+            ${summaryCards.map((card) => `
+              <article class="unit-summary-card ${/^At a glance$/i.test(card.title) ? "key-summary" : "topic-overview"}">
+                <span>${/^At a glance$/i.test(card.title) ? "KEY SUMMARY" : "TOPIC OVERVIEW"}</span>
+                <h2>${escapeHtml(card.title)}</h2>
+                <div class="unit-card-body">${card.html}</div>
+              </article>
+            `).join("")}
+          </div>
+        `}
+    </section>
+  `;
+}
+
+function renderSyllabusPoints(points) {
+  const understandingCount = points.reduce(
+    (total, point) => total + (point.understandings?.length || 0),
+    0,
+  );
+  const levelLabel = syllabusLevelLabel(points);
+  const chatIsAsking = activeChatIsAsking();
+  return `
+    <section class="syllabus-points" data-syllabus-points aria-labelledby="syllabus-points-title">
+      <div class="syllabus-points-heading">
+        <h2 id="syllabus-points-title">Syllabus points</h2>
+        <p>${understandingCount} ${understandingCount === 1 ? "understanding" : "understandings"}${levelLabel ? ` · ${escapeHtml(levelLabel)}` : ""}</p>
+      </div>
+      <div class="syllabus-point-list">
+        ${points.map((point) => `
+          <article class="syllabus-point-card">
+            <span class="syllabus-point-code">${escapeHtml(point.bulletId)}</span>
+            <div class="syllabus-point-understandings">
+              ${(point.understandings || []).map((understanding) => `<p>${escapeHtml(understanding)}</p>`).join("")}
+            </div>
+            <button
+              class="syllabus-point-ask"
+              type="button"
+              data-syllabus-ask="${escapeHtml(point.bulletId)}"
+              aria-label="Ask about syllabus point ${escapeHtml(point.bulletId)}"
+              ${chatIsAsking ? "disabled" : ""}
+            >Ask</button>
           </article>
         `).join("")}
       </div>
     </section>
   `;
+}
+
+function syllabusLevelLabel(points) {
+  const levels = new Set(points.map((point) => point.level).filter(Boolean));
+  if (levels.size === 1 && levels.has("SL/HL")) return "SL/HL shared";
+  if (levels.size === 1 && levels.has("HL only")) return "HL only";
+  if (levels.has("SL/HL") && levels.has("HL only")) return "SL/HL + HL only";
+  return [...levels].join(" + ");
 }
 
 function renderProblemPatternsPanel(tab) {
@@ -2952,6 +2999,32 @@ function bindProblemPatternsPanelEvents(root = document) {
   bindPatternQuestionViewEvents(root);
 }
 
+function bindSyllabusPointEvents(root = document) {
+  root.querySelectorAll("[data-syllabus-ask]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const bulletId = button.getAttribute("data-syllabus-ask") || "";
+      if (!bulletId || activeChatIsAsking()) return;
+
+      switchChatContext(pageContextForKey(state.activePageKey));
+      state.chatScope = "current";
+      state.chatDraft = `Help me understand syllabus point ${bulletId}.`;
+      render({ preserveSidebarScroll: true, chatForceBottom: true });
+
+      requestAnimationFrame(() => {
+        const form = document.querySelector(".embedded-chat-panel [data-chat-form]");
+        if (!form) return;
+        form.requestSubmit();
+        requestAnimationFrame(() => {
+          document.querySelector(".unit-ask-card")?.scrollIntoView({
+            behavior: "smooth",
+            block: "start",
+          });
+        });
+      });
+    });
+  });
+}
+
 function bindEvents() {
   document.querySelector("[data-search]")?.addEventListener("input", (event) => {
     state.searchQuery = event.target.value;
@@ -2997,6 +3070,7 @@ function bindEvents() {
     });
   });
 
+  bindSyllabusPointEvents(document);
   bindProblemPatternsPanelEvents(document);
 
   document.querySelector("[data-chat-messages]")?.addEventListener("scroll", scheduleChatScrollSave, { passive: true });
