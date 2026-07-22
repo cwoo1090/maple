@@ -1781,11 +1781,11 @@ h4:hover .heading-anchor {
 
 .message.assistant {
   align-self: flex-start;
-  width: calc(100% - 14px);
-  margin-left: 14px;
+  width: calc(100% - 42px);
+  margin-left: 42px;
   border: 1px solid rgba(216, 221, 231, 0.92);
-  border-radius: 16px 16px 16px 6px;
-  padding: 13px 15px 14px 19px;
+  border-radius: 18px;
+  padding: 14px 16px 15px;
   background: rgba(255, 255, 255, 0.96);
   box-shadow: 0 4px 14px rgba(31, 42, 66, 0.07);
   color: var(--text);
@@ -1793,11 +1793,11 @@ h4:hover .heading-anchor {
 
 .message.assistant::before {
   position: absolute;
-  top: 13px;
-  left: -14px;
+  top: 14px;
+  left: -39px;
   display: grid;
-  width: 28px;
-  height: 28px;
+  width: 30px;
+  height: 30px;
   place-items: center;
   border-radius: 999px;
   background: linear-gradient(145deg, #4f7cff 0%, #6858f5 100%);
@@ -1806,7 +1806,7 @@ h4:hover .heading-anchor {
     0 5px 12px rgba(80, 91, 225, 0.2);
   color: #ffffff;
   content: "\2726";
-  font-size: 14px;
+  font-size: 15px;
   line-height: 1;
 }
 
